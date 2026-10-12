@@ -1,0 +1,1242 @@
+From 35913165b9202d0f1d3352906355d5077f9c4716 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 12 Oct 2026 14:54:47 +0000
+Subject: [PATCH 3/5] feat(control-plane): add the deployment workflow and the
+ runtime launcher contract
+
+Nothing in the control plane could start an inference instance: the
+reconciler started an empty workflow and plugins cannot be imported by
+the control plane. Add forgemesh.controlplane.deployment:
+
+- RuntimeLauncher, the boundary to a runtime backend: launch a
+  LaunchRequest (instance key, tenant, resource, spec, allocation and
+  devices) into a LaunchedInstance (instance id, base url, protocol,
+  validated like status.endpoints), verify it, stop it by instance id,
+  plus an optional prepare step. Each call must be idempotent because
+  steps are retried and re-executed after a restart.
+- The deployment workflow prepare-model -> launch-instance ->
+  verify-instance; DeploymentSteps runs the steps on a launcher and
+  registers "stop" as the compensation of launch-instance.
+- deployment_run_key(uid): one deployment run (and instance key) per
+  resource uid. There is no update flow, so a generation change can
+  neither start a second deployment nor hide the first one from delete.
+- DeploymentReleaser, a ReleaseProvider that cancels an in-flight run
+  with cleanup and stops an instance that may still be running.
+- InMemoryLauncher, a test double; real launchers come later.
+- workflow_db_path(): the workflow store lives in its own file next to
+  the control-plane database so its frequent step writes never wait for
+  the registry's write lock.
+
+The package depends on the workflow contract only, not on the workflow
+runtime, which the control-plane image does not ship yet.
+---
+ .../controlplane/deployment/__init__.py       |  45 ++
+ .../controlplane/deployment/launcher.py       | 124 ++++
+ .../controlplane/deployment/memory.py         |  72 +++
+ .../controlplane/deployment/release.py        |  65 ++
+ .../controlplane/deployment/workflow.py       | 165 +++++
+ .../src/forgemesh/controlplane/sqlite.py      |  22 +-
+ tests/unit/controlplane/test_deployment.py    | 571 ++++++++++++++++++
+ tests/unit/controlplane/test_sqlite.py        |  47 +-
+ 8 files changed, 1108 insertions(+), 3 deletions(-)
+ create mode 100644 packages/control-plane/src/forgemesh/controlplane/deployment/__init__.py
+ create mode 100644 packages/control-plane/src/forgemesh/controlplane/deployment/launcher.py
+ create mode 100644 packages/control-plane/src/forgemesh/controlplane/deployment/memory.py
+ create mode 100644 packages/control-plane/src/forgemesh/controlplane/deployment/release.py
+ create mode 100644 packages/control-plane/src/forgemesh/controlplane/deployment/workflow.py
+ create mode 100644 tests/unit/controlplane/test_deployment.py
+
+diff --git a/packages/control-plane/src/forgemesh/controlplane/deployment/__init__.py b/packages/control-plane/src/forgemesh/controlplane/deployment/__init__.py
+new file mode 100644
+index 0000000..feeee84
+--- /dev/null
++++ b/packages/control-plane/src/forgemesh/controlplane/deployment/__init__.py
+@@ -0,0 +1,45 @@
++"""ForgeMesh 控制平面 — 推理服务部署（启动器契约、部署工作流、删除时的清理）。
++
++* :mod:`.launcher` —— 启动器契约 :class:`RuntimeLauncher` 及其请求 / 结果模型；
++* :mod:`.workflow` —— 部署工作流定义、幂等键与步骤 handler :class:`DeploymentSteps`；
++* :mod:`.release` —— 删除资源时取消部署、停止实例的 :class:`DeploymentReleaser`；
++* :mod:`.memory` —— 测试替身 :class:`InMemoryLauncher`。
++
++本包只依赖工作流契约（``forgemesh-workflow-api``），不依赖具体的工作流运行时。
++"""
++
++from __future__ import annotations
++
++from .launcher import LaunchedInstance, LaunchRequest, RuntimeLauncher
++from .memory import InMemoryLauncher
++from .release import DeploymentReleaser
++from .workflow import (
++    DEPLOYMENT_WORKFLOW,
++    LAUNCH_INSTANCE,
++    PREPARE_MODEL,
++    VERIFY_INSTANCE,
++    DeploymentSteps,
++    StepCallable,
++    deployment_inputs,
++    deployment_run_key,
++    deployment_workflow,
++    launched_instance,
++)
++
++__all__ = [
++    "DEPLOYMENT_WORKFLOW",
++    "LAUNCH_INSTANCE",
++    "PREPARE_MODEL",
++    "VERIFY_INSTANCE",
++    "DeploymentReleaser",
++    "DeploymentSteps",
++    "InMemoryLauncher",
++    "LaunchRequest",
++    "LaunchedInstance",
++    "RuntimeLauncher",
++    "StepCallable",
++    "deployment_inputs",
++    "deployment_run_key",
++    "deployment_workflow",
++    "launched_instance",
++]
+diff --git a/packages/control-plane/src/forgemesh/controlplane/deployment/launcher.py b/packages/control-plane/src/forgemesh/controlplane/deployment/launcher.py
+new file mode 100644
+index 0000000..dd70014
+--- /dev/null
++++ b/packages/control-plane/src/forgemesh/controlplane/deployment/launcher.py
+@@ -0,0 +1,124 @@
++"""推理实例启动器契约：部署工作流通过它准备、启动、验证和停止推理实例。
++
++:class:`RuntimeLauncher` 是控制平面与运行时后端（本地进程、容器等）之间的边界。部署
++工作流（:mod:`forgemesh.controlplane.deployment.workflow`）的三个步骤依次调用
++:meth:`~RuntimeLauncher.prepare`、:meth:`~RuntimeLauncher.launch` 与
++:meth:`~RuntimeLauncher.verify`；部署失败时的补偿与删除资源时调用
++:meth:`~RuntimeLauncher.stop`。
++
++契约放在控制平面而不是契约包中：启动器由控制平面按配置选择和组装，请求直接使用强类型
++的 :class:`~forgemesh.resource.inference.InferenceServiceSpec`。插件不能导入控制平面，
++以后若由插件提供启动器，需要先把契约移到契约包中。
++"""
++
++from __future__ import annotations
++
++from abc import ABC, abstractmethod
++from typing import Self
++
++from forgemesh.core.scheduler import AllocatedDevice, ResourceRef
++from forgemesh.resource.inference import Endpoint, EndpointProtocol, InferenceServiceSpec
++from pydantic import BaseModel, ConfigDict, Field, model_validator
++
++
++class LaunchRequest(BaseModel):
++    """启动一个推理实例所需的信息（部署工作流的输入，可 JSON 序列化）。
++
++    Attributes:
++        instance_key: 实例的幂等键，同一个资源（uid）的部署不变。
++        tenant_id: 资源所属租户。
++        resource: 被部署的资源（kind / namespace / name / uid）。
++        spec: 资源的期望状态（模型、运行时、加速器申请、副本数）。
++        allocation_id: 调度器为该资源记录的分配。
++        devices: 分配给该资源的加速器设备（同一节点）；没有加速器申请时为空。
++    """
++
++    model_config = ConfigDict(extra="forbid", frozen=True)
++
++    instance_key: str = Field(min_length=1)
++    tenant_id: str = Field(min_length=1)
++    resource: ResourceRef
++    spec: InferenceServiceSpec
++    allocation_id: str = Field(min_length=1)
++    devices: tuple[AllocatedDevice, ...] = ()
++
++
++class LaunchedInstance(BaseModel):
++    """已启动的实例：控制器据此写入 ``status.endpoints``。
++
++    Attributes:
++        instance_id: 启动器内的实例标识，:meth:`RuntimeLauncher.stop` 据此停止实例。
++        url: 实例基地址，规则同 :class:`~forgemesh.resource.inference.Endpoint` 的 ``url``
++            （不带凭证、查询串与片段的 ``http`` / ``https`` URL）。
++        protocol: 实例提供的协议，决定网关把请求转发到实例的哪个路径。
++    """
++
++    model_config = ConfigDict(extra="forbid", frozen=True)
++
++    instance_id: str = Field(min_length=1)
++    url: str
++    protocol: EndpointProtocol
++
++    @model_validator(mode="after")
++    def _require_valid_endpoint(self) -> Self:
++        self.endpoint()
++        return self
++
++    def endpoint(self) -> Endpoint:
++        """``status.endpoints`` 中对应的一项（实例已就绪）。"""
++        return Endpoint(
++            url=self.url, ready=True, instanceId=self.instance_id, protocol=self.protocol
++        )
++
++
++class RuntimeLauncher(ABC):
++    """推理实例启动器（运行时后端）。
++
++    部署工作流的每一步可能重试（按工作流运行时的重试策略），也可能在控制平面重启后以
++    相同的请求再执行一次，因此每个方法都须幂等；每次调用受该步骤的时限约束，超时或取消
++    部署时调用方的任务被取消（收到 :class:`asyncio.CancelledError`）。
++    """
++
++    async def prepare(self, request: LaunchRequest) -> None:  # noqa: B027 - 可选步骤，默认不做事
++        """准备实例需要的模型制品（下载、校验摘要等）；默认什么都不做。
++
++        Raises:
++            Exception: 无法准备；步骤按重试策略重试，用尽后部署失败。
++        """
++
++    @abstractmethod
++    async def launch(self, request: LaunchRequest) -> LaunchedInstance:
++        """启动实例并返回它的地址；实例开始启动即可返回，就绪由 :meth:`verify` 检查。
++
++        同一 ``request.instance_key`` 再次调用时（重试、重启后重新执行该步骤），实例仍在
++        运行就返回同一实例，不得启动第二个。抛出异常或被取消时须停止已经启动的部分：
++        这种情况下调用方没有拿到实例 id，无法再停止它。
++
++        Raises:
++            Exception: 无法启动；步骤按重试策略重试，用尽后部署失败。
++        """
++
++    @abstractmethod
++    async def verify(self, instance: LaunchedInstance) -> None:
++        """检查实例能否提供服务（如请求 ``/health``），不能时抛出异常。
++
++        失败按重试策略重试。实例需要较长时间加载模型时，实现应在一次调用内等待它就绪
++        （直到被取消），而不是立即失败。
++
++        Raises:
++            Exception: 实例不能提供服务。
++        """
++
++    @abstractmethod
++    async def stop(self, instance_id: str) -> None:
++        """停止实例并释放它占用的资源；实例不存在或已停止时直接返回。
++
++        部署失败的补偿和删除资源都会调用它，阻塞会让删除一直停在 ``Terminating``：须在
++        有限时间内返回（例如先请求退出，超过宽限期后强制结束）。
++
++        Raises:
++            Exception: 无法确认实例已停止；调用方稍后重试。
++        """
++
++
++__all__ = ["LaunchRequest", "LaunchedInstance", "RuntimeLauncher"]
+diff --git a/packages/control-plane/src/forgemesh/controlplane/deployment/memory.py b/packages/control-plane/src/forgemesh/controlplane/deployment/memory.py
+new file mode 100644
+index 0000000..5073e98
+--- /dev/null
++++ b/packages/control-plane/src/forgemesh/controlplane/deployment/memory.py
+@@ -0,0 +1,72 @@
++"""启动器的测试替身：在内存中记录实例，不启动进程、不提供服务。"""
++
++from __future__ import annotations
++
++import itertools
++
++from forgemesh.resource.inference import EndpointProtocol
++
++from .launcher import LaunchedInstance, LaunchRequest, RuntimeLauncher
++
++
++class InMemoryLauncher(RuntimeLauncher):
++    """记录启动与停止的启动器测试替身。
++
++    实例只是内存中的记录，地址 ``http://<instance-id>.launcher.invalid`` 不可解析
++    （``.invalid`` 见 RFC 2606），用于测试控制器与工作流；需要能接收请求的实例时使用其他
++    启动器。同一个对象跨“重启”复用，相当于实例在控制平面重启后仍在运行。
++
++    Args:
++        protocol: 实例的协议。
++
++    Attributes:
++        prepared: 每次 ``prepare`` 调用的请求。
++        launches: 每次 ``launch`` 调用的请求（含返回已有实例的调用）。
++        stops: 每次 ``stop`` 调用的实例 id（含实例已停止的调用）。
++    """
++
++    def __init__(self, protocol: EndpointProtocol = EndpointProtocol.OPENAI_CHAT) -> None:
++        self._protocol = protocol
++        self._ids = itertools.count(1)
++        self._instances: dict[str, LaunchedInstance] = {}
++        self.prepared: list[LaunchRequest] = []
++        self.launches: list[LaunchRequest] = []
++        self.stops: list[str] = []
++
++    @property
++    def running(self) -> dict[str, LaunchedInstance]:
++        """正在运行的实例（按实例 id）。"""
++        return {instance.instance_id: instance for instance in self._instances.values()}
++
++    async def prepare(self, request: LaunchRequest) -> None:
++        self.prepared.append(request)
++
++    async def launch(self, request: LaunchRequest) -> LaunchedInstance:
++        """返回 ``instance_key`` 对应的运行中实例，没有时创建一个。"""
++        self.launches.append(request)
++        instance = self._instances.get(request.instance_key)
++        if instance is None:
++            instance_id = f"instance-{next(self._ids)}"
++            instance = LaunchedInstance(
++                instance_id=instance_id,
++                url=f"http://{instance_id}.launcher.invalid",
++                protocol=self._protocol,
++            )
++            self._instances[request.instance_key] = instance
++        return instance
++
++    async def verify(self, instance: LaunchedInstance) -> None:
++        """实例不在运行时抛出 :class:`RuntimeError`。"""
++        if instance.instance_id not in self.running:
++            raise RuntimeError(f"instance {instance.instance_id} is not running")
++
++    async def stop(self, instance_id: str) -> None:
++        self.stops.append(instance_id)
++        self._instances = {
++            key: instance
++            for key, instance in self._instances.items()
++            if instance.instance_id != instance_id
++        }
++
++
++__all__ = ["InMemoryLauncher"]
+diff --git a/packages/control-plane/src/forgemesh/controlplane/deployment/release.py b/packages/control-plane/src/forgemesh/controlplane/deployment/release.py
+new file mode 100644
+index 0000000..516f64b
+--- /dev/null
++++ b/packages/control-plane/src/forgemesh/controlplane/deployment/release.py
+@@ -0,0 +1,65 @@
++"""删除资源时清理它的部署：取消进行中的部署运行并停止实例。"""
++
++from __future__ import annotations
++
++import logging
++
++from forgemesh.core.objects import Resource
++from forgemesh.workflow.runtime import WorkflowRuntime
++
++from .launcher import RuntimeLauncher
++from .workflow import deployment_run_key, launched_instance
++
++logger = logging.getLogger(__name__)
++
++
++class DeploymentReleaser:
++    """协调器的 :class:`~forgemesh.controlplane.reconciler.ReleaseProvider`：资源进入
++    ``Terminating`` 后清理它的部署，协调器随后释放分配并删除资源。
++
++    按 :func:`~forgemesh.controlplane.deployment.workflow.deployment_run_key` 找到资源（uid）
++    的部署运行：
++
++    * 运行未结束（正在部署）：``cancel(cleanup=True)`` 中断正在执行的步骤、补偿已完成的
++      步骤（停止已启动的实例），并等待运行结束；
++    * 之后实例仍可能在运行（服务已 ``Ready``，或补偿失败）：调用 ``launcher.stop``。
++
++    没有部署运行（资源没有进入过 ``Preparing``）时什么也不做。任何一步失败都抛出异常，
++    协调器保持 ``Terminating`` 并稍后重试；取消与停止都是幂等的。
++
++    Args:
++        runtime: 执行部署工作流的运行时（须实现 ``find_run``，``get_run`` 须返回步骤输出）。
++        launcher: 部署所用的启动器。
++    """
++
++    def __init__(self, runtime: WorkflowRuntime, launcher: RuntimeLauncher) -> None:
++        self._runtime = runtime
++        self._launcher = launcher
++
++    async def release(self, resource: Resource) -> None:
++        """取消 ``resource`` 的部署并停止它的实例；失败时抛出异常。"""
++        meta = resource.metadata
++        if not meta.uid:
++            return
++        run = await self._runtime.find_run(deployment_run_key(meta.uid))
++        if run is None:
++            return
++        if not run.terminal:
++            await self._runtime.cancel(run.run_id, cleanup=True)
++            run = await self._runtime.get_run(run.run_id)
++        instance = launched_instance(run)
++        if instance is None:
++            return
++        await self._launcher.stop(instance.instance_id)
++        logger.info(
++            "instance stopped: instance_id=%s kind=%s namespace=%s name=%s uid=%s run_id=%s",
++            instance.instance_id,
++            resource.kind,
++            meta.namespace,
++            meta.name,
++            meta.uid,
++            run.run_id,
++        )
++
++
++__all__ = ["DeploymentReleaser"]
+diff --git a/packages/control-plane/src/forgemesh/controlplane/deployment/workflow.py b/packages/control-plane/src/forgemesh/controlplane/deployment/workflow.py
+new file mode 100644
+index 0000000..33bd238
+--- /dev/null
++++ b/packages/control-plane/src/forgemesh/controlplane/deployment/workflow.py
+@@ -0,0 +1,165 @@
++"""推理服务的部署工作流：准备模型 → 启动实例 → 验证实例。
++
++协调器以 :func:`deployment_run_key` 为幂等键启动工作流（每个资源 uid 一次运行），运行
++输入是 :func:`deployment_inputs` 包装的
++:class:`~forgemesh.controlplane.deployment.launcher.LaunchRequest`。各步骤经
++:class:`DeploymentSteps` 调用 :class:`~forgemesh.controlplane.deployment.launcher.RuntimeLauncher`：
++
++``prepare-model``
++    ``launcher.prepare(request)``，结果为空。
++``launch-instance``
++    ``launcher.launch(request)``，结果是 :class:`LaunchedInstance` 的 JSON 形式；补偿为
++    ``launcher.stop(instance_id)``。
++``verify-instance``
++    ``launcher.verify(instance)``，检查 ``launch-instance`` 启动的实例，结果为空。
++
++某一步用尽重试后，工作流运行时补偿已成功的 ``launch-instance``（停止实例），运行以
++``Failed`` 结束；:func:`launched_instance` 从运行快照中取出可能仍在运行的实例。
++
++工作流运行时（``forgemesh-workflow-runtime``，控制平面本身只依赖工作流契约）这样组装::
++
++    steps = DeploymentSteps(launcher)
++    compensation = CompensationExecutor()
++    for step_id, handler in steps.compensations().items():
++        compensation.registry.register(step_id, handler)
++    runtime = LocalWorkflowRuntime(
++        store=WorkflowStore(workflow_db_path(db_path)),
++        executor=WorkflowExecutor(),
++        compensation=compensation,
++        approval=ApprovalGate(),
++        handler=steps.handle,
++    )
++"""
++
++from __future__ import annotations
++
++from collections.abc import Awaitable, Callable
++from typing import Any
++
++from forgemesh.workflow.runtime import RunInfo, Step, WorkflowDefinition
++from forgemesh.workflow.states import StepStatus
++
++from .launcher import LaunchedInstance, LaunchRequest, RuntimeLauncher
++
++#: 部署工作流的名称。
++DEPLOYMENT_WORKFLOW = "inference-service-deployment"
++
++PREPARE_MODEL = "prepare-model"
++LAUNCH_INSTANCE = "launch-instance"
++VERIFY_INSTANCE = "verify-instance"
++
++#: 各步骤单次尝试的时限（秒）。下载模型可能很慢；验证包含实例加载模型的时间。
++PREPARE_TIMEOUT_SECONDS = 3600
++LAUNCH_TIMEOUT_SECONDS = 600
++VERIFY_TIMEOUT_SECONDS = 1800
++
++#: 步骤与补偿 handler 的类型：``async (step, inputs) -> dict``。
++StepCallable = Callable[[Step, dict[str, Any]], Awaitable[dict[str, Any]]]
++
++_USES_PREFIX = "deployment."
++#: ``launch-instance`` 处于这些状态时，它启动的实例可能仍在运行。
++_INSTANCE_MAY_RUN = frozenset(
++    {StepStatus.SUCCEEDED, StepStatus.COMPENSATING, StepStatus.COMPENSATION_FAILED}
++)
++
++
++def deployment_workflow() -> WorkflowDefinition:
++    """部署工作流定义（每次返回新对象；不设工作流超时，由各步骤的时限约束）。"""
++    return WorkflowDefinition(
++        name=DEPLOYMENT_WORKFLOW,
++        steps=[
++            Step(
++                id=PREPARE_MODEL,
++                uses=_USES_PREFIX + PREPARE_MODEL,
++                timeout=PREPARE_TIMEOUT_SECONDS,
++            ),
++            Step(
++                id=LAUNCH_INSTANCE,
++                uses=_USES_PREFIX + LAUNCH_INSTANCE,
++                needs=[PREPARE_MODEL],
++                timeout=LAUNCH_TIMEOUT_SECONDS,
++            ),
++            Step(
++                id=VERIFY_INSTANCE,
++                uses=_USES_PREFIX + VERIFY_INSTANCE,
++                needs=[LAUNCH_INSTANCE],
++                timeout=VERIFY_TIMEOUT_SECONDS,
++            ),
++        ],
++    )
++
++
++def deployment_run_key(uid: str) -> str:
++    """资源 ``uid`` 的部署运行的幂等键，也是实例的幂等键（``LaunchRequest.instance_key``）。
++
++    不含 generation：还没有更新已部署服务的流程，generation 变化时不会再启动一次部署，
++    删除时也总能找到唯一的那次部署，不会留下无人管理的实例。
++    """
++    return f"deployment:{uid}"
++
++
++def deployment_inputs(request: LaunchRequest) -> dict[str, Any]:
++    """部署工作流的运行输入。"""
++    return {"request": request.model_dump(mode="json")}
++
++
++def launched_instance(run: RunInfo) -> LaunchedInstance | None:
++    """运行启动的、可能仍在运行的实例：``launch-instance`` 成功过且没有补偿成功时返回。"""
++    output = run.outputs.get(LAUNCH_INSTANCE)
++    if run.steps.get(LAUNCH_INSTANCE) not in _INSTANCE_MAY_RUN or output is None:
++        return None
++    return LaunchedInstance.model_validate(output)
++
++
++class DeploymentSteps:
++    """部署工作流的步骤 handler 与补偿 handler，交给工作流运行时调用。
++
++    Args:
++        launcher: 执行各步骤的启动器。
++    """
++
++    def __init__(self, launcher: RuntimeLauncher) -> None:
++        self._launcher = launcher
++
++    async def handle(self, step: Step, inputs: dict[str, Any]) -> dict[str, Any]:
++        """步骤 handler：按 ``step.uses`` 调用启动器，返回步骤结果。
++
++        Raises:
++            ValueError: 不是部署工作流的步骤。
++        """
++        if step.uses == _USES_PREFIX + PREPARE_MODEL:
++            await self._launcher.prepare(LaunchRequest.model_validate(inputs["request"]))
++            return {}
++        if step.uses == _USES_PREFIX + LAUNCH_INSTANCE:
++            request = LaunchRequest.model_validate(inputs["request"])
++            return (await self._launcher.launch(request)).model_dump(mode="json")
++        if step.uses == _USES_PREFIX + VERIFY_INSTANCE:
++            await self._launcher.verify(LaunchedInstance.model_validate(inputs[LAUNCH_INSTANCE]))
++            return {}
++        raise ValueError(f"not a deployment step: {step.uses!r}")
++
++    async def stop_instance(self, step: Step, result: dict[str, Any]) -> dict[str, Any]:
++        """``launch-instance`` 的补偿：停止该步骤启动的实例（参数为该步骤的结果）。"""
++        await self._launcher.stop(LaunchedInstance.model_validate(result).instance_id)
++        return {}
++
++    def compensations(self) -> dict[str, StepCallable]:
++        """要注册到补偿执行器的补偿 handler（按步骤 id）。"""
++        return {LAUNCH_INSTANCE: self.stop_instance}
++
++
++__all__ = [
++    "DEPLOYMENT_WORKFLOW",
++    "LAUNCH_INSTANCE",
++    "LAUNCH_TIMEOUT_SECONDS",
++    "PREPARE_MODEL",
++    "PREPARE_TIMEOUT_SECONDS",
++    "VERIFY_INSTANCE",
++    "VERIFY_TIMEOUT_SECONDS",
++    "DeploymentSteps",
++    "StepCallable",
++    "deployment_inputs",
++    "deployment_run_key",
++    "deployment_workflow",
++    "launched_instance",
++]
+diff --git a/packages/control-plane/src/forgemesh/controlplane/sqlite.py b/packages/control-plane/src/forgemesh/controlplane/sqlite.py
+index 18633ed..5075b1e 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/sqlite.py
++++ b/packages/control-plane/src/forgemesh/controlplane/sqlite.py
+@@ -11,13 +11,19 @@
+ * ``synchronous`` 保持默认的 ``FULL``：WAL 模式下 ``NORMAL`` 可能让已提交、已向客户端
+   确认的事务在掉电后丢失，权威存储不接受。
+ * 等待锁的时长沿用 :func:`sqlite3.connect` 默认的 5 秒（``timeout``，即 ``busy_timeout``）。
++
++工作流运行时的存储（``forgemesh.workflowruntime.store.WorkflowStore``）不在这个文件里，
++而是使用 :func:`workflow_db_path` 给出的同目录独立文件：它在后台频繁写入步骤状态，
++放在同一个文件里会与资源注册表争用唯一的写锁（WAL 只让读写互不阻塞，写入仍然排队）。
++两个文件各自启用 WAL，备份与恢复须同时覆盖两者。
+ """
+ 
+ from __future__ import annotations
+ 
+ import sqlite3
++from pathlib import Path
+ 
+-__all__ = ["connect"]
++__all__ = ["connect", "workflow_db_path"]
+ 
+ 
+ def connect(db_path: str) -> sqlite3.Connection:
+@@ -34,3 +40,17 @@ def connect(db_path: str) -> sqlite3.Connection:
+     conn.execute("PRAGMA journal_mode=WAL")
+     conn.execute("PRAGMA foreign_keys=ON")
+     return conn
++
++
++def workflow_db_path(db_path: str) -> str:
++    """控制平面数据库 ``db_path`` 对应的工作流存储文件（同目录）。
++
++    ``/data/forgemesh.db`` → ``/data/forgemesh.workflows.db``；没有扩展名时追加
++    ``.workflows.db``；``:memory:`` 原样返回（每个连接各自是一个独立的内存库）。
++    """
++    if db_path == ":memory:":
++        return db_path
++    path = Path(db_path)
++    if not path.suffix:
++        return f"{db_path}.workflows.db"
++    return str(path.with_suffix(".workflows.db"))
+diff --git a/tests/unit/controlplane/test_deployment.py b/tests/unit/controlplane/test_deployment.py
+new file mode 100644
+index 0000000..e61f472
+--- /dev/null
++++ b/tests/unit/controlplane/test_deployment.py
+@@ -0,0 +1,571 @@
++"""推理服务部署单元测试：启动器契约、部署工作流、删除时的清理与测试替身。
++
++覆盖：
++
++* ``LaunchRequest`` / ``LaunchedInstance`` 的校验，实例地址与 ``status.endpoints`` 同规则；
++* 部署工作流的步骤、时限与幂等键；步骤 handler 调用启动器，``launch-instance`` 的补偿停止实例；
++* 在 ``LocalWorkflowRuntime`` 中执行：成功、验证失败时停止已启动的实例、启动失败、
++  启动中途重启后复用同一实例；
++* ``DeploymentReleaser``：没有部署时不做事、停止已部署的实例、取消进行中的部署、
++  重试补偿时没能停止的实例、停止失败时抛出异常；
++* ``InMemoryLauncher`` 按实例幂等键复用实例。
++"""
++
++from __future__ import annotations
++
++import asyncio
++import json
++from collections import defaultdict
++from typing import Any
++
++import pytest
++from forgemesh.controlplane.deployment import (
++    DEPLOYMENT_WORKFLOW,
++    LAUNCH_INSTANCE,
++    PREPARE_MODEL,
++    VERIFY_INSTANCE,
++    DeploymentReleaser,
++    DeploymentSteps,
++    InMemoryLauncher,
++    LaunchedInstance,
++    LaunchRequest,
++    RuntimeLauncher,
++    deployment_inputs,
++    deployment_run_key,
++    deployment_workflow,
++    launched_instance,
++)
++from forgemesh.controlplane.deployment.workflow import (
++    LAUNCH_TIMEOUT_SECONDS,
++    PREPARE_TIMEOUT_SECONDS,
++    VERIFY_TIMEOUT_SECONDS,
++)
++from forgemesh.core.objects import ObjectMeta, Resource
++from forgemesh.core.scheduler import AllocatedDevice, ResourceRef
++from forgemesh.resource.inference import (
++    AcceleratorSpec,
++    Endpoint,
++    EndpointProtocol,
++    InferenceServiceSpec,
++    ModelRef,
++    ResourcesSpec,
++    RuntimeRef,
++)
++from forgemesh.workflow.runtime import RetryPolicy, RunInfo, Step
++from forgemesh.workflow.states import StepStatus, WorkflowStatus
++from forgemesh.workflowruntime.approval import ApprovalGate
++from forgemesh.workflowruntime.compensate import CompensationExecutor
++from forgemesh.workflowruntime.exec import StepExecutor, WorkflowExecutor
++from forgemesh.workflowruntime.runtime import LocalWorkflowRuntime
++from forgemesh.workflowruntime.store import WorkflowStore
++from pydantic import ValidationError
++
++KEY = deployment_run_key("uid-1")
++
++
++def _request(key: str = KEY) -> LaunchRequest:
++    return LaunchRequest(
++        instance_key=key,
++        tenant_id="tenant-1",
++        resource=ResourceRef(
++            kind="InferenceService", namespace="team-a", name="svc-1", uid="uid-1"
++        ),
++        spec=InferenceServiceSpec(
++            model=ModelRef(reference="models/llama"),
++            runtime=RuntimeRef(provider="vllm"),
++            resources=ResourcesSpec(
++                accelerator=AcceleratorSpec(type="nvidia-gpu", minMemoryGiB=16)
++            ),
++        ),
++        allocation_id="alloc-1",
++        devices=(AllocatedDevice(node_id="node-a", device_id="gpu-0"),),
++    )
++
++
++def _resource(uid: str | None = "uid-1", generation: int = 1) -> Resource:
++    return Resource(
++        kind="InferenceService",
++        metadata=ObjectMeta(
++            name="svc-1", namespace="team-a", uid=uid, generation=generation, tenant_id="tenant-1"
++        ),
++    )
++
++
++class _ScriptedLauncher(InMemoryLauncher):
++    """可让各个调用失败或在中途阻塞的启动器。
++
++    ``block`` / ``fail`` 中的名称：``prepare``、``launch``（创建实例之前）、``launched``
++    （创建实例之后、返回之前，模拟结果落盘前进程崩溃）、``verify``。
++    """
++
++    def __init__(self) -> None:
++        super().__init__()
++        self.block: set[str] = set()
++        self.fail: set[str] = set()
++        self.stop_failures = 0
++        self.entered: defaultdict[str, asyncio.Event] = defaultdict(asyncio.Event)
++        self.cancelled: list[str] = []
++
++    async def _gate(self, name: str) -> None:
++        self.entered[name].set()
++        if name in self.block:
++            try:
++                await asyncio.Event().wait()
++            except asyncio.CancelledError:
++                self.cancelled.append(name)
++                raise
++        if name in self.fail:
++            raise RuntimeError(f"{name} broke")
++
++    async def prepare(self, request: LaunchRequest) -> None:
++        await self._gate("prepare")
++        await super().prepare(request)
++
++    async def launch(self, request: LaunchRequest) -> LaunchedInstance:
++        await self._gate("launch")
++        instance = await super().launch(request)
++        await self._gate("launched")
++        return instance
++
++    async def verify(self, instance: LaunchedInstance) -> None:
++        await self._gate("verify")
++        await super().verify(instance)
++
++    async def stop(self, instance_id: str) -> None:
++        if self.stop_failures:
++            self.stop_failures -= 1
++            raise RuntimeError("stop broke")
++        await super().stop(instance_id)
++
++
++def _runtime(launcher: RuntimeLauncher, store: WorkflowStore | None = None) -> LocalWorkflowRuntime:
++    steps = DeploymentSteps(launcher)
++    compensation = CompensationExecutor()
++    for step_id, handler in steps.compensations().items():
++        compensation.registry.register(step_id, handler)
++    retry = RetryPolicy(max_attempts=2, initial_backoff_seconds=0.0, max_backoff_seconds=0.0)
++    return LocalWorkflowRuntime(
++        store=store if store is not None else WorkflowStore(),
++        executor=WorkflowExecutor(StepExecutor(retry)),
++        compensation=compensation,
++        approval=ApprovalGate(),
++        handler=steps.handle,
++    )
++
++
++async def _deploy(runtime: LocalWorkflowRuntime) -> str:
++    ref = await runtime.start(deployment_workflow(), deployment_inputs(_request()), KEY)
++    return ref.run_id
++
++
++# ---------------------------------------------------------------------- #
++# 启动器契约
++# ---------------------------------------------------------------------- #
++
++
++@pytest.mark.unit
++def test_launch_request_round_trips_through_the_workflow_inputs() -> None:
++    inputs = deployment_inputs(_request())
++
++    assert json.loads(json.dumps(inputs)) == inputs
++    assert LaunchRequest.model_validate(inputs["request"]) == _request()
++
++
++@pytest.mark.unit
++def test_launch_request_is_strict_and_frozen() -> None:
++    data = _request().model_dump()
++    with pytest.raises(ValidationError):
++        LaunchRequest.model_validate({**data, "replicas": 2})
++    with pytest.raises(ValidationError):
++        LaunchRequest.model_validate({**data, "instance_key": ""})
++    with pytest.raises(ValidationError):
++        _request().allocation_id = "alloc-2"
++
++
++@pytest.mark.unit
++def test_launched_instance_is_a_ready_endpoint() -> None:
++    instance = LaunchedInstance(
++        instance_id="i-1", url="http://10.0.0.1:8000", protocol="tgi-generate"
++    )
++
++    assert instance.endpoint() == Endpoint(
++        url="http://10.0.0.1:8000",
++        ready=True,
++        instanceId="i-1",
++        protocol=EndpointProtocol.TGI_GENERATE,
++    )
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize(
++    "url",
++    ["ftp://10.0.0.1", "http://user:pw@10.0.0.1", "http://10.0.0.1/?q=1", "http://h:99999", "h"],
++)
++def test_launched_instance_rejects_urls_that_endpoints_reject(url: str) -> None:
++    with pytest.raises(ValidationError):
++        LaunchedInstance(instance_id="i-1", url=url, protocol="openai-chat")
++
++
++@pytest.mark.unit
++def test_runtime_launcher_requires_launch_verify_and_stop() -> None:
++    assert RuntimeLauncher.__abstractmethods__ == {"launch", "verify", "stop"}
++
++    class _Minimal(RuntimeLauncher):
++        async def launch(self, request: LaunchRequest) -> LaunchedInstance:
++            raise NotImplementedError
++
++        async def verify(self, instance: LaunchedInstance) -> None:
++            return None
++
++        async def stop(self, instance_id: str) -> None:
++            return None
++
++    assert asyncio.run(_Minimal().prepare(_request())) is None
++
++
++# ---------------------------------------------------------------------- #
++# 部署工作流
++# ---------------------------------------------------------------------- #
++
++
++@pytest.mark.unit
++def test_deployment_workflow_prepares_launches_and_verifies() -> None:
++    defn = deployment_workflow()
++
++    assert defn.name == DEPLOYMENT_WORKFLOW
++    assert defn.timeout_seconds is None
++    assert [(step.id, step.uses, step.needs, step.timeout) for step in defn.steps] == [
++        (PREPARE_MODEL, "deployment.prepare-model", [], PREPARE_TIMEOUT_SECONDS),
++        (LAUNCH_INSTANCE, "deployment.launch-instance", [PREPARE_MODEL], LAUNCH_TIMEOUT_SECONDS),
++        (VERIFY_INSTANCE, "deployment.verify-instance", [LAUNCH_INSTANCE], VERIFY_TIMEOUT_SECONDS),
++    ]
++    assert deployment_workflow() is not defn
++
++
++@pytest.mark.unit
++def test_deployment_run_key_is_per_resource_uid() -> None:
++    assert KEY == "deployment:uid-1"
++    assert deployment_run_key("uid-2") != KEY
++
++
++@pytest.mark.unit
++def test_steps_call_the_launcher() -> None:
++    launcher = InMemoryLauncher()
++    steps = DeploymentSteps(launcher)
++    by_id = {step.id: step for step in deployment_workflow().steps}
++    inputs = deployment_inputs(_request())
++
++    async def scenario() -> None:
++        assert await steps.handle(by_id[PREPARE_MODEL], inputs) == {}
++        launched = await steps.handle(by_id[LAUNCH_INSTANCE], inputs)
++        assert (
++            await steps.handle(by_id[VERIFY_INSTANCE], {**inputs, LAUNCH_INSTANCE: launched}) == {}
++        )
++        [instance] = launcher.running.values()
++        assert launched == instance.model_dump(mode="json")
++        with pytest.raises(ValueError, match="not a deployment step"):
++            await steps.handle(Step(id="other", uses="test.other"), inputs)
++
++    asyncio.run(scenario())
++    assert launcher.prepared == launcher.launches == [_request()]
++
++
++@pytest.mark.unit
++def test_launch_compensation_stops_the_instance() -> None:
++    launcher = InMemoryLauncher()
++    steps = DeploymentSteps(launcher)
++    launch = deployment_workflow().steps[1]
++
++    async def scenario() -> None:
++        instance = await launcher.launch(_request())
++        [(step_id, compensate)] = steps.compensations().items()
++        assert step_id == LAUNCH_INSTANCE
++        assert await compensate(launch, instance.model_dump(mode="json")) == {}
++        assert launcher.stops == [instance.instance_id]
++
++    asyncio.run(scenario())
++    assert launcher.running == {}
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize(
++    ("status", "may_run"),
++    [
++        (StepStatus.SUCCEEDED, True),
++        (StepStatus.COMPENSATING, True),
++        (StepStatus.COMPENSATION_FAILED, True),
++        (StepStatus.COMPENSATED, False),
++        (StepStatus.FAILED, False),
++        (StepStatus.CANCELLED, False),
++        (StepStatus.SKIPPED, False),
++        (StepStatus.PENDING, False),
++    ],
++)
++def test_launched_instance_reports_instances_that_may_still_run(
++    status: StepStatus, may_run: bool
++) -> None:
++    instance = LaunchedInstance(
++        instance_id="i-1", url="http://10.0.0.1:8000", protocol="openai-chat"
++    )
++    run = RunInfo(
++        run_id="run-1",
++        status=WorkflowStatus.RUNNING,
++        steps={LAUNCH_INSTANCE: status},
++        outputs={LAUNCH_INSTANCE: instance.model_dump(mode="json")},
++    )
++
++    assert launched_instance(run) == (instance if may_run else None)
++    assert launched_instance(run.model_copy(update={"outputs": {}})) is None
++
++
++# ---------------------------------------------------------------------- #
++# 在工作流运行时中执行
++# ---------------------------------------------------------------------- #
++
++
++@pytest.mark.unit
++def test_deployment_run_launches_and_verifies_an_instance() -> None:
++    launcher = InMemoryLauncher()
++
++    async def scenario() -> RunInfo:
++        runtime = _runtime(launcher)
++        try:
++            run_id = await _deploy(runtime)
++            await runtime.wait(run_id)
++            assert (await runtime.find_run(KEY)).run_id == run_id
++            return await runtime.get_run(run_id)
++        finally:
++            await runtime.aclose()
++
++    run = asyncio.run(scenario())
++
++    assert run.status is WorkflowStatus.SUCCEEDED
++    [instance] = launcher.running.values()
++    assert launched_instance(run) == instance
++    assert [request.instance_key for request in launcher.launches] == [KEY]
++
++
++@pytest.mark.unit
++def test_failed_verification_stops_the_launched_instance() -> None:
++    launcher = _ScriptedLauncher()
++    launcher.fail.add("verify")
++
++    async def scenario() -> RunInfo:
++        runtime = _runtime(launcher)
++        try:
++            return await runtime.wait(await _deploy(runtime))
++        finally:
++            await runtime.aclose()
++
++    run = asyncio.run(scenario())
++
++    assert run.status is WorkflowStatus.FAILED
++    assert run.error == "step 'verify-instance' failed: verify broke"
++    assert run.steps == {
++        PREPARE_MODEL: StepStatus.SUCCEEDED,
++        LAUNCH_INSTANCE: StepStatus.COMPENSATED,
++        VERIFY_INSTANCE: StepStatus.FAILED,
++    }
++    assert launcher.running == {}
++    assert launcher.stops == [run.outputs[LAUNCH_INSTANCE]["instance_id"]]
++    assert launched_instance(run) is None
++
++
++@pytest.mark.unit
++def test_failed_launch_leaves_nothing_to_stop() -> None:
++    launcher = _ScriptedLauncher()
++    launcher.fail.add("launch")
++
++    async def scenario() -> RunInfo:
++        runtime = _runtime(launcher)
++        try:
++            return await runtime.wait(await _deploy(runtime))
++        finally:
++            await runtime.aclose()
++
++    run = asyncio.run(scenario())
++
++    assert run.status is WorkflowStatus.FAILED
++    assert run.steps[LAUNCH_INSTANCE] is StepStatus.FAILED
++    assert run.steps[VERIFY_INSTANCE] is StepStatus.SKIPPED
++    assert launcher.stops == []
++    assert launcher.running == {}
++
++
++@pytest.mark.unit
++def test_restart_during_launch_reuses_the_running_instance(tmp_path) -> None:
++    """实例已创建、结果还没落盘时进程退出：恢复后重新执行启动，启动器按幂等键返回同一实例。"""
++    path = str(tmp_path / "workflows.db")
++    launcher = _ScriptedLauncher()
++    launcher.block.add("launched")
++
++    async def interrupted() -> str:
++        store = WorkflowStore(path)
++        runtime = _runtime(launcher, store)
++        run_id = await _deploy(runtime)
++        await launcher.entered["launched"].wait()
++        await runtime.aclose()
++        await store.close()
++        return run_id
++
++    run_id = asyncio.run(interrupted())
++    assert launcher.cancelled == ["launched"]
++    launcher.block.clear()
++
++    async def resumed() -> RunInfo:
++        store = WorkflowStore(path)
++        runtime = _runtime(launcher, store)
++        try:
++            assert await runtime.recover() == [run_id]
++            return await runtime.wait(run_id)
++        finally:
++            await runtime.aclose()
++            await store.close()
++
++    run = asyncio.run(resumed())
++
++    assert run.status is WorkflowStatus.SUCCEEDED
++    [instance] = launcher.running.values()
++    assert launched_instance(run) == instance
++    assert [request.instance_key for request in launcher.launches] == [KEY, KEY]
++
++
++# ---------------------------------------------------------------------- #
++# 删除时的清理
++# ---------------------------------------------------------------------- #
++
++
++async def _release(
++    launcher: _ScriptedLauncher, resource: Resource, *, until: str | None = None
++) -> tuple[RunInfo | None, list[str]]:
++    """部署（可先等到某个调用开始）后释放资源，返回运行快照与释放期间停止的实例。"""
++    runtime = _runtime(launcher)
++    try:
++        run_id = await _deploy(runtime)
++        if until is None:
++            await runtime.wait(run_id)
++        else:
++            await launcher.entered[until].wait()
++        stops_before = len(launcher.stops)
++        await DeploymentReleaser(runtime, launcher).release(resource)
++        return await runtime.find_run(KEY), launcher.stops[stops_before:]
++    finally:
++        await runtime.aclose()
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize("resource", [_resource(uid="uid-2"), _resource(uid=None)])
++def test_releaser_does_nothing_without_a_deployment_run(resource: Resource) -> None:
++    launcher = _ScriptedLauncher()
++
++    async def scenario() -> list[str]:
++        runtime = _runtime(launcher)
++        try:
++            await runtime.wait(await _deploy(runtime))
++            await DeploymentReleaser(runtime, launcher).release(resource)
++            return launcher.stops
++        finally:
++            await runtime.aclose()
++
++    assert asyncio.run(scenario()) == []
++    assert len(launcher.running) == 1
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize("generation", [1, 2])
++def test_releaser_stops_the_instance_of_a_finished_deployment(generation: int) -> None:
++    """部署按 uid 查找：generation 变化后删除也能找到并停止实例。"""
++    launcher = _ScriptedLauncher()
++
++    run, stops = asyncio.run(_release(launcher, _resource(generation=generation)))
++
++    assert run.status is WorkflowStatus.SUCCEEDED
++    assert stops == [run.outputs[LAUNCH_INSTANCE]["instance_id"]]
++    assert launcher.running == {}
++
++
++@pytest.mark.unit
++def test_releaser_cancels_a_launch_in_progress() -> None:
++    """启动被中断：启动器自己清理，运行以 Cancelled 结束，没有实例需要停止。"""
++    launcher = _ScriptedLauncher()
++    launcher.block.add("launch")
++
++    run, stops = asyncio.run(_release(launcher, _resource(), until="launch"))
++
++    assert run.status is WorkflowStatus.CANCELLED
++    assert run.steps[LAUNCH_INSTANCE] is StepStatus.CANCELLED
++    assert launcher.cancelled == ["launch"]
++    assert stops == []
++    assert launcher.running == {}
++
++
++@pytest.mark.unit
++def test_releaser_cancels_a_verification_in_progress() -> None:
++    """实例已启动、正在验证：取消时补偿停止实例，释放器不再重复停止。"""
++    launcher = _ScriptedLauncher()
++    launcher.block.add("verify")
++
++    run, stops = asyncio.run(_release(launcher, _resource(), until="verify"))
++
++    assert run.status is WorkflowStatus.CANCELLED
++    assert run.steps[LAUNCH_INSTANCE] is StepStatus.COMPENSATED
++    assert stops == [run.outputs[LAUNCH_INSTANCE]["instance_id"]]
++    assert launcher.running == {}
++
++
++@pytest.mark.unit
++def test_releaser_retries_a_stop_that_failed_during_compensation() -> None:
++    launcher = _ScriptedLauncher()
++    launcher.fail.add("verify")
++    launcher.stop_failures = 1
++
++    run, stops = asyncio.run(_release(launcher, _resource()))
++
++    assert run.status is WorkflowStatus.FAILED
++    assert run.steps[LAUNCH_INSTANCE] is StepStatus.COMPENSATION_FAILED
++    assert stops == [run.outputs[LAUNCH_INSTANCE]["instance_id"]]
++    assert launcher.running == {}
++
++
++@pytest.mark.unit
++def test_releaser_raises_when_the_instance_cannot_be_stopped() -> None:
++    launcher = _ScriptedLauncher()
++    launcher.stop_failures = 1
++
++    with pytest.raises(RuntimeError, match="stop broke"):
++        asyncio.run(_release(launcher, _resource()))
++    assert len(launcher.running) == 1
++
++
++# ---------------------------------------------------------------------- #
++# 测试替身
++# ---------------------------------------------------------------------- #
++
++
++@pytest.mark.unit
++def test_in_memory_launcher_reuses_instances_per_key() -> None:
++    launcher = InMemoryLauncher(protocol=EndpointProtocol.TGI_GENERATE)
++
++    async def scenario() -> dict[str, Any]:
++        first = await launcher.launch(_request())
++        again = await launcher.launch(_request())
++        other = await launcher.launch(_request(deployment_run_key("uid-2")))
++        await launcher.verify(first)
++        await launcher.stop(first.instance_id)
++        await launcher.stop(first.instance_id)
++        with pytest.raises(RuntimeError, match="is not running"):
++            await launcher.verify(first)
++        relaunched = await launcher.launch(_request())
++        return {"first": first, "again": again, "other": other, "relaunched": relaunched}
++
++    instances = asyncio.run(scenario())
++
++    assert instances["again"] == instances["first"]
++    assert instances["first"].protocol is EndpointProtocol.TGI_GENERATE
++    assert instances["first"].url == f"http://{instances['first'].instance_id}.launcher.invalid"
++    assert len({instance.instance_id for instance in instances.values()}) == 3
++    assert set(launcher.running) == {
++        instances["other"].instance_id,
++        instances["relaunched"].instance_id,
++    }
++    assert launcher.stops == [instances["first"].instance_id] * 2
+diff --git a/tests/unit/controlplane/test_sqlite.py b/tests/unit/controlplane/test_sqlite.py
+index 28e6a36..751824a 100644
+--- a/tests/unit/controlplane/test_sqlite.py
++++ b/tests/unit/controlplane/test_sqlite.py
+@@ -4,7 +4,8 @@
+ 
+ * ``connect`` 启用 WAL 与外键约束，``synchronous`` 保持 ``FULL``，等锁 5 秒；
+ * 控制平面的各个存储都以 WAL 模式打开数据库文件；
+-* 同一文件上一个连接的读事务不阻塞另一个存储写入。
++* 同一文件上一个连接的读事务不阻塞另一个存储写入；
++* 工作流存储使用同目录的独立文件，控制平面库被写锁占用时照常写入。
+ """
+ 
+ from __future__ import annotations
+@@ -19,8 +20,10 @@ from forgemesh.controlplane.audit import AuditLog
+ from forgemesh.controlplane.outbox import Outbox
+ from forgemesh.controlplane.reconciler import ProcessedKeyStore
+ from forgemesh.controlplane.registry import SQLiteRegistry
+-from forgemesh.controlplane.sqlite import connect
++from forgemesh.controlplane.sqlite import connect, workflow_db_path
+ from forgemesh.controlplane.tasks import TaskStore
++from forgemesh.workflow.runtime import Step, WorkflowDefinition
++from forgemesh.workflowruntime.store import WorkflowStore
+ 
+ 
+ def _close(store) -> None:
+@@ -86,3 +89,43 @@ def test_open_read_does_not_block_writes_from_another_store(tmp_path) -> None:
+         reader.rollback()
+         reader.close()
+         _close(store)
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize(
++    ("db_path", "expected"),
++    [
++        ("/data/forgemesh.db", "/data/forgemesh.workflows.db"),
++        ("relative/cp.sqlite3", "relative/cp.workflows.db"),
++        ("/data.d/forgemesh", "/data.d/forgemesh.workflows.db"),
++        (":memory:", ":memory:"),
++    ],
++)
++def test_workflow_db_path_is_a_sibling_file(db_path: str, expected: str) -> None:
++    assert workflow_db_path(db_path) == expected
++
++
++@pytest.mark.unit
++def test_workflow_store_writes_while_the_control_plane_database_is_locked(tmp_path) -> None:
++    path = str(tmp_path / "cp.db")
++    writer = connect(path)
++    workflows = WorkflowStore(workflow_db_path(path))
++    try:
++        writer.execute("BEGIN IMMEDIATE")
++        started = time.monotonic()
++        asyncio.run(
++            workflows.create_run(
++                WorkflowDefinition(name="wf", steps=[Step(id="s1", uses="test.step")]), {}, "key-a"
++            )
++        )
++        assert time.monotonic() - started < 1
++        probe = sqlite3.connect(tmp_path / "cp.workflows.db")
++        try:
++            assert probe.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
++            assert probe.execute("SELECT COUNT(*) FROM workflow_runs").fetchone()[0] == 1
++        finally:
++            probe.close()
++    finally:
++        writer.rollback()
++        writer.close()
++        asyncio.run(workflows.close())
+-- 
+2.43.0
+

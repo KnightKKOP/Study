@@ -1,0 +1,189 @@
+From 3318eaa041f9861a42a43a87f24273a10970cac6 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 12 Oct 2026 15:46:57 +0000
+Subject: [PATCH 5/5] docs: describe the deployment workflow and the
+ phase-driven reconciler
+
+Record in the changelog what the workflow runtime, the deployment
+package and the reconciler now do, including the breaking changes, and
+bring the README, the module mapping (33 control-plane modules, 25
+control-plane test files, the run snapshot contract, LocalWorkflowRuntime,
+which providers can run the deployment workflow and where its store
+lives) and the workflow-reference README in line with the code. The
+dedup module now names the deployment run key next to the allocation
+key.
+
+The application still wires no workflow runtime or launcher, so the
+documented defaults (WorkflowRuntimeUnavailable before any allocation,
+one database file) are unchanged.
+---
+ CHANGELOG.md                                  | 10 ++++++++
+ README.md                                     |  2 +-
+ docs/architecture/module-mapping.md           | 24 +++++++++----------
+ .../controlplane/reconciler/dedup.py          |  7 +++---
+ plugins/workflow-reference/README.md          |  7 +++---
+ 5 files changed, 31 insertions(+), 19 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index e8334f4..777d27e 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -30,6 +30,9 @@
+ - 调度器 `forgemesh.controlplane.scheduler.FirstFitScheduler`：按静态加速器清单首次适配分配。清单是 JSON 文件，路径取自 `FORGEMESH_INVENTORY_FILE`（未设置时不启用调度器），列出节点及其设备（`id` / `type` / `memoryGiB`），严格校验（未知字段、隐式类型转换、空列表、重复 id 都是错误），文件不可读或非法时控制平面拒绝启动，格式见 README「运行控制平面」。调度器按清单顺序取第一个能凑齐数量的节点（类型精确匹配、单卡显存不低于 `minMemoryGiB`，不跨节点）；同一幂等键返回同一分配（重启后亦然）；资源已持有仍满足需求的分配时直接复用，不满足时报冲突，须先释放；`feasible()` 只读，`release()` 幂等。分配不设租约，资源删除时由协调器释放。应用尚未接入工作流运行时，因此协调器在分配之前即报告 `Ready=False`（`WorkflowRuntimeUnavailable`）。
+ - 设备级独占：新表 `allocation_devices` 记录每个分配占用的 `(node_id, device_id)`，部分唯一索引 `idx_allocation_devices_one_active` 保证一个设备至多属于一个 Active 分配，触发器 `trg_allocation_devices_follow_status` 让设备随分配状态一起释放。`SQLiteRegistry.create_allocation` 在同一个 `BEGIN IMMEDIATE` 事务中检查归属资源（存在、uid 一致、不在 `Terminating`）、幂等键（重放返回原分配，用过的键不再复用）、资源与设备是否已被占用，再一起写入分配与设备行；另新增 `get_allocation`、`get_allocation_by_idempotency_key`、`allocated_devices`、`release_active_allocation`，分配记录包含 `devices`。
+ - 调度契约：`ScheduleRequest` 新增 `resource_ref`（`ResourceRef`：`kind` / `namespace` / `name` / `uid`）与 `idempotency_key`，`AllocationRef` 新增 `devices`（`AllocatedDevice`：`node_id` / `device_id`）。协调器以 `{uid}:{generation}`（`allocation_idempotency_key`）为幂等键，`requirements` 取自 `spec.resources.accelerator`（`{"accelerator": {"type", "count", "minMemoryGiB"}}`）；没有 `metadata.uid` 的资源报告 `Ready=False`（`MissingUid`），不分配。
++- 工作流契约：运行快照 `RunInfo`（`status`、按定义顺序的步骤状态 `steps`、已成功步骤的输出 `outputs`（步骤之后被补偿也保留）、失败原因 `error`、属性 `terminal`）；`WorkflowRuntime` 新增两个非抽象方法：`get_run(run_id)`（默认只填 `status`）与 `find_run(idempotency_key)`（按幂等键查找运行、不创建，默认抛 `NotImplementedError`），既有实现（如 `workflow-temporal`）无需修改。
++- 工作流运行时 `forgemesh.workflowruntime.runtime.LocalWorkflowRuntime`：`start()` 创建（或按幂等键复用）运行后立即返回，步骤由运行时持有的后台任务按定义顺序执行（重试、步骤超时与工作流超时沿用 `WorkflowExecutor`），每一步的状态与结果都落盘。全部成功 → `Succeeded`；某一步用尽重试或工作流超时 → `Compensating`，反向补偿已成功且注册了补偿的步骤，未执行的步骤置为 `Skipped`，然后 `Failed`（`error` 记录失败的步骤与错误）。`cancel()` 中断正在执行的步骤并等待运行进入 `Cancelled`（`cleanup=True` 时先补偿）；`recover()`（进程启动时调用一次）让未结束的运行从第一个未成功的步骤继续，或完成中断的补偿；`wait()` 等待后台执行结束；`aclose()` 取消或等待全部后台任务，之后才能关闭存储。审批结果只保存在内存中，重启后需要重新审批。`workflow-reference` 插件的 `ReferenceWorkflowRuntime` 即是它的子类。`WorkflowStore` 记录运行失败原因（打开旧库时自动补上 `error` 列）、补偿后保留步骤结果、记录步骤尝试次数，新增 `get_run_by_idempotency_key`；连接以锁串行化，文件库以 WAL 模式打开。
++- 推理服务部署 `forgemesh.controlplane.deployment`：启动器契约 `RuntimeLauncher`（`prepare`（可选）/ `launch` / `verify` / `stop`，均须幂等，`stop` 须在有限时间内返回）及其请求 `LaunchRequest`（实例幂等键、租户、资源身份、`spec`、分配 id 与设备）与结果 `LaunchedInstance`（实例 id、地址、协议，按 `status.endpoints` 的规则校验）；部署工作流 `inference-service-deployment`：`prepare-model`（单次时限 3600 秒）→ `launch-instance`（600 秒，补偿为 `stop`）→ `verify-instance`（1800 秒），步骤 handler 为 `DeploymentSteps`；每个资源 uid 一次部署运行，幂等键 `deployment:{uid}`（`deployment_run_key`）同时是实例幂等键；`DeploymentReleaser`（协调器的 `ReleaseProvider`）在资源删除时取消进行中的部署运行（补偿停止已启动的实例）并停止可能仍在运行的实例。仓库只提供测试替身 `InMemoryLauncher`，还没有真实的启动器；控制平面应用也尚未注入工作流运行时与启动器。`forgemesh.controlplane.sqlite.workflow_db_path()` 给出工作流存储的文件：控制平面数据库旁的独立文件（`forgemesh.db` → `forgemesh.workflows.db`），步骤写入不必等待 Registry 的写锁。
+ 
+ ### Changed
+ 
+@@ -58,6 +61,11 @@
+ - **破坏性**：`ScheduleRequest` 必须提供 `resource_ref` 与 `idempotency_key`（见 Added）；`resource_kind` 改为只读属性（等同 `resource_ref.kind`），构造时传入会被拒绝。`AllocationRef.resource_id` 改为归属资源的 `uid`。
+ - **破坏性**：`allocations.resource_id` 改为归属资源的 `uid`（此前协调器按 `{kind}/{name}` 查找），同一租户内同一 uid 至多一个 Active 分配：部分唯一索引 `idx_allocations_one_active_per_tenant_resource`（`ON allocations(tenant_id, resource_id) WHERE status = 'Active'`）取代 `idx_allocations_one_active_per_resource`，打开旧库时自动替换，已有行保留。旧库中以 `{kind}/{name}` 记录的分配不做迁移，也不再随资源删除释放（此前仓库没有调度器实现，正常部署不会产生这类分配）。
+ - **破坏性**：持有 Active 分配的资源无论处于哪个 phase，`DELETE` 都返回 `202` 并先进入 `Terminating`（此前 `Pending` / `Scheduling` / `Preparing` / `Failed` / `Unknown` 直接物理删除并返回 `204`），由协调器释放分配后再物理删除；检查之后才提交的分配使这次删除失败（`409`），而不是遗留一个没有归属的分配。OpenAPI 已同步。
++- **破坏性**：协调器按 phase 逐轮部署 `InferenceService`，每一轮只做一个合法的 phase 转移并写回 `status.phase`：`Pending` → `Scheduling`（策略放行；策略只在离开 `Pending` 时评估）→ `Preparing`（分配加速器）→ `Deploying`（以同一幂等键取回分配，启动部署工作流，输入携带分配的设备）→ `Verifying`（`launch-instance` 已成功）→ `Ready`（运行成功：写入 `status.endpoints` 与 `Ready=True`，原因 `Reconciled`）。部署过程中 `Ready=False`，原因即当前 phase；运行未结束时按幂等键 `find_run()`，每 `workflow_poll_interval` 秒查询一次。只有进入 `Ready` 或 `Failed` 的一轮登记去重键。
++- **破坏性**：部署失败时资源进入终态 `Failed`（`Ready=False`）：运行失败、被取消或超时 → `WorkflowFailed`（消息为运行记录的失败原因，如 `step 'verify-instance' failed: …`），释放分配；补偿没能停止实例时保留分配（消息说明实例可能仍在运行），删除资源时经 `Terminating` 停止实例后再释放；找不到运行（`WorkflowRunNotFound`，如工作流数据库被重置）或运行成功却没有报告实例时同样进入 `Failed` 并保留分配。协调器不自动重试，删除后重新创建资源即可再次部署。
++- **破坏性**：处于 `Ready` / `Degraded` / `Updating` / `Failed` / `Unknown` 的资源不再被协调（不评估策略、不写 `status`）：还没有更新已部署服务的流程，修改 `spec`（新 `generation`）不会重新部署。此前协调器对 `Updating` / `Failed` / `Unknown` 的资源（`Ready` / `Degraded` 在 generation 变化时）重新评估策略后写入 `Ready=True`。
++- **破坏性**：`ReconciliationController` 注入 `workflow_runtime` 时必须同时注入 `release_provider`（否则抛 `ValueError`：删除资源会留下运行中的实例），运行时须实现 `find_run` 并在快照中返回步骤输出；新增参数 `workflow_poll_interval`（默认 `2.0` 秒，须为正数）。不是 `InferenceService` 的资源报告 `Ready=False`（`NotDeployable`），不分配、不启动工作流。
++- **破坏性**：`ReferenceWorkflowRuntime` 在后台执行运行（见 Added）：`start()` 返回时运行可能仍在执行，步骤失败时补偿并以 `Failed` 结束，`cancel()` 等待运行进入终态；使用方须在启动时调用 `recover()`、关闭时调用 `aclose()`。
+ 
+ ### Deprecated
+ 
+@@ -90,6 +98,8 @@
+ - 协调器传给调度器的 `requirements` 恒为空，调度器无从得知资源申请了几张什么卡：现取自 `spec.resources.accelerator`。
+ - 删除处于 `Pending` / `Scheduling` 等无副作用 phase、但已持有分配的资源时直接物理删除，分配及其设备永远不会被释放：现先进入 `Terminating`（见 Changed）。
+ - `Terminating` 协调按 `{kind}/{name}` 释放分配，忽略命名空间，删除一个服务可能释放另一个命名空间中同名服务的分配：现按资源 uid（限本租户）释放。资源已被删除、或同名资源已以新 uid 重建时，只释放原资源的分配，不再移除新资源的 finalizer 并把它删除。
++- 协调器启动一个没有步骤的工作流后立即登记去重键并写入 `Ready=True`（`Reconciled`），启动失败时只记一条警告、同样报告 `Ready=True`；`phase` 停在 `Pending`，`status.endpoints` 从不写入（改进计划 4.10 遗留问题、5.3）：现按 phase 逐轮部署，运行成功之后才 `Ready=True`（见 Changed）。部署工作流没能启动时停在 `Preparing`、`Ready=False`（`WorkflowStartFailed`），保留分配，不登记去重键，退避重试（从 `workflow_poll_interval` 起每次翻倍，最多 60 秒）；查询运行失败同样处理（`WorkflowLookupFailed`）。
++- 参考工作流运行时的 `start()` 只创建运行记录并推进到 `Running`，从不执行步骤，运行永远停在 `Running`，`cancel(cleanup=True)` 补偿的是从未执行过的步骤：现由 `LocalWorkflowRuntime` 在后台执行（见 Added）。
+ 
+ ### Security
+ 
+diff --git a/README.md b/README.md
+index 133b280..0a1bd8e 100644
+--- a/README.md
++++ b/README.md
+@@ -174,7 +174,7 @@ curl -s -H "Authorization: Bearer fmk_…" http://127.0.0.1:8080/api/v1/inferenc
+ 
+ 节点 `id` 在清单内唯一，设备 `id` 在所属节点内唯一，节点与设备都至少一个，不允许其他字段；`type` 与 `spec.resources.accelerator.type` 按字符串精确匹配，`memoryGiB` 是单卡显存（正整数，不接受 `"80"` 或 `80.0`）。调度器按清单顺序取第一个能凑齐 `count` 张卡的节点，在该节点内按顺序取类型匹配、显存不低于 `minMemoryGiB` 且未被占用的设备，不跨节点凑数。分配按资源 `uid` 记录在权威存储中（`allocations` / `allocation_devices`），同一设备同时至多属于一个生效的分配；分配不设租约，在资源删除时释放：持有分配的资源无论处于哪个 phase，`DELETE` 都返回 `202` 并先进入 `Terminating`。
+ 
+-控制平面启动后会自动协调 `InferenceService`：新建、修改或请求删除的资源在 0.5 秒内被处理，协调结果写入 `status.conditions`（例如 `Ready=False` 及其原因）。未设置 `FORGEMESH_INVENTORY_FILE` 时，新建的服务会停在 `Pending`，并带有 `Ready=False`（`SchedulerUnavailable`）条件；设置后，由于应用尚未接入工作流运行时，条件为 `Ready=False`（`WorkflowRuntimeUnavailable`），协调器在分配之前停下，暂不占用设备。控制器与 API 运行在同一个进程中，是权威存储的唯一写者（ADR-013）：请以单进程运行，不要使用 `uvicorn --workers` 或多副本。
++控制平面启动后会自动协调 `InferenceService`：新建、修改或请求删除的资源在 0.5 秒内被处理，协调结果写入 `status.conditions`（例如 `Ready=False` 及其原因）。未设置 `FORGEMESH_INVENTORY_FILE` 时，新建的服务会停在 `Pending`，并带有 `Ready=False`（`SchedulerUnavailable`）条件；设置后，由于应用尚未接入工作流运行时，条件为 `Ready=False`（`WorkflowRuntimeUnavailable`），协调器在分配之前停下，暂不占用设备。协调器本身已能完成部署：注入工作流运行时与推理实例启动器（`forgemesh.controlplane.deployment.RuntimeLauncher`）后，资源每轮推进一个 phase（`Pending` → `Scheduling` → `Preparing` → `Deploying` → `Verifying` → `Ready`），部署工作流（准备模型 → 启动实例 → 验证实例）成功后写入 `status.endpoints` 与 `Ready=True`；部署失败时资源进入 `Failed`，不自动重试，删除后重新创建即可再次部署；删除时先取消部署、停止实例，再释放分配。仓库目前只有测试用的内存启动器。控制器与 API 运行在同一个进程中，是权威存储的唯一写者（ADR-013）：请以单进程运行，不要使用 `uvicorn --workers` 或多副本。
+ 
+ ### Go 网关
+ 
+diff --git a/docs/architecture/module-mapping.md b/docs/architecture/module-mapping.md
+index 63549fc..50ad379 100644
+--- a/docs/architecture/module-mapping.md
++++ b/docs/architecture/module-mapping.md
+@@ -120,13 +120,13 @@
+ | 字段 | 内容 |
+ |---|---|
+ | 架构模块 | L2 Core Control Plane（权威状态、协调、插件管理、审计） |
+-| 当前代码路径 | `packages/control-plane/src/forgemesh/controlplane/`：`registry/{models,store}.py`、`reconciler/{core,dedup}.py`、`controller/{manager,queue}.py`、`scheduler/{inventory,first_fit}.py`、`api/{routes,dependencies,errors}.py`、`plugin_manager.py`、`outbox.py`、`audit.py`、`tasks.py`、`heartbeat.py`、`observability.py`、`diagnostics.py`、`app.py`、`auth.py`、`keygen.py`、`sqlite.py`（共 28 个 `.py`；其中 `auth.py` / `keygen.py` / `api/errors.py` 为 API 认证与错误信封，见 ADR-014；`controller/` 驱动协调器并回写 status；`scheduler/` 按静态加速器清单首次适配分配；`sqlite.py` 统一 SQLite 连接设置（WAL、外键）；其余与任务书的 9 个子模块一一对应） |
+-| 核心契约 | 实现 `core-contracts` 的 `ResourceRegistry` / `Reconciler` / `Scheduler`（`FirstFitScheduler`：清单来自 `FORGEMESH_INVENTORY_FILE`，设置时才注入控制器；分配与设备占用经 `SQLiteRegistry.create_allocation` 在同一事务中写入，设备独占由 `allocation_devices` 部分唯一索引保证）；`app.py` 提供 HTTP 服务（FastAPI，未安装时回退纯标准库占位——生产必须 FastAPI/ASGI），并在 lifespan 中运行控制器；控制器按序号增量读取 `resource_changes` 变更记录，经 `update_status`（status 子资源，CAS）回写协调结果；Outbox 事务性事件（architecture.md 3.3 规则 7）；`ProcessedKeyStore` 去重（reconciler/dedup.py） |
++| 当前代码路径 | `packages/control-plane/src/forgemesh/controlplane/`：`registry/{models,store}.py`、`reconciler/{core,dedup}.py`、`controller/{manager,queue}.py`、`scheduler/{inventory,first_fit}.py`、`deployment/{launcher,workflow,release,memory}.py`、`api/{routes,dependencies,errors}.py`、`plugin_manager.py`、`outbox.py`、`audit.py`、`tasks.py`、`heartbeat.py`、`observability.py`、`diagnostics.py`、`app.py`、`auth.py`、`keygen.py`、`sqlite.py`（共 33 个 `.py`；其中 `auth.py` / `keygen.py` / `api/errors.py` 为 API 认证与错误信封，见 ADR-014；`controller/` 驱动协调器并回写 status；`scheduler/` 按静态加速器清单首次适配分配；`deployment/` 为部署工作流（准备模型 → 启动实例 → 验证实例）、启动器契约 `RuntimeLauncher`、删除时的清理 `DeploymentReleaser` 与测试替身 `InMemoryLauncher`；`sqlite.py` 统一 SQLite 连接设置（WAL、外键），并由 `workflow_db_path` 给出工作流存储文件；其余与任务书的 9 个子模块一一对应） |
++| 核心契约 | 实现 `core-contracts` 的 `ResourceRegistry` / `Reconciler` / `Scheduler`（`FirstFitScheduler`：清单来自 `FORGEMESH_INVENTORY_FILE`，设置时才注入控制器；分配与设备占用经 `SQLiteRegistry.create_allocation` 在同一事务中写入，设备独占由 `allocation_devices` 部分唯一索引保证）；协调器按 phase 逐轮推进 `InferenceService`（`Pending` → `Scheduling` → `Preparing` → `Deploying` → `Verifying` → `Ready`），以 `deployment:{uid}` 为幂等键启动并查询部署工作流，成功后写入 `status.endpoints`，删除时经 `DeploymentReleaser` 取消部署、停止实例（部署包只依赖工作流契约，运行时与启动器由组装方注入；应用尚未注入，协调器在分配之前报告 `WorkflowRuntimeUnavailable`）；`app.py` 提供 HTTP 服务（FastAPI，未安装时回退纯标准库占位——生产必须 FastAPI/ASGI），并在 lifespan 中运行控制器；控制器按序号增量读取 `resource_changes` 变更记录，经 `update_status`（status 子资源，CAS）回写协调结果；Outbox 事务性事件（architecture.md 3.3 规则 7）；`ProcessedKeyStore` 去重（reconciler/dedup.py） |
+ | 运行形态 | 单实例控制平面进程（模块化单体，architecture.md 3.3 规则 8）；ADR-013 约束：仅允许单写方写同一 SQLite 权威库；控制器与 API 同进程运行，不得以多个 worker 进程启动 |
+ | 数据所有权 | **全部业务资源权威状态**（registry/store.py）、审计事件（audit.py，默认内存库，控制平面应用尚未接入）、Outbox 事件、任务与心跳状态 |
+ | 允许依赖 | `forgemesh.core` / `forgemesh.resource` / `forgemesh.policy` / `forgemesh.decision` / `forgemesh.workflow*` / `forgemesh.plugin`（plugin-sdk）、标准库 `sqlite3`、FastAPI |
+ | 禁止依赖 | 任何插件私有模块（`decision_rules` / `gpu_nvidia` 等，扫描二验证 ✅，见 3.2） |
+-| 测试路径 | `tests/unit/controlplane/`：`test_api.py`、`test_routes.py`、`test_registry.py`、`test_reconciler.py`、`test_dedup_store.py`、`test_plugin_manager.py`、`test_outbox.py`、`test_audit.py`、`test_tasks.py`、`test_heartbeat.py`、`test_observability.py`、`test_diagnostics.py`、`test_app.py`、`test_auth.py`、`test_controller_manager.py`、`test_controller_queue.py`、`test_registry_changes.py`、`test_registry_status.py`、`test_registry_allocations.py`、`test_sqlite.py`、`test_scheduler.py`、`test_scheduler_inventory.py`、`test_allocation_lifecycle.py`（23 个文件，glob 核对） |
++| 测试路径 | `tests/unit/controlplane/`：`test_api.py`、`test_routes.py`、`test_registry.py`、`test_reconciler.py`、`test_dedup_store.py`、`test_plugin_manager.py`、`test_outbox.py`、`test_audit.py`、`test_tasks.py`、`test_heartbeat.py`、`test_observability.py`、`test_diagnostics.py`、`test_app.py`、`test_auth.py`、`test_controller_manager.py`、`test_controller_queue.py`、`test_registry_changes.py`、`test_registry_status.py`、`test_registry_allocations.py`、`test_sqlite.py`、`test_scheduler.py`、`test_scheduler_inventory.py`、`test_allocation_lifecycle.py`、`test_deployment.py`、`test_deployment_lifecycle.py`（25 个文件，glob 核对；`test_deployment_lifecycle.py` 以控制器、调度器、本地工作流运行时与内存启动器覆盖部署、重启、失败与删除闭环） |
+ | 状态 | 已实现且有测试覆盖 |
+ | 演进动作 | 保留；WP-C1 补故障路径（CAS 并发、重启恢复、finalizer 闭环、Allocation 唯一性） |
+ 
+@@ -181,12 +181,12 @@
+ |---|---|
+ | 架构模块 | WorkEngine API（architecture.md 第 6 章，ADR-003） |
+ | 当前代码路径 | `packages/workflow-api/src/forgemesh/workflow/{runtime,states}.py` |
+-| 核心契约 | `WorkflowRuntime(ABC)` + `WorkflowDefinition` / `Step` / `RetryPolicy` / `RunRef`（runtime.py）；`WorkflowStatus` / `StepStatus` 状态机与 `validate_workflow_transition`（states.py） |
++| 核心契约 | `WorkflowRuntime(ABC)` + `WorkflowDefinition` / `Step` / `RetryPolicy` / `RunRef` / `RunInfo`（运行快照：状态、步骤状态、步骤输出、失败原因；`get_run` / `find_run` 为非抽象方法，默认分别只返回状态、抛 `NotImplementedError`）（runtime.py）；`WorkflowStatus` / `StepStatus` 状态机与 `validate_workflow_transition`（states.py） |
+ | 运行形态 | 进程内库（抽象层，实现见 2.10） |
+ | 数据所有权 | 无 |
+ | 允许依赖 | `forgemesh.core`、pydantic |
+ | 禁止依赖 | 插件、DB 驱动（`sqlite3` 等）、Web 框架、LLM SDK（扫描一验证 ✅，见 3.1） |
+-| 测试路径 | `tests/unit/workflow/test_states.py` |
++| 测试路径 | `tests/unit/workflow/test_states.py`、`test_runtime_contract.py` |
+ | 状态 | 已实现且有测试覆盖 |
+ | 演进动作 | 保留 |
+ 
+@@ -195,13 +195,13 @@
+ | 字段 | 内容 |
+ |---|---|
+ | 架构模块 | 工作流执行引擎（ADR-003 内部结构：DSL / 执行 / 存储 / 审批 / 补偿） |
+-| 当前代码路径 | `packages/workflow-runtime/src/forgemesh/workflowruntime/{dsl,exec,store,approval,compensate,gpu_onboarding}.py` |
+-| 核心契约 | 实现 `WorkflowRuntime(ABC)`；DSL 解析（dsl.py）、步骤执行与重试（exec.py）、运行存储（store.py）、审批集成（approval.py）、补偿语义（compensate.py）；GPU onboarding 内置工作流（gpu_onboarding.py） |
++| 当前代码路径 | `packages/workflow-runtime/src/forgemesh/workflowruntime/{dsl,exec,store,approval,compensate,gpu_onboarding,runtime}.py` |
++| 核心契约 | `LocalWorkflowRuntime`（runtime.py）实现 `WorkflowRuntime(ABC)`：在后台执行运行、失败时反向补偿、`recover()` 让重启前未结束的运行继续、`aclose()` 结束全部后台任务；DSL 解析（dsl.py）、步骤执行与重试（exec.py）、运行存储（store.py）、审批集成（approval.py）、补偿语义（compensate.py）；GPU onboarding 内置工作流（gpu_onboarding.py） |
+ | 运行形态 | 进程内模块（被控制平面编排调用） |
+-| 数据所有权 | 工作流运行实例状态（store.py；恢复/重启语义见 performance 测试） |
++| 数据所有权 | 工作流运行实例状态（store.py，含步骤结果与失败原因；恢复/重启语义见 performance 测试与 `test_runtime.py`）；部署工作流的存储文件由控制平面的 `workflow_db_path` 给出（应用尚未打开） |
+ | 允许依赖 | `forgemesh.workflow`（API）、`forgemesh.core`、`forgemesh.resource`、标准库 |
+ | 禁止依赖 | Workflow Provider 插件私有模块（扫描六验证 ✅，见 3.5）、直连插件 |
+-| 测试路径 | `tests/unit/workflowruntime/test_{dsl,exec,store,approval,compensate}.py`；端到端 `tests/e2e/test_gpu_onboarding.py`；恢复语义 `tests/performance/test_restart_recovery.py` |
++| 测试路径 | `tests/unit/workflowruntime/test_{dsl,exec,store,approval,compensate,runtime}.py`；端到端 `tests/e2e/test_gpu_onboarding.py`；恢复语义 `tests/performance/test_restart_recovery.py` |
+ | 状态 | 已实现且有测试覆盖 |
+ | 演进动作 | 保留；WP-C2 补长步骤超时/断联/取消补偿/版本固定等混沌场景 |
+ 
+@@ -211,7 +211,7 @@
+ |---|---|
+ | 架构模块 | L4 工作流能力插件 |
+ | 当前代码路径 | `plugins/workflow-reference/{provider.py,manifest.yaml}`；`plugins/workflow-temporal/{provider.py,manifest.yaml,__init__.py}` |
+-| 核心契约 | 实现 `WorkflowRuntime(ABC)`（作为可插拔后端）；manifest 同 2.8 |
++| 核心契约 | 实现 `WorkflowRuntime(ABC)`（作为可插拔后端）：`workflow-reference` 是 `LocalWorkflowRuntime` 的子类；`workflow-temporal` 沿用 `get_run` / `find_run` 的默认实现（快照不含步骤输出、不能按幂等键查找），不能执行部署工作流；manifest 同 2.8 |
+ | 运行形态 | 插件（进程内加载；temporal 为本地语义实现，生产 Temporal 集群对接待核验） |
+ | 数据所有权 | 无（运行权威状态在 runtime/store 或其自身后端内） |
+ | 允许依赖 | `forgemesh.workflow`、plugin-sdk |
+@@ -287,11 +287,11 @@
+ | 架构模块 | L6 权威存储（过渡态：SQLite；目标态：PostgreSQL） |
+ | 当前代码路径 | `packages/control-plane/src/forgemesh/controlplane/registry/store.py`（`SQLiteRegistry`，权威资源状态，CAS 乐观并发 `resource_version`；分配 `allocations` 与设备占用 `allocation_devices`，部分唯一索引保证每个资源 uid 在其租户内至多一个 Active 分配、每个设备（跨租户）至多属于一个 Active 分配）；`packages/decision-api/src/forgemesh/decision/records.py`（`DecisionRecordStore`）；`packages/workflow-runtime/src/forgemesh/workflowruntime/store.py`（工作流运行存储）；审计 `audit.py` |
+ | 核心契约 | ADR-013：**SQLite 为权威存储、单控制平面实例写、禁止扩展 replicas；PostgreSQL 为目标态**（迁移由真实 SLO/基准触发）；Registry 对齐 `core-contracts.ResourceRegistry` 契约 |
+-| 运行形态 | 进程内嵌入式：控制平面应用只打开 `FORGEMESH_DB_PATH` 一个 SQLite 文件（Registry 与去重键，WAL 模式），审计、决策记录、工作流存储默认使用内存库；备份见 docs/operations/backup-restore.md |
++| 运行形态 | 进程内嵌入式：控制平面应用只打开 `FORGEMESH_DB_PATH` 一个 SQLite 文件（Registry 与去重键，WAL 模式），审计、决策记录、工作流存储默认使用内存库；部署工作流的存储应使用 `workflow_db_path(FORGEMESH_DB_PATH)` 给出的同目录独立文件（`*.workflows.db`，步骤写入不必等待 Registry 的写锁），应用尚未接入；备份见 docs/operations/backup-restore.md |
+ | 数据所有权 | 权威写方：控制平面**唯一实例**（registry/audit/outbox）；决策记录写方为 Decision 链路（D1 关联） |
+ | 允许依赖 | 标准库 `sqlite3`（仅控制平面实现层；API 层现状见 D1） |
+ | 禁止依赖 | 第三方 DB 驱动（v1.x）、多实例并发写同一库文件 |
+-| 测试路径 | `tests/unit/controlplane/test_registry.py`、`tests/unit/controlplane/test_registry_allocations.py`、`tests/unit/decision/test_records.py`、`tests/unit/workflowruntime/test_store.py`；恢复/并发：`tests/performance/test_restart_recovery.py`、`test_conflict_correctness.py`、`tests/chaos/test_cp_restart.py`；备份恢复演练见 `docs/operations/backup-restore.md` |
++| 测试路径 | `tests/unit/controlplane/test_registry.py`、`tests/unit/controlplane/test_registry_allocations.py`、`tests/unit/decision/test_records.py`、`tests/unit/workflowruntime/test_store.py`；恢复/并发：`tests/performance/test_restart_recovery.py`、`test_conflict_correctness.py`、`tests/chaos/test_cp_restart.py`、`tests/unit/workflowruntime/test_runtime.py`、`tests/unit/controlplane/test_deployment_lifecycle.py`；备份恢复演练见 `docs/operations/backup-restore.md` |
+ | 状态 | 已实现且有测试覆盖 |
+ | 演进动作 | 保留；WP-C1 补 CAS 并发冲突/重启恢复/备份恢复的故障路径测试；PostgreSQL 迁移属阶段 F（有证据后） |
+ 
+diff --git a/packages/control-plane/src/forgemesh/controlplane/reconciler/dedup.py b/packages/control-plane/src/forgemesh/controlplane/reconciler/dedup.py
+index 3eacc4b..2868ebb 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/reconciler/dedup.py
++++ b/packages/control-plane/src/forgemesh/controlplane/reconciler/dedup.py
+@@ -1,9 +1,10 @@
+ """幂等去重键生成与持久化。
+ 
+ 对齐 development-plan 5.4：dedup_key 由 kind/namespace/name/uid/generation/operation 派生，
+-同一键的协调不得重复产生副作用。资源分配另有自己的幂等键
+-（:func:`allocation_idempotency_key`，由 uid + generation 派生；``allocations.idempotency_key``
+-唯一，一个键只对应一个分配）。
++同一键的协调不得重复产生副作用。资源分配与部署运行另有自己的幂等键：分配为
++:func:`allocation_idempotency_key`（由 uid + generation 派生；``allocations.idempotency_key``
++唯一，一个键只对应一个分配），部署运行为
++:func:`~forgemesh.controlplane.deployment.workflow.deployment_run_key`（由 uid 派生）。
+ 
+ :class:`ProcessedKeyStore` 将已处理去重键持久化到 SQLite（对齐 architecture
+ §5.5「不能依赖单进程内存状态保证全局正确性」）：进程重启后已处理键仍然
+diff --git a/plugins/workflow-reference/README.md b/plugins/workflow-reference/README.md
+index c005719..df265c4 100644
+--- a/plugins/workflow-reference/README.md
++++ b/plugins/workflow-reference/README.md
+@@ -1,8 +1,9 @@
+ # workflow-reference
+ 
+-参考工作流运行时：执行有序、可补偿的工作流步骤（plan/authorize/prepare/deploy/verify/commit）。
++参考工作流运行时：在后台按定义顺序执行工作流步骤，每一步的状态与结果都落盘；某一步用尽重试后反向补偿已完成的步骤，运行以 `Failed` 结束；进程重启后恢复未结束的运行。执行引擎是 `forgemesh.workflowruntime.runtime.LocalWorkflowRuntime`，本插件以子类 `ReferenceWorkflowRuntime` 提供，供插件管理器按清单加载；控制平面不导入插件，直接使用该引擎。
+ 
+-- **状态**：已实现（v1.0.0）
++- **状态**：已实现（v1.0.0；1.1.0 起在后台执行运行）
+ - **分类**：provider
+-- **契约**：`manifest.yaml`；实现须遵循 `packages/workflow-api` 冻结的 WorkflowRuntime 契约与 `api/schemas/plugin-manifest.schema.json`。
++- **契约**：`manifest.yaml`；实现须遵循 `packages/workflow-api` 冻结的 WorkflowRuntime 契约（含 `get_run` / `find_run`）与 `api/schemas/plugin-manifest.schema.json`。
++- **使用**：进程启动时调用 `recover()`，关闭时先 `aclose()` 再关闭 `WorkflowStore`。步骤 handler 拿不到运行 id：重启后，中断时正在执行的步骤以相同的输入再执行一次，幂等所需的标识须放在运行输入中。
+ - **注意**：`commit` 必须重校验资源版本/分配所有权/验收条件；高风险步骤支持人工审批与补偿。
+-- 
+2.43.0
+

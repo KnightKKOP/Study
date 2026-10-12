@@ -1,0 +1,238 @@
+From e0cdadd1f5f71eef07f2bad9ed15fa2b673f76c1 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 12 Oct 2026 14:20:43 +0000
+Subject: [PATCH 1/5] feat(workflow): add run snapshots and lookup by
+ idempotency key
+
+Callers of a WorkflowRuntime can only ask for the run status, so the
+reconciler cannot read what a step produced (for a deployment: the
+launched instance and its address) nor find the run of a resource
+without calling start(), which creates and executes a run when none
+exists. Deleting a resource must look for an in-flight deployment
+without starting one.
+
+Add RunInfo (status, step statuses in definition order, outputs of the
+steps that succeeded, failure reason) and two non-abstract methods:
+get_run(run_id), which defaults to the status only, and
+find_run(idempotency_key), which has no side effects and raises
+NotImplementedError unless a runtime implements it. The abstract
+methods are unchanged, so existing runtimes such as the Temporal plugin
+keep working; the additions are registered in a contract test.
+---
+ .../src/forgemesh/workflow/__init__.py        |  2 +
+ .../src/forgemesh/workflow/runtime.py         | 53 +++++++++++-
+ tests/unit/workflow/test_runtime_contract.py  | 85 +++++++++++++++++++
+ 3 files changed, 138 insertions(+), 2 deletions(-)
+ create mode 100644 tests/unit/workflow/test_runtime_contract.py
+
+diff --git a/packages/workflow-api/src/forgemesh/workflow/__init__.py b/packages/workflow-api/src/forgemesh/workflow/__init__.py
+index 9baca06..9228931 100644
+--- a/packages/workflow-api/src/forgemesh/workflow/__init__.py
++++ b/packages/workflow-api/src/forgemesh/workflow/__init__.py
+@@ -13,6 +13,7 @@ from __future__ import annotations
+ 
+ from .runtime import (
+     RetryPolicy,
++    RunInfo,
+     RunRef,
+     Step,
+     WorkflowDefinition,
+@@ -40,5 +41,6 @@ __all__ = [
+     "RetryPolicy",
+     "WorkflowDefinition",
+     "RunRef",
++    "RunInfo",
+     "WorkflowRuntime",
+ ]
+diff --git a/packages/workflow-api/src/forgemesh/workflow/runtime.py b/packages/workflow-api/src/forgemesh/workflow/runtime.py
+index 7fa93b4..c6ffc89 100644
+--- a/packages/workflow-api/src/forgemesh/workflow/runtime.py
++++ b/packages/workflow-api/src/forgemesh/workflow/runtime.py
+@@ -13,7 +13,9 @@ Temporal/Cadence 等）都必须满足同一语义，业务模型不与之耦合
+ * **补偿**：失败的运行按反向补偿步骤回滚已产生的副作用。
+ * **审批**：等待人工或外部事件的运行进入 ``WAITING``，由外部信号唤醒。
+ * **版本固定**：运行实例固定其 ``definition_version``，升级定义不影响既有实例。
+-* **结果查询**：不确定状态下应先查询真实状态，不得盲目重试不可幂等操作。
++* **结果查询**：不确定状态下应先查询真实状态，不得盲目重试不可幂等操作
++  （:meth:`WorkflowRuntime.get_run` 返回步骤状态与输出，
++  :meth:`WorkflowRuntime.find_run` 按幂等键查找而不创建运行）。
+ """
+ 
+ from __future__ import annotations
+@@ -23,7 +25,7 @@ from typing import Any
+ 
+ from pydantic import BaseModel, ConfigDict, Field
+ 
+-from .states import WorkflowStatus
++from .states import WORKFLOW_TRANSITIONS, StepStatus, WorkflowStatus
+ 
+ 
+ class Step(BaseModel):
+@@ -95,6 +97,32 @@ class RunRef(BaseModel):
+     definition_version: int
+ 
+ 
++class RunInfo(BaseModel):
++    """运行实例快照（只读）。
++
++    Attributes:
++        run_id: 运行实例标识。
++        status: 运行状态。
++        steps: 各步骤状态，按定义中的步骤顺序。
++        outputs: 已成功步骤的输出 ``{step_id: result}``；步骤之后被补偿也保留，
++            调用方据此取回步骤创建的外部对象（如实例 id）。
++        error: 运行失败的原因（失败的步骤与错误信息）；运行没有失败时为 ``None``。
++    """
++
++    model_config = ConfigDict(extra="forbid", frozen=True)
++
++    run_id: str
++    status: WorkflowStatus
++    steps: dict[str, StepStatus] = Field(default_factory=dict)
++    outputs: dict[str, Any] = Field(default_factory=dict)
++    error: str | None = None
++
++    @property
++    def terminal(self) -> bool:
++        """运行是否已到终态（之后不再变化）。"""
++        return not WORKFLOW_TRANSITIONS[self.status]
++
++
+ class WorkflowRuntime(ABC):
+     """工作流运行契约（ADR-003：可替换 Provider，语义不随引擎改变）。
+ 
+@@ -112,6 +140,8 @@ class WorkflowRuntime(ABC):
+     ) -> RunRef:
+         """启动（或幂等复用）一个运行实例。
+ 
++        返回时运行可能仍在执行，进度经 :meth:`get_status` / :meth:`get_run` 查询。
++
+         Args:
+             defn: 工作流定义（运行实例将固定其当前版本）。
+             inputs: 运行时输入，覆盖/补充 ``defn.inputs``。
+@@ -130,6 +160,24 @@ class WorkflowRuntime(ABC):
+         """
+         raise NotImplementedError
+ 
++    async def get_run(self, run_id: str) -> RunInfo:
++        """查询运行实例快照（状态、步骤状态、步骤输出与失败原因）。
++
++        默认实现只经 :meth:`get_status` 填充 ``status``；持久化步骤结果的实现应覆盖。
++
++        Raises:
++            NotFoundError: 运行实例不存在（与 :meth:`get_status` 一致）。
++        """
++        return RunInfo(run_id=run_id, status=await self.get_status(run_id))
++
++    async def find_run(self, idempotency_key: str) -> RunInfo | None:
++        """按幂等键查找运行实例，不创建；不存在时返回 ``None``。
++
++        与 :meth:`start` 不同，本方法没有副作用：调用方不确定运行是否存在时（如删除
++        资源前取消进行中的部署）据此查询真实状态。默认实现抛出 :class:`NotImplementedError`。
++        """
++        raise NotImplementedError
++
+     @abstractmethod
+     async def cancel(self, run_id: str, cleanup: bool = False) -> None:
+         """取消运行实例。
+@@ -159,5 +207,6 @@ __all__ = [
+     "RetryPolicy",
+     "WorkflowDefinition",
+     "RunRef",
++    "RunInfo",
+     "WorkflowRuntime",
+ ]
+diff --git a/tests/unit/workflow/test_runtime_contract.py b/tests/unit/workflow/test_runtime_contract.py
+new file mode 100644
+index 0000000..96a1fd8
+--- /dev/null
++++ b/tests/unit/workflow/test_runtime_contract.py
+@@ -0,0 +1,85 @@
++"""``forgemesh.workflow.runtime`` 契约单元测试（向后兼容的新增项在此登记）。
++
++覆盖：:class:`RunInfo` 快照模型；``get_run`` / ``find_run`` 是带默认实现的非抽象方法，
++只实现四个抽象方法的既有运行时（如 Temporal 插件）不受影响。
++"""
++
++from __future__ import annotations
++
++import asyncio
++from typing import Any
++
++import forgemesh.workflow as workflow_api
++import pytest
++from forgemesh.workflow.runtime import RunInfo, RunRef, WorkflowDefinition, WorkflowRuntime
++from forgemesh.workflow.states import StepStatus, WorkflowStatus
++from pydantic import ValidationError
++
++
++class _StatusOnlyRuntime(WorkflowRuntime):
++    """只实现抽象方法的运行时。"""
++
++    async def start(
++        self, defn: WorkflowDefinition, inputs: dict[str, Any], idempotency_key: str
++    ) -> RunRef:
++        return RunRef(run_id="run-1", definition_version=1)
++
++    async def get_status(self, run_id: str) -> WorkflowStatus:
++        return WorkflowStatus.RUNNING
++
++    async def cancel(self, run_id: str, cleanup: bool = False) -> None:
++        return None
++
++    async def signal(self, run_id: str, name: str, payload: dict[str, Any]) -> None:
++        return None
++
++
++def test_the_abstract_methods_are_unchanged() -> None:
++    assert WorkflowRuntime.__abstractmethods__ == {"start", "get_status", "cancel", "signal"}
++
++
++def test_get_run_defaults_to_the_status_and_find_run_is_optional() -> None:
++    runtime = _StatusOnlyRuntime()
++
++    info = asyncio.run(runtime.get_run("run-1"))
++
++    assert info == RunInfo(run_id="run-1", status=WorkflowStatus.RUNNING)
++    assert (info.steps, info.outputs, info.error) == ({}, {}, None)
++    with pytest.raises(NotImplementedError):
++        asyncio.run(runtime.find_run("uid-1:1"))
++
++
++def test_run_info_is_strict_and_frozen() -> None:
++    info = RunInfo(
++        run_id="run-1",
++        status="Failed",
++        steps={"launch": "Compensated"},
++        outputs={"launch": {"instanceId": "i-1"}},
++        error="step 'launch' failed: boom",
++    )
++
++    assert info.status is WorkflowStatus.FAILED
++    assert info.steps == {"launch": StepStatus.COMPENSATED}
++    with pytest.raises(ValidationError):
++        RunInfo(run_id="run-1", status="Running", definition="x")
++    with pytest.raises(ValidationError):
++        RunInfo(run_id="run-1", status="Exploded")
++    with pytest.raises(ValidationError):
++        info.error = None
++
++
++@pytest.mark.parametrize("status", list(WorkflowStatus))
++def test_terminal_matches_the_state_machine(status: WorkflowStatus) -> None:
++    terminal = status in {
++        WorkflowStatus.SUCCEEDED,
++        WorkflowStatus.FAILED,
++        WorkflowStatus.CANCELLED,
++        WorkflowStatus.TIMEDOUT,
++    }
++
++    assert RunInfo(run_id="run-1", status=status).terminal is terminal
++
++
++def test_run_info_is_exported_from_the_package() -> None:
++    assert workflow_api.RunInfo is RunInfo
++    assert "RunInfo" in workflow_api.__all__
+-- 
+2.43.0
+
