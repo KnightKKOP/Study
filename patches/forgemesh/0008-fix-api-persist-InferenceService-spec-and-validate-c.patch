@@ -1,0 +1,328 @@
+From 5a1785aa751adc8a69e389027c1425ccbccadbc9 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 12 Oct 2026 02:42:53 +0000
+Subject: [PATCH 8/8] fix(api): persist InferenceService spec and validate
+ create/list input
+
+POST /inference-services built a base Resource from the body, silently dropping
+spec and status, accepted any kind, never assigned a uid and returned 200,
+although the OpenAPI contract requires spec and answers 201. List endpoints
+passed limit straight through, so limit=-1 returned every row.
+
+Validate the body as a typed InferenceService (server-owned uid, tenant and
+status), answer 400 with the error envelope for invalid bodies or limits
+outside [1, 1000], 409 for create conflicts and for delete races, and 201 on
+success.
+---
+ .../src/forgemesh/controlplane/api/routes.py  | 116 +++++++++++-------
+ tests/unit/controlplane/test_api.py           |  64 +++++++++-
+ tests/unit/controlplane/test_app.py           |  12 +-
+ 3 files changed, 146 insertions(+), 46 deletions(-)
+
+diff --git a/packages/control-plane/src/forgemesh/controlplane/api/routes.py b/packages/control-plane/src/forgemesh/controlplane/api/routes.py
+index 8179a33..f2d165d 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/api/routes.py
++++ b/packages/control-plane/src/forgemesh/controlplane/api/routes.py
+@@ -31,8 +31,8 @@ from uuid import uuid4
+ from fastapi import APIRouter, Depends, Header, HTTPException
+ from fastapi.responses import JSONResponse, Response
+ from forgemesh.core.errors import ConflictError, NotFoundError
+-from forgemesh.core.objects import ObjectMeta, Resource
+ from forgemesh.decision.provider import DecisionRequest as InternalDecisionRequest
++from forgemesh.resource.inference import InferenceService
+ from forgemesh.workflow.runtime import WorkflowDefinition
+ from pydantic import BaseModel, ConfigDict, Field, ValidationError
+ 
+@@ -48,24 +48,6 @@ from .dependencies import (
+ router = APIRouter(prefix="/api/v1")
+ 
+ 
+-class ResourceCreateRequest(BaseModel):
+-    """资源创建请求体。
+-
+-    Attributes:
+-        apiVersion: 资源组/版本，默认 ``forgemesh.io/v1alpha1``。
+-        kind: 资源类型（如 ``InferenceService``）。
+-        metadata: 资源元数据（name/namespace/labels 等）。
+-        spec: 期望状态（P1 基类 ``Resource`` 暂不持久化，后续强类型子类扩展）。
+-        status: 观测状态（同上）。
+-    """
+-
+-    apiVersion: str = "forgemesh.io/v1alpha1"
+-    kind: str
+-    metadata: dict[str, Any]
+-    spec: dict[str, Any] | None = None
+-    status: dict[str, Any] | None = None
+-
+-
+ class ResourceListResponse(BaseModel):
+     """资源列表响应。"""
+ 
+@@ -73,20 +55,52 @@ class ResourceListResponse(BaseModel):
+     count: int
+ 
+ 
+-def _build_resource(body: ResourceCreateRequest, tenant_id: str) -> Resource:
+-    """从请求体构造 :class:`Resource`，注入租户上下文。
++#: 由服务端维护、创建请求中一律忽略的元数据字段。请求头 ``X-Tenant-Id`` 为租户
++#: 权威来源，覆盖请求体中的租户字段，防止跨租户伪造。
++_SERVER_OWNED_METADATA = ("tenant_id", "tenantId", "uid", "resourceVersion")
++
++#: 列表接口单页条数上限。
++MAX_LIST_LIMIT = 1000
++
+ 
+-    请求头 ``X-Tenant-Id`` 为租户权威来源，覆盖请求体中可能存在的
+-    ``tenant_id`` / ``tenantId`` 字段，防止跨租户伪造。
++def _build_inference_service(body: dict[str, Any], tenant_id: str) -> InferenceService:
++    """从请求体构造强类型 :class:`InferenceService`（OpenAPI 要求必须携带 ``spec``）。
+ 
+-    P1 简化：基类 ``Resource`` 配置 ``extra="forbid"``，不携带 spec/status；
+-    强类型子类（如 ``InferenceService``）在后续阶段扩展。
++    租户取自请求头，``uid`` 由服务端分配；``status`` 属于观测状态，只能由控制器
++    写入，创建请求中的 ``status`` 被忽略。
++
++    Raises:
++        ValueError: ``kind`` 不是 ``InferenceService``，或 ``metadata`` 不是对象。
++        pydantic.ValidationError: ``metadata`` / ``spec`` 不满足模型约束。
+     """
+-    meta_dict = dict(body.metadata)
+-    meta_dict.pop("tenant_id", None)
+-    meta_dict.pop("tenantId", None)
+-    metadata = ObjectMeta(**meta_dict, tenant_id=tenant_id)
+-    return Resource(kind=body.kind, metadata=metadata)
++    kind = body.get("kind", "InferenceService")
++    if kind != "InferenceService":
++        raise ValueError(f"kind must be 'InferenceService' on this endpoint, got {kind!r}")
++    metadata = body.get("metadata")
++    if not isinstance(metadata, dict):
++        raise ValueError("metadata must be an object")
++    metadata = {k: v for k, v in metadata.items() if k not in _SERVER_OWNED_METADATA}
++    metadata["tenantId"] = tenant_id
++    metadata["uid"] = uuid4().hex
++    return InferenceService.model_validate(
++        {
++            "apiVersion": body.get("apiVersion", "forgemesh.io/v1alpha1"),
++            "kind": "InferenceService",
++            "metadata": metadata,
++            "spec": body.get("spec"),
++        }
++    )
++
++
++def _invalid_limit(limit: int) -> JSONResponse | None:
++    if 1 <= limit <= MAX_LIST_LIMIT:
++        return None
++    return _error_response(
++        400,
++        "BAD_REQUEST",
++        f"limit must be between 1 and {MAX_LIST_LIMIT}, got {limit}",
++        uuid4().hex,
++    )
+ 
+ 
+ # ------------------------------------------------------------------ #
+@@ -94,22 +108,34 @@ def _build_resource(body: ResourceCreateRequest, tenant_id: str) -> Resource:
+ # ------------------------------------------------------------------ #
+ 
+ 
+-@router.post("/inference-services")
++@router.post("/inference-services", status_code=201)
+ async def create_inference_service(
+-    body: ResourceCreateRequest,
++    body: dict[str, Any],
+     tenant_id: str = Depends(get_tenant_id),
+-) -> dict[str, Any]:
+-    """创建推理服务。
++    x_correlation_id: str | None = Header(default=None, alias="X-Correlation-Id"),
++) -> Any:
++    """创建推理服务（201）。
+ 
+-    同名资源已存在时返回 HTTP 409（ConflictError）。
++    请求体不合法（缺少 ``spec``、kind 不匹配等）返回 400；同名资源已存在返回 409。
+     """
+-    registry = get_registry()
+-    resource = _build_resource(body, tenant_id)
++    correlation_id = x_correlation_id or uuid4().hex
++    try:
++        resource = _build_inference_service(body, tenant_id)
++    except ValidationError as exc:
++        return _error_response(
++            400,
++            "BAD_REQUEST",
++            "推理服务创建请求校验失败",
++            correlation_id,
++            {"errors": _validation_details(exc)},
++        )
++    except ValueError as exc:
++        return _error_response(400, "BAD_REQUEST", str(exc), correlation_id)
+     try:
+-        created = await registry.put(resource)
++        created = await get_registry().put(resource)
+     except ConflictError as exc:
+-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+-    return created.model_dump(by_alias=True)
++        return _error_response(409, "CONFLICT", str(exc), correlation_id)
++    return JSONResponse(status_code=201, content=created.model_dump(by_alias=True, mode="json"))
+ 
+ 
+ @router.get("/inference-services")
+@@ -117,8 +143,10 @@ async def list_inference_services(
+     tenant_id: str = Depends(get_tenant_id),
+     namespace: str | None = None,
+     limit: int = 100,
+-) -> dict[str, Any]:
++) -> Any:
+     """列出推理服务（可选按 namespace 过滤、limit 分页）。"""
++    if (invalid := _invalid_limit(limit)) is not None:
++        return invalid
+     registry = get_registry()
+     items = await registry.list("InferenceService", tenant_id, namespace=namespace, limit=limit)
+     return {"items": [r.model_dump(by_alias=True) for r in items], "count": len(items)}
+@@ -159,6 +187,8 @@ async def delete_inference_service(
+         result = await registry.request_delete("InferenceService", namespace, name, tenant_id)
+     except NotFoundError as exc:
+         raise HTTPException(status_code=404, detail=f"InferenceService '{name}' not found") from exc
++    except ConflictError as exc:
++        return _error_response(409, "CONFLICT", str(exc), uuid4().hex)
+     if result.deleted:
+         return Response(status_code=204)
+     return JSONResponse(status_code=202, content={"name": name, "phase": "Terminating"})
+@@ -175,11 +205,13 @@ async def list_resources(
+     kind: str | None = None,
+     namespace: str | None = None,
+     limit: int = 100,
+-) -> dict[str, Any]:
++) -> Any:
+     """列出资源（可选按 kind / namespace 过滤）。
+ 
+     未指定 ``kind`` 时返回空列表（P1 简化：避免全表扫描）。
+     """
++    if (invalid := _invalid_limit(limit)) is not None:
++        return invalid
+     registry = get_registry()
+     if kind:
+         items = await registry.list(kind, tenant_id, namespace=namespace, limit=limit)
+diff --git a/tests/unit/controlplane/test_api.py b/tests/unit/controlplane/test_api.py
+index f6392eb..20dea14 100644
+--- a/tests/unit/controlplane/test_api.py
++++ b/tests/unit/controlplane/test_api.py
+@@ -45,19 +45,27 @@ def client() -> TestClient:
+     return TestClient(app)
+ 
+ 
++SPEC = {
++    "model": {"reference": "models/llama"},
++    "runtime": {"provider": "vllm", "version": "0.6.3"},
++    "resources": {"accelerator": {"type": "nvidia-gpu", "count": 1, "minMemoryGiB": 16}},
++}
++
++
+ def _payload(name: str = "svc-1", namespace: str = "default") -> dict:
+-    """构造推理服务创建请求体。"""
++    """构造推理服务创建请求体（OpenAPI 要求必须携带 spec）。"""
+     return {
+         "apiVersion": "forgemesh.io/v1alpha1",
+         "kind": "InferenceService",
+         "metadata": {"name": name, "namespace": namespace},
++        "spec": SPEC,
+     }
+ 
+ 
+ def test_create_and_get_inference_service(client: TestClient) -> None:
+     """POST 创建 → GET 查询返回同一资源。"""
+     resp = client.post("/api/v1/inference-services", json=_payload(), headers=TENANT_HEADERS)
+-    assert resp.status_code == 200, resp.text
++    assert resp.status_code == 201, resp.text
+     created = resp.json()
+     assert created["kind"] == "InferenceService"
+     assert created["metadata"]["name"] == "svc-1"
+@@ -160,3 +168,55 @@ def test_missing_tenant_header(client: TestClient) -> None:
+     """无 X-Tenant-Id 头返回 400。"""
+     resp = client.post("/api/v1/inference-services", json=_payload())
+     assert resp.status_code == 400, resp.text
++
++
++def test_create_preserves_spec_and_assigns_server_fields(client: TestClient) -> None:
++    """spec 原样持久化；uid 由服务端分配；status 由控制器维护，请求中的值被忽略。"""
++    body = _payload()
++    body["metadata"]["uid"] = "client-chosen"
++    body["status"] = {"phase": "Ready"}
++    resp = client.post("/api/v1/inference-services", json=body, headers=TENANT_HEADERS)
++    assert resp.status_code == 201, resp.text
++    created = resp.json()
++    assert created["spec"]["model"] == {"reference": "models/llama", "digest": None}
++    assert created["spec"]["runtime"] == {"provider": "vllm", "version": "0.6.3"}
++    assert created["metadata"]["uid"] not in (None, "client-chosen")
++    assert created["status"]["phase"] == "Pending"
++
++    fetched = client.get(
++        "/api/v1/inference-services/svc-1", headers=TENANT_HEADERS, params={"namespace": "default"}
++    ).json()
++    assert fetched["spec"] == created["spec"]
++    assert fetched["metadata"]["uid"] == created["metadata"]["uid"]
++
++
++@pytest.mark.parametrize(
++    "mutate",
++    [
++        pytest.param(lambda b: b.pop("spec"), id="missing-spec"),
++        pytest.param(lambda b: b.update(kind="TotallyNotAnInferenceService"), id="wrong-kind"),
++        pytest.param(lambda b: b.update(metadata="svc-1"), id="metadata-not-object"),
++        pytest.param(lambda b: b["spec"].update(replicas=4), id="unknown-spec-field"),
++    ],
++)
++def test_create_rejects_invalid_body(client: TestClient, mutate) -> None:
++    """不合法请求体返回 400 错误信封，且不落库。"""
++    body = _payload()
++    body["spec"] = dict(SPEC)
++    mutate(body)
++    resp = client.post("/api/v1/inference-services", json=body, headers=TENANT_HEADERS)
++    assert resp.status_code == 400, resp.text
++    assert resp.json()["error"]["code"] == "BAD_REQUEST"
++    listed = client.get("/api/v1/inference-services", headers=TENANT_HEADERS).json()
++    assert listed["count"] == 0
++
++
++@pytest.mark.parametrize("path", ["/api/v1/inference-services", "/api/v1/resources"])
++@pytest.mark.parametrize("limit", [-1, 0, 1001])
++def test_list_rejects_out_of_range_limit(client: TestClient, path: str, limit: int) -> None:
++    """limit 超出 [1, 1000] 返回 400（SQLite 中 LIMIT -1 表示不限条数）。"""
++    resp = client.get(
++        path, headers=TENANT_HEADERS, params={"limit": limit, "kind": "InferenceService"}
++    )
++    assert resp.status_code == 400, resp.text
++    assert resp.json()["error"]["code"] == "BAD_REQUEST"
+diff --git a/tests/unit/controlplane/test_app.py b/tests/unit/controlplane/test_app.py
+index 1e16c9f..47d5b71 100644
+--- a/tests/unit/controlplane/test_app.py
++++ b/tests/unit/controlplane/test_app.py
+@@ -8,7 +8,15 @@ from forgemesh.controlplane.api.dependencies import get_registry, reset_runtime_
+ from forgemesh.controlplane.app import DB_PATH_ENV, create_app
+ 
+ HEADERS = {"X-Tenant-Id": "acme"}
+-BODY = {"kind": "InferenceService", "metadata": {"name": "llama", "namespace": "default"}}
++BODY = {
++    "kind": "InferenceService",
++    "metadata": {"name": "llama", "namespace": "default"},
++    "spec": {
++        "model": {"reference": "models/llama"},
++        "runtime": {"provider": "vllm"},
++        "resources": {"accelerator": {"type": "nvidia-gpu", "minMemoryGiB": 16}},
++    },
++}
+ 
+ 
+ @pytest.fixture(autouse=True)
+@@ -24,7 +32,7 @@ def test_api_routes_are_served_and_persisted_across_restarts(tmp_path) -> None:
+ 
+     with TestClient(create_app(db_path=str(db_file))) as client:
+         created = client.post("/api/v1/inference-services", json=BODY, headers=HEADERS)
+-        assert created.status_code == 200
++        assert created.status_code == 201
+ 
+     with TestClient(create_app(db_path=str(db_file))) as client:
+         fetched = client.get(
+-- 
+2.43.0
+

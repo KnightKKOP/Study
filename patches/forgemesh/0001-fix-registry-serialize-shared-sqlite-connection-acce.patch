@@ -1,0 +1,232 @@
+From f6461e7163324836a6637811450d43cd6b63902a Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 12 Oct 2026 02:31:28 +0000
+Subject: [PATCH 1/8] fix(registry): serialize shared sqlite connection access
+ (R-1)
+
+All SQLiteRegistry methods ran on asyncio.to_thread worker threads against one
+shared sqlite3 connection without a lock. Interleaved transactions let a failing
+writer's rollback discard another writer's uncommitted insert, so creates were
+reported as successful but never persisted, and raw sqlite3 errors leaked.
+
+Serialize every database call through an instance-level RLock.
+---
+ .../forgemesh/controlplane/registry/store.py  | 39 +++++++++----
+ tests/contract/test_registry_hardening.py     | 57 +++++++++++++++++++
+ 2 files changed, 84 insertions(+), 12 deletions(-)
+ create mode 100644 tests/contract/test_registry_hardening.py
+
+diff --git a/packages/control-plane/src/forgemesh/controlplane/registry/store.py b/packages/control-plane/src/forgemesh/controlplane/registry/store.py
+index 34f82ee..00f04d0 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/registry/store.py
++++ b/packages/control-plane/src/forgemesh/controlplane/registry/store.py
+@@ -2,7 +2,8 @@
+ 
+ 对齐 ``forgemesh.core.registry.ResourceRegistry`` 契约，以 SQLite 作为权威状态
+ 存储后端（阶段 P1）。所有异步方法通过 :func:`asyncio.to_thread` 包装同步 sqlite3
+-调用，适配事件循环环境。
++调用，适配事件循环环境；同一实例共享单一连接，所有数据库访问经实例级锁串行化
++（sqlite3 连接级事务不可跨线程交错，否则一方 rollback 会连带丢弃另一方未提交的写入）。
+ 
+ 并发语义
+ --------
+@@ -52,8 +53,10 @@ import builtins
+ import json
+ import logging
+ import sqlite3
++import threading
++from collections.abc import Callable
+ from dataclasses import dataclass, field
+-from typing import Any
++from typing import Any, TypeVar
+ from uuid import uuid4
+ 
+ from forgemesh.core.errors import ConflictError, NotFoundError
+@@ -66,6 +69,8 @@ from pydantic import ValidationError
+ 
+ logger = logging.getLogger(__name__)
+ 
++_T = TypeVar("_T")
++
+ #: kind → 权威状态机映射；未登记的 kind 视为不受管，put() 跳过转移校验。
+ _KIND_STATE_MACHINES = {
+     "InferenceService": INFERENCE_STATE_MACHINE,
+@@ -148,12 +153,22 @@ class SQLiteRegistry(ResourceRegistry):
+         # check_same_thread=False：asyncio.to_thread 会在不同线程执行 sqlite 调用。
+         self._conn = sqlite3.connect(db_path, check_same_thread=False)
+         self._conn.row_factory = sqlite3.Row
++        self._lock = threading.RLock()
+         self._init_schema()
+ 
+     # ------------------------------------------------------------------ #
+     # 内部辅助
+     # ------------------------------------------------------------------ #
+ 
++    async def _run(self, fn: Callable[[], _T]) -> _T:
++        """在工作线程中持锁执行一段同步数据库操作（读写均串行化）。"""
++
++        def _locked() -> _T:
++            with self._lock:
++                return fn()
++
++        return await asyncio.to_thread(_locked)
++
+     def _init_schema(self) -> None:
+         """创建表与索引（幂等），并对存量库做列迁移。"""
+         self._conn.executescript(_SCHEMA_SQL)
+@@ -273,7 +288,7 @@ class SQLiteRegistry(ResourceRegistry):
+                 )
+             return self._row_to_resource(row)
+ 
+-        return await asyncio.to_thread(_get)
++        return await self._run(_get)
+ 
+     async def put(
+         self,
+@@ -386,7 +401,7 @@ class SQLiteRegistry(ResourceRegistry):
+                     f"namespace={namespace!r} name={name} tenant_id={tenant_id}",
+                 ) from exc
+ 
+-        return await asyncio.to_thread(_put)
++        return await self._run(_put)
+ 
+     async def list(
+         self,
+@@ -432,7 +447,7 @@ class SQLiteRegistry(ResourceRegistry):
+                 ]
+             return results
+ 
+-        return await asyncio.to_thread(_list)
++        return await self._run(_list)
+ 
+     async def delete(
+         self,
+@@ -459,7 +474,7 @@ class SQLiteRegistry(ResourceRegistry):
+                 )
+             self._conn.commit()
+ 
+-        await asyncio.to_thread(_delete)
++        await self._run(_delete)
+ 
+     async def request_delete(
+         self,
+@@ -590,7 +605,7 @@ class SQLiteRegistry(ResourceRegistry):
+             )
+             return RequestDeleteResult(False, effective)
+ 
+-        return await asyncio.to_thread(_request_delete)
++        return await self._run(_request_delete)
+ 
+     # ------------------------------------------------------------------ #
+     # Allocation 持久化（development-plan 7.2 DDL）
+@@ -645,7 +660,7 @@ class SQLiteRegistry(ResourceRegistry):
+                 ) from exc
+             return allocation_id
+ 
+-        return await asyncio.to_thread(_put_allocation)
++        return await self._run(_put_allocation)
+ 
+     async def get_active_allocation(
+         self,
+@@ -664,7 +679,7 @@ class SQLiteRegistry(ResourceRegistry):
+             ).fetchone()
+             return dict(row) if row is not None else None
+ 
+-        return await asyncio.to_thread(_get_active)
++        return await self._run(_get_active)
+ 
+     async def release_allocation(
+         self,
+@@ -708,7 +723,7 @@ class SQLiteRegistry(ResourceRegistry):
+                     reason,
+                 )
+ 
+-        await asyncio.to_thread(_release)
++        await self._run(_release)
+ 
+     async def list_allocations(
+         self,
+@@ -723,7 +738,7 @@ class SQLiteRegistry(ResourceRegistry):
+             ).fetchall()
+             return [dict(row) for row in rows]
+ 
+-        return await asyncio.to_thread(_list_allocations)
++        return await self._run(_list_allocations)
+ 
+     # ------------------------------------------------------------------ #
+     # 生命周期
+@@ -731,7 +746,7 @@ class SQLiteRegistry(ResourceRegistry):
+ 
+     async def close(self) -> None:
+         """关闭数据库连接。"""
+-        await asyncio.to_thread(self._conn.close)
++        await self._run(self._conn.close)
+ 
+ 
+ __all__ = [
+diff --git a/tests/contract/test_registry_hardening.py b/tests/contract/test_registry_hardening.py
+new file mode 100644
+index 0000000..3d4cd3f
+--- /dev/null
++++ b/tests/contract/test_registry_hardening.py
+@@ -0,0 +1,57 @@
++"""Registry 加固回归测试：单实例并发、身份唯一性、受控删除 CAS、标签过滤。
++
++每个用例对应一个已复现的缺陷，修复前稳定失败、修复后必须通过。
++"""
++
++from __future__ import annotations
++
++import asyncio
++
++import pytest
++from forgemesh.controlplane.registry import SQLiteRegistry
++from forgemesh.core.errors import ConflictError
++from forgemesh.core.objects import ObjectMeta, Resource
++
++KIND = "Node"
++TENANT = "tenant-a"
++
++
++def _make_resource(
++    name: str,
++    namespace: str | None = "ns-a",
++    labels: dict[str, str] | None = None,
++) -> Resource:
++    return Resource(
++        kind=KIND,
++        metadata=ObjectMeta(
++            name=name,
++            namespace=namespace,
++            uid=f"uid-{name}",
++            tenant_id=TENANT,
++            labels=labels or {},
++        ),
++    )
++
++
++@pytest.mark.contract
++def test_shared_instance_concurrent_writes_are_not_lost() -> None:
++    """同一实例并发写：失败方的 rollback 不得连带丢弃成功方的写入（缺陷 R-1）。"""
++
++    async def scenario() -> None:
++        reg = SQLiteRegistry(":memory:")
++        try:
++            seed = await reg.put(_make_resource("seed"))
++            for round_no in range(10):
++                names = [f"svc-{round_no}-{i}" for i in range(32)]
++                creates = [reg.put(_make_resource(n)) for n in names]
++                stale = [reg.put(seed, expected_version="999") for _ in range(32)]
++                results = await asyncio.gather(*creates, *stale, return_exceptions=True)
++                created, rejected = results[:32], results[32:]
++                assert not [r for r in created if isinstance(r, BaseException)]
++                assert all(isinstance(r, ConflictError) for r in rejected)
++                stored = {r.metadata.name for r in await reg.list(KIND, TENANT, limit=10_000)}
++                assert set(names) <= stored
++        finally:
++            await reg.close()
++
++    asyncio.run(scenario())
+-- 
+2.43.0
+

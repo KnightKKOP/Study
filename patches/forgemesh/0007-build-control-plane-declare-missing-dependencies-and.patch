@@ -1,0 +1,39 @@
+From 40620aa4b71e867440283e8aa885694810b4e705 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 12 Oct 2026 02:40:13 +0000
+Subject: [PATCH 7/8] build(control-plane): declare missing dependencies and a
+ console script
+
+reconciler/core.py imports forgemesh.policy and plugin_manager.py imports
+forgemesh.plugin, but neither package was declared, so a standalone install
+failed at import time. Also expose main() as forgemesh-control-plane.
+---
+ packages/control-plane/pyproject.toml | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/packages/control-plane/pyproject.toml b/packages/control-plane/pyproject.toml
+index c2c8ad5..bf6ffc0 100644
+--- a/packages/control-plane/pyproject.toml
++++ b/packages/control-plane/pyproject.toml
+@@ -13,6 +13,8 @@ dependencies = [
+     "forgemesh-resource-model",
+     "forgemesh-workflow-api",
+     "forgemesh-decision-api",
++    "forgemesh-policy-engine",
++    "forgemesh-plugin-sdk",
+ ]
+ 
+ [project.optional-dependencies]
+@@ -21,6 +23,9 @@ api = [
+     "uvicorn>=0.29",
+ ]
+ 
++[project.scripts]
++forgemesh-control-plane = "forgemesh.controlplane.app:main"
++
+ [tool.setuptools]
+ package-dir = { "" = "src" }
+ 
+-- 
+2.43.0
+

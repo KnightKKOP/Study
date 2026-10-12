@@ -1,0 +1,281 @@
+From f30b5714d5297042aa63e97d38bb75b2dcaea2f3 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 12 Oct 2026 02:34:40 +0000
+Subject: [PATCH 3/8] fix(registry): make request_delete and release_allocation
+ compare-and-swap
+
+request_delete read the row and then wrote Terminating (or physically deleted)
+without checking resource_version, so a write committed in between was lost, or
+a finalizer added in between was bypassed. release_allocation likewise could
+rewrite an allocation that had just expired.
+
+Condition both writes on the version/status that was read and raise
+ConflictError when another writer got there first.
+---
+ .../forgemesh/controlplane/registry/store.py  |  31 ++--
+ tests/contract/test_registry_hardening.py     | 143 ++++++++++++++++++
+ 2 files changed, 165 insertions(+), 9 deletions(-)
+
+diff --git a/packages/control-plane/src/forgemesh/controlplane/registry/store.py b/packages/control-plane/src/forgemesh/controlplane/registry/store.py
+index 4b97aef..fc10e30 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/registry/store.py
++++ b/packages/control-plane/src/forgemesh/controlplane/registry/store.py
+@@ -547,6 +547,8 @@ class SQLiteRegistry(ResourceRegistry):
+         Raises:
+             NotFoundError: 目标资源不存在（或跨租户不可见）。
+             InvalidStateTransition: 当前 phase 不允许转移到 ``Terminating``。
++            ConflictError: 读取后资源被并发修改（``resource_version`` 已变化），
++                调用方应重新读取后重试。
+         """
+         terminating = "Terminating"
+ 
+@@ -563,6 +565,7 @@ class SQLiteRegistry(ResourceRegistry):
+                     f"namespace={namespace!r} name={name} tenant_id={tenant_id}",
+                 )
+             phase = row["phase"]
++            read_version = row["resource_version"]
+             current_finalizers = json.loads(row["finalizers"] or "[]")
+             if phase == terminating:
+                 # 幂等：删除请求已受理，仍在受控释放流程中。
+@@ -572,22 +575,24 @@ class SQLiteRegistry(ResourceRegistry):
+                 effective.append(DEFAULT_RELEASE_FINALIZER)
+             if not effective:
+                 # 无 finalizer 且无外部副作用 → 直接物理删除（向后兼容）。
++                # 以读到的版本为条件：并发写入可能刚追加了 finalizer。
+                 cur.execute(
+                     "DELETE FROM resources "
+-                    "WHERE tenant_id=? AND kind=? AND namespace IS ? AND name=?",
+-                    (tenant_id, kind, namespace, name),
++                    "WHERE tenant_id=? AND kind=? AND namespace IS ? AND name=? "
++                    " AND resource_version=?",
++                    (tenant_id, kind, namespace, name, read_version),
+                 )
+                 if cur.rowcount == 0:
+                     self._conn.rollback()
+-                    raise NotFoundError(
+-                        f"resource not found: kind={kind} "
++                    raise ConflictError(
++                        f"request_delete raced with concurrent write: kind={kind} "
+                         f"namespace={namespace!r} name={name} tenant_id={tenant_id}",
+                     )
+                 self._conn.commit()
+                 return RequestDeleteResult(True, [])
+             # finalizer 非空（或自动追加）→ 受控删除：置 Terminating。
+             self._validate_phase_transition(kind, phase, terminating)
+-            new_version = row["resource_version"] + 1
++            new_version = read_version + 1
+             body = json.loads(row["body"])
+             body["finalizers"] = effective
+             # 仅当 payload 已携带 status 子树（强类型子类）时同步 phase；
+@@ -602,7 +607,8 @@ class SQLiteRegistry(ResourceRegistry):
+             cur.execute(
+                 "UPDATE resources SET body=?, phase=?, finalizers=?, "
+                 " resource_version=?, updated_at=datetime('now') "
+-                "WHERE tenant_id=? AND kind=? AND namespace IS ? AND name=?",
++                "WHERE tenant_id=? AND kind=? AND namespace IS ? AND name=? "
++                " AND resource_version=?",
+                 (
+                     json.dumps(body, ensure_ascii=False),
+                     terminating,
+@@ -612,6 +618,7 @@ class SQLiteRegistry(ResourceRegistry):
+                     kind,
+                     namespace,
+                     name,
++                    read_version,
+                 ),
+             )
+             if cur.rowcount == 0:
+@@ -725,6 +732,7 @@ class SQLiteRegistry(ResourceRegistry):
+         Raises:
+             NotFoundError: 分配不存在（或跨租户不可见）。
+             InvalidStateTransition: 当前状态非 ``Active``（终态不可逆）。
++            ConflictError: 读取后状态被并发修改（如已被另一方释放或过期）。
+         """
+ 
+         def _release() -> None:
+@@ -737,11 +745,16 @@ class SQLiteRegistry(ResourceRegistry):
+                     f"allocation not found: id={allocation_id} tenant_id={tenant_id}",
+                 )
+             ALLOCATION_STATE_MACHINE.validate(row["status"], AllocationStatus.RELEASED.value)
+-            self._conn.execute(
++            cur = self._conn.execute(
+                 "UPDATE allocations SET status=?, released_at=datetime('now') "
+-                "WHERE tenant_id=? AND id=?",
+-                (AllocationStatus.RELEASED.value, tenant_id, allocation_id),
++                "WHERE tenant_id=? AND id=? AND status=?",
++                (AllocationStatus.RELEASED.value, tenant_id, allocation_id, row["status"]),
+             )
++            if cur.rowcount == 0:
++                self._conn.rollback()
++                raise ConflictError(
++                    f"allocation changed concurrently: id={allocation_id} tenant_id={tenant_id}",
++                )
+             self._conn.commit()
+             if reason is not None:
+                 logger.debug(
+diff --git a/tests/contract/test_registry_hardening.py b/tests/contract/test_registry_hardening.py
+index faeecda..7dd449a 100644
+--- a/tests/contract/test_registry_hardening.py
++++ b/tests/contract/test_registry_hardening.py
+@@ -12,11 +12,56 @@ import pytest
+ from forgemesh.controlplane.registry import SQLiteRegistry
+ from forgemesh.core.errors import ConflictError, PreconditionFailedError
+ from forgemesh.core.objects import ObjectMeta, Resource
++from forgemesh.resource.allocation import Allocation
+ 
+ KIND = "Node"
+ TENANT = "tenant-a"
+ 
+ 
++class _InterleavedWriter:
++    """包装 sqlite3 连接：命中指定 SELECT 后立即插入一次已提交的写入。
++
++    模拟另一个连接（另一副本 / CLI / 运维脚本）恰好在「读」与「写」之间完成了写入。
++    """
++
++    def __init__(self, inner: sqlite3.Connection, trigger: str, statement: str) -> None:
++        self._inner = inner
++        self._trigger = trigger
++        self._statement = statement
++        self.fired = False
++
++    def _maybe_fire(self, sql: str) -> None:
++        if not self.fired and sql.lstrip().startswith(self._trigger):
++            self.fired = True
++            self._inner.execute(self._statement)
++            self._inner.commit()
++
++    def execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
++        result = self._inner.execute(sql, params)
++        self._maybe_fire(sql)
++        return result
++
++    def cursor(self) -> _InterleavedCursor:
++        return _InterleavedCursor(self, self._inner.cursor())
++
++    def __getattr__(self, item: str):
++        return getattr(self._inner, item)
++
++
++class _InterleavedCursor:
++    def __init__(self, writer: _InterleavedWriter, inner: sqlite3.Cursor) -> None:
++        self._writer = writer
++        self._inner = inner
++
++    def execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
++        result = self._inner.execute(sql, params)
++        self._writer._maybe_fire(sql)
++        return result
++
++    def __getattr__(self, item: str):
++        return getattr(self._inner, item)
++
++
+ def _make_resource(
+     name: str,
+     namespace: str | None = "ns-a",
+@@ -95,3 +140,101 @@ def test_open_refuses_legacy_db_with_duplicate_identities(tmp_path) -> None:
+ 
+     with pytest.raises(PreconditionFailedError, match="name=dup"):
+         SQLiteRegistry(str(db_file))
++
++
++@pytest.mark.contract
++def test_request_delete_does_not_overwrite_concurrent_update() -> None:
++    """受控删除的「置 Terminating」写入以读到的版本为条件，不覆盖并发更新。"""
++
++    async def scenario() -> None:
++        reg = SQLiteRegistry(":memory:")
++        try:
++            victim = _make_resource("victim")
++            victim.finalizers = ["forgemesh.io/resource-release"]
++            await reg.put(victim)
++            conn = reg._conn
++            reg._conn = _InterleavedWriter(
++                conn,
++                trigger="SELECT body, phase, finalizers, resource_version",
++                statement=(
++                    "UPDATE resources SET resource_version = resource_version + 1, "
++                    "body = json_set(body, '$.metadata.labels.writer', 'concurrent', "
++                    "'$.metadata.resourceVersion', '1') WHERE name = 'victim'"
++                ),
++            )
++            with pytest.raises(ConflictError):
++                await reg.request_delete(KIND, "ns-a", "victim", TENANT)
++            reg._conn = conn
++
++            current = await reg.get(KIND, "ns-a", "victim", TENANT)
++            assert current.metadata.labels == {"writer": "concurrent"}
++            assert current.metadata.resourceVersion == "1"
++
++            retried = await reg.request_delete(KIND, "ns-a", "victim", TENANT)
++            assert retried.deleted is False
++            after = await reg.get(KIND, "ns-a", "victim", TENANT)
++            assert after.metadata.labels == {"writer": "concurrent"}
++            assert after.metadata.resourceVersion == "2"
++        finally:
++            await reg.close()
++
++    asyncio.run(scenario())
++
++
++@pytest.mark.contract
++def test_request_delete_does_not_bypass_concurrently_added_finalizer() -> None:
++    """物理删除以读到的版本为条件：并发追加的 finalizer 不能被绕过。"""
++
++    async def scenario() -> None:
++        reg = SQLiteRegistry(":memory:")
++        try:
++            await reg.put(_make_resource("victim"))
++            conn = reg._conn
++            reg._conn = _InterleavedWriter(
++                conn,
++                trigger="SELECT body, phase, finalizers, resource_version",
++                statement=(
++                    "UPDATE resources SET resource_version = resource_version + 1, "
++                    "finalizers = '[\"guard\"]', "
++                    "body = json_set(body, '$.finalizers', json('[\"guard\"]'), "
++                    "'$.metadata.resourceVersion', '1') WHERE name = 'victim'"
++                ),
++            )
++            with pytest.raises(ConflictError):
++                await reg.request_delete(KIND, "ns-a", "victim", TENANT)
++            reg._conn = conn
++
++            survivor = await reg.get(KIND, "ns-a", "victim", TENANT)
++            assert survivor.finalizers == ["guard"]
++        finally:
++            await reg.close()
++
++    asyncio.run(scenario())
++
++
++@pytest.mark.contract
++def test_release_allocation_does_not_overwrite_terminal_state() -> None:
++    """释放分配以读到的状态为条件：并发过期后不得被改写为 Released。"""
++
++    async def scenario() -> None:
++        reg = SQLiteRegistry(":memory:")
++        try:
++            allocation_id = await reg.put_allocation(
++                Allocation(resource_id="gpu-0", tenant_id=TENANT, idempotency_key="alloc-1"),
++            )
++            conn = reg._conn
++            reg._conn = _InterleavedWriter(
++                conn,
++                trigger="SELECT status FROM allocations",
++                statement="UPDATE allocations SET status = 'Expired'",
++            )
++            with pytest.raises(ConflictError):
++                await reg.release_allocation(allocation_id, TENANT)
++            reg._conn = conn
++
++            [record] = await reg.list_allocations(TENANT)
++            assert record["status"] == "Expired"
++        finally:
++            await reg.close()
++
++    asyncio.run(scenario())
+-- 
+2.43.0
+

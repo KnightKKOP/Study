@@ -1,0 +1,154 @@
+From b907a9e044160343de2e7481a8b4276bbabf9cac Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 12 Oct 2026 02:37:12 +0000
+Subject: [PATCH 5/8] fix(reconciler): do not record dedup keys on
+ side-effect-free failure paths
+
+The deny, require_approval and allocation-failure paths marked the dedup key as
+processed and then asked to be requeued. The requeued call hit the idempotency
+short-circuit and returned done=True, so a blocked resource was never
+re-evaluated until its spec changed or the 24h dedup TTL expired.
+
+None of these paths produced a side effect, so leave the key unmarked.
+---
+ .../forgemesh/controlplane/reconciler/core.py |  5 +-
+ tests/unit/controlplane/test_reconciler.py    | 85 ++++++++++++++++++-
+ 2 files changed, 86 insertions(+), 4 deletions(-)
+
+diff --git a/packages/control-plane/src/forgemesh/controlplane/reconciler/core.py b/packages/control-plane/src/forgemesh/controlplane/reconciler/core.py
+index de18b24..9a8991e 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/reconciler/core.py
++++ b/packages/control-plane/src/forgemesh/controlplane/reconciler/core.py
+@@ -164,8 +164,9 @@ class ReconciliationController(Reconciler):
+             resource={"kind": resource.kind, "name": resource.metadata.name},
+         )
+         policy_result = await self._policy.check(ctx, action)
++        # deny / require_approval / 分配失败均未产生副作用：不登记 dedup_key，
++        # 否则 requeue 回来会命中幂等短路，永远不会重新评估。
+         if policy_result.decision == "deny":
+-            await self._mark_processed(ctx.dedup_key)
+             return ReconcileResult(
+                 done=False,
+                 requeue_after=30.0,
+@@ -186,7 +187,6 @@ class ReconciliationController(Reconciler):
+             # 工作流），requeue 等待人工审批后重新协调（对齐
+             # development-plan 5.6 三态 / architecture 7.5——高风险操作
+             # 不允许在审批前放行）
+-            await self._mark_processed(ctx.dedup_key)
+             return ReconcileResult(
+                 done=False,
+                 requeue_after=30.0,
+@@ -216,7 +216,6 @@ class ReconciliationController(Reconciler):
+                 allocation_ref = await self._scheduler.allocate(sched_req)
+             except Exception as exc:  # noqa: BLE001 - 分配失败需可重试
+                 logger.warning("scheduler allocate failed: %s", exc)
+-                await self._mark_processed(ctx.dedup_key)
+                 return ReconcileResult(
+                     done=False,
+                     requeue_after=10.0,
+diff --git a/tests/unit/controlplane/test_reconciler.py b/tests/unit/controlplane/test_reconciler.py
+index 6971a01..c18de33 100644
+--- a/tests/unit/controlplane/test_reconciler.py
++++ b/tests/unit/controlplane/test_reconciler.py
+@@ -13,7 +13,11 @@ import json
+ from typing import Any
+ 
+ import pytest
+-from forgemesh.controlplane.reconciler import ReconciliationController, compute_dedup_key
++from forgemesh.controlplane.reconciler import (
++    ProcessedKeyStore,
++    ReconciliationController,
++    compute_dedup_key,
++)
+ from forgemesh.controlplane.registry import SQLiteRegistry
+ from forgemesh.core.errors import NotFoundError
+ from forgemesh.core.objects import ObjectMeta, Resource
+@@ -275,6 +279,85 @@ def test_reconcile_allocation_failure():
+     assert any(c["status"] == "False" for c in conditions)
+ 
+ 
++class SequencePolicyEngine:
++    """按调用顺序依次返回预设决策（最后一个决策重复使用）。"""
++
++    def __init__(self, *decisions: str) -> None:
++        self._decisions = list(decisions)
++        self.calls = 0
++
++    async def check(self, ctx, action):  # noqa: ANN001
++        decision = self._decisions[min(self.calls, len(self._decisions) - 1)]
++        self.calls += 1
++        return PolicyDecision(decision=decision, reason=f"call-{self.calls}")
++
++
++class FlakyScheduler(MockScheduler):
++    """首次 allocate 失败，之后成功。"""
++
++    async def allocate(self, req):  # noqa: ANN001
++        self._fail = self.allocate_count == 0
++        return await super().allocate(req)
++
++
++def _processed_store_variants():
++    return [
++        pytest.param(lambda: None, id="in-memory-keys"),
++        pytest.param(lambda: ProcessedKeyStore(":memory:"), id="processed-store"),
++    ]
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize("first_decision", ["deny", "require_approval"])
++@pytest.mark.parametrize("make_store", _processed_store_variants())
++def test_reconcile_requeue_after_policy_block_is_reevaluated(first_decision, make_store):
++    """deny / require_approval 未产生副作用：requeue 回来必须重新评估策略。"""
++    ctx = make_context(make_resource(generation=1, observed_generation=0), {"phase": "Pending"})
++    policy = SequencePolicyEngine(first_decision, "allow")
++    scheduler = MockScheduler()
++    controller = ReconciliationController(
++        registry=None,
++        policy_engine=policy,
++        scheduler=scheduler,
++        processed_store=make_store(),
++    )
++
++    blocked = asyncio.run(controller.reconcile(ctx))
++    assert blocked.done is False
++    assert scheduler.allocate_called is False
++
++    retried = asyncio.run(controller.reconcile(ctx))
++    assert policy.calls == 2
++    assert retried.done is True
++    assert any(c["reason"] == "Reconciled" for c in retried.status_patch["conditions"])
++    assert scheduler.allocate_count == 1
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize("make_store", _processed_store_variants())
++def test_reconcile_requeue_after_allocation_failure_retries_allocation(make_store):
++    """分配失败未产生分配：requeue 回来必须重新尝试分配。"""
++    ctx = make_context(make_resource(generation=1, observed_generation=0), {"phase": "Pending"})
++    scheduler = FlakyScheduler()
++    controller = ReconciliationController(
++        registry=None,
++        policy_engine=MockPolicyEngine(PolicyDecision(decision="allow", reason="ok")),
++        scheduler=scheduler,
++        processed_store=make_store(),
++    )
++
++    failed = asyncio.run(controller.reconcile(ctx))
++    assert failed.done is False
++
++    retried = asyncio.run(controller.reconcile(ctx))
++    assert retried.done is True
++    assert scheduler.allocate_count == 2
++
++    again = asyncio.run(controller.reconcile(ctx))
++    assert again.status_patch == {}
++    assert scheduler.allocate_count == 2
++
++
+ # ---------------------------------------------------------------------- #
+ # Terminating 受控删除闭环（architecture §5.3/§12.4 / development-plan 第 7 章）
+ # ---------------------------------------------------------------------- #
+-- 
+2.43.0
+
