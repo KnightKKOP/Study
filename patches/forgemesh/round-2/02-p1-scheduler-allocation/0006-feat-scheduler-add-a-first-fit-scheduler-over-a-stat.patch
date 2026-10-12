@@ -1,0 +1,1369 @@
+From 8916089f1b80eef2cce32f5dc2d01cce62f5475a Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 12 Oct 2026 13:13:05 +0000
+Subject: [PATCH 6/8] feat(scheduler): add a first-fit scheduler over a static
+ inventory
+
+Nothing implemented the Scheduler contract, so the reconciler could
+never allocate accelerators. FirstFitScheduler allocates from a static
+inventory of nodes and accelerator devices, read from the JSON file
+named by FORGEMESH_INVENTORY_FILE and validated strictly: unknown
+fields, implicit type coercion, empty lists and duplicate ids are
+errors, so that the control plane can refuse to start on a broken
+file.
+
+allocate() takes the first node, in inventory order, that has enough
+free devices of the requested type with at least minMemoryGiB each,
+and records the allocation together with its devices through
+SQLiteRegistry.create_allocation, so device exclusivity stays enforced
+by the database. Allocations are serialized within one scheduler:
+under first-fit, concurrent requests all pick the same free device and
+the losers would run out of retries while devices were still free. A
+conflict caused by another connection is retried a bounded number of
+times.
+
+The same idempotency key returns the same allocation, also after a
+restart. A resource that already holds an allocation that still fits
+(a new generation that kept the accelerator request) keeps it; one
+that no longer fits is a conflict until it is released. feasible()
+only reads, and release() is idempotent. No lease is set: the
+reconciler releases the allocation when the resource is deleted.
+---
+ .../controlplane/scheduler/__init__.py        |  26 +
+ .../controlplane/scheduler/first_fit.py       | 269 +++++++++
+ .../controlplane/scheduler/inventory.py       | 134 +++++
+ .../controlplane/test_allocation_lifecycle.py | 172 ++++++
+ tests/unit/controlplane/test_scheduler.py     | 521 ++++++++++++++++++
+ .../controlplane/test_scheduler_inventory.py  | 163 ++++++
+ 6 files changed, 1285 insertions(+)
+ create mode 100644 packages/control-plane/src/forgemesh/controlplane/scheduler/__init__.py
+ create mode 100644 packages/control-plane/src/forgemesh/controlplane/scheduler/first_fit.py
+ create mode 100644 packages/control-plane/src/forgemesh/controlplane/scheduler/inventory.py
+ create mode 100644 tests/unit/controlplane/test_allocation_lifecycle.py
+ create mode 100644 tests/unit/controlplane/test_scheduler.py
+ create mode 100644 tests/unit/controlplane/test_scheduler_inventory.py
+
+diff --git a/packages/control-plane/src/forgemesh/controlplane/scheduler/__init__.py b/packages/control-plane/src/forgemesh/controlplane/scheduler/__init__.py
+new file mode 100644
+index 0000000..61a07e9
+--- /dev/null
++++ b/packages/control-plane/src/forgemesh/controlplane/scheduler/__init__.py
+@@ -0,0 +1,26 @@
++"""ForgeMesh 控制平面 — 调度器（静态加速器清单 + 首次适配分配）。"""
++
++from __future__ import annotations
++
++from .first_fit import FirstFitScheduler, InsufficientCapacityError
++from .inventory import (
++    INVENTORY_FILE_ENV,
++    Inventory,
++    InventoryConfigError,
++    InventoryDevice,
++    InventoryNode,
++    inventory_from_env,
++    load_inventory,
++)
++
++__all__ = [
++    "FirstFitScheduler",
++    "InsufficientCapacityError",
++    "INVENTORY_FILE_ENV",
++    "Inventory",
++    "InventoryConfigError",
++    "InventoryDevice",
++    "InventoryNode",
++    "inventory_from_env",
++    "load_inventory",
++]
+diff --git a/packages/control-plane/src/forgemesh/controlplane/scheduler/first_fit.py b/packages/control-plane/src/forgemesh/controlplane/scheduler/first_fit.py
+new file mode 100644
+index 0000000..a60c32c
+--- /dev/null
++++ b/packages/control-plane/src/forgemesh/controlplane/scheduler/first_fit.py
+@@ -0,0 +1,269 @@
++"""首次适配（first-fit）调度器：按静态加速器清单为资源挑选设备。
++
++实现 :class:`forgemesh.core.scheduler.Scheduler`：
++
++* 需求取自 ``ScheduleRequest.requirements["accelerator"]``（``type`` / ``count`` /
++  ``minMemoryGiB``，即 ``spec.resources.accelerator``）；没有加速器需求的请求得到
++  不含设备的分配；
++* 按清单顺序取第一个能满足全部数量的节点，在该节点内按清单顺序取前 ``count`` 个类型
++  精确匹配、显存不低于 ``minMemoryGiB`` 且不属于任何 Active 分配的设备（不跨节点）；
++* 分配与设备占用写入注册表（:meth:`SQLiteRegistry.create_allocation`），设备独占由
++  数据库约束保证；同一调度器实例内的分配串行执行，其他连接的并发分配抢到同一设备时，
++  落败方重新挑选；
++* 同一 ``idempotency_key`` 返回同一分配（重启后亦然）；资源（uid）已持有恰好满足
++  需求的 Active 分配时直接复用（例如 spec 其他字段变更产生的新 generation），不满足
++  时报冲突，须先释放；
++* 不设租约（``lease_until`` 为 ``None``）：分配在资源删除时由协调器释放。
++"""
++
++from __future__ import annotations
++
++import asyncio
++import logging
++from typing import Any
++
++from forgemesh.core.errors import (
++    ConflictError,
++    ForgeMeshError,
++    InvalidStateTransition,
++    NotFoundError,
++)
++from forgemesh.core.scheduler import (
++    AllocatedDevice,
++    AllocationRef,
++    FeasibilityResult,
++    Scheduler,
++    ScheduleRequest,
++)
++from forgemesh.resource.allocation import AllocationStatus
++from forgemesh.resource.inference import AcceleratorSpec
++from pydantic import BaseModel, ConfigDict, ValidationError
++
++from ..registry.store import SQLiteRegistry
++from .inventory import Inventory, InventoryDevice
++
++logger = logging.getLogger(__name__)
++
++#: 挑中的设备被并发分配抢走后重新挑选的总尝试次数。
++_MAX_ATTEMPTS = 3
++
++
++class InsufficientCapacityError(ForgeMeshError):
++    """清单中没有足够的空闲设备满足需求。"""
++
++
++class _Requirements(BaseModel):
++    model_config = ConfigDict(extra="forbid")
++
++    accelerator: AcceleratorSpec | None = None
++
++
++def _accelerator(req: ScheduleRequest) -> AcceleratorSpec | None:
++    try:
++        return _Requirements.model_validate(req.requirements).accelerator
++    except ValidationError as exc:
++        raise ValueError(f"invalid scheduling requirements: {exc}") from exc
++
++
++def _fits(device: InventoryDevice, accelerator: AcceleratorSpec) -> bool:
++    return device.type == accelerator.type and device.memoryGiB >= accelerator.minMemoryGiB
++
++
++def _to_ref(record: dict[str, Any]) -> AllocationRef:
++    return AllocationRef(
++        allocation_id=record["id"],
++        resource_id=record["resource_id"],
++        devices=[AllocatedDevice(**device) for device in record["devices"]],
++        lease_until=record["lease_until"],
++    )
++
++
++def _names(devices: list[AllocatedDevice]) -> list[str]:
++    return [f"{device.node_id}/{device.device_id}" for device in devices]
++
++
++class FirstFitScheduler(Scheduler):
++    """按静态清单首次适配的调度器（规则见模块说明）。
++
++    Args:
++        registry: 权威注册表，分配与设备占用的唯一记录。
++        inventory: 启动时加载的加速器清单。
++    """
++
++    def __init__(self, registry: SQLiteRegistry, inventory: Inventory) -> None:
++        self._registry = registry
++        self._inventory = inventory
++        self._devices = {
++            (node.id, device.id): device for node in inventory.nodes for device in node.devices
++        }
++        # 首次适配下并发请求总会挑中同一个空闲设备：不串行化时，落败方耗尽重试次数后报冲突，
++        # 设备却仍有空闲。
++        self._allocate_lock = asyncio.Lock()
++
++    async def feasible(self, req: ScheduleRequest) -> FeasibilityResult:
++        """只读判断 ``req`` 能否满足，不写库。
++
++        ``candidates`` 为 :meth:`allocate` 此刻会分配（或已分配给该请求）的设备，
++        形如 ``node-a/gpu-0``。
++
++        Raises:
++            ValueError: ``req.requirements`` 不合法。
++        """
++        accelerator = _accelerator(req)
++        try:
++            existing = await self._existing_allocation(req, accelerator)
++            if existing is not None:
++                return FeasibilityResult(
++                    feasible=True,
++                    reason=f"allocation {existing.allocation_id} already serves the request",
++                    candidates=_names(existing.devices),
++                )
++            devices = self._first_fit(accelerator, await self._registry.allocated_devices())
++        except (ConflictError, InsufficientCapacityError) as exc:
++            return FeasibilityResult(feasible=False, reason=str(exc))
++        return FeasibilityResult(feasible=True, candidates=_names(devices))
++
++    async def allocate(self, req: ScheduleRequest) -> AllocationRef:
++        """首次适配分配；同一 ``idempotency_key`` 返回同一分配。
++
++        Raises:
++            ValueError: ``req.requirements`` 不合法。
++            InsufficientCapacityError: 没有足够的空闲设备。
++            ConflictError: 幂等键属于其他资源或已释放的分配；资源已持有不满足需求的
++                Active 分配；归属资源正在删除；或多次重新挑选后仍被其他连接的并发分配抢先。
++            NotFoundError: 归属资源不存在（或 uid 不一致）。
++        """
++        accelerator = _accelerator(req)
++        async with self._allocate_lock:
++            attempt = 0
++            while True:
++                attempt += 1
++                existing = await self._existing_allocation(req, accelerator)
++                if existing is not None:
++                    return existing
++                devices = self._first_fit(accelerator, await self._registry.allocated_devices())
++                try:
++                    record = await self._registry.create_allocation(
++                        req.tenant_id, req.resource_ref, req.idempotency_key, devices
++                    )
++                except ConflictError:
++                    if attempt >= _MAX_ATTEMPTS:
++                        raise
++                    continue
++                allocation = _to_ref(record)
++                ref = req.resource_ref
++                logger.info(
++                    "allocation created: allocation_id=%s tenant_id=%s kind=%s namespace=%s "
++                    "name=%s uid=%s devices=%s",
++                    allocation.allocation_id,
++                    req.tenant_id,
++                    ref.kind,
++                    ref.namespace,
++                    ref.name,
++                    ref.uid,
++                    _names(allocation.devices),
++                )
++                return allocation
++
++    async def release(self, allocation_id: str) -> None:
++        """释放分配及其设备；分配已释放或已过期时直接返回（幂等）。
++
++        Raises:
++            NotFoundError: 分配不存在。
++        """
++        record = await self._registry.get_allocation(allocation_id)
++        if record is None:
++            raise NotFoundError(f"allocation not found: id={allocation_id}")
++        if record["status"] != AllocationStatus.ACTIVE.value:
++            return
++        try:
++            await self._registry.release_allocation(
++                allocation_id, record["tenant_id"], reason="released by scheduler"
++            )
++        except (ConflictError, InvalidStateTransition):
++            current = await self._registry.get_allocation(allocation_id)
++            if current is not None and current["status"] == AllocationStatus.ACTIVE.value:
++                raise
++            return
++        logger.info(
++            "allocation released: allocation_id=%s tenant_id=%s uid=%s",
++            allocation_id,
++            record["tenant_id"],
++            record["resource_id"],
++        )
++
++    async def _existing_allocation(
++        self, req: ScheduleRequest, accelerator: AcceleratorSpec | None
++    ) -> AllocationRef | None:
++        """返回已服务于 ``req`` 的 Active 分配：同一幂等键的分配，或资源持有的满足需求的分配。
++
++        Raises:
++            ConflictError: 幂等键属于其他资源或已不再 Active 的分配；资源持有的 Active
++                分配不满足需求。
++        """
++        uid = req.resource_ref.uid
++        by_key = await self._registry.get_allocation_by_idempotency_key(
++            req.idempotency_key, req.tenant_id
++        )
++        if by_key is not None:
++            if by_key["resource_id"] != uid:
++                raise ConflictError(
++                    f"idempotency_key {req.idempotency_key!r} belongs to another resource"
++                )
++            if by_key["status"] != AllocationStatus.ACTIVE.value:
++                raise ConflictError(
++                    f"idempotency_key {req.idempotency_key!r} belongs to allocation "
++                    f"{by_key['id']} which is {by_key['status']}",
++                )
++            return _to_ref(by_key)
++        held = await self._registry.get_active_allocation(uid, req.tenant_id)
++        if held is None:
++            return None
++        ref = _to_ref(held)
++        if not self._satisfies(ref.devices, accelerator):
++            raise ConflictError(
++                f"resource uid={uid} holds allocation {ref.allocation_id} "
++                f"({_names(ref.devices)}) that does not match the requested accelerator; "
++                "it must be released first",
++            )
++        return ref
++
++    def _first_fit(
++        self, accelerator: AcceleratorSpec | None, taken: frozenset[AllocatedDevice]
++    ) -> list[AllocatedDevice]:
++        """按清单顺序挑选不在 ``taken`` 中的设备。
++
++        Raises:
++            InsufficientCapacityError: 没有节点能满足全部数量。
++        """
++        if accelerator is None:
++            return []
++        for node in self._inventory.nodes:
++            free = []
++            for device in node.devices:
++                candidate = AllocatedDevice(node_id=node.id, device_id=device.id)
++                if _fits(device, accelerator) and candidate not in taken:
++                    free.append(candidate)
++            if len(free) >= accelerator.count:
++                return free[: accelerator.count]
++        raise InsufficientCapacityError(
++            f"no node has {accelerator.count} free {accelerator.type} device(s) "
++            f"with at least {accelerator.minMemoryGiB} GiB"
++        )
++
++    def _satisfies(
++        self, devices: list[AllocatedDevice], accelerator: AcceleratorSpec | None
++    ) -> bool:
++        """已分配的设备是否恰好满足需求（数量相等，且每个设备都在清单中并符合要求）。"""
++        if accelerator is None:
++            return not devices
++        if len(devices) != accelerator.count:
++            return False
++        for device in devices:
++            spec = self._devices.get((device.node_id, device.device_id))
++            if spec is None or not _fits(spec, accelerator):
++                return False
++        return True
++
++
++__all__ = ["FirstFitScheduler", "InsufficientCapacityError"]
+diff --git a/packages/control-plane/src/forgemesh/controlplane/scheduler/inventory.py b/packages/control-plane/src/forgemesh/controlplane/scheduler/inventory.py
+new file mode 100644
+index 0000000..197b04d
+--- /dev/null
++++ b/packages/control-plane/src/forgemesh/controlplane/scheduler/inventory.py
+@@ -0,0 +1,134 @@
++"""静态加速器清单：调度器可分配的节点与设备，来自 ``FORGEMESH_INVENTORY_FILE``。
++
++控制平面启动时读取一次清单文件（JSON）并严格校验：未知字段、类型不符（不做隐式
++转换，如 ``"80"`` / ``80.0`` 不是合法的 ``memoryGiB``）、空列表、重复的节点 id、
++同一节点内重复的设备 id 都会让启动失败。修改清单后需重启控制平面。
++
++文件格式::
++
++    {"nodes": [{"id": "node-a",
++                "devices": [{"id": "gpu-0", "type": "nvidia-gpu", "memoryGiB": 80},
++                            {"id": "gpu-1", "type": "nvidia-gpu", "memoryGiB": 80}]}]}
++
++* ``type`` 与 ``spec.resources.accelerator.type`` 按字符串精确匹配；
++* ``memoryGiB`` 为单卡显存（GiB），与 ``spec.resources.accelerator.minMemoryGiB`` 比较；
++* 设备以 ``(节点 id, 设备 id)`` 标识；节点与设备的先后顺序即首次适配的挑选顺序。
++"""
++
++from __future__ import annotations
++
++import os
++from collections.abc import Mapping
++from pathlib import Path
++
++from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
++
++INVENTORY_FILE_ENV = "FORGEMESH_INVENTORY_FILE"
++
++
++class InventoryConfigError(ValueError):
++    """加速器清单文件不可读或内容非法；服务应拒绝启动。"""
++
++
++# 非空检查不用 ``Field(min_length=1)``：元组中某一项校验失败时，pydantic 还会对外层元组
++# 报一条误导性的 too_short 错误。
++def _check_ids(what: str, ids: list[str]) -> None:
++    if not ids:
++        raise ValueError(f"at least one {what} is required")
++    duplicates = sorted({value for value in ids if ids.count(value) > 1})
++    if duplicates:
++        raise ValueError(f"duplicate {what} ids: {duplicates}")
++
++
++class InventoryDevice(BaseModel):
++    """清单中的一个加速器设备。
++
++    Attributes:
++        id: 设备标识，在所属节点内唯一。
++        type: 加速器类型，如 ``nvidia-gpu``。
++        memoryGiB: 单卡显存（GiB）。
++    """
++
++    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
++
++    id: str = Field(min_length=1)
++    type: str = Field(min_length=1)
++    memoryGiB: int = Field(ge=1)
++
++
++class InventoryNode(BaseModel):
++    """清单中的一个节点及其设备。
++
++    Attributes:
++        id: 节点标识，在清单内唯一。
++        devices: 节点上的设备（至少一个）。
++    """
++
++    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
++
++    id: str = Field(min_length=1)
++    devices: tuple[InventoryDevice, ...]
++
++    @field_validator("devices")
++    @classmethod
++    def _check_devices(cls, value: tuple[InventoryDevice, ...]) -> tuple[InventoryDevice, ...]:
++        _check_ids("device", [device.id for device in value])
++        return value
++
++
++class Inventory(BaseModel):
++    """静态加速器清单（清单文件的顶层结构）。
++
++    Attributes:
++        nodes: 节点列表（至少一个）。
++    """
++
++    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
++
++    nodes: tuple[InventoryNode, ...]
++
++    @field_validator("nodes")
++    @classmethod
++    def _check_nodes(cls, value: tuple[InventoryNode, ...]) -> tuple[InventoryNode, ...]:
++        _check_ids("node", [node.id for node in value])
++        return value
++
++
++def load_inventory(path: str | os.PathLike[str]) -> Inventory:
++    """读取并校验清单文件。
++
++    Raises:
++        InventoryConfigError: 文件不可读，或内容不符合清单格式。
++    """
++    try:
++        raw = Path(path).read_bytes()
++    except OSError as exc:
++        raise InventoryConfigError(f"cannot read inventory file {path}: {exc}") from exc
++    try:
++        return Inventory.model_validate_json(raw)
++    except ValidationError as exc:
++        raise InventoryConfigError(f"invalid inventory file {path}: {exc}") from exc
++
++
++def inventory_from_env(environ: Mapping[str, str] | None = None) -> Inventory | None:
++    """按 ``FORGEMESH_INVENTORY_FILE`` 加载清单；未设置或为空时返回 ``None``（不启用调度器）。
++
++    Raises:
++        InventoryConfigError: 已设置，但文件不可读或内容非法。
++    """
++    env = os.environ if environ is None else environ
++    path = (env.get(INVENTORY_FILE_ENV) or "").strip()
++    if not path:
++        return None
++    return load_inventory(path)
++
++
++__all__ = [
++    "INVENTORY_FILE_ENV",
++    "Inventory",
++    "InventoryConfigError",
++    "InventoryDevice",
++    "InventoryNode",
++    "inventory_from_env",
++    "load_inventory",
++]
+diff --git a/tests/unit/controlplane/test_allocation_lifecycle.py b/tests/unit/controlplane/test_allocation_lifecycle.py
+new file mode 100644
+index 0000000..c3fc85a
+--- /dev/null
++++ b/tests/unit/controlplane/test_allocation_lifecycle.py
+@@ -0,0 +1,172 @@
++"""分配生命周期测试：控制器 + 协调器 + 首次适配调度器 + 注册表。
++
++* 同一 generation 的重放（含分配后、status 写入前崩溃，再以文件库重启）始终只有
++  一个分配，且分配的设备满足 ``spec.resources.accelerator``；
++* 处于 Scheduling 的资源被删除后不留下 Active 分配，同名资源重建后能再次分到同一设备。
++
++测试以 ``asyncio.run`` 驱动异步方法，不依赖 pytest-asyncio。
++"""
++
++from __future__ import annotations
++
++import asyncio
++import json
++from typing import Any
++
++import pytest
++from forgemesh.controlplane.controller import ControllerManager
++from forgemesh.controlplane.reconciler import ProcessedKeyStore, ReconciliationController
++from forgemesh.controlplane.registry import ResourceKey, SQLiteRegistry
++from forgemesh.controlplane.scheduler import FirstFitScheduler, Inventory
++from forgemesh.core.errors import NotFoundError
++from forgemesh.core.objects import ObjectMeta
++from forgemesh.policy.engine import DefaultPolicyEngine
++from forgemesh.policy.rules import AuthzRule
++from forgemesh.resource.inference import (
++    AcceleratorSpec,
++    InferenceService,
++    InferenceServiceSpec,
++    ModelRef,
++    ResourcesSpec,
++    RuntimeRef,
++)
++from forgemesh.workflow.runtime import RunRef
++
++KIND = "InferenceService"
++TENANT = "tenant-a"
++NAMESPACE = "team-a"
++KEY = ResourceKey(TENANT, KIND, NAMESPACE, "svc")
++
++
++def _inventory(*devices: tuple[str, int]) -> Inventory:
++    """单节点 ``node-a`` 的清单，设备按 ``(设备 id, 显存 GiB)`` 给出。"""
++    node = {
++        "id": "node-a",
++        "devices": [
++            {"id": device_id, "type": "nvidia-gpu", "memoryGiB": memory}
++            for device_id, memory in devices
++        ],
++    }
++    return Inventory.model_validate_json(json.dumps({"nodes": [node]}))
++
++
++def _service(uid: str, min_memory: int = 16) -> InferenceService:
++    return InferenceService(
++        metadata=ObjectMeta(
++            name="svc", namespace=NAMESPACE, uid=uid, tenant_id=TENANT, generation=1
++        ),
++        spec=InferenceServiceSpec(
++            model=ModelRef(reference="models/llama"),
++            runtime=RuntimeRef(provider="vllm"),
++            resources=ResourcesSpec(
++                accelerator=AcceleratorSpec(type="nvidia-gpu", minMemoryGiB=min_memory)
++            ),
++        ),
++    )
++
++
++class _Workflow:
++    async def start(self, defn: Any, inputs: Any, idempotency_key: str) -> RunRef:
++        return RunRef(run_id=idempotency_key, definition_version=1)
++
++
++def _manager(
++    registry: SQLiteRegistry, inventory: Inventory, store: ProcessedKeyStore | None = None
++) -> ControllerManager:
++    reconciler = ReconciliationController(
++        registry,
++        DefaultPolicyEngine(authz_rules=[AuthzRule(action="reconcile", effect="allow")]),
++        scheduler=FirstFitScheduler(registry, inventory),
++        workflow_runtime=_Workflow(),
++        processed_store=store,
++        record_dedup_keys=False,
++    )
++    return ControllerManager(registry, reconciler)
++
++
++@pytest.mark.unit
++def test_replaying_a_generation_after_a_crash_and_restart_keeps_one_allocation(
++    tmp_path, monkeypatch
++):
++    """分配之后、status 写入之前进程退出：去重键没有登记，重启后同一 generation 再次
++    协调，拿到的仍是原来的分配。"""
++    db = str(tmp_path / "cp.db")
++    inventory = _inventory(("gpu-0", 24), ("gpu-1", 80))
++
++    async def killed(*args: Any, **kwargs: Any) -> Any:
++        raise RuntimeError("process killed")
++
++    async def before_crash() -> list[dict[str, Any]]:
++        registry = SQLiteRegistry(db)
++        store = ProcessedKeyStore(db)
++        try:
++            await registry.put(_service("uid-1", min_memory=40))
++            monkeypatch.setattr(registry, "update_status", killed)
++            with pytest.raises(RuntimeError, match="process killed"):
++                await _manager(registry, inventory, store).process(KEY)
++            return await registry.list_allocations(TENANT)
++        finally:
++            await store.close()
++            await registry.close()
++
++    async def after_restart() -> tuple[InferenceService, list[dict[str, Any]]]:
++        registry = SQLiteRegistry(db)
++        store = ProcessedKeyStore(db)
++        try:
++            manager = _manager(registry, inventory, store)
++            await manager.process(KEY)
++            await manager.process(KEY)
++            service = await registry.get(KIND, NAMESPACE, "svc", TENANT)
++            return service, await registry.list_allocations(TENANT)
++        finally:
++            await store.close()
++            await registry.close()
++
++    [allocation] = asyncio.run(before_crash())
++    service, allocations = asyncio.run(after_restart())
++
++    assert allocations == [allocation]
++    assert (allocation["resource_id"], allocation["idempotency_key"]) == ("uid-1", "uid-1:1")
++    assert allocation["devices"] == [{"node_id": "node-a", "device_id": "gpu-1"}]
++    assert [condition.reason for condition in service.status.conditions] == ["Reconciled"]
++
++
++@pytest.mark.unit
++def test_deleting_a_scheduling_resource_frees_its_device_for_a_re_created_one():
++    """单卡清单：Scheduling 不是有外部副作用的 phase，但资源持有分配，删除仍先进入
++    Terminating；协调器释放分配并物理删除后，同名资源以新 uid 重建能分到这张卡。"""
++    inventory = _inventory(("gpu-0", 80))
++
++    async def scenario() -> None:
++        registry = SQLiteRegistry()
++        try:
++            manager = _manager(registry, inventory)
++            await registry.put(_service("uid-1"))
++            await manager.process(KEY)
++            [first] = await registry.list_allocations(TENANT)
++            await registry.update_status(KIND, NAMESPACE, "svc", TENANT, {"phase": "Scheduling"})
++
++            deletion = await registry.request_delete(KIND, NAMESPACE, "svc", TENANT)
++            assert deletion.deleted is False
++            await manager.process(KEY)
++
++            with pytest.raises(NotFoundError):
++                await registry.get(KIND, NAMESPACE, "svc", TENANT)
++            assert await registry.get_active_allocation("uid-1", TENANT) is None
++            assert await registry.allocated_devices() == frozenset()
++            assert (await registry.get_allocation(first["id"]))["status"] == "Released"
++
++            await registry.put(_service("uid-2"))
++            await manager.process(KEY)
++
++            second = await registry.get_active_allocation("uid-2", TENANT)
++            assert second is not None and second["id"] != first["id"]
++            assert (
++                second["devices"]
++                == first["devices"]
++                == [{"node_id": "node-a", "device_id": "gpu-0"}]
++            )
++        finally:
++            await registry.close()
++
++    asyncio.run(scenario())
+diff --git a/tests/unit/controlplane/test_scheduler.py b/tests/unit/controlplane/test_scheduler.py
+new file mode 100644
+index 0000000..66c1618
+--- /dev/null
++++ b/tests/unit/controlplane/test_scheduler.py
+@@ -0,0 +1,521 @@
++"""首次适配调度器单元测试（:class:`FirstFitScheduler` + :class:`SQLiteRegistry`）。
++
++覆盖：
++
++* 按清单顺序挑选类型精确匹配、显存足够的空闲设备，不跨节点凑数；容量不足时不写库；
++* 同一幂等键返回同一分配（含重启后、并发重放）；已释放分配的键不复用；
++* 资源已持有满足需求的分配时复用，不满足时报冲突；
++* ``feasible()`` 只读；``release()`` 幂等并释放设备；
++* 并发分配不重复占用设备，同一进程内的并发分配能用满空闲设备；
++* 同名资源在不同命名空间 / 租户中各自持有分配；
++* 非法需求、没有加速器需求、归属资源不存在或正在删除。
++
++测试以 ``asyncio.run`` 驱动异步方法，不依赖 pytest-asyncio。
++"""
++
++from __future__ import annotations
++
++import asyncio
++import json
++from collections.abc import Callable, Iterator
++from typing import Any
++
++import pytest
++from forgemesh.controlplane.registry import SQLiteRegistry
++from forgemesh.controlplane.scheduler import (
++    FirstFitScheduler,
++    InsufficientCapacityError,
++    Inventory,
++)
++from forgemesh.core.errors import ConflictError, NotFoundError
++from forgemesh.core.objects import ObjectMeta
++from forgemesh.core.scheduler import (
++    AllocatedDevice,
++    AllocationRef,
++    ResourceRef,
++    ScheduleRequest,
++)
++from forgemesh.resource.inference import (
++    AcceleratorSpec,
++    InferenceService,
++    InferenceServiceSpec,
++    ModelRef,
++    ResourcesSpec,
++    RuntimeRef,
++)
++
++KIND = "InferenceService"
++TENANT = "tenant-a"
++OTHER_TENANT = "tenant-b"
++
++
++def _gpu(device_id: str, memory: int = 80, accelerator: str = "nvidia-gpu") -> dict[str, Any]:
++    return {"id": device_id, "type": accelerator, "memoryGiB": memory}
++
++
++def _inventory(*nodes: tuple[str, list[dict[str, Any]]]) -> Inventory:
++    document = {"nodes": [{"id": node_id, "devices": devices} for node_id, devices in nodes]}
++    return Inventory.model_validate_json(json.dumps(document))
++
++
++#: node-a：一张小显存卡、一张大显存卡、一张其他类型的卡；node-b：两张大显存卡。
++INVENTORY = _inventory(
++    ("node-a", [_gpu("gpu-0", memory=24), _gpu("gpu-1"), _gpu("gpu-2", accelerator="amd-gpu")]),
++    ("node-b", [_gpu("gpu-0"), _gpu("gpu-1")]),
++)
++
++#: 两个节点各两张同规格的卡。
++FOUR_GPUS = _inventory(
++    ("node-a", [_gpu("gpu-0"), _gpu("gpu-1")]), ("node-b", [_gpu("gpu-0"), _gpu("gpu-1")])
++)
++
++
++def _device(node_id: str, device_id: str) -> AllocatedDevice:
++    return AllocatedDevice(node_id=node_id, device_id=device_id)
++
++
++def _service(
++    name: str = "svc",
++    namespace: str | None = "team-a",
++    uid: str = "uid-1",
++    tenant_id: str = TENANT,
++) -> InferenceService:
++    return InferenceService(
++        metadata=ObjectMeta(name=name, namespace=namespace, uid=uid, tenant_id=tenant_id),
++        spec=InferenceServiceSpec(
++            model=ModelRef(reference="models/llama"),
++            runtime=RuntimeRef(provider="vllm"),
++            resources=ResourcesSpec(
++                accelerator=AcceleratorSpec(type="nvidia-gpu", minMemoryGiB=16)
++            ),
++        ),
++    )
++
++
++def _ref(service: InferenceService) -> ResourceRef:
++    meta = service.metadata
++    return ResourceRef(kind=service.kind, namespace=meta.namespace, name=meta.name, uid=meta.uid)
++
++
++def _put(registry: SQLiteRegistry, name: str = "svc", **kwargs: Any) -> ResourceRef:
++    """创建一个推理服务并返回它的资源引用。"""
++    service = _service(name, **kwargs)
++    asyncio.run(registry.put(service))
++    return _ref(service)
++
++
++def _request(
++    owner: ResourceRef,
++    key: str | None = None,
++    *,
++    tenant_id: str = TENANT,
++    accelerator: str = "nvidia-gpu",
++    count: int = 1,
++    memory: int = 16,
++) -> ScheduleRequest:
++    return ScheduleRequest(
++        tenant_id=tenant_id,
++        resource_ref=owner,
++        idempotency_key=key or f"{owner.uid}:1",
++        requirements={"accelerator": {"type": accelerator, "count": count, "minMemoryGiB": memory}},
++    )
++
++
++@pytest.fixture
++def registry() -> Iterator[SQLiteRegistry]:
++    reg = SQLiteRegistry()
++    yield reg
++    asyncio.run(reg.close())
++
++
++@pytest.fixture
++def scheduler(registry) -> FirstFitScheduler:
++    return FirstFitScheduler(registry, INVENTORY)
++
++
++@pytest.mark.unit
++def test_first_fit_takes_matching_free_devices_in_inventory_order(registry, scheduler):
++    """类型精确匹配、显存不低于下限；同一节点凑不齐数量时整体换到下一个节点。"""
++    big = asyncio.run(scheduler.allocate(_request(_put(registry, uid="uid-big"), memory=40)))
++    pair = asyncio.run(scheduler.allocate(_request(_put(registry, "pair", uid="uid-p"), count=2)))
++    amd = asyncio.run(
++        scheduler.allocate(_request(_put(registry, "amd", uid="uid-amd"), accelerator="amd-gpu"))
++    )
++    small = asyncio.run(scheduler.allocate(_request(_put(registry, "small", uid="uid-s"))))
++
++    assert big.devices == [_device("node-a", "gpu-1")]
++    assert pair.devices == [_device("node-b", "gpu-0"), _device("node-b", "gpu-1")]
++    assert amd.devices == [_device("node-a", "gpu-2")]
++    assert small.devices == [_device("node-a", "gpu-0")]
++    assert (big.resource_id, big.lease_until) == ("uid-big", None)
++    stored = asyncio.run(registry.get_active_allocation("uid-p", TENANT))
++    assert stored is not None and stored["id"] == pair.allocation_id
++    assert stored["devices"] == [
++        {"node_id": "node-b", "device_id": "gpu-0"},
++        {"node_id": "node-b", "device_id": "gpu-1"},
++    ]
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize(
++    "requirements",
++    [
++        {"count": 3},
++        {"memory": 81},
++        {"accelerator": "tpu"},
++        {"accelerator": "amd-gpu", "count": 2},
++    ],
++    ids=["count-beyond-any-node", "memory", "type", "count-of-type"],
++)
++def test_insufficient_capacity_raises_and_writes_nothing(registry, scheduler, requirements):
++    owner = _put(registry)
++
++    with pytest.raises(InsufficientCapacityError, match="no node has"):
++        asyncio.run(scheduler.allocate(_request(owner, **requirements)))
++
++    assert asyncio.run(registry.list_allocations(TENANT)) == []
++    assert asyncio.run(registry.allocated_devices()) == frozenset()
++
++
++@pytest.mark.unit
++def test_devices_held_by_active_allocations_are_skipped_until_released(registry):
++    scheduler = FirstFitScheduler(registry, _inventory(("node-a", [_gpu("gpu-0")])))
++    first = asyncio.run(scheduler.allocate(_request(_put(registry))))
++    other = _put(registry, "other", uid="uid-2")
++
++    with pytest.raises(InsufficientCapacityError):
++        asyncio.run(scheduler.allocate(_request(other)))
++    asyncio.run(scheduler.release(first.allocation_id))
++    second = asyncio.run(scheduler.allocate(_request(other)))
++
++    assert second.devices == first.devices == [_device("node-a", "gpu-0")]
++
++
++@pytest.mark.unit
++def test_replaying_a_key_returns_the_same_allocation(registry, scheduler):
++    owner = _put(registry)
++    first = asyncio.run(scheduler.allocate(_request(owner)))
++
++    replay = asyncio.run(scheduler.allocate(_request(owner)))
++
++    assert replay == first
++    assert len(asyncio.run(registry.list_allocations(TENANT))) == 1
++    assert asyncio.run(registry.allocated_devices()) == set(first.devices)
++
++
++@pytest.mark.unit
++def test_replaying_a_key_after_a_restart_returns_the_same_allocation(tmp_path):
++    db = str(tmp_path / "registry.db")
++    registry = SQLiteRegistry(db)
++    owner = _put(registry)
++    first = asyncio.run(FirstFitScheduler(registry, INVENTORY).allocate(_request(owner)))
++    asyncio.run(registry.close())
++
++    reopened = SQLiteRegistry(db)
++    try:
++        scheduler = FirstFitScheduler(reopened, INVENTORY)
++        replay = asyncio.run(scheduler.allocate(_request(owner)))
++        other = asyncio.run(scheduler.allocate(_request(_put(reopened, "other", uid="uid-2"))))
++
++        assert replay == first
++        assert len(asyncio.run(reopened.list_allocations(TENANT))) == 2
++        assert other.devices != first.devices
++    finally:
++        asyncio.run(reopened.close())
++
++
++@pytest.mark.unit
++def test_a_new_generation_reuses_an_allocation_that_still_fits(registry, scheduler):
++    owner = _put(registry)
++    first = asyncio.run(scheduler.allocate(_request(owner, "uid-1:1", memory=40)))
++
++    second = asyncio.run(scheduler.allocate(_request(owner, "uid-1:2", memory=60)))
++
++    assert second == first
++    assert len(asyncio.run(registry.list_allocations(TENANT))) == 1
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize(
++    "requirements",
++    [{"count": 2}, {"memory": 40}, {"accelerator": "amd-gpu"}],
++    ids=["count", "memory", "type"],
++)
++def test_a_new_generation_that_no_longer_fits_must_release_first(registry, scheduler, requirements):
++    owner = _put(registry)
++    first = asyncio.run(scheduler.allocate(_request(owner, "uid-1:1")))
++    assert first.devices == [_device("node-a", "gpu-0")]
++
++    with pytest.raises(ConflictError, match="must be released first"):
++        asyncio.run(scheduler.allocate(_request(owner, "uid-1:2", **requirements)))
++    assert asyncio.run(registry.allocated_devices()) == set(first.devices)
++
++    asyncio.run(scheduler.release(first.allocation_id))
++    second = asyncio.run(scheduler.allocate(_request(owner, "uid-1:2", **requirements)))
++    assert second.allocation_id != first.allocation_id
++
++
++@pytest.mark.unit
++def test_a_released_key_is_not_reused(registry, scheduler):
++    owner = _put(registry)
++    first = asyncio.run(scheduler.allocate(_request(owner, "uid-1:1")))
++    asyncio.run(scheduler.release(first.allocation_id))
++
++    with pytest.raises(ConflictError, match="Released"):
++        asyncio.run(scheduler.allocate(_request(owner, "uid-1:1")))
++    retried = asyncio.run(scheduler.allocate(_request(owner, "uid-1:1:retry")))
++
++    assert retried.allocation_id != first.allocation_id
++    assert retried.devices == first.devices
++
++
++@pytest.mark.unit
++def test_a_key_of_another_resource_is_rejected(registry, scheduler):
++    owner = _put(registry)
++    asyncio.run(scheduler.allocate(_request(owner, "shared-key")))
++    other = _put(registry, "other", uid="uid-2")
++
++    with pytest.raises(ConflictError, match="belongs to another resource"):
++        asyncio.run(scheduler.allocate(_request(other, "shared-key")))
++    assert asyncio.run(registry.get_active_allocation("uid-2", TENANT)) is None
++
++
++@pytest.mark.unit
++def test_feasible_reports_without_writing(registry, scheduler):
++    owner = _put(registry)
++    other = _put(registry, "other", uid="uid-2")
++    changes = registry._conn.total_changes
++
++    fresh = asyncio.run(scheduler.feasible(_request(owner, memory=40)))
++    assert (fresh.feasible, fresh.candidates) == (True, ["node-a/gpu-1"])
++    assert registry._conn.total_changes == changes
++    assert asyncio.run(registry.list_allocations(TENANT)) == []
++
++    allocation = asyncio.run(scheduler.allocate(_request(owner, memory=40)))
++    changes = registry._conn.total_changes
++    results = {
++        "served": asyncio.run(scheduler.feasible(_request(owner, memory=40))),
++        "next": asyncio.run(scheduler.feasible(_request(other, memory=40))),
++        "too-many": asyncio.run(scheduler.feasible(_request(other, count=3))),
++        "mismatch": asyncio.run(scheduler.feasible(_request(owner, "uid-1:2", count=2))),
++        "foreign-key": asyncio.run(scheduler.feasible(_request(other, "uid-1:1"))),
++    }
++
++    assert registry._conn.total_changes == changes
++    assert results["served"].feasible is True
++    assert allocation.allocation_id in results["served"].reason
++    assert results["served"].candidates == ["node-a/gpu-1"]
++    assert (results["next"].feasible, results["next"].candidates) == (True, ["node-b/gpu-0"])
++    assert results["too-many"].feasible is False
++    assert "no node has 3 free nvidia-gpu device(s)" in results["too-many"].reason
++    assert results["mismatch"].feasible is False
++    assert "must be released first" in results["mismatch"].reason
++    assert results["foreign-key"].feasible is False
++    assert "belongs to another resource" in results["foreign-key"].reason
++
++
++@pytest.mark.unit
++def test_release_frees_the_devices_and_is_idempotent(registry, scheduler):
++    allocation = asyncio.run(scheduler.allocate(_request(_put(registry), count=2)))
++
++    asyncio.run(scheduler.release(allocation.allocation_id))
++    asyncio.run(scheduler.release(allocation.allocation_id))
++
++    assert asyncio.run(registry.allocated_devices()) == frozenset()
++    released = asyncio.run(registry.get_allocation(allocation.allocation_id))
++    assert released["status"] == "Released"
++    assert asyncio.run(registry.get_active_allocation("uid-1", TENANT)) is None
++    with pytest.raises(NotFoundError):
++        asyncio.run(scheduler.release("no-such-allocation"))
++
++
++@pytest.mark.unit
++def test_concurrent_releases_of_one_allocation_both_succeed(registry, scheduler):
++    allocation = asyncio.run(scheduler.allocate(_request(_put(registry))))
++
++    async def release_twice() -> None:
++        await asyncio.gather(
++            scheduler.release(allocation.allocation_id),
++            scheduler.release(allocation.allocation_id),
++        )
++
++    asyncio.run(release_twice())
++
++    assert asyncio.run(registry.get_allocation(allocation.allocation_id))["status"] == "Released"
++
++
++class _InlineRegistry(SQLiteRegistry):
++    """在事件循环线程内执行数据库操作，每次操作后让出一次：并发协程的交错顺序固定。"""
++
++    async def _run(self, fn: Callable[[], Any]) -> Any:
++        with self._lock:
++            result = fn()
++        await asyncio.sleep(0)
++        return result
++
++
++async def _allocate_concurrently(registries: list[SQLiteRegistry], requests: int) -> list[Any]:
++    """为 ``requests`` 个资源各申请一张卡，轮流交给各注册表上的调度器并发执行。"""
++    schedulers = [FirstFitScheduler(reg, FOUR_GPUS) for reg in registries]
++    owners = []
++    for index in range(requests):
++        service = _service(f"svc-{index}", uid=f"uid-{index}")
++        await registries[0].put(service)
++        owners.append(_ref(service))
++    return await asyncio.gather(
++        *(
++            schedulers[index % len(schedulers)].allocate(_request(owner))
++            for index, owner in enumerate(owners)
++        ),
++        return_exceptions=True,
++    )
++
++
++@pytest.mark.unit
++def test_concurrent_allocations_in_one_process_use_every_free_device():
++    """6 个单卡请求争抢 4 张卡：恰好 4 个成功且各占一张，其余容量不足。
++
++    首次适配下并发请求会挑中同一张卡：调度器内不串行化时，落败方耗尽重试后报冲突，
++    卡却仍有空闲。``_InlineRegistry`` 固定交错顺序，使结果可复现。
++    """
++
++    async def scenario() -> tuple[list[Any], frozenset[AllocatedDevice]]:
++        registry = _InlineRegistry()
++        try:
++            results = await _allocate_concurrently([registry], 6)
++            return results, await registry.allocated_devices()
++        finally:
++            await registry.close()
++
++    results, allocated = asyncio.run(scenario())
++
++    winners = [result for result in results if isinstance(result, AllocationRef)]
++    losers = [result for result in results if not isinstance(result, AllocationRef)]
++    assert len(winners) == len(allocated) == 4
++    assert {device for winner in winners for device in winner.devices} == allocated
++    assert len(losers) == 2
++    assert all(isinstance(loser, InsufficientCapacityError) for loser in losers)
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize("connections", [1, 2], ids=["shared-registry", "two-connections"])
++def test_concurrent_allocations_never_double_book_a_device(tmp_path, connections):
++    """工作线程中真实并发（含两个连接上各自的调度器）：成功的分配之间不共享设备，
++    Active 分配与占用的设备一一对应，失败只有容量不足或冲突两种。"""
++    db = str(tmp_path / "registry.db")
++
++    async def scenario() -> tuple[list[Any], list[dict[str, Any]], frozenset[AllocatedDevice]]:
++        registries = [SQLiteRegistry(db) for _ in range(connections)]
++        try:
++            results = await _allocate_concurrently(registries, 6)
++            records = await registries[-1].list_allocations(TENANT)
++            return results, records, await registries[-1].allocated_devices()
++        finally:
++            for reg in registries:
++                await reg.close()
++
++    results, records, allocated = asyncio.run(scenario())
++
++    winners = [result for result in results if isinstance(result, AllocationRef)]
++    losers = [result for result in results if not isinstance(result, AllocationRef)]
++    claimed = [device for winner in winners for device in winner.devices]
++    assert len(claimed) == len(set(claimed)) == len(winners) >= 1
++    assert set(claimed) == allocated
++    active_ids = sorted(record["id"] for record in records if record["status"] == "Active")
++    assert active_ids == sorted(winner.allocation_id for winner in winners)
++    assert all(isinstance(loser, (InsufficientCapacityError, ConflictError)) for loser in losers)
++
++
++@pytest.mark.unit
++def test_concurrent_replays_of_one_key_share_one_allocation(registry):
++    owner = _put(registry)
++
++    async def replay() -> list[AllocationRef]:
++        scheduler = FirstFitScheduler(registry, INVENTORY)
++        return await asyncio.gather(*(scheduler.allocate(_request(owner)) for _ in range(5)))
++
++    results = asyncio.run(replay())
++
++    assert len({result.allocation_id for result in results}) == 1
++    assert len(asyncio.run(registry.list_allocations(TENANT))) == 1
++
++
++@pytest.mark.unit
++def test_same_name_in_other_namespaces_and_tenants_holds_independent_allocations(
++    registry, scheduler
++):
++    owners = [
++        (TENANT, _put(registry, namespace="team-a", uid="uid-a")),
++        (TENANT, _put(registry, namespace="team-b", uid="uid-b")),
++        (TENANT, _put(registry, namespace=None, uid="uid-c")),
++        (OTHER_TENANT, _put(registry, namespace="team-a", uid="uid-d", tenant_id=OTHER_TENANT)),
++    ]
++
++    allocations = [
++        asyncio.run(scheduler.allocate(_request(owner, tenant_id=tenant_id)))
++        for tenant_id, owner in owners
++    ]
++    asyncio.run(scheduler.release(allocations[0].allocation_id))
++
++    assert len({device for allocation in allocations for device in allocation.devices}) == 4
++    assert asyncio.run(registry.get_active_allocation("uid-a", TENANT)) is None
++    for tenant_id, owner in owners[1:]:
++        active = asyncio.run(registry.get_active_allocation(owner.uid, tenant_id))
++        assert active is not None and active["resource_id"] == owner.uid
++    assert asyncio.run(registry.get_active_allocation("uid-d", TENANT)) is None
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize(
++    "requirements",
++    [
++        {"accelerator": {"type": "nvidia-gpu", "count": 0, "minMemoryGiB": 16}},
++        {"accelerator": {"type": "nvidia-gpu"}},
++        {"accelerator": "nvidia-gpu"},
++        {"gpu": 1},
++    ],
++    ids=["zero-count", "no-memory", "not-an-object", "unknown-key"],
++)
++def test_invalid_requirements_are_rejected(registry, scheduler, requirements):
++    request = _request(_put(registry)).model_copy(update={"requirements": requirements})
++
++    with pytest.raises(ValueError, match="invalid scheduling requirements"):
++        asyncio.run(scheduler.feasible(request))
++    with pytest.raises(ValueError, match="invalid scheduling requirements"):
++        asyncio.run(scheduler.allocate(request))
++    assert asyncio.run(registry.list_allocations(TENANT)) == []
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize("requirements", [{}, {"accelerator": None}], ids=["empty", "null"])
++def test_a_request_without_an_accelerator_gets_an_allocation_without_devices(
++    registry, scheduler, requirements
++):
++    owner = _put(registry)
++    request = _request(owner).model_copy(update={"requirements": requirements})
++
++    allocation = asyncio.run(scheduler.allocate(request))
++    next_generation = request.model_copy(update={"idempotency_key": "uid-1:2"})
++
++    assert allocation.devices == []
++    assert asyncio.run(scheduler.feasible(request)).feasible is True
++    assert asyncio.run(scheduler.allocate(next_generation)) == allocation
++    assert asyncio.run(registry.allocated_devices()) == frozenset()
++
++
++@pytest.mark.unit
++def test_allocation_requires_a_live_owner(registry, scheduler):
++    ghost = ResourceRef(kind=KIND, namespace="team-a", name="ghost", uid="uid-ghost")
++    with pytest.raises(NotFoundError):
++        asyncio.run(scheduler.allocate(_request(ghost)))
++
++    leaving = _put(registry, "leaving", uid="uid-leaving")
++    current = asyncio.run(registry.get(KIND, "team-a", "leaving", TENANT))
++    current.finalizers = ["example.com/hold"]
++    asyncio.run(registry.put(current, expected_version=current.metadata.resourceVersion))
++    asyncio.run(registry.request_delete(KIND, "team-a", "leaving", TENANT))
++    with pytest.raises(ConflictError, match="terminating"):
++        asyncio.run(scheduler.allocate(_request(leaving)))
++
++    assert asyncio.run(registry.list_allocations(TENANT)) == []
++    assert asyncio.run(registry.allocated_devices()) == frozenset()
+diff --git a/tests/unit/controlplane/test_scheduler_inventory.py b/tests/unit/controlplane/test_scheduler_inventory.py
+new file mode 100644
+index 0000000..6081495
+--- /dev/null
++++ b/tests/unit/controlplane/test_scheduler_inventory.py
+@@ -0,0 +1,163 @@
++"""静态加速器清单单元测试：``FORGEMESH_INVENTORY_FILE`` 的加载与严格校验。
++
++清单不可读或内容不合法（未知字段、类型不符且不做隐式转换、空列表、重复 id、JSON
++损坏）时抛 :class:`InventoryConfigError`，控制平面据此拒绝启动。
++"""
++
++from __future__ import annotations
++
++import json
++from pathlib import Path
++from typing import Any
++
++import pytest
++from forgemesh.controlplane.scheduler import (
++    INVENTORY_FILE_ENV,
++    InventoryConfigError,
++    inventory_from_env,
++    load_inventory,
++)
++
++
++def _device(device_id: str = "gpu-0", **overrides: Any) -> dict[str, Any]:
++    return {"id": device_id, "type": "nvidia-gpu", "memoryGiB": 80, **overrides}
++
++
++def _node(*devices: dict[str, Any], node_id: str = "node-a", **extra: Any) -> dict[str, Any]:
++    return {"id": node_id, "devices": list(devices), **extra}
++
++
++def _write(tmp_path: Path, content: Any) -> Path:
++    path = tmp_path / "inventory.json"
++    if isinstance(content, bytes):
++        path.write_bytes(content)
++    else:
++        path.write_text(json.dumps(content), encoding="utf-8")
++    return path
++
++
++@pytest.mark.unit
++def test_inventory_keeps_nodes_and_devices_in_file_order(tmp_path):
++    """节点与设备保持文件中的顺序（即首次适配顺序）；设备 id 只需在节点内唯一。"""
++    path = _write(
++        tmp_path,
++        {
++            "nodes": [
++                _node(_device("gpu-1", memoryGiB=24), _device("gpu-0"), node_id="node-b"),
++                _node(_device("gpu-0", type="amd-gpu", memoryGiB=64), node_id="node-a"),
++            ]
++        },
++    )
++
++    inventory = load_inventory(path)
++
++    assert [node.id for node in inventory.nodes] == ["node-b", "node-a"]
++    assert [
++        [(device.id, device.type, device.memoryGiB) for device in node.devices]
++        for node in inventory.nodes
++    ] == [
++        [("gpu-1", "nvidia-gpu", 24), ("gpu-0", "nvidia-gpu", 80)],
++        [("gpu-0", "amd-gpu", 64)],
++    ]
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize(
++    ("content", "expected"),
++    [
++        pytest.param(
++            {"nodes": [_node(_device())], "version": 1}, "type=extra_forbidden", id="top-level"
++        ),
++        pytest.param({"nodes": [_node(_device(), zone="z")]}, "type=extra_forbidden", id="node"),
++        pytest.param(
++            {"nodes": [_node(_device(vendor="nvidia"))]}, "type=extra_forbidden", id="device"
++        ),
++        pytest.param(
++            {"nodes": [_node({"id": "gpu-0", "type": "nvidia-gpu", "memory_gib": 80})]},
++            "type=extra_forbidden",
++            id="snake-case-memory",
++        ),
++        pytest.param(
++            {"nodes": [_node(_device(memory_gib=40))]},
++            "type=extra_forbidden",
++            id="snake-case-alongside",
++        ),
++        pytest.param({"nodes": [_node(_device(memoryGiB="80"))]}, "type=int_type", id="mem-str"),
++        pytest.param({"nodes": [_node(_device(memoryGiB=80.0))]}, "type=int_type", id="mem-float"),
++        pytest.param({"nodes": [_node(_device(memoryGiB=True))]}, "type=int_type", id="mem-bool"),
++        pytest.param(
++            {"nodes": [_node(_device(memoryGiB=0))]}, "type=greater_than_equal", id="mem-zero"
++        ),
++        pytest.param(
++            {"nodes": [_node({"id": "gpu-0", "memoryGiB": 80})]}, "type=missing", id="no-type"
++        ),
++        pytest.param({"nodes": [_node(_device(type=""))]}, "type=string_too_short", id="type"),
++        pytest.param({"nodes": [_node(_device(""))]}, "type=string_too_short", id="device-id"),
++        pytest.param(
++            {"nodes": [_node(_device(), node_id="")]}, "type=string_too_short", id="node-id"
++        ),
++        pytest.param({}, "type=missing", id="no-nodes-field"),
++        pytest.param({"nodes": []}, "at least one node is required", id="no-nodes"),
++        pytest.param({"nodes": [_node()]}, "at least one device is required", id="no-devices"),
++        pytest.param({"nodes": _node(_device())}, "type=tuple_type", id="nodes-object"),
++        pytest.param(
++            {"nodes": [_node(_device()), _node(_device("gpu-1"))]},
++            "duplicate node ids: ['node-a']",
++            id="duplicate-nodes",
++        ),
++        pytest.param(
++            {"nodes": [_node(_device(), _device())]},
++            "duplicate device ids: ['gpu-0']",
++            id="duplicate-devices",
++        ),
++        pytest.param([_node(_device())], "type=model_type", id="array"),
++        pytest.param(b"", "type=json_invalid", id="empty-file"),
++        pytest.param(b'{"nodes": [', "type=json_invalid", id="truncated"),
++        pytest.param(b"\xff\xfe", "type=json_invalid", id="not-utf8"),
++    ],
++)
++def test_invalid_inventory_is_rejected(tmp_path, content, expected):
++    path = _write(tmp_path, content)
++
++    with pytest.raises(InventoryConfigError) as excinfo:
++        load_inventory(path)
++
++    message = str(excinfo.value)
++    assert message.startswith(f"invalid inventory file {path}:")
++    assert expected in message
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize("target", ["missing.json", "."], ids=["missing", "directory"])
++def test_unreadable_inventory_file_is_rejected(tmp_path, target):
++    path = tmp_path / target
++
++    with pytest.raises(InventoryConfigError, match="cannot read inventory file"):
++        load_inventory(path)
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize("environ", [{}, {INVENTORY_FILE_ENV: ""}, {INVENTORY_FILE_ENV: "  "}])
++def test_inventory_from_env_is_disabled_when_unset_or_blank(environ):
++    assert inventory_from_env(environ) is None
++
++
++@pytest.mark.unit
++def test_inventory_from_env_loads_the_configured_file(tmp_path, monkeypatch):
++    path = _write(tmp_path, {"nodes": [_node(_device())]})
++
++    configured = inventory_from_env({INVENTORY_FILE_ENV: f" {path} "})
++    monkeypatch.setenv(INVENTORY_FILE_ENV, str(path))
++
++    assert configured is not None
++    assert [node.id for node in configured.nodes] == ["node-a"]
++    assert inventory_from_env() == configured
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize("content", [None, {"nodes": []}], ids=["missing-file", "invalid-file"])
++def test_inventory_from_env_rejects_a_configured_but_unusable_file(tmp_path, content):
++    path = tmp_path / "inventory.json" if content is None else _write(tmp_path, content)
++
++    with pytest.raises(InventoryConfigError):
++        inventory_from_env({INVENTORY_FILE_ENV: str(path)})
+-- 
+2.43.0
+

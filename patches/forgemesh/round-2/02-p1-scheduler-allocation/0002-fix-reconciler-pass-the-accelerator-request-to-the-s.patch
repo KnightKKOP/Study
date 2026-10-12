@@ -1,0 +1,182 @@
+From 8545fc6394265097f40f3135d50040c498ea772e Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 12 Oct 2026 12:30:19 +0000
+Subject: [PATCH 2/8] fix(reconciler): pass the accelerator request to the
+ scheduler
+
+_compute_diff always sent empty requirements, so a scheduler could not
+tell how many devices of which type an InferenceService asked for.
+Extract spec.resources.accelerator (type, count, minMemoryGiB) into
+requirements["accelerator"]; resources without a typed accelerator
+request (base Resource, unregistered kinds) keep empty requirements.
+---
+ .../forgemesh/controlplane/reconciler/core.py | 29 ++++++++---
+ tests/unit/controlplane/test_reconciler.py    | 49 ++++++++++++++++++-
+ 2 files changed, 69 insertions(+), 9 deletions(-)
+
+diff --git a/packages/control-plane/src/forgemesh/controlplane/reconciler/core.py b/packages/control-plane/src/forgemesh/controlplane/reconciler/core.py
+index 0160bd9..aef8e19 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/reconciler/core.py
++++ b/packages/control-plane/src/forgemesh/controlplane/reconciler/core.py
+@@ -11,10 +11,10 @@
+ 4. **生成候选**：调用 DecisionProvider 产出候选动作（建议，非授权）。
+ 5. **Policy 校验**：PolicyEngine.check()，deny 则停止（不可绕过，INV-3）。
+ 6. **Scheduler 分配**：如需分配资源，Scheduler.allocate()（唯一授权分配点）。请求携带
+-   资源身份（kind/namespace/name/uid）与幂等键（uid + generation，见
+-   :func:`~forgemesh.controlplane.reconciler.dedup.allocation_idempotency_key`）：同一
+-   generation 的重放得到同一分配；没有 ``metadata.uid`` 的资源报告 ``Ready=False``
+-   （``MissingUid``），不分配。
++   资源身份（kind/namespace/name/uid）、幂等键（uid + generation，见
++   :func:`~forgemesh.controlplane.reconciler.dedup.allocation_idempotency_key`）与取自
++   ``spec.resources.accelerator`` 的调度需求：同一 generation 的重放得到同一分配；
++   没有 ``metadata.uid`` 的资源报告 ``Ready=False``（``MissingUid``），不分配。
+ 7. **WorkEngine 执行**：如需执行工作流，WorkflowRuntime.start()。
+ 8. **重观察**：收集执行后的新观测状态（P1 简化为标记完成）。
+ 9. **更新 status + 安排下次**：写回 status patch，返回 requeue_after。
+@@ -46,6 +46,7 @@ from forgemesh.core.errors import ConflictError, NotFoundError
+ from forgemesh.core.objects import Resource
+ from forgemesh.core.reconciler import ReconcileContext, Reconciler, ReconcileResult
+ from forgemesh.policy.api import PolicyAction, PolicyEngine
++from forgemesh.resource.inference import AcceleratorSpec
+ 
+ from ..registry.store import DEFAULT_RELEASE_FINALIZER
+ from .dedup import ProcessedKeyStore, allocation_idempotency_key
+@@ -53,6 +54,19 @@ from .dedup import ProcessedKeyStore, allocation_idempotency_key
+ logger = logging.getLogger(__name__)
+ 
+ 
++def _scheduling_requirements(resource: Resource) -> dict[str, Any]:
++    """提取资源的调度需求 ``{"accelerator": {"type", "count", "minMemoryGiB"}}``。
++
++    取自强类型 spec 的 ``spec.resources.accelerator``；没有加速器申请的资源（基类
++    ``Resource``、未登记的 kind）返回 ``{}``。
++    """
++    spec = getattr(resource, "spec", None)
++    accelerator = getattr(getattr(spec, "resources", None), "accelerator", None)
++    if not isinstance(accelerator, AcceleratorSpec):
++        return {}
++    return {"accelerator": accelerator.model_dump(mode="json")}
++
++
+ class ReleaseProvider(Protocol):
+     """受控释放 Provider 协议（控制平面侧，不绑定具体运行时插件）。
+ 
+@@ -502,7 +516,8 @@ class ReconciliationController(Reconciler):
+         * 若 ``observed_generation >= desired_generation`` 且 phase 为 ``Ready``
+           或 ``Degraded``，认为已收敛，无需协调。
+         * 否则需要协调；根据 phase 判断是否需要分配（Pending/None）和
+-          是否需要工作流（None/Pending/Scheduling）。
++          是否需要工作流（None/Pending/Scheduling）；``requirements`` 为传给
++          调度器的需求（见 :func:`_scheduling_requirements`）。
+ 
+         Args:
+             resource: 目标资源（含期望状态与元数据）。
+@@ -510,7 +525,7 @@ class ReconciliationController(Reconciler):
+ 
+         Returns:
+             差异描述字典，含 ``needs_reconcile`` / ``operation`` /
+-            ``needs_allocation`` / ``needs_workflow`` 等字段。
++            ``needs_allocation`` / ``needs_workflow`` / ``requirements`` 等字段。
+         """
+         observed_phase = observed.get("phase")
+         desired_generation = resource.metadata.generation
+@@ -531,7 +546,7 @@ class ReconciliationController(Reconciler):
+             "operation": operation,
+             "needs_allocation": needs_allocation,
+             "needs_workflow": needs_workflow,
+-            "requirements": {},
++            "requirements": _scheduling_requirements(resource),
+             "desired_generation": desired_generation,
+             "observed_generation": observed_generation,
+             "observed_phase": observed_phase,
+diff --git a/tests/unit/controlplane/test_reconciler.py b/tests/unit/controlplane/test_reconciler.py
+index c5b2be5..b3a3a62 100644
+--- a/tests/unit/controlplane/test_reconciler.py
++++ b/tests/unit/controlplane/test_reconciler.py
+@@ -3,6 +3,7 @@
+ 覆盖：幂等去重键、差异计算、Policy 三态
+ （allow/deny/require_approval——degraded 已按 architecture 7.5 移除）、
+ Scheduler 分配成功与失败、分配请求的资源身份与幂等键（uid + generation）、
++调度需求取自 ``spec.resources.accelerator``、
+ 缺少调度器/工作流运行时时如实报告 ``Ready=False``、
+ 幂等性，以及 Terminating 受控删除闭环
+ （ReleaseProvider 释放 → 移除 finalizer → 释放 Allocation → 物理删除）。
+@@ -175,6 +176,29 @@ def test_compute_diff_pending_needs_reconcile():
+     assert diff["needs_workflow"] is True
+ 
+ 
++@pytest.mark.unit
++def test_compute_diff_takes_requirements_from_the_accelerator_request():
++    """调度需求取自 spec.resources.accelerator（type / count / minMemoryGiB）。"""
++    service = make_inference_service(
++        phase=InferencePhase.PENDING,
++        accelerator=AcceleratorSpec(type="nvidia-gpu", count=2, minMemoryGiB=40),
++    )
++
++    diff = ReconciliationController._compute_diff(service, {"phase": "Pending"})
++
++    assert diff["requirements"] == {
++        "accelerator": {"type": "nvidia-gpu", "count": 2, "minMemoryGiB": 40}
++    }
++
++
++@pytest.mark.unit
++def test_compute_diff_without_an_accelerator_request_has_no_requirements():
++    """没有强类型 spec 的资源（基类 Resource）没有调度需求。"""
++    diff = ReconciliationController._compute_diff(make_resource(), {"phase": "Pending"})
++
++    assert diff["requirements"] == {}
++
++
+ # ---------------------------------------------------------------------- #
+ # 协调闭环测试
+ # ---------------------------------------------------------------------- #
+@@ -397,6 +421,25 @@ def test_allocation_request_identifies_the_resource_and_its_generation():
+     assert req.idempotency_key == allocation_idempotency_key("uid-1", 3) == "uid-1:3"
+ 
+ 
++@pytest.mark.unit
++def test_allocation_request_carries_the_accelerator_request():
++    """调度器收到的需求即 InferenceService 的加速器申请。"""
++    service = make_inference_service(
++        phase=InferencePhase.PENDING,
++        accelerator=AcceleratorSpec(type="nvidia-gpu", count=1, minMemoryGiB=24),
++    )
++    scheduler = MockScheduler()
++
++    asyncio.run(
++        _allocating_controller(scheduler).reconcile(make_context(service, {"phase": "Pending"}))
++    )
++
++    [req] = scheduler.requests
++    assert req.requirements == {
++        "accelerator": {"type": "nvidia-gpu", "count": 1, "minMemoryGiB": 24}
++    }
++
++
+ @pytest.mark.unit
+ def test_replaying_a_generation_requests_the_same_allocation():
+     """去重键丢失后（如未持久化的进程重启）重放同一 generation 使用同一幂等键；
+@@ -567,15 +610,17 @@ def make_inference_service(
+     name: str = "svc-1",
+     tenant_id: str = "tenant-1",
+     phase: InferencePhase = InferencePhase.READY,
++    accelerator: AcceleratorSpec | None = None,
+ ) -> InferenceService:
+     """构造带 spec/status 的 InferenceService（phase 由 status 携带）。"""
+     return InferenceService(
+-        metadata=ObjectMeta(name=name, tenant_id=tenant_id, generation=1),
++        metadata=ObjectMeta(name=name, uid="uid-1", tenant_id=tenant_id, generation=1),
+         spec=InferenceServiceSpec(
+             model=ModelRef(reference="models/llama"),
+             runtime=RuntimeRef(provider="vllm"),
+             resources=ResourcesSpec(
+-                accelerator=AcceleratorSpec(type="nvidia-gpu", count=1, minMemoryGiB=16)
++                accelerator=accelerator
++                or AcceleratorSpec(type="nvidia-gpu", count=1, minMemoryGiB=16)
+             ),
+         ),
+         status=InferenceServiceStatus(phase=phase),
+-- 
+2.43.0
+

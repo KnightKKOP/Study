@@ -1,0 +1,895 @@
+From dc4742fd29b162fc5ff4de2e7a77d5e12d0ea3ae Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 12 Oct 2026 12:40:49 +0000
+Subject: [PATCH 3/8] feat(registry): record allocations per resource uid with
+ exclusive devices
+
+Allocations did not record the devices they hold, and the only
+exclusivity guarantee was a unique index on resource_id that ignored
+tenants. Nothing in the database stopped two allocations from holding
+the same device, and the same resource id could not hold an allocation
+in two tenants.
+
+- allocations.resource_id holds the owning resource's uid. At most one
+  Active allocation per (tenant_id, resource_id) is enforced by the new
+  partial index idx_allocations_one_active_per_tenant_resource; opening
+  an existing database drops the old global index and keeps its rows.
+- New allocation_devices table. A partial unique index keeps every
+  (node_id, device_id) in at most one Active allocation, and a trigger
+  keeps device rows in step with their allocation's status, so
+  releasing or expiring an allocation frees its devices in the same
+  statement.
+- create_allocation checks the owner (exists, same uid, not
+  Terminating), the idempotency key (a replay returns the existing
+  allocation, a used key is never reused), the owner's active
+  allocation and the devices, and writes the allocation with its
+  devices, all in one BEGIN IMMEDIATE transaction.
+- get_allocation, get_allocation_by_idempotency_key, allocated_devices
+  and release_active_allocation serve the scheduler and the delete
+  path; allocation records now list their devices.
+---
+ .../forgemesh/controlplane/registry/store.py  | 301 +++++++++++++-
+ .../src/forgemesh/resource/allocation.py      |   8 +-
+ tests/contract/test_allocation_exclusivity.py |   9 +-
+ tests/unit/controlplane/test_registry.py      |   2 +-
+ .../controlplane/test_registry_allocations.py | 366 ++++++++++++++++++
+ 5 files changed, 662 insertions(+), 24 deletions(-)
+ create mode 100644 tests/unit/controlplane/test_registry_allocations.py
+
+diff --git a/packages/control-plane/src/forgemesh/controlplane/registry/store.py b/packages/control-plane/src/forgemesh/controlplane/registry/store.py
+index 7352389..a62ac8c 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/registry/store.py
++++ b/packages/control-plane/src/forgemesh/controlplane/registry/store.py
+@@ -36,9 +36,20 @@
+ Allocation 持久化
+ ------------------
+ ``allocations`` 表持久化 :class:`~forgemesh.resource.allocation.Allocation`
+-（``Active | Released | Expired``），以**部分唯一索引**
+-``idx_allocations_one_active_per_resource`` 兜底「同一 ``resource_id`` 至多一个
+-Active 分配」；``release_allocation`` 走 ``ALLOCATION_STATE_MACHINE`` 校验。
++（``Active | Released | Expired``），``resource_id`` 为归属资源（如
++``InferenceService``）的 uid；分配到的设备记录在 ``allocation_devices`` 表
++（``node_id`` / ``device_id``），设备行的状态由触发器
++``trg_allocation_devices_follow_status`` 与所属分配同步。数据库层兜底的约束：
++
++* 部分唯一索引 ``idx_allocations_one_active_per_tenant_resource``：同一租户的同一
++  资源至多一个 Active 分配（取代不分租户的旧索引
++  ``idx_allocations_one_active_per_resource``，打开存量库时删除旧索引）；
++* 部分唯一索引 ``idx_allocation_devices_one_active``：同一设备至多属于一个 Active
++  分配；
++* ``allocations.idempotency_key`` 唯一：一个幂等键只对应一个分配，释放后也不复用。
++
++:meth:`SQLiteRegistry.create_allocation` 在同一个 ``BEGIN IMMEDIATE`` 事务中写入
++分配行与设备行；``release_allocation`` 走 ``ALLOCATION_STATE_MACHINE`` 校验。
+ 
+ 变更记录
+ --------
+@@ -52,7 +63,9 @@ Active 分配」；``release_allocation`` 走 ``ALLOCATION_STATE_MACHINE`` 校
+ 面向租户的查询均以 ``tenant_id`` 作为首要过滤条件；跨租户访问一律视为
+ :class:`~forgemesh.core.errors.NotFoundError`，不泄露存在性。
+ :meth:`SQLiteRegistry.list_resource_keys` 与 :meth:`SQLiteRegistry.changes_since`
+-是例外：它们跨租户返回资源键，仅供控制平面内部的控制器使用，不得暴露给 API。
++是例外：它们跨租户返回资源键，仅供控制平面内部的控制器使用，不得暴露给 API；
++:meth:`SQLiteRegistry.get_allocation` 与 :meth:`SQLiteRegistry.allocated_devices`
++同样跨租户读取，仅供调度器使用（设备由全部租户共享）。
+ """
+ 
+ from __future__ import annotations
+@@ -60,11 +73,12 @@ from __future__ import annotations
+ import asyncio
+ import base64
+ import builtins
++import contextlib
+ import json
+ import logging
+ import sqlite3
+ import threading
+-from collections.abc import Callable, Collection
++from collections.abc import Callable, Collection, Iterator, Sequence
+ from dataclasses import dataclass, field
+ from datetime import UTC, datetime
+ from enum import StrEnum
+@@ -74,6 +88,7 @@ from uuid import uuid4
+ from forgemesh.core.errors import ConflictError, NotFoundError, PreconditionFailedError
+ from forgemesh.core.objects import Condition, Resource
+ from forgemesh.core.registry import ResourceRegistry
++from forgemesh.core.scheduler import AllocatedDevice, ResourceRef
+ from forgemesh.resource.allocation import Allocation, AllocationStatus
+ from forgemesh.resource.inference import Endpoint, InferenceService
+ from forgemesh.resource.states import ALLOCATION_STATE_MACHINE, INFERENCE_STATE_MACHINE
+@@ -136,8 +151,22 @@ CREATE TABLE IF NOT EXISTS allocations (
+     released_at TEXT
+ );
+ CREATE INDEX IF NOT EXISTS idx_allocations_tenant ON allocations(tenant_id);
+-CREATE UNIQUE INDEX IF NOT EXISTS idx_allocations_one_active_per_resource
+-    ON allocations(resource_id) WHERE status = 'Active';
++CREATE UNIQUE INDEX IF NOT EXISTS idx_allocations_one_active_per_tenant_resource
++    ON allocations(tenant_id, resource_id) WHERE status = 'Active';
++CREATE TABLE IF NOT EXISTS allocation_devices (
++    allocation_id TEXT NOT NULL REFERENCES allocations(id),
++    node_id TEXT NOT NULL,
++    device_id TEXT NOT NULL,
++    status TEXT NOT NULL,
++    PRIMARY KEY (allocation_id, node_id, device_id)
++);
++CREATE UNIQUE INDEX IF NOT EXISTS idx_allocation_devices_one_active
++    ON allocation_devices(node_id, device_id) WHERE status = 'Active';
++CREATE TRIGGER IF NOT EXISTS trg_allocation_devices_follow_status
++    AFTER UPDATE OF status ON allocations
++BEGIN
++    UPDATE allocation_devices SET status = NEW.status WHERE allocation_id = NEW.id;
++END;
+ CREATE TABLE IF NOT EXISTS resource_changes (
+     seq INTEGER PRIMARY KEY AUTOINCREMENT,
+     tenant_id TEXT NOT NULL,
+@@ -267,13 +296,58 @@ class SQLiteRegistry(ResourceRegistry):
+             (tenant_id, kind, namespace, name, change.value),
+         )
+ 
++    @contextlib.contextmanager
++    def _immediate_transaction(self) -> Iterator[sqlite3.Cursor]:
++        """``BEGIN IMMEDIATE`` 事务：开始即持有写锁，事务内的检查不会被其他连接的
++        写入穿插；异常时回滚，正常退出时提交。"""
++        cur = self._conn.cursor()
++        cur.execute("BEGIN IMMEDIATE")
++        try:
++            yield cur
++        except BaseException:
++            self._conn.rollback()
++            raise
++        self._conn.commit()
++
++    def _allocation_record(self, row: sqlite3.Row) -> dict[str, Any]:
++        """分配行 → 记录字典：各列加 ``devices``（按分配时的顺序）。"""
++        record = dict(row)
++        record["devices"] = [
++            {"node_id": device["node_id"], "device_id": device["device_id"]}
++            for device in self._conn.execute(
++                "SELECT node_id, device_id FROM allocation_devices "
++                "WHERE allocation_id=? ORDER BY rowid",
++                (row["id"],),
++            )
++        ]
++        return record
++
+     def _init_schema(self) -> None:
+-        """创建表与索引（幂等），并对存量库做列迁移。"""
++        """创建表与索引（幂等），并对存量库做列与索引迁移。"""
+         self._conn.executescript(_SCHEMA_SQL)
+         self._migrate_legacy_resources()
++        self._migrate_legacy_allocations()
+         self._ensure_identity_index()
+         self._conn.commit()
+ 
++    def _migrate_legacy_allocations(self) -> None:
++        """删除存量库中不分租户的旧索引 ``idx_allocations_one_active_per_resource``。
++
++        取代它的 ``idx_allocations_one_active_per_tenant_resource`` 只在同一租户内约束
++        ``resource_id``，旧索引成立的数据必然满足新索引；存量分配记录原样保留。
++        """
++        legacy = self._conn.execute(
++            "SELECT 1 FROM sqlite_master "
++            "WHERE type='index' AND name='idx_allocations_one_active_per_resource'"
++        ).fetchone()
++        if legacy is not None:
++            self._conn.execute("DROP INDEX idx_allocations_one_active_per_resource")
++            logger.info(
++                "migrated legacy allocations table: replaced index "
++                "'idx_allocations_one_active_per_resource' with "
++                "'idx_allocations_one_active_per_tenant_resource'"
++            )
++
+     def _ensure_identity_index(self) -> None:
+         """建立把 NULL namespace 视为相等的身份唯一索引。
+ 
+@@ -1005,10 +1079,11 @@ class SQLiteRegistry(ResourceRegistry):
+     # ------------------------------------------------------------------ #
+ 
+     async def put_allocation(self, allocation: Allocation) -> str:
+-        """插入分配记录，返回新生成的分配 id。
++        """插入一条不持有设备的分配记录，返回新生成的分配 id。
+ 
+-        同一 ``resource_id`` 已存在 ``Active`` 分配时，由部分唯一索引
+-        ``idx_allocations_one_active_per_resource`` 兜底拒绝；重复
++        不校验归属资源是否存在；调度器经 :meth:`create_allocation` 写入分配。
++        同一租户的同一 ``resource_id`` 已存在 ``Active`` 分配时，由部分唯一索引
++        ``idx_allocations_one_active_per_tenant_resource`` 兜底拒绝；重复
+         ``idempotency_key`` 由唯一约束拒绝；两者均转
+         :class:`~forgemesh.core.errors.ConflictError`。
+ 
+@@ -1055,14 +1130,160 @@ class SQLiteRegistry(ResourceRegistry):
+ 
+         return await self._run(_put_allocation)
+ 
++    async def create_allocation(
++        self,
++        tenant_id: str,
++        resource: ResourceRef,
++        idempotency_key: str,
++        devices: Sequence[AllocatedDevice] = (),
++    ) -> dict[str, Any]:
++        """为 ``resource`` 创建持有 ``devices`` 的 Active 分配，返回分配记录。
++
++        检查与写入在同一个 ``BEGIN IMMEDIATE`` 事务中完成（另一连接的写入无法穿插），
++        分配行与设备行一起提交或一起回滚：
++
++        * ``idempotency_key`` 已属于该资源（同租户、同 uid）的 Active 分配 → 原样返回
++          该分配，不写库，忽略 ``devices``；
++        * ``idempotency_key`` 已被其他分配使用（含已释放 / 过期的分配）→ 冲突；
++        * 归属资源须存在、uid 一致且不处于 ``Terminating``；
++        * 该资源已有 Active 分配，或任一设备已属于某个 Active 分配 → 冲突，不写库。
++
++        Args:
++            tenant_id: 租户标识（多租户边界）。
++            resource: 归属资源；分配以其 ``uid`` 记为 ``resource_id``。
++            idempotency_key: 分配的幂等键。
++            devices: 分配的设备（可为空：没有加速器需求的资源）。
++
++        Returns:
++            分配记录：``allocations`` 各列加 ``devices``（``node_id`` / ``device_id``）。
++
++        Raises:
++            NotFoundError: 归属资源不存在，或同名资源的 uid 不同（原资源已被删除）。
++            ConflictError: 见上；以及归属资源处于 ``Terminating``。
++            ValueError: ``devices`` 含重复设备。
++        """
++        if len(set(devices)) != len(devices):
++            raise ValueError(f"duplicate devices in allocation request: {list(devices)}")
++        active = AllocationStatus.ACTIVE.value
++
++        def _create() -> dict[str, Any]:
++            with self._immediate_transaction() as cur:
++                existing = cur.execute(
++                    "SELECT * FROM allocations WHERE idempotency_key=?", (idempotency_key,)
++                ).fetchone()
++                if existing is not None:
++                    owner = (existing["tenant_id"], existing["resource_id"], existing["status"])
++                    if owner == (tenant_id, resource.uid, active):
++                        return self._allocation_record(existing)
++                    raise ConflictError(
++                        f"allocation idempotency_key already used: {idempotency_key!r}"
++                    )
++                row = cur.execute(
++                    "SELECT uid, phase FROM resources "
++                    "WHERE tenant_id=? AND kind=? AND namespace IS ? AND name=?",
++                    (tenant_id, resource.kind, resource.namespace, resource.name),
++                ).fetchone()
++                if row is None or row["uid"] != resource.uid:
++                    raise NotFoundError(
++                        f"resource not found: kind={resource.kind} "
++                        f"namespace={resource.namespace!r} name={resource.name} "
++                        f"uid={resource.uid} tenant_id={tenant_id}",
++                    )
++                if row["phase"] == "Terminating":
++                    raise ConflictError(
++                        f"resource is terminating: kind={resource.kind} "
++                        f"namespace={resource.namespace!r} name={resource.name}",
++                    )
++                held = cur.execute(
++                    "SELECT id FROM allocations WHERE tenant_id=? AND resource_id=? AND status=?",
++                    (tenant_id, resource.uid, active),
++                ).fetchone()
++                if held is not None:
++                    raise ConflictError(
++                        "resource already has an active allocation: "
++                        f"resource_id={resource.uid!r} allocation_id={held['id']}",
++                    )
++                for device in devices:
++                    taken = cur.execute(
++                        "SELECT 1 FROM allocation_devices "
++                        "WHERE node_id=? AND device_id=? AND status=?",
++                        (device.node_id, device.device_id, active),
++                    ).fetchone()
++                    if taken is not None:
++                        raise ConflictError(
++                            f"device already allocated: node_id={device.node_id} "
++                            f"device_id={device.device_id}",
++                        )
++                allocation_id = uuid4().hex
++                cur.execute(
++                    "INSERT INTO allocations (id, tenant_id, resource_id, status, idempotency_key) "
++                    "VALUES (?, ?, ?, ?, ?)",
++                    (allocation_id, tenant_id, resource.uid, active, idempotency_key),
++                )
++                cur.executemany(
++                    "INSERT INTO allocation_devices (allocation_id, node_id, device_id, status) "
++                    "VALUES (?, ?, ?, ?)",
++                    [(allocation_id, d.node_id, d.device_id, active) for d in devices],
++                )
++                created = cur.execute(
++                    "SELECT * FROM allocations WHERE id=?", (allocation_id,)
++                ).fetchone()
++                return self._allocation_record(created)
++
++        try:
++            return await self._run(_create)
++        except sqlite3.IntegrityError as exc:
++            raise ConflictError(f"allocation rejected by a database constraint: {exc}") from exc
++
++    async def get_allocation(self, allocation_id: str) -> dict[str, Any] | None:
++        """按 id 读取分配记录（跨租户，仅供调度器释放分配）；不存在返回 ``None``。"""
++
++        def _get() -> dict[str, Any] | None:
++            row = self._conn.execute(
++                "SELECT * FROM allocations WHERE id=?", (allocation_id,)
++            ).fetchone()
++            return self._allocation_record(row) if row is not None else None
++
++        return await self._run(_get)
++
++    async def get_allocation_by_idempotency_key(
++        self,
++        idempotency_key: str,
++        tenant_id: str,
++    ) -> dict[str, Any] | None:
++        """读取以 ``idempotency_key`` 创建的分配（含终态）；本租户没有时返回 ``None``。"""
++
++        def _get_by_key() -> dict[str, Any] | None:
++            row = self._conn.execute(
++                "SELECT * FROM allocations WHERE tenant_id=? AND idempotency_key=?",
++                (tenant_id, idempotency_key),
++            ).fetchone()
++            return self._allocation_record(row) if row is not None else None
++
++        return await self._run(_get_by_key)
++
++    async def allocated_devices(self) -> frozenset[AllocatedDevice]:
++        """属于 Active 分配的全部设备（跨租户：设备由全部租户共享）。"""
++
++        def _allocated() -> frozenset[AllocatedDevice]:
++            rows = self._conn.execute(
++                "SELECT node_id, device_id FROM allocation_devices WHERE status=?",
++                (AllocationStatus.ACTIVE.value,),
++            ).fetchall()
++            return frozenset(
++                AllocatedDevice(node_id=row["node_id"], device_id=row["device_id"]) for row in rows
++            )
++
++        return await self._run(_allocated)
++
+     async def get_active_allocation(
+         self,
+         resource_id: str,
+         tenant_id: str,
+     ) -> dict[str, Any] | None:
+-        """读取 ``resource_id`` 当前唯一的 Active 分配；不存在返回 ``None``。
++        """读取 ``resource_id``（归属资源 uid）当前唯一的 Active 分配；不存在返回 ``None``。
+ 
+-        强制以 ``tenant_id`` 过滤（与 resources 一致的多租户边界）。
++        强制以 ``tenant_id`` 过滤（与 resources 一致的多租户边界）。记录含 ``devices``。
+         """
+ 
+         def _get_active() -> dict[str, Any] | None:
+@@ -1070,10 +1291,56 @@ class SQLiteRegistry(ResourceRegistry):
+                 "SELECT * FROM allocations WHERE tenant_id=? AND resource_id=? AND status=?",
+                 (tenant_id, resource_id, AllocationStatus.ACTIVE.value),
+             ).fetchone()
+-            return dict(row) if row is not None else None
++            return self._allocation_record(row) if row is not None else None
+ 
+         return await self._run(_get_active)
+ 
++    async def release_active_allocation(
++        self,
++        resource_id: str,
++        tenant_id: str,
++        reason: str | None = None,
++    ) -> str | None:
++        """释放 ``resource_id``（归属资源 uid）当前的 Active 分配及其设备。
++
++        没有 Active 分配（含已被并发释放或过期）时返回 ``None``，可重复调用。
++
++        Args:
++            resource_id: 归属资源 uid。
++            tenant_id: 租户标识（多租户边界，强制过滤）。
++            reason: 释放原因（仅记录日志）。
++
++        Returns:
++            被释放的分配 id；没有可释放的分配时为 ``None``。
++        """
++        active = AllocationStatus.ACTIVE.value
++
++        def _release_active() -> str | None:
++            row = self._conn.execute(
++                "SELECT id FROM allocations WHERE tenant_id=? AND resource_id=? AND status=?",
++                (tenant_id, resource_id, active),
++            ).fetchone()
++            if row is None:
++                return None
++            cur = self._conn.execute(
++                "UPDATE allocations SET status=?, released_at=datetime('now') "
++                "WHERE id=? AND status=?",
++                (AllocationStatus.RELEASED.value, row["id"], active),
++            )
++            self._conn.commit()
++            if cur.rowcount == 0:
++                return None
++            logger.debug(
++                "allocation released: id=%s tenant_id=%s resource_id=%s reason=%s",
++                row["id"],
++                tenant_id,
++                resource_id,
++                reason,
++            )
++            return str(row["id"])
++
++        return await self._run(_release_active)
++
+     async def release_allocation(
+         self,
+         allocation_id: str,
+@@ -1082,6 +1349,8 @@ class SQLiteRegistry(ResourceRegistry):
+     ) -> None:
+         """将分配 ``Active → Released``（走 ``ALLOCATION_STATE_MACHINE`` 校验）。
+ 
++        分配持有的设备随同一条 UPDATE 释放（触发器 ``trg_allocation_devices_follow_status``）。
++
+         Args:
+             allocation_id: 分配 id。
+             tenant_id: 租户标识（多租户边界，强制过滤）。
+@@ -1128,14 +1397,14 @@ class SQLiteRegistry(ResourceRegistry):
+         self,
+         tenant_id: str,
+     ) -> builtins.list[dict[str, Any]]:
+-        """列出租户的全部分配记录（含终态），强制租户过滤。"""
++        """列出租户的全部分配记录（含终态与各自的 ``devices``），强制租户过滤。"""
+ 
+         def _list_allocations() -> list[dict[str, Any]]:
+             rows = self._conn.execute(
+                 "SELECT * FROM allocations WHERE tenant_id=? ORDER BY created_at, id",
+                 (tenant_id,),
+             ).fetchall()
+-            return [dict(row) for row in rows]
++            return [self._allocation_record(row) for row in rows]
+ 
+         return await self._run(_list_allocations)
+ 
+diff --git a/packages/resource-model/src/forgemesh/resource/allocation.py b/packages/resource-model/src/forgemesh/resource/allocation.py
+index 2ba6875..316e660 100644
+--- a/packages/resource-model/src/forgemesh/resource/allocation.py
++++ b/packages/resource-model/src/forgemesh/resource/allocation.py
+@@ -9,7 +9,8 @@
+ 关键语义：
+ 
+ * ``AllocationStatus`` 只有 ``Active → {Released, Expired}`` 的单向转移；
+-* 同一设备同一时刻**至多一个** ``Active`` 分配（由部分唯一索引兜底，此处以状态表达）；
++* 同一租户的同一归属资源、以及同一设备，同一时刻**至多一个** ``Active`` 分配
++  （由注册表的部分唯一索引兜底，此处以状态表达）；
+ * ``idempotency_key`` 保证重复分配请求幂等（不产生重复副作用）。
+ 
+ 字段命名与 DDL 保持一致（snake_case），便于持久化层直接映射。
+@@ -41,9 +42,10 @@ class Allocation(BaseModel):
+     """资源分配记录。
+ 
+     Attributes:
+-        resource_id: 被分配的加速器 / 设备实例 id。
++        resource_id: 归属资源（如 ``InferenceService``）的 uid；分配到的设备由注册表
++            另行记录（``allocation_devices`` 表）。
+         tenant_id: 归属租户（多租户隔离边界）。
+-        owner_uid: 归属资源 uid（如 ``InferenceService`` 的 uid）；平台级分配可为空。
++        owner_uid: 注册表不持久化该字段（归属资源 uid 记在 ``resource_id``）。
+         idempotency_key: 幂等键，唯一（重复请求不产生重复分配）。
+         status: 分配状态，默认 ``Active``。
+         lease_until: 租约到期时间；为空表示无期限（不推荐）。
+diff --git a/tests/contract/test_allocation_exclusivity.py b/tests/contract/test_allocation_exclusivity.py
+index 3d338d8..b65fb88 100644
+--- a/tests/contract/test_allocation_exclusivity.py
++++ b/tests/contract/test_allocation_exclusivity.py
+@@ -1,8 +1,9 @@
+ """Allocation 唯一 Active 契约测试（任务 61 / WP-C1，v1.1 §9.2/§9.3 阶段 C）。
+ 
+ 验证 ``allocations`` 表部分唯一索引
+-``idx_allocations_one_active_per_resource``（``WHERE status = 'Active'``，
+-``registry/store.py`` DDL）兜底的「同一 ``resource_id`` 至多一个 Active 分配」：
++``idx_allocations_one_active_per_tenant_resource``（``WHERE status = 'Active'``，
++``registry/store.py`` DDL）兜底的「同一租户内同一 ``resource_id``（归属资源 uid）
++至多一个 Active 分配」：
+ 
+ * 并发创建同一 resource_id 的两个 Active Allocation：恰好一个成功，另一个
+   因唯一索引失败（实现包装为 :class:`ConflictError`）；
+@@ -77,7 +78,7 @@ def test_concurrent_put_allocation_single_active_winner(tmp_path) -> None:
+         writer1 = SQLiteRegistry(str(db_file))
+         writer2 = SQLiteRegistry(str(db_file))
+         try:
+-            # 两写入方并发为同一 GPU 创建 Active 分配（不同幂等键）
++            # 两写入方并发为同一资源创建 Active 分配（不同幂等键）
+             results = await asyncio.gather(
+                 writer1.put_allocation(
+                     _make_allocation("gpu-0", idempotency_key="idem-a")
+@@ -191,7 +192,7 @@ def test_distinct_resource_ids_independent(tmp_path) -> None:
+             )
+             assert all(isinstance(i, str) and i for i in ids)
+ 
+-            # 两个设备的 Active 分配各自成立，唯一索引不跨 resource_id 约束
++            # 两个资源的 Active 分配各自成立，唯一索引不跨 resource_id 约束
+             for resource_id in ("gpu-0", "gpu-1"):
+                 active = await writer1.get_active_allocation(resource_id, TENANT)
+                 assert active is not None
+diff --git a/tests/unit/controlplane/test_registry.py b/tests/unit/controlplane/test_registry.py
+index f29bcde..c89dcfe 100644
+--- a/tests/unit/controlplane/test_registry.py
++++ b/tests/unit/controlplane/test_registry.py
+@@ -334,7 +334,7 @@ def test_allocation_released_allows_new_active() -> None:
+     alloc_id = _run(reg.put_allocation(_make_allocation(idempotency_key="idem-1")))
+     _run(reg.release_allocation(alloc_id, TENANT_A, reason="test"))
+ 
+-    # 释放后可再次分配同一设备
++    # 释放后可再次为同一资源分配
+     new_id = _run(reg.put_allocation(_make_allocation(idempotency_key="idem-2")))
+     assert new_id != alloc_id
+     active = _run(reg.get_active_allocation("gpu-0", TENANT_A))
+diff --git a/tests/unit/controlplane/test_registry_allocations.py b/tests/unit/controlplane/test_registry_allocations.py
+new file mode 100644
+index 0000000..ec45c16
+--- /dev/null
++++ b/tests/unit/controlplane/test_registry_allocations.py
+@@ -0,0 +1,366 @@
++"""分配持久化单元测试：归属资源 uid、设备独占、幂等键与存量库迁移。
++
++覆盖 :meth:`SQLiteRegistry.create_allocation` 及配套的读取 / 释放方法：
++
++* 分配以归属资源 uid 记录，设备写入 ``allocation_devices``；
++* 一个幂等键只对应一个分配：重放返回原分配，释放后也不复用；
++* 归属资源须存在、uid 一致且不在删除中；
++* 同一资源至多一个 Active 分配、同一设备至多属于一个 Active 分配，冲突时不写库；
++* 同名资源在不同命名空间 / 租户中各自持有分配；
++* 释放后设备回到空闲；约束由数据库强制（直接写库、独立连接并发、重启后依然成立）；
++* 打开存量库时以按租户的唯一索引取代旧索引。
++
++测试以 ``asyncio.run`` 驱动异步方法，不依赖 pytest-asyncio。
++"""
++
++from __future__ import annotations
++
++import asyncio
++import sqlite3
++from collections.abc import Iterator
++
++import pytest
++from forgemesh.controlplane.registry import SQLiteRegistry
++from forgemesh.core.errors import ConflictError, NotFoundError
++from forgemesh.core.objects import ObjectMeta
++from forgemesh.core.scheduler import AllocatedDevice, ResourceRef
++from forgemesh.resource.allocation import Allocation
++from forgemesh.resource.inference import (
++    AcceleratorSpec,
++    InferenceService,
++    InferenceServiceSpec,
++    ModelRef,
++    ResourcesSpec,
++    RuntimeRef,
++)
++
++KIND = "InferenceService"
++TENANT = "tenant-a"
++OTHER_TENANT = "tenant-b"
++GPU0 = AllocatedDevice(node_id="node-a", device_id="gpu-0")
++GPU1 = AllocatedDevice(node_id="node-a", device_id="gpu-1")
++
++
++def _service(
++    name: str = "svc",
++    namespace: str | None = "team-a",
++    uid: str = "uid-1",
++    tenant_id: str = TENANT,
++) -> InferenceService:
++    return InferenceService(
++        metadata=ObjectMeta(name=name, namespace=namespace, uid=uid, tenant_id=tenant_id),
++        spec=InferenceServiceSpec(
++            model=ModelRef(reference="models/llama"),
++            runtime=RuntimeRef(provider="vllm"),
++            resources=ResourcesSpec(
++                accelerator=AcceleratorSpec(type="nvidia-gpu", minMemoryGiB=16)
++            ),
++        ),
++    )
++
++
++def _ref(service: InferenceService) -> ResourceRef:
++    meta = service.metadata
++    return ResourceRef(kind=service.kind, namespace=meta.namespace, name=meta.name, uid=meta.uid)
++
++
++def _put(registry: SQLiteRegistry, **kwargs) -> ResourceRef:
++    """创建一个推理服务并返回它的资源引用。"""
++    service = _service(**kwargs)
++    asyncio.run(registry.put(service))
++    return _ref(service)
++
++
++@pytest.fixture
++def registry() -> Iterator[SQLiteRegistry]:
++    reg = SQLiteRegistry()
++    yield reg
++    asyncio.run(reg.close())
++
++
++@pytest.mark.unit
++def test_allocation_is_recorded_against_the_owner_uid_with_its_devices(registry):
++    owner = _put(registry)
++
++    record = asyncio.run(registry.create_allocation(TENANT, owner, "uid-1:1", [GPU1, GPU0]))
++
++    assert record["resource_id"] == "uid-1"
++    assert record["status"] == "Active"
++    assert record["idempotency_key"] == "uid-1:1"
++    assert record["devices"] == [
++        {"node_id": "node-a", "device_id": "gpu-1"},
++        {"node_id": "node-a", "device_id": "gpu-0"},
++    ]
++    assert asyncio.run(registry.get_active_allocation("uid-1", TENANT)) == record
++    assert asyncio.run(registry.list_allocations(TENANT)) == [record]
++    assert asyncio.run(registry.allocated_devices()) == {GPU0, GPU1}
++
++
++@pytest.mark.unit
++def test_replaying_an_idempotency_key_returns_the_same_allocation(registry):
++    owner = _put(registry)
++    first = asyncio.run(registry.create_allocation(TENANT, owner, "uid-1:1", [GPU0]))
++
++    replay = asyncio.run(registry.create_allocation(TENANT, owner, "uid-1:1", [GPU1]))
++
++    assert replay == first
++    assert len(asyncio.run(registry.list_allocations(TENANT))) == 1
++    assert asyncio.run(registry.allocated_devices()) == {GPU0}
++
++
++@pytest.mark.unit
++def test_an_idempotency_key_is_never_reused(registry):
++    """其他资源、其他租户使用同一键冲突；分配释放后，同一资源也不能再用这个键。"""
++    owner = _put(registry)
++    other = _put(registry, name="svc-2", uid="uid-2")
++    foreign = _put(registry, uid="uid-3", tenant_id=OTHER_TENANT)
++    record = asyncio.run(registry.create_allocation(TENANT, owner, "key-1"))
++
++    for tenant_id, ref in ((TENANT, other), (OTHER_TENANT, foreign)):
++        with pytest.raises(ConflictError, match="idempotency_key"):
++            asyncio.run(registry.create_allocation(tenant_id, ref, "key-1"))
++    asyncio.run(registry.release_allocation(record["id"], TENANT))
++    with pytest.raises(ConflictError, match="idempotency_key"):
++        asyncio.run(registry.create_allocation(TENANT, owner, "key-1"))
++
++
++@pytest.mark.unit
++def test_allocation_requires_the_live_owner(registry):
++    """归属资源不存在、uid 不一致（原资源已删除）、属于其他租户或正在删除时不分配。"""
++    owner = _put(registry)
++    leaving = _service(name="leaving", uid="uid-leaving")
++    leaving.finalizers = ["example.com/hold"]
++    asyncio.run(registry.put(leaving))
++    asyncio.run(registry.request_delete(KIND, "team-a", "leaving", TENANT))
++
++    for tenant_id, ref in (
++        (TENANT, ResourceRef(kind=KIND, namespace="team-a", name="ghost", uid="uid-ghost")),
++        (TENANT, ResourceRef(kind=KIND, namespace="team-a", name="svc", uid="uid-old")),
++        (TENANT, ResourceRef(kind=KIND, namespace=None, name="svc", uid="uid-1")),
++        (OTHER_TENANT, owner),
++    ):
++        with pytest.raises(NotFoundError):
++            asyncio.run(registry.create_allocation(tenant_id, ref, f"key-{ref.uid}", [GPU0]))
++    with pytest.raises(ConflictError, match="terminating"):
++        asyncio.run(registry.create_allocation(TENANT, _ref(leaving), "key-leaving", [GPU0]))
++
++    assert asyncio.run(registry.list_allocations(TENANT)) == []
++    assert asyncio.run(registry.allocated_devices()) == frozenset()
++
++
++@pytest.mark.unit
++def test_a_resource_holds_at_most_one_active_allocation(registry):
++    owner = _put(registry)
++    first = asyncio.run(registry.create_allocation(TENANT, owner, "uid-1:1", [GPU0]))
++
++    with pytest.raises(ConflictError, match="active allocation"):
++        asyncio.run(registry.create_allocation(TENANT, owner, "uid-1:2", [GPU1]))
++    assert asyncio.run(registry.allocated_devices()) == {GPU0}
++
++    asyncio.run(registry.release_allocation(first["id"], TENANT))
++    second = asyncio.run(registry.create_allocation(TENANT, owner, "uid-1:2", [GPU1]))
++    assert second["id"] != first["id"]
++    assert asyncio.run(registry.allocated_devices()) == {GPU1}
++
++
++@pytest.mark.unit
++def test_a_device_belongs_to_at_most_one_active_allocation(registry):
++    """设备已被占用时整个请求被拒绝（不写分配行，也不占用其余设备）；释放后可再分配。"""
++    first = asyncio.run(registry.create_allocation(TENANT, _put(registry), "key-1", [GPU0]))
++    other = _put(registry, name="svc-2", uid="uid-2")
++
++    with pytest.raises(ConflictError, match="device already allocated"):
++        asyncio.run(registry.create_allocation(TENANT, other, "key-2", [GPU1, GPU0]))
++    assert asyncio.run(registry.get_active_allocation("uid-2", TENANT)) is None
++    assert asyncio.run(registry.allocated_devices()) == {GPU0}
++
++    asyncio.run(registry.release_allocation(first["id"], TENANT))
++    assert asyncio.run(registry.allocated_devices()) == frozenset()
++    asyncio.run(registry.create_allocation(TENANT, other, "key-2", [GPU1, GPU0]))
++    assert asyncio.run(registry.allocated_devices()) == {GPU0, GPU1}
++    released = asyncio.run(registry.get_allocation(first["id"]))
++    assert released["status"] == "Released"
++    assert released["devices"] == [{"node_id": "node-a", "device_id": "gpu-0"}]
++
++
++@pytest.mark.unit
++def test_same_name_in_other_namespaces_and_tenants_allocates_independently(registry):
++    owners = [
++        (TENANT, _put(registry, namespace="team-a", uid="uid-a")),
++        (TENANT, _put(registry, namespace="team-b", uid="uid-b")),
++        (TENANT, _put(registry, namespace=None, uid="uid-c")),
++        (OTHER_TENANT, _put(registry, namespace="team-a", uid="uid-d", tenant_id=OTHER_TENANT)),
++    ]
++
++    for index, (tenant_id, owner) in enumerate(owners):
++        device = AllocatedDevice(node_id="node-a", device_id=f"gpu-{index}")
++        asyncio.run(registry.create_allocation(tenant_id, owner, f"{owner.uid}:1", [device]))
++
++    for tenant_id, owner in owners:
++        active = asyncio.run(registry.get_active_allocation(owner.uid, tenant_id))
++        assert active is not None and active["resource_id"] == owner.uid
++    assert asyncio.run(registry.get_active_allocation("uid-d", TENANT)) is None
++    assert len(asyncio.run(registry.allocated_devices())) == 4
++
++
++@pytest.mark.unit
++def test_release_active_allocation_releases_by_owner_uid_within_the_tenant(registry):
++    record = asyncio.run(registry.create_allocation(TENANT, _put(registry), "key-1", [GPU0]))
++
++    assert asyncio.run(registry.release_active_allocation("uid-1", OTHER_TENANT)) is None
++    assert asyncio.run(registry.get_active_allocation("uid-1", TENANT)) is not None
++
++    released_id = asyncio.run(registry.release_active_allocation("uid-1", TENANT, reason="test"))
++    assert released_id == record["id"]
++    assert asyncio.run(registry.release_active_allocation("uid-1", TENANT)) is None
++    assert asyncio.run(registry.allocated_devices()) == frozenset()
++    [released] = asyncio.run(registry.list_allocations(TENANT))
++    assert released["status"] == "Released"
++    assert released["released_at"] is not None
++
++
++@pytest.mark.unit
++def test_allocation_lookups_by_id_and_idempotency_key(registry):
++    owner = _put(registry, uid="uid-x", tenant_id=OTHER_TENANT)
++    record = asyncio.run(registry.create_allocation(OTHER_TENANT, owner, "key-x", [GPU0]))
++
++    assert asyncio.run(registry.get_allocation(record["id"])) == record
++    assert asyncio.run(registry.get_allocation("no-such-id")) is None
++    assert asyncio.run(registry.get_allocation_by_idempotency_key("key-x", OTHER_TENANT)) == record
++    assert asyncio.run(registry.get_allocation_by_idempotency_key("key-x", TENANT)) is None
++
++
++@pytest.mark.unit
++def test_duplicate_devices_in_one_request_are_rejected(registry):
++    with pytest.raises(ValueError, match="duplicate devices"):
++        asyncio.run(registry.create_allocation(TENANT, _put(registry), "key-1", [GPU0, GPU0]))
++
++
++@pytest.mark.unit
++def test_the_database_enforces_exclusivity_without_the_registry_checks(registry):
++    """绕过 create_allocation 直接写库：设备重复占用、同一资源两个 Active 均被约束拒绝；
++    分配状态改变时设备随之释放（如租约过期）。"""
++    first = asyncio.run(registry.create_allocation(TENANT, _put(registry), "key-1", [GPU0]))
++    conn = registry._conn
++    insert_allocation = (
++        "INSERT INTO allocations (id, tenant_id, resource_id, status) VALUES (?, ?, ?, 'Active')"
++    )
++    insert_device = (
++        "INSERT INTO allocation_devices (allocation_id, node_id, device_id, status) "
++        "VALUES (?, 'node-a', 'gpu-0', 'Active')"
++    )
++
++    conn.execute(insert_allocation, ("raw", TENANT, "uid-raw"))
++    with pytest.raises(sqlite3.IntegrityError):
++        conn.execute(insert_device, ("raw",))
++    with pytest.raises(sqlite3.IntegrityError):
++        conn.execute(insert_allocation, ("raw-2", TENANT, "uid-1"))
++    conn.execute(insert_allocation, ("raw-3", OTHER_TENANT, "uid-1"))
++    conn.rollback()
++
++    conn.execute("UPDATE allocations SET status = 'Expired' WHERE id = ?", (first["id"],))
++    conn.commit()
++    assert asyncio.run(registry.allocated_devices()) == frozenset()
++
++
++@pytest.mark.unit
++def test_opening_a_legacy_database_replaces_the_global_active_index(tmp_path):
++    db_file = tmp_path / "legacy.db"
++    asyncio.run(SQLiteRegistry(str(db_file)).close())
++    conn = sqlite3.connect(db_file)
++    conn.executescript(
++        """
++        DROP TRIGGER trg_allocation_devices_follow_status;
++        DROP TABLE allocation_devices;
++        DROP INDEX idx_allocations_one_active_per_tenant_resource;
++        CREATE UNIQUE INDEX idx_allocations_one_active_per_resource
++            ON allocations(resource_id) WHERE status = 'Active';
++        INSERT INTO allocations (id, tenant_id, resource_id, status, idempotency_key)
++            VALUES ('legacy', 'tenant-a', 'InferenceService/svc', 'Active', 'legacy-key');
++        """
++    )
++    conn.close()
++
++    reg = SQLiteRegistry(str(db_file))
++    try:
++        names = {row["name"] for row in reg._conn.execute("SELECT name FROM sqlite_master")}
++        assert "idx_allocations_one_active_per_resource" not in names
++        assert {
++            "idx_allocations_one_active_per_tenant_resource",
++            "allocation_devices",
++            "idx_allocation_devices_one_active",
++            "trg_allocation_devices_follow_status",
++        } <= names
++        [legacy] = asyncio.run(reg.list_allocations(TENANT))
++        assert (legacy["id"], legacy["resource_id"], legacy["devices"]) == (
++            "legacy",
++            "InferenceService/svc",
++            [],
++        )
++        asyncio.run(
++            reg.put_allocation(
++                Allocation(
++                    resource_id="InferenceService/svc",
++                    tenant_id=OTHER_TENANT,
++                    idempotency_key="other-tenant",
++                )
++            )
++        )
++    finally:
++        asyncio.run(reg.close())
++
++
++@pytest.mark.unit
++def test_allocations_and_device_claims_survive_a_restart(tmp_path):
++    db = str(tmp_path / "registry.db")
++    reg = SQLiteRegistry(db)
++    owner = _put(reg)
++    record = asyncio.run(reg.create_allocation(TENANT, owner, "uid-1:1", [GPU0]))
++    asyncio.run(reg.close())
++
++    reopened = SQLiteRegistry(db)
++    try:
++        assert asyncio.run(reopened.create_allocation(TENANT, owner, "uid-1:1", [GPU1])) == record
++        assert asyncio.run(reopened.allocated_devices()) == {GPU0}
++        other = _put(reopened, name="svc-2", uid="uid-2")
++        with pytest.raises(ConflictError, match="device already allocated"):
++            asyncio.run(reopened.create_allocation(TENANT, other, "uid-2:1", [GPU0]))
++    finally:
++        asyncio.run(reopened.close())
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize("connections", [1, 2], ids=["shared-registry", "two-connections"])
++def test_concurrent_allocations_never_double_book_a_device(tmp_path, connections):
++    db = str(tmp_path / "registry.db")
++
++    async def scenario() -> None:
++        registries = [SQLiteRegistry(db) for _ in range(connections)]
++        try:
++            owners = []
++            for index in range(8):
++                service = _service(name=f"svc-{index}", uid=f"uid-{index}")
++                await registries[0].put(service)
++                owners.append(_ref(service))
++
++            results = await asyncio.gather(
++                *(
++                    registries[index % connections].create_allocation(
++                        TENANT, owner, f"{owner.uid}:1", [GPU0]
++                    )
++                    for index, owner in enumerate(owners)
++                ),
++                return_exceptions=True,
++            )
++
++            winners = [result for result in results if isinstance(result, dict)]
++            losers = [result for result in results if not isinstance(result, dict)]
++            assert len(winners) == 1
++            assert all(isinstance(loser, ConflictError) for loser in losers)
++            assert await registries[-1].allocated_devices() == {GPU0}
++            assert len(await registries[-1].list_allocations(TENANT)) == 1
++        finally:
++            for reg in registries:
++                await reg.close()
++
++    asyncio.run(scenario())
+-- 
+2.43.0
+

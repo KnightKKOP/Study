@@ -1,0 +1,304 @@
+From a19381384e091fb22cc71d117b672f44e87ab457 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 12 Oct 2026 12:43:55 +0000
+Subject: [PATCH 4/8] fix(reconciler): release a deleted resource's allocation
+ by uid
+
+The Terminating path looked the allocation up by "{kind}/{name}". That
+key ignores the namespace, so deleting a service could release the
+allocation of a same-name service in another namespace, and it never
+matched the allocations the registry now records per resource uid.
+
+Release the active allocation owned by the resource's uid within its
+tenant via release_active_allocation; its devices are freed with it.
+When the resource has already been deleted, or the name was re-created
+under a new uid before this pass, release only the old uid's allocation
+and finish, instead of stripping the finalizer from and deleting the
+new resource.
+---
+ .../forgemesh/controlplane/reconciler/core.py | 54 +++++++-----
+ tests/contract/test_finalizer_closed_loop.py  | 11 +--
+ tests/unit/controlplane/test_reconciler.py    | 83 +++++++++++++++----
+ 3 files changed, 106 insertions(+), 42 deletions(-)
+
+diff --git a/packages/control-plane/src/forgemesh/controlplane/reconciler/core.py b/packages/control-plane/src/forgemesh/controlplane/reconciler/core.py
+index aef8e19..25622d0 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/reconciler/core.py
++++ b/packages/control-plane/src/forgemesh/controlplane/reconciler/core.py
+@@ -32,8 +32,9 @@
+    租约等；未注入时为 Noop 语义，仅移除 finalizer）；失败 → 保持
+    ``Terminating`` 并 requeue 重试；
+ 2. 移除默认 release finalizer（``forgemesh.io/resource-release``）并 CAS 写回；
+-3. finalizers 全部清空后：释放关联 Allocation（若存在 Active）→ 物理 DELETE
+-   → 记审计日志。
++3. finalizers 全部清空后：释放归属该资源的 Active Allocation 及其设备（按
++   ``metadata.uid`` 查找，限本租户）→ 物理 DELETE → 记审计日志。资源已被删除、
++   或同名资源已以新 uid 重建时，只释放原资源的分配，不触碰新资源。
+ """
+ 
+ from __future__ import annotations
+@@ -401,10 +402,11 @@ class ReconciliationController(Reconciler):
+         1. ``release_provider.release(resource)``（未注入 → Noop）；异常 →
+            保持 ``Terminating`` + requeue 重试（不物理删除，GPU 不误删）；
+         2. 读取最新资源，移除默认 release finalizer 后 CAS 写回；仍有其他
+-           finalizer → 等待（requeue）；
+-        3. finalizers 清空 → 释放关联 Allocation（P1 约定：以
+-           ``{kind}/{name}`` 作为 ``allocations.resource_id`` 关联键，由
+-           Scheduler 装配方对齐）→ 物理 DELETE → 记审计日志。
++           finalizer → 等待（requeue）；资源已不存在、或 uid 已不同（同名重建）
++           → 释放原资源的分配后完成；
++        3. finalizers 清空 → 释放归属该资源 uid 的 Active Allocation
++           （``allocations.resource_id`` 即资源 uid，限本租户）→ 物理 DELETE
++           → 记审计日志。
+ 
+         失败路径**不**登记 ``_processed_keys``，保证 requeue 后可重试。
+         """
+@@ -446,7 +448,10 @@ class ReconciliationController(Reconciler):
+                 resource.kind, meta.namespace, meta.name, ctx.tenant_id
+             )
+         except NotFoundError:
+-            # 已被并发删除：视为完成。
++            current = None
++        if current is None or current.metadata.uid != meta.uid:
++            # 已被并发删除，或同名资源已以新 uid 重建：只释放原资源的分配。
++            await self._release_allocation(ctx)
+             await self._mark_processed(ctx.dedup_key)
+             return ReconcileResult(done=True)
+ 
+@@ -473,19 +478,8 @@ class ReconciliationController(Reconciler):
+                 },
+             )
+ 
+-        # 步骤 3：finalizers 已清空 → 释放关联 Allocation → 物理 DELETE。
+-        allocation_key = f"{resource.kind}/{meta.name}"
+-        get_active = getattr(self._registry, "get_active_allocation", None)
+-        if callable(get_active):
+-            active = await get_active(allocation_key, ctx.tenant_id)
+-            if active is not None:
+-                release = getattr(self._registry, "release_allocation", None)
+-                if callable(release):
+-                    await release(
+-                        active["id"],
+-                        ctx.tenant_id,
+-                        reason=f"resource {allocation_key} deleted",
+-                    )
++        # 步骤 3：finalizers 已清空 → 释放归属该资源的 Allocation → 物理 DELETE。
++        await self._release_allocation(ctx)
+         with contextlib.suppress(NotFoundError):
+             # 已被并发删除：幂等完成
+             await self._registry.delete(
+@@ -507,6 +501,26 @@ class ReconciliationController(Reconciler):
+         )
+         return ReconcileResult(done=True, requeue_after=None)
+ 
++    async def _release_allocation(self, ctx: ReconcileContext) -> None:
++        """释放归属 ``ctx.resource``（按 uid，限本租户）的 Active 分配；没有则跳过。"""
++        meta = ctx.resource.metadata
++        release_active = getattr(self._registry, "release_active_allocation", None)
++        if not meta.uid or not callable(release_active):
++            return
++        allocation_id = await release_active(meta.uid, ctx.tenant_id, reason="resource deleted")
++        if allocation_id is not None:
++            logger.info(
++                "allocation released: allocation_id=%s kind=%s namespace=%s name=%s "
++                "uid=%s tenant_id=%s correlation_id=%s",
++                allocation_id,
++                ctx.resource.kind,
++                meta.namespace,
++                meta.name,
++                meta.uid,
++                ctx.tenant_id,
++                ctx.correlation_id,
++            )
++
+     @staticmethod
+     def _compute_diff(resource: Resource, observed: dict[str, Any]) -> dict[str, Any]:
+         """计算期望状态与观测状态的差异（步骤 2-3）。
+diff --git a/tests/contract/test_finalizer_closed_loop.py b/tests/contract/test_finalizer_closed_loop.py
+index cd64697..ce5dae4 100644
+--- a/tests/contract/test_finalizer_closed_loop.py
++++ b/tests/contract/test_finalizer_closed_loop.py
+@@ -13,8 +13,8 @@
+ * 无 finalizer 且无外部副作用的资源走直接物理删除路径（向后兼容）；
+ * 已 ``Terminating`` 的重复删除请求幂等（版本不重复递增）。
+ 
+-关联 Allocation 的 P1 约定：``allocations.resource_id = "{kind}/{name}"``
+-（``reconciler/core.py`` 步骤 3）。
++关联 Allocation 以归属资源 uid 记录：``allocations.resource_id = metadata.uid``
++（``reconciler/core.py`` 步骤 3 按 uid、限本租户释放）。
+ """
+ 
+ from __future__ import annotations
+@@ -62,6 +62,7 @@ def _make_inference_service(
+         metadata=ObjectMeta(
+             name=name,
+             namespace=NAMESPACE,
++            uid=f"uid-{name}",
+             tenant_id=TENANT,
+             generation=1,
+         ),
+@@ -159,11 +160,11 @@ def test_happy_path_full_closure_with_allocation() -> None:
+     reg = SQLiteRegistry()
+     try:
+         _run(reg.put(_make_inference_service(phase=InferencePhase.READY)))
+-        # 建立关联 Allocation（P1 约定 resource_id = "{kind}/{name}"）
++        # 建立归属该资源的 Allocation（resource_id 为资源 uid）
+         _run(
+             reg.put_allocation(
+                 Allocation(
+-                    resource_id=f"{KIND}/svc-1",
++                    resource_id="uid-svc-1",
+                     tenant_id=TENANT,
+                     idempotency_key="alloc-key-1",
+                 )
+@@ -197,7 +198,7 @@ def test_happy_path_full_closure_with_allocation() -> None:
+         assert len(allocs) == 1
+         assert allocs[0]["status"] == "Released"
+         assert allocs[0]["released_at"] is not None
+-        assert _run(reg.get_active_allocation(f"{KIND}/svc-1", TENANT)) is None
++        assert _run(reg.get_active_allocation("uid-svc-1", TENANT)) is None
+     finally:
+         _run(reg.close())
+ 
+diff --git a/tests/unit/controlplane/test_reconciler.py b/tests/unit/controlplane/test_reconciler.py
+index b3a3a62..1244534 100644
+--- a/tests/unit/controlplane/test_reconciler.py
++++ b/tests/unit/controlplane/test_reconciler.py
+@@ -6,7 +6,7 @@ Scheduler 分配成功与失败、分配请求的资源身份与幂等键（uid
+ 调度需求取自 ``spec.resources.accelerator``、
+ 缺少调度器/工作流运行时时如实报告 ``Ready=False``、
+ 幂等性，以及 Terminating 受控删除闭环
+-（ReleaseProvider 释放 → 移除 finalizer → 释放 Allocation → 物理删除）。
++（ReleaseProvider 释放 → 移除 finalizer → 按 uid 释放 Allocation → 物理删除）。
+ """
+ 
+ from __future__ import annotations
+@@ -26,9 +26,8 @@ from forgemesh.controlplane.registry import SQLiteRegistry
+ from forgemesh.core.errors import NotFoundError
+ from forgemesh.core.objects import ObjectMeta, Resource
+ from forgemesh.core.reconciler import ReconcileContext
+-from forgemesh.core.scheduler import ResourceRef, ScheduleRequest
++from forgemesh.core.scheduler import AllocatedDevice, ResourceRef, ScheduleRequest
+ from forgemesh.policy.api import PolicyDecision
+-from forgemesh.resource.allocation import Allocation
+ from forgemesh.resource.inference import (
+     AcceleratorSpec,
+     InferencePhase,
+@@ -611,10 +610,14 @@ def make_inference_service(
+     tenant_id: str = "tenant-1",
+     phase: InferencePhase = InferencePhase.READY,
+     accelerator: AcceleratorSpec | None = None,
++    uid: str = "uid-1",
++    namespace: str | None = None,
+ ) -> InferenceService:
+     """构造带 spec/status 的 InferenceService（phase 由 status 携带）。"""
+     return InferenceService(
+-        metadata=ObjectMeta(name=name, uid="uid-1", tenant_id=tenant_id, generation=1),
++        metadata=ObjectMeta(
++            name=name, namespace=namespace, uid=uid, tenant_id=tenant_id, generation=1
++        ),
+         spec=InferenceServiceSpec(
+             model=ModelRef(reference="models/llama"),
+             runtime=RuntimeRef(provider="vllm"),
+@@ -632,9 +635,10 @@ def _terminating_context(
+     name: str = "svc-1",
+     tenant_id: str = "tenant-1",
+     dedup_key: str = "term-1",
++    namespace: str | None = None,
+ ) -> ReconcileContext:
+     """构造 Terminating 资源的协调上下文（resource 以注册表读回为准注入）。"""
+-    resource = asyncio.run(registry.get("InferenceService", None, name, tenant_id))
++    resource = asyncio.run(registry.get("InferenceService", namespace, name, tenant_id))
+     return ReconcileContext(
+         resource=resource,
+         observed={"phase": "Terminating"},
+@@ -656,22 +660,22 @@ def _make_controller(
+     )
+ 
+ 
++def _allocate(registry: SQLiteRegistry, service: InferenceService, device_id: str = "gpu-0"):
++    """为 ``service`` 建立持有一个设备的 Active 分配（归属其 uid）。"""
++    meta = service.metadata
++    owner = ResourceRef(kind=service.kind, namespace=meta.namespace, name=meta.name, uid=meta.uid)
++    device = AllocatedDevice(node_id="node-a", device_id=device_id)
++    return asyncio.run(registry.create_allocation(meta.tenant_id, owner, f"{meta.uid}:1", [device]))
++
++
+ @pytest.mark.unit
+ def test_terminating_full_delete_closure():
+     """删除闭环：Ready → DELETE(Terminating) → reconcile 释放 → finalizer 清空
+-    → Allocation Released → 物理删除。"""
++    → Allocation Released（设备回到空闲）→ 物理删除。"""
+     reg = SQLiteRegistry()
+-    asyncio.run(reg.put(make_inference_service()))
+-    # 建立关联 Allocation（P1 约定：resource_id = "{kind}/{name}"）
+-    asyncio.run(
+-        reg.put_allocation(
+-            Allocation(
+-                resource_id="InferenceService/svc-1",
+-                tenant_id="tenant-1",
+-                idempotency_key="alloc-key-1",
+-            )
+-        )
+-    )
++    service = make_inference_service()
++    asyncio.run(reg.put(service))
++    _allocate(reg, service)
+     # DELETE 受理：Ready 有副作用 → 自动加 finalizer → Terminating
+     delete_result = asyncio.run(reg.request_delete("InferenceService", None, "svc-1", "tenant-1"))
+     assert delete_result.deleted is False
+@@ -695,6 +699,51 @@ def test_terminating_full_delete_closure():
+     assert len(allocs) == 1
+     assert allocs[0]["status"] == "Released"
+     assert allocs[0]["released_at"] is not None
++    assert asyncio.run(reg.allocated_devices()) == frozenset()
++
++
++@pytest.mark.unit
++def test_terminating_releases_only_the_allocation_of_the_deleted_uid():
++    """释放按 uid、限本租户：同名资源在其他命名空间 / 租户中的分配不受影响。"""
++    reg = SQLiteRegistry()
++    services = [
++        make_inference_service(namespace="team-a", uid="uid-a"),
++        make_inference_service(namespace="team-b", uid="uid-b"),
++        make_inference_service(namespace="team-a", uid="uid-c", tenant_id="tenant-2"),
++    ]
++    for index, service in enumerate(services):
++        asyncio.run(reg.put(service))
++        _allocate(reg, service, device_id=f"gpu-{index}")
++    asyncio.run(reg.request_delete("InferenceService", "team-a", "svc-1", "tenant-1"))
++    ctx = _terminating_context(reg, namespace="team-a")
++
++    result = asyncio.run(_make_controller(reg).reconcile(ctx))
++
++    assert result.done is True
++    assert asyncio.run(reg.get_active_allocation("uid-a", "tenant-1")) is None
++    assert asyncio.run(reg.get_active_allocation("uid-b", "tenant-1")) is not None
++    assert asyncio.run(reg.get_active_allocation("uid-c", "tenant-2")) is not None
++
++
++@pytest.mark.unit
++def test_terminating_resource_replaced_by_a_new_uid_is_left_alone():
++    """协调前原资源已被删除、同名资源以新 uid 重建：只释放原资源的分配，新资源不动。"""
++    reg = SQLiteRegistry()
++    original = make_inference_service()
++    asyncio.run(reg.put(original))
++    _allocate(reg, original)
++    asyncio.run(reg.request_delete("InferenceService", None, "svc-1", "tenant-1"))
++    ctx = _terminating_context(reg)
++    asyncio.run(reg.delete("InferenceService", None, "svc-1", "tenant-1"))
++    asyncio.run(reg.put(make_inference_service(phase=InferencePhase.PENDING, uid="uid-2")))
++
++    result = asyncio.run(_make_controller(reg).reconcile(ctx))
++
++    assert result.done is True
++    survivor = asyncio.run(reg.get("InferenceService", None, "svc-1", "tenant-1"))
++    assert survivor.metadata.uid == "uid-2"
++    assert asyncio.run(reg.get_active_allocation("uid-1", "tenant-1")) is None
++    assert asyncio.run(reg.allocated_devices()) == frozenset()
+ 
+ 
+ @pytest.mark.unit
+-- 
+2.43.0
+

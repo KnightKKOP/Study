@@ -1,0 +1,207 @@
+From 35a78a7d08da3e4ccd544c13fb63d37b73bdb1a4 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 12 Oct 2026 13:15:58 +0000
+Subject: [PATCH 7/8] feat(control-plane): enable the scheduler when an
+ inventory is set
+
+The control plane never injected a scheduler, so every resource that
+needs accelerators stopped at SchedulerUnavailable. When
+FORGEMESH_INVENTORY_FILE is set, the lifespan now loads the inventory
+and gives the controller's reconciler a FirstFitScheduler over it. The
+file is loaded right after the authenticator and before the database
+is opened, so an unreadable or invalid inventory makes startup fail
+without creating the database, as an invalid API key file does.
+Without the variable nothing changes.
+
+The app still has no workflow runtime, so the reconciler reports
+WorkflowRuntimeUnavailable before it allocates anything; the workflow
+runtime and the launchers follow in later changes. The compose smoke
+script comment no longer claims that the repository has no scheduler.
+---
+ .../src/forgemesh/controlplane/app.py         | 29 +++++++++--
+ scripts/compose_smoke.sh                      |  3 +-
+ tests/unit/controlplane/test_app.py           | 48 ++++++++++++++++++-
+ 3 files changed, 75 insertions(+), 5 deletions(-)
+
+diff --git a/packages/control-plane/src/forgemesh/controlplane/app.py b/packages/control-plane/src/forgemesh/controlplane/app.py
+index 0bfeece..f193a66 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/app.py
++++ b/packages/control-plane/src/forgemesh/controlplane/app.py
+@@ -16,6 +16,12 @@
+   自动协调 ``InferenceService`` 并回写 status；去重键与资源存放在同一个数据库
+   文件中。控制器是单写者（ADR-013），本应用只能以单进程运行（不要使用
+   ``uvicorn --workers``）。
++* **调度器**：设置 ``FORGEMESH_INVENTORY_FILE``（静态加速器清单，格式见
++  :mod:`forgemesh.controlplane.scheduler.inventory`）时，控制器的协调器使用
++  :class:`~forgemesh.controlplane.scheduler.FirstFitScheduler`，清单不可读或非法时
++  拒绝启动；未设置时需要分配加速器的资源报告 ``Ready=False``
++  （``SchedulerUnavailable``）。应用尚未注入工作流运行时，协调器在分配之前即报告
++  ``WorkflowRuntimeUnavailable``。
+ * **无导入副作用**：数据库在应用启动（lifespan）时才打开，导入本模块不会
+   创建文件。
+ * **探针**：``/healthz``（存活）恒为 ok；``/readyz``（就绪）探测权威存储可用。
+@@ -49,10 +55,12 @@ from .auth import (
+ )
+ from .controller import ControllerManager
+ from .reconciler import ProcessedKeyStore, ReconciliationController
++from .scheduler import INVENTORY_FILE_ENV, FirstFitScheduler, inventory_from_env
+ 
+ if TYPE_CHECKING:  # pragma: no cover - 仅静态类型检查使用
+     from .auth import Authenticator
+     from .registry import SQLiteRegistry
++    from .scheduler import Inventory
+ 
+ try:  # pragma: no cover - 取决于运行环境是否安装 FastAPI
+     from fastapi import FastAPI
+@@ -125,13 +133,20 @@ def resolve_db_path(db_path: str | None = None) -> str:
+ 
+ 
+ def _build_controller(
+-    registry: SQLiteRegistry, processed_store: ProcessedKeyStore
++    registry: SQLiteRegistry,
++    processed_store: ProcessedKeyStore,
++    inventory: Inventory | None,
+ ) -> ControllerManager:
+     # 没有授权规则的 DefaultPolicyEngine 拒绝一切操作。资源的创建和删除已经由 API 的
+     # 认证与 scope 把关，协调只是推进这些已被接受的期望状态，因此放行 reconcile。
+     policy = DefaultPolicyEngine(authz_rules=[AuthzRule(action="reconcile", effect="allow")])
++    scheduler = FirstFitScheduler(registry, inventory) if inventory is not None else None
+     reconciler = ReconciliationController(
+-        registry, policy, processed_store=processed_store, record_dedup_keys=False
++        registry,
++        policy,
++        scheduler=scheduler,
++        processed_store=processed_store,
++        record_dedup_keys=False,
+     )
+     return ControllerManager(registry, reconciler)
+ 
+@@ -169,6 +184,14 @@ if _FASTAPI_AVAILABLE:
+                     AUTH_MODE_ENV,
+                     AUTH_MODE_DEV,
+                 )
++            inventory = inventory_from_env()
++            if inventory is not None:
++                logger.info(
++                    "first-fit scheduler enabled from %s: %d node(s), %d device(s)",
++                    INVENTORY_FILE_ENV,
++                    len(inventory.nodes),
++                    sum(len(node.devices) for node in inventory.nodes),
++                )
+             path = resolve_db_path(db_path)
+             async with AsyncExitStack() as cleanup:
+                 registry = init_registry(path)
+@@ -178,7 +201,7 @@ if _FASTAPI_AVAILABLE:
+                 cleanup.callback(reset_authenticator)
+                 processed_store = ProcessedKeyStore(path)
+                 cleanup.push_async_callback(processed_store.close)
+-                controller = _build_controller(registry, processed_store)
++                controller = _build_controller(registry, processed_store, inventory)
+                 cleanup.push_async_callback(controller.stop)
+                 await controller.start()
+                 yield
+diff --git a/scripts/compose_smoke.sh b/scripts/compose_smoke.sh
+index 724e53b..484aee9 100755
+--- a/scripts/compose_smoke.sh
++++ b/scripts/compose_smoke.sh
+@@ -75,7 +75,8 @@ check "create through the gateway" 201 "${auth[@]}" -H "Content-Type: applicatio
+   -X POST -d "$body" "$service"
+ check "read through the gateway" 200 "${auth[@]}" "$service/smoke-svc?namespace=default"
+ 
+-# 仓库没有调度器实现，控制器把新服务协调为 Ready=False（SchedulerUnavailable）。
++# compose 没有配置加速器清单（FORGEMESH_INVENTORY_FILE），控制器把新服务协调为
++# Ready=False（SchedulerUnavailable）。
+ reconciled=""
+ for _ in $(seq 1 20); do
+   if curl -sf "${auth[@]}" "$service/smoke-svc?namespace=default" | grep -q SchedulerUnavailable; then
+diff --git a/tests/unit/controlplane/test_app.py b/tests/unit/controlplane/test_app.py
+index 9be205d..007032f 100644
+--- a/tests/unit/controlplane/test_app.py
++++ b/tests/unit/controlplane/test_app.py
+@@ -1,8 +1,10 @@
+-"""控制平面应用入口测试：真实路由已挂载、存储可配置、探针反映存储状态、控制器随应用运行。"""
++"""控制平面应用入口测试：真实路由已挂载、存储可配置、探针反映存储状态、控制器随应用运行、
++配置加速器清单时启用调度器。"""
+ 
+ from __future__ import annotations
+ 
+ import asyncio
++import json
+ import sqlite3
+ import time
+ from pathlib import Path
+@@ -20,6 +22,7 @@ from forgemesh.controlplane.app import DB_PATH_ENV, create_app
+ from forgemesh.controlplane.auth import AUTH_MODE_DEV, AUTH_MODE_ENV
+ from forgemesh.controlplane.controller import ControllerManager
+ from forgemesh.controlplane.registry import SQLiteRegistry
++from forgemesh.controlplane.scheduler import INVENTORY_FILE_ENV, InventoryConfigError
+ from forgemesh.resource.inference import InferenceService
+ 
+ HEADERS = {"X-Tenant-Id": "acme"}
+@@ -37,6 +40,7 @@ BODY = {
+ @pytest.fixture(autouse=True)
+ def _reset_components(monkeypatch):
+     monkeypatch.setenv(AUTH_MODE_ENV, AUTH_MODE_DEV)
++    monkeypatch.delenv(INVENTORY_FILE_ENV, raising=False)
+     reset_runtime_components()
+     yield
+     reset_runtime_components()
+@@ -69,6 +73,14 @@ async def _store_service(db_file: Path) -> None:
+         await registry.close()
+ 
+ 
++async def _allocations(db_file: Path) -> list[dict[str, Any]]:
++    registry = SQLiteRegistry(str(db_file))
++    try:
++        return await registry.list_allocations("acme")
++    finally:
++        await registry.close()
++
++
+ @pytest.mark.unit
+ def test_api_routes_are_served_and_persisted_across_restarts(tmp_path) -> None:
+     db_file = tmp_path / "cp.db"
+@@ -189,6 +201,40 @@ def test_controller_picks_up_services_stored_while_it_was_not_running(tmp_path)
+     assert ready["reason"] == "SchedulerUnavailable"
+ 
+ 
++@pytest.mark.unit
++def test_controller_schedules_when_an_inventory_is_configured(tmp_path, monkeypatch) -> None:
++    """配置清单后不再报告 SchedulerUnavailable；应用尚未注入工作流运行时，协调器在分配
++    之前停在 WorkflowRuntimeUnavailable，不留下分配。"""
++    db_file = tmp_path / "cp.db"
++    inventory = tmp_path / "inventory.json"
++    gpu = {"id": "gpu-0", "type": "nvidia-gpu", "memoryGiB": 80}
++    inventory.write_text(json.dumps({"nodes": [{"id": "node-a", "devices": [gpu]}]}))
++    monkeypatch.setenv(INVENTORY_FILE_ENV, str(inventory))
++
++    with TestClient(create_app(db_path=str(db_file))) as client:
++        created = client.post("/api/v1/inference-services", json=BODY, headers=HEADERS)
++        assert created.status_code == 201
++        ready = _wait_for_ready_condition(client)
++
++    assert (ready["status"], ready["reason"]) == ("False", "WorkflowRuntimeUnavailable")
++    assert asyncio.run(_allocations(db_file)) == []
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize("content", [None, '{"nodes": []}'], ids=["missing-file", "invalid-file"])
++def test_app_refuses_to_start_with_an_unusable_inventory(tmp_path, monkeypatch, content) -> None:
++    db_file = tmp_path / "cp.db"
++    inventory = tmp_path / "inventory.json"
++    if content is not None:
++        inventory.write_text(content)
++    monkeypatch.setenv(INVENTORY_FILE_ENV, str(inventory))
++
++    with pytest.raises(InventoryConfigError), TestClient(create_app(db_path=str(db_file))):
++        pass
++
++    assert not db_file.exists()
++
++
+ @pytest.mark.unit
+ def test_failed_controller_start_releases_the_registry_and_authenticator(
+     tmp_path, monkeypatch
+-- 
+2.43.0
+
