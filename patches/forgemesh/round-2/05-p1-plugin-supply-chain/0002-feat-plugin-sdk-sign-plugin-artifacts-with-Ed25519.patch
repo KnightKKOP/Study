@@ -1,0 +1,1290 @@
+From bbcf6915c82dae60fe34983f4a5f8313e5ee054d Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 12 Oct 2026 12:23:24 +0000
+Subject: [PATCH 2/8] feat(plugin-sdk): sign plugin artifacts with Ed25519
+
+The artifact signer used HMAC-SHA256, so the "public" verification key
+was the signing key itself: whoever could verify a plugin could also
+forge one. verify() trusted the digest carried by the artifact whenever
+the content was absent, never looked at the algorithm field, and the
+signature did not cover the manifest, so the permissions a plugin asks
+for could be changed after signing.
+
+Replace it with Ed25519 signatures over a domain-separated payload of
+the algorithm, the artifact content digest and a canonical manifest
+digest. verify() now takes the artifact content and the manifest,
+recomputes both digests itself, picks the verification key from an
+explicit set of trusted public keys by key id, and rejects unsigned
+artifacts, unknown algorithms, untrusted keys, digest mismatches and
+bad signatures. The signature is a detached JSON document
+(PluginSignature) that travels with the artifact.
+
+Plugin authors get key helpers (generate_private_key, public_key_pem,
+load_trusted_keys, ...) and "python -m forgemesh.plugin.signtool" with
+keygen, sign and verify subcommands; keygen writes the private key with
+mode 0600 and never overwrites an existing file.
+
+Add the "cryptography" package (>=42) as a dependency of
+forgemesh-plugin-sdk and to requirements-dev.txt: the standard library
+has no asymmetric signature primitives, and cryptography is the
+maintained binding to audited implementations that pip installs from
+wheels on the supported platforms, including the python:3.12-slim
+image the control plane is built on.
+
+PluginSigner.sign() and verify() change their signatures and the
+PluginArtifact model of the signing module is removed; only tests
+called them.
+---
+ packages/plugin-sdk/pyproject.toml            |   1 +
+ .../plugin-sdk/src/forgemesh/plugin/sdk.py    |   7 +-
+ .../src/forgemesh/plugin/signing.py           | 286 ++++++++++++------
+ .../src/forgemesh/plugin/signtool.py          | 155 ++++++++++
+ requirements-dev.txt                          |   1 +
+ tests/compat/test_plugin_compatibility.py     |  70 ++---
+ tests/security/test_plugin_permissions.py     |  42 +--
+ tests/unit/plugins/test_signing.py            | 278 +++++++++++------
+ tests/unit/plugins/test_signtool.py           | 119 ++++++++
+ 9 files changed, 716 insertions(+), 243 deletions(-)
+ create mode 100644 packages/plugin-sdk/src/forgemesh/plugin/signtool.py
+ create mode 100644 tests/unit/plugins/test_signtool.py
+
+diff --git a/packages/plugin-sdk/pyproject.toml b/packages/plugin-sdk/pyproject.toml
+index 502272c..3ef25c6 100644
+--- a/packages/plugin-sdk/pyproject.toml
++++ b/packages/plugin-sdk/pyproject.toml
+@@ -10,6 +10,7 @@ requires-python = ">=3.12"
+ dependencies = [
+     "pydantic>=2,<3",
+     "pyyaml>=6.0.1",
++    "cryptography>=42",
+     "forgemesh-core",
+ ]
+ 
+diff --git a/packages/plugin-sdk/src/forgemesh/plugin/sdk.py b/packages/plugin-sdk/src/forgemesh/plugin/sdk.py
+index f085b32..1800812 100644
+--- a/packages/plugin-sdk/src/forgemesh/plugin/sdk.py
++++ b/packages/plugin-sdk/src/forgemesh/plugin/sdk.py
+@@ -8,9 +8,8 @@
+ 设计要点：
+ 
+ * **数据类分离**：:class:`ValidationResult` / :class:`PluginArtifact` /
+-  :class:`PublishResult` 为纯数据载体，与 :mod:`forgemesh.plugin.signing` 中
+-  的同名签名制品类职责不同（本模块的 ``PluginArtifact`` 携带打包产物路径，
+-  签名模块的携带内容字节与签名对象）。
++  :class:`PublishResult` 为纯数据载体；制品签名由 :mod:`forgemesh.plugin.signing`
++  负责，签名对象是打包产物的内容与清单。
+ * **校验分层**：``validate_manifest`` 先做 Schema 校验（pydantic），再做语义
+   检查（未声明权限/隔离等告警），``valid`` 仅在无 error 时为真。
+ * **发布可模拟**：``publish`` 支持 ``memory://`` 协议用于本地/测试环境；
+@@ -58,7 +57,7 @@ class ValidationResult:
+ 
+ @dataclass
+ class PluginArtifact:
+-    """打包制品（携带产物路径，区别于签名模块的内容制品）。
++    """打包制品（携带产物路径）。
+ 
+     Attributes:
+         name: 制品名称（来自 manifest metadata.id）。
+diff --git a/packages/plugin-sdk/src/forgemesh/plugin/signing.py b/packages/plugin-sdk/src/forgemesh/plugin/signing.py
+index 4f4d6b6..a56a3c4 100644
+--- a/packages/plugin-sdk/src/forgemesh/plugin/signing.py
++++ b/packages/plugin-sdk/src/forgemesh/plugin/signing.py
+@@ -1,12 +1,18 @@
+-"""插件制品签名与摘要校验（对齐 development-plan 5.7 供应链安全）。
++"""插件制品签名与校验（Ed25519，对齐 development-plan 5.7 供应链安全）。
+ 
+ 设计要点：
+ 
+-* **摘要**：制品内容用 SHA-256 计算摘要（``sha256:<hex>``），供完整性校验。
+-* **签名**：使用 HMAC-SHA256 对摘要签名，对称密钥模型（``private_key`` 与
+-  ``public_key`` 为同一密钥）。
+-* **三重拒绝**：未签名、摘要不符、签名不符分别抛出 :class:`SigningError`，
+-  拒绝原因明确可审计，不静默放行。
++* **非对称签名**：插件作者用 Ed25519 私钥签名，控制平面只保存公钥；能验签的一方
++  无法伪造签名。
++* **签名对象**：签名覆盖「算法标识 + 制品内容摘要 + 清单摘要」，篡改制品内容或清单
++  中的任何字段（例如申请的权限）都会使签名失效。
++* **不信任调用方给出的摘要**：:meth:`PluginSigner.verify` 总是从制品内容和清单重新
++  计算两个摘要，签名文档中记录的摘要只用于给出更明确的拒绝原因。
++* **拒绝即报错**：未签名、算法未知、签名公钥不受信任、摘要不符、签名不符，均抛出
++  :class:`SigningError`，不静默放行。
++
++签名是一份独立的 JSON 文档（:class:`PluginSignature`），随制品分发；生成密钥、签名与
++验签的命令行工具见 :mod:`forgemesh.plugin.signtool`。
+ 
+ ``SigningError`` 复用 :class:`forgemesh.core.errors.ForgeMeshError` 统一异常体系；
+ 若核心包未就绪，则回退到本地兜底基类。
+@@ -14,11 +20,19 @@
+ 
+ from __future__ import annotations
+ 
++import base64
+ import hashlib
+-import hmac
+-import time
+-
+-from pydantic import BaseModel
++import json
++from collections.abc import Iterable, Mapping
++
++from cryptography.exceptions import InvalidSignature, UnsupportedAlgorithm
++from cryptography.hazmat.primitives import serialization
++from cryptography.hazmat.primitives.asymmetric.ed25519 import (
++    Ed25519PrivateKey,
++    Ed25519PublicKey,
++)
++from forgemesh.plugin.manifest import PluginManifest
++from pydantic import BaseModel, ConfigDict, Field
+ 
+ try:  # 优先复用核心包统一异常体系
+     from forgemesh.core.errors import ForgeMeshError
+@@ -33,129 +47,225 @@ except ImportError:  # pragma: no cover - 仅在核心包未就绪时触发
+             self.details = details
+ 
+ 
++#: 唯一支持的签名算法。
++SIGNATURE_ALGORITHM = "ed25519"
++
++#: 签名载荷的域分隔前缀：同一把密钥对其他格式数据的签名不能被当作插件签名。
++_PAYLOAD_DOMAIN = "forgemesh.io/plugin-signature/v1"
++
++_DIGEST_PATTERN = r"^sha256:[0-9a-f]{64}$"
++
++
+ class SigningError(ForgeMeshError):
+-    """签名/摘要校验失败。"""
++    """签名、验签或密钥加载失败。"""
+ 
+ 
+ class PluginSignature(BaseModel):
+-    """插件签名信息。
++    """插件制品的签名文档（JSON，随制品分发）。
++
++    字段只按 JSON 名（``keyId`` 等）解析。
+ 
+     Attributes:
+-        algorithm: 签名算法标识（如 ``HMAC-SHA256``）。
+-        signature: 签名原始字节。
+-        signer: 签名者标识（密钥指纹）。
+-        signed_at: 签名时间戳（Unix epoch 秒）。
++        algorithm: 签名算法，目前只支持 ``ed25519``。
++        key_id: 签名公钥的指纹（见 :func:`public_key_id`），验签时据此选择受信任公钥。
++        artifact_digest: 签名时的制品内容摘要（``sha256:<hex>``）。
++        manifest_digest: 签名时的清单摘要（见 :meth:`PluginSigner.compute_manifest_digest`）。
++        signature: 对签名载荷的 Ed25519 签名，标准 base64 编码。
+     """
+ 
++    model_config = ConfigDict(extra="forbid", frozen=True)
++
+     algorithm: str
+-    signature: bytes
+-    signer: str
+-    signed_at: float
++    key_id: str = Field(alias="keyId", min_length=1)
++    artifact_digest: str = Field(alias="artifactDigest", pattern=_DIGEST_PATTERN)
++    manifest_digest: str = Field(alias="manifestDigest", pattern=_DIGEST_PATTERN)
++    signature: str = Field(min_length=1)
+ 
+ 
+-class PluginArtifact(BaseModel):
+-    """插件制品。
++def generate_private_key() -> bytes:
++    """生成新的 Ed25519 私钥，返回未加密的 PKCS#8 PEM；私钥只应由插件作者保管。"""
++    return Ed25519PrivateKey.generate().private_bytes(
++        serialization.Encoding.PEM,
++        serialization.PrivateFormat.PKCS8,
++        serialization.NoEncryption(),
++    )
+ 
+-    Attributes:
+-        name: 制品名称。
+-        version: 制品语义版本。
+-        digest: 制品内容摘要（``sha256:<hex>``）。
+-        signature: 制品签名；未签名时为 ``None``。
+-        content: 制品内容字节；校验摘要时需要，可为 ``None``。
++
++def load_private_key(pem: bytes) -> Ed25519PrivateKey:
++    """加载未加密的 PEM 私钥。
++
++    Raises:
++        SigningError: 内容不是合法的 PEM 私钥，或不是 Ed25519 密钥。
+     """
++    try:
++        key = serialization.load_pem_private_key(pem, password=None)
++    except (ValueError, TypeError, UnsupportedAlgorithm) as exc:
++        raise SigningError(f"invalid private key: {exc}") from exc
++    if not isinstance(key, Ed25519PrivateKey):
++        raise SigningError("private key is not an Ed25519 key")
++    return key
+ 
+-    name: str
+-    version: str
+-    digest: str
+-    signature: PluginSignature | None = None
+-    content: bytes | None = None
+ 
++def load_public_key(pem: bytes | str) -> Ed25519PublicKey:
++    """加载 PEM（SubjectPublicKeyInfo）公钥。
++
++    Raises:
++        SigningError: 内容不是合法的 PEM 公钥，或不是 Ed25519 密钥。
++    """
++    data = pem.encode("utf-8") if isinstance(pem, str) else pem
++    try:
++        key = serialization.load_pem_public_key(data)
++    except (ValueError, UnsupportedAlgorithm) as exc:
++        raise SigningError(f"invalid public key: {exc}") from exc
++    if not isinstance(key, Ed25519PublicKey):
++        raise SigningError("public key is not an Ed25519 key")
++    return key
++
++
++def public_key_pem(private_key_pem: bytes) -> bytes:
++    """返回私钥对应的公钥 PEM（配置为受信任公钥的就是它）。"""
++    return (
++        load_private_key(private_key_pem)
++        .public_key()
++        .public_bytes(
++            serialization.Encoding.PEM,
++            serialization.PublicFormat.SubjectPublicKeyInfo,
++        )
++    )
+ 
+-class PluginSigner:
+-    """插件制品签名器（HMAC-SHA256）。
+ 
+-    对制品摘要做 HMAC-SHA256 签名；验证时依次校验「是否签名 → 摘要是否一致 →
+-    签名是否匹配」，任一环节失败均抛出 :class:`SigningError`。
++def public_key_id(key: Ed25519PublicKey) -> str:
++    """公钥指纹：原始 32 字节公钥的 SHA-256 前 16 个十六进制字符。"""
++    raw = key.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
++    return hashlib.sha256(raw).hexdigest()[:16]
++
++
++def load_trusted_keys(pems: Iterable[bytes | str]) -> dict[str, Ed25519PublicKey]:
++    """把受信任公钥（PEM）整理为 ``key_id → 公钥``。
++
++    Raises:
++        SigningError: 某个公钥非法，或同一公钥出现多次。
+     """
++    keys: dict[str, Ed25519PublicKey] = {}
++    for pem in pems:
++        key = load_public_key(pem)
++        key_id = public_key_id(key)
++        if key_id in keys:
++            raise SigningError(f"duplicate trusted key {key_id!r}")
++        keys[key_id] = key
++    return keys
++
++
++def _signing_payload(algorithm: str, artifact_digest: str, manifest_digest: str) -> bytes:
++    return "\n".join((_PAYLOAD_DOMAIN, algorithm, artifact_digest, manifest_digest)).encode("utf-8")
+ 
+-    ALGORITHM = "HMAC-SHA256"
++
++class PluginSigner:
++    """插件制品签名器（Ed25519）。"""
++
++    ALGORITHM = SIGNATURE_ALGORITHM
+ 
+     @staticmethod
+     def compute_digest(content: bytes) -> str:
+-        """计算制品内容的 SHA-256 摘要。
++        """计算制品内容的 SHA-256 摘要，形如 ``sha256:<hex>``。"""
++        return f"sha256:{hashlib.sha256(content).hexdigest()}"
+ 
+-        Args:
+-            content: 制品内容字节。
++    @staticmethod
++    def compute_manifest_digest(manifest: PluginManifest) -> str:
++        """计算清单摘要：清单规范 JSON 形式（键排序、省略取默认值的字段）的 SHA-256。
+ 
+-        Returns:
+-            形如 ``sha256:<hex>`` 的摘要字符串。
++        省略默认值使同一份清单显式写出默认值（如 ``permissions: []``）与省略时摘要相同，
++        后续版本为清单增加带默认值的字段也不会使既有签名失效。
+         """
+-        return f"sha256:{hashlib.sha256(content).hexdigest()}"
+-
+-    def sign(self, artifact: PluginArtifact, private_key: bytes) -> PluginSignature:
+-        """对制品摘要签名。
++        canonical = json.dumps(
++            manifest.model_dump(mode="json", exclude_defaults=True),
++            sort_keys=True,
++            separators=(",", ":"),
++            ensure_ascii=False,
++        )
++        return PluginSigner.compute_digest(canonical.encode("utf-8"))
+ 
+-        签名对象为 ``artifact.digest``（而非原始内容），因此调用方需先用
+-        :meth:`compute_digest` 计算并填入 ``artifact.digest``。
++    def sign(
++        self, content: bytes, manifest: PluginManifest, private_key_pem: bytes
++    ) -> PluginSignature:
++        """对制品内容与清单签名。
+ 
+         Args:
+-            artifact: 待签名制品。
+-            private_key: HMAC 密钥字节。
++            content: 制品内容字节（如 :meth:`forgemesh.plugin.sdk.PluginSdk.pack` 产出的
++                tar.gz）。
++            manifest: 制品对应的插件清单。
++            private_key_pem: 插件作者的 Ed25519 私钥（PEM）。
+ 
+         Returns:
+-            生成的 :class:`PluginSignature`。
++            签名文档。
++
++        Raises:
++            SigningError: 私钥非法。
+         """
+-        sig = hmac.new(private_key, artifact.digest.encode("utf-8"), hashlib.sha256).digest()
+-        signer = hashlib.sha256(private_key).hexdigest()[:16]
++        key = load_private_key(private_key_pem)
++        artifact_digest = self.compute_digest(content)
++        manifest_digest = self.compute_manifest_digest(manifest)
++        signature = key.sign(_signing_payload(self.ALGORITHM, artifact_digest, manifest_digest))
+         return PluginSignature(
+             algorithm=self.ALGORITHM,
+-            signature=sig,
+-            signer=signer,
+-            signed_at=time.time(),
++            keyId=public_key_id(key.public_key()),
++            artifactDigest=artifact_digest,
++            manifestDigest=manifest_digest,
++            signature=base64.b64encode(signature).decode("ascii"),
+         )
+ 
+-    def verify(self, artifact: PluginArtifact, public_key: bytes) -> bool:
+-        """验证制品签名。
+-
+-        依次执行三重校验，任一失败抛出 :class:`SigningError`：
++    def verify(
++        self,
++        content: bytes,
++        manifest: PluginManifest,
++        signature: PluginSignature | None,
++        trusted_keys: Mapping[str, Ed25519PublicKey],
++    ) -> str:
++        """校验制品签名，通过时返回签名公钥的 key id。
+ 
+-        1. **未签名拒绝**：``artifact.signature`` 为 ``None``。
+-        2. **摘要不符拒绝**：``artifact.content`` 非空时重算摘要并与
+-           ``artifact.digest`` 比对。
+-        3. **签名不符拒绝**：用 ``public_key`` 重算 HMAC 并与签名比对。
++        依次拒绝：未签名、算法不是 ``ed25519``、签名公钥不在 ``trusted_keys`` 中、
++        重新计算的制品摘要或清单摘要与签名文档不符、签名不符。签名总是针对重新计算的
++        摘要校验，签名文档中记录的摘要不参与判定。
+ 
+         Args:
+-            artifact: 待验证制品。
+-            public_key: HMAC 密钥字节（与签名时相同）。
+-
+-        Returns:
+-            验证通过返回 ``True``。
++            content: 制品内容字节（从制品存储读取，而不是调用方给出的摘要）。
++            manifest: 待注册的插件清单。
++            signature: 签名文档；``None`` 表示未签名。
++            trusted_keys: 受信任公钥（见 :func:`load_trusted_keys`）。
+ 
+         Raises:
+-            SigningError: 未签名 / 摘要不符 / 签名不符。
++            SigningError: 任一校验失败。
+         """
+-        if artifact.signature is None:
++        if signature is None:
+             raise SigningError("unsigned plugin rejected")
+-
+-        # 摘要校验：仅当制品携带内容时重算并比对。
+-        if artifact.content is not None:
+-            computed = self.compute_digest(artifact.content)
+-            if computed != artifact.digest:
+-                raise SigningError("digest mismatch")
+-
+-        # 签名校验：对摘要做 HMAC 并常量时间比对。
+-        expected = hmac.new(
+-            public_key, artifact.digest.encode("utf-8"), hashlib.sha256
+-        ).digest()
+-        if not hmac.compare_digest(expected, artifact.signature.signature):
+-            raise SigningError("signature verification failed")
+-
+-        return True
++        if signature.algorithm != self.ALGORITHM:
++            raise SigningError(f"unsupported signature algorithm: {signature.algorithm!r}")
++        key = trusted_keys.get(signature.key_id)
++        if key is None:
++            raise SigningError(f"signing key {signature.key_id!r} is not trusted")
++        artifact_digest = self.compute_digest(content)
++        if artifact_digest != signature.artifact_digest:
++            raise SigningError("artifact digest mismatch")
++        manifest_digest = self.compute_manifest_digest(manifest)
++        if manifest_digest != signature.manifest_digest:
++            raise SigningError("manifest digest mismatch")
++        payload = _signing_payload(self.ALGORITHM, artifact_digest, manifest_digest)
++        try:
++            key.verify(base64.b64decode(signature.signature, validate=True), payload)
++        except (ValueError, InvalidSignature) as exc:
++            raise SigningError("signature verification failed") from exc
++        return signature.key_id
+ 
+ 
+ __all__ = [
++    "SIGNATURE_ALGORITHM",
+     "PluginSignature",
+-    "PluginArtifact",
+-    "SigningError",
+     "PluginSigner",
++    "SigningError",
++    "generate_private_key",
++    "load_private_key",
++    "load_public_key",
++    "load_trusted_keys",
++    "public_key_id",
++    "public_key_pem",
+ ]
+diff --git a/packages/plugin-sdk/src/forgemesh/plugin/signtool.py b/packages/plugin-sdk/src/forgemesh/plugin/signtool.py
+new file mode 100644
+index 0000000..e7ef032
+--- /dev/null
++++ b/packages/plugin-sdk/src/forgemesh/plugin/signtool.py
+@@ -0,0 +1,155 @@
++"""插件签名工具：``python -m forgemesh.plugin.signtool {keygen,sign,verify}``。
++
++* ``keygen --private-key author.key``：生成 Ed25519 私钥（文件权限 0600）与公钥
++  ``author.key.pub``，已有文件不会被覆盖；输出 key id 以及可追加到插件策略文件
++  ``trustedKeys`` 数组的公钥条目（格式见 :mod:`forgemesh.controlplane.plugin_manager`）。
++* ``sign --private-key author.key --manifest manifest.yaml --artifact <制品>``：写出签名
++  文档，默认 ``<制品>.sig``。
++* ``verify --public-key author.key.pub --manifest manifest.yaml --artifact <制品>``：用给定
++  公钥校验签名文档（默认 ``<制品>.sig``），失败时返回 1。
++
++私钥只应由插件作者保管：不要提交到代码仓库，也不要放进插件目录或制品。
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import os
++import sys
++from pathlib import Path
++
++import yaml
++from forgemesh.plugin.manifest import PluginManifest
++from forgemesh.plugin.signing import (
++    PluginSignature,
++    PluginSigner,
++    SigningError,
++    generate_private_key,
++    load_public_key,
++    load_trusted_keys,
++    public_key_id,
++    public_key_pem,
++)
++from pydantic import ValidationError
++
++
++class _ToolError(Exception):
++    """输入文件缺失或非法（退出码 1）。"""
++
++
++def _read_bytes(path: Path) -> bytes:
++    try:
++        return path.read_bytes()
++    except OSError as exc:
++        raise _ToolError(f"cannot read {path}: {exc}") from exc
++
++
++def _load_manifest(path: Path) -> PluginManifest:
++    try:
++        raw = yaml.safe_load(_read_bytes(path))
++        return PluginManifest.model_validate(raw)
++    except (yaml.YAMLError, ValidationError) as exc:
++        raise _ToolError(f"invalid manifest {path}: {exc}") from exc
++
++
++def _load_signature(path: Path) -> PluginSignature:
++    try:
++        return PluginSignature.model_validate_json(_read_bytes(path))
++    except ValidationError as exc:
++        raise _ToolError(f"invalid signature document {path}: {exc}") from exc
++
++
++def _write_private(path: Path, data: bytes) -> None:
++    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
++    with os.fdopen(fd, "wb") as handle:
++        handle.write(data)
++
++
++def _keygen(args: argparse.Namespace) -> int:
++    private_path = Path(args.private_key)
++    public_path = Path(args.public_key) if args.public_key else Path(f"{private_path}.pub")
++    for path in (private_path, public_path):
++        if path.exists():
++            print(f"refusing to overwrite existing file {path}", file=sys.stderr)
++            return 2
++    private_pem = generate_private_key()
++    public_pem = public_key_pem(private_pem)
++    key_id = public_key_id(load_public_key(public_pem))
++    _write_private(private_path, private_pem)
++    public_path.write_bytes(public_pem)
++    print(f"Private key written to {private_path} (keep it secret; never commit or ship it).")
++    print(f"Public key written to {public_path}; key id {key_id}.")
++    print('Trusted key entry (append it to the "trustedKeys" array of the plugin policy file):')
++    print(json.dumps(public_pem.decode("ascii")))
++    return 0
++
++
++def _sign(args: argparse.Namespace) -> int:
++    artifact_path = Path(args.artifact)
++    output_path = Path(args.output) if args.output else Path(f"{artifact_path}.sig")
++    signature = PluginSigner().sign(
++        _read_bytes(artifact_path),
++        _load_manifest(Path(args.manifest)),
++        _read_bytes(Path(args.private_key)),
++    )
++    output_path.write_text(signature.model_dump_json(by_alias=True) + "\n", encoding="utf-8")
++    print(f"Signature written to {output_path} (key id {signature.key_id}).")
++    return 0
++
++
++def _verify(args: argparse.Namespace) -> int:
++    artifact_path = Path(args.artifact)
++    signature_path = Path(args.signature) if args.signature else Path(f"{artifact_path}.sig")
++    trusted = load_trusted_keys([_read_bytes(Path(args.public_key))])
++    try:
++        key_id = PluginSigner().verify(
++            _read_bytes(artifact_path),
++            _load_manifest(Path(args.manifest)),
++            _load_signature(signature_path),
++            trusted,
++        )
++    except SigningError as exc:
++        print(f"verification failed: {exc}", file=sys.stderr)
++        return 1
++    print(f"OK: {artifact_path} is signed by key {key_id}.")
++    return 0
++
++
++def main(argv: list[str] | None = None) -> int:
++    """命令行入口：成功返回 0，校验失败或输入非法返回 1，参数非法返回 2。"""
++    parser = argparse.ArgumentParser(
++        prog="python -m forgemesh.plugin.signtool",
++        description="Generate signing keys, sign plugin artifacts and verify signatures.",
++    )
++    commands = parser.add_subparsers(dest="command", required=True)
++
++    keygen = commands.add_parser("keygen", help="generate an Ed25519 key pair")
++    keygen.add_argument("--private-key", required=True, help="private key output path")
++    keygen.add_argument("--public-key", help="public key output path (default: <private>.pub)")
++    keygen.set_defaults(handler=_keygen)
++
++    sign = commands.add_parser("sign", help="sign an artifact and its manifest")
++    sign.add_argument("--private-key", required=True, help="Ed25519 private key (PEM)")
++    sign.add_argument("--manifest", required=True, help="manifest.yaml of the artifact")
++    sign.add_argument("--artifact", required=True, help="artifact file, e.g. the packed tar.gz")
++    sign.add_argument("--output", help="signature output path (default: <artifact>.sig)")
++    sign.set_defaults(handler=_sign)
++
++    verify = commands.add_parser("verify", help="verify an artifact signature")
++    verify.add_argument("--public-key", required=True, help="trusted Ed25519 public key (PEM)")
++    verify.add_argument("--manifest", required=True, help="manifest.yaml of the artifact")
++    verify.add_argument("--artifact", required=True, help="artifact file")
++    verify.add_argument("--signature", help="signature document (default: <artifact>.sig)")
++    verify.set_defaults(handler=_verify)
++
++    args = parser.parse_args(argv)
++    try:
++        return args.handler(args)
++    except (_ToolError, SigningError, OSError) as exc:
++        print(exc, file=sys.stderr)
++        return 1
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/requirements-dev.txt b/requirements-dev.txt
+index 66436e4..6fab0e4 100644
+--- a/requirements-dev.txt
++++ b/requirements-dev.txt
+@@ -7,6 +7,7 @@ pytest>=7
+ pytest-cov
+ ruff
+ pydantic>=2,<3
++cryptography>=42
+ jsonschema
+ pyyaml
+ fastapi
+diff --git a/tests/compat/test_plugin_compatibility.py b/tests/compat/test_plugin_compatibility.py
+index 4a2c01a..7c4ae34 100644
+--- a/tests/compat/test_plugin_compatibility.py
++++ b/tests/compat/test_plugin_compatibility.py
+@@ -3,7 +3,7 @@
+ 覆盖：
+ 
+ * **核心 API 版本兼容**：PluginManifest apiVersion、PluginVersionCompat 语义版本兼容。
+-* **签名验证（安全认证）**：PluginSigner 三重拒绝（未签名/摘要不符/签名不符）。
++* **签名验证（安全认证）**：PluginSigner 拒绝未签名、摘要不符、签名公钥不受信任的制品。
+ * **隔离边界（安全认证）**：RESTRICTED_RPC 资源访问边界、UNTRUSTED 权限边界。
+ * **升级安全（IVT-8）**：升级不静默改变既有工作流实例的执行定义。
+ * **SDK 打包/发布兼容**：PluginSdk.pack/publish 端到端兼容性。
+@@ -28,12 +28,23 @@ from forgemesh.plugin.isolation import (
+ from forgemesh.plugin.manifest import PluginManifest, PluginMeta, PluginSpec
+ from forgemesh.plugin.sdk import PluginArtifact as SdkArtifact
+ from forgemesh.plugin.sdk import PluginSdk, PublishResult, ValidationResult
+-from forgemesh.plugin.signing import PluginArtifact as SignedArtifact
+-from forgemesh.plugin.signing import PluginSigner, SigningError
++from forgemesh.plugin.signing import (
++    PluginSigner,
++    SigningError,
++    generate_private_key,
++    load_trusted_keys,
++    public_key_pem,
++)
+ 
+ #: 兼容性测试统一标记。
+ _compat = pytest.mark.contract
+ 
++#: 签名测试使用的清单。
++_SIGNED_MANIFEST = PluginManifest(
++    metadata=PluginMeta(id="p", version="0.1.0"),
++    spec=PluginSpec(category="policy"),
++)
++
+ 
+ # ===========================================================================
+ # 1. 核心 API 版本兼容
+@@ -153,7 +164,7 @@ class TestPluginVersionCompat:
+ 
+ 
+ class TestSigningSecurity:
+-    """PluginSigner 安全认证：三重拒绝 + 正常验证通过。"""
++    """PluginSigner 安全认证：拒绝未签名、篡改与非受信任签名 + 正常验证通过。"""
+ 
+     @_compat
+     def test_compute_digest_format(self) -> None:
+@@ -164,49 +175,41 @@ class TestSigningSecurity:
+ 
+     @_compat
+     def test_sign_and_verify_success(self) -> None:
+-        """签名后用相同密钥验证应通过。"""
++        """签名后用对应的受信任公钥验证应通过。"""
+         signer = PluginSigner()
+-        key = b"secret-key"
++        key = generate_private_key()
+         content = b"plugin content"
+-        digest = PluginSigner.compute_digest(content)
+-        artifact = SignedArtifact(name="p", version="0.1.0", digest=digest, content=content)
+-        artifact.signature = signer.sign(artifact, key)
+-        assert signer.verify(artifact, key) is True
++        signature = signer.sign(content, _SIGNED_MANIFEST, key)
++        trusted = load_trusted_keys([public_key_pem(key)])
++        assert signer.verify(content, _SIGNED_MANIFEST, signature, trusted) == signature.key_id
+ 
+     @_compat
+     def test_unsigned_rejected(self) -> None:
+         """未签名制品应被拒绝。"""
+         signer = PluginSigner()
+-        artifact = SignedArtifact(name="p", version="0.1.0", digest="sha256:x")
+         with pytest.raises(SigningError, match="unsigned"):
+-            signer.verify(artifact, b"key")
++            signer.verify(b"plugin content", _SIGNED_MANIFEST, None, {})
+ 
+     @_compat
+     def test_digest_mismatch_rejected(self) -> None:
+         """摘要不符应被拒绝。"""
+         signer = PluginSigner()
+-        key = b"secret-key"
+-        content = b"plugin content"
+-        digest = PluginSigner.compute_digest(content)
+-        artifact = SignedArtifact(name="p", version="0.1.0", digest=digest, content=content)
+-        artifact.signature = signer.sign(artifact, key)
++        key = generate_private_key()
++        signature = signer.sign(b"plugin content", _SIGNED_MANIFEST, key)
++        trusted = load_trusted_keys([public_key_pem(key)])
+         # 篡改内容使摘要不匹配
+-        artifact.content = b"tampered"
+         with pytest.raises(SigningError, match="digest"):
+-            signer.verify(artifact, key)
++            signer.verify(b"tampered", _SIGNED_MANIFEST, signature, trusted)
+ 
+     @_compat
+     def test_signature_mismatch_rejected(self) -> None:
+-        """签名不符（密钥不同）应被拒绝。"""
++        """签名公钥不受信任（密钥不同）应被拒绝。"""
+         signer = PluginSigner()
+-        sign_key = b"sign-key"
+-        verify_key = b"different-key"
+         content = b"plugin content"
+-        digest = PluginSigner.compute_digest(content)
+-        artifact = SignedArtifact(name="p", version="0.1.0", digest=digest, content=content)
+-        artifact.signature = signer.sign(artifact, sign_key)
+-        with pytest.raises(SigningError, match="signature"):
+-            signer.verify(artifact, verify_key)
++        signature = signer.sign(content, _SIGNED_MANIFEST, generate_private_key())
++        trusted = load_trusted_keys([public_key_pem(generate_private_key())])
++        with pytest.raises(SigningError, match="not trusted"):
++            signer.verify(content, _SIGNED_MANIFEST, signature, trusted)
+ 
+     @_compat
+     def test_digest_deterministic(self) -> None:
+@@ -217,15 +220,12 @@ class TestSigningSecurity:
+ 
+     @_compat
+     def test_signer_fingerprint_stable(self) -> None:
+-        """相同密钥应产生相同 signer 指纹。"""
++        """相同密钥应产生相同 key id。"""
+         signer = PluginSigner()
+-        key = b"secret-key"
+-        digest = PluginSigner.compute_digest(b"content")
+-        art1 = SignedArtifact(name="p", version="0.1.0", digest=digest)
+-        art2 = SignedArtifact(name="p", version="0.1.0", digest=digest)
+-        sig1 = signer.sign(art1, key)
+-        sig2 = signer.sign(art2, key)
+-        assert sig1.signer == sig2.signer
++        key = generate_private_key()
++        sig1 = signer.sign(b"content", _SIGNED_MANIFEST, key)
++        sig2 = signer.sign(b"other content", _SIGNED_MANIFEST, key)
++        assert sig1.key_id == sig2.key_id
+ 
+ 
+ # ===========================================================================
+diff --git a/tests/security/test_plugin_permissions.py b/tests/security/test_plugin_permissions.py
+index 637447f..1ba13ee 100644
+--- a/tests/security/test_plugin_permissions.py
++++ b/tests/security/test_plugin_permissions.py
+@@ -22,30 +22,22 @@ from forgemesh.plugin.isolation import (
+     PluginVersionCompat,
+     TrustLevel,
+ )
++from forgemesh.plugin.manifest import PluginManifest, PluginMeta, PluginSpec
+ from forgemesh.plugin.signing import (
+-    PluginArtifact,
+-    PluginSignature,
+     PluginSigner,
+     SigningError,
++    generate_private_key,
++    load_trusted_keys,
++    public_key_pem,
+ )
+ 
+ _SIGNER = PluginSigner()
+-_KEY = b"test-secret-key-for-security-tests"
+-
+-
+-def _make_artifact(
+-    content: bytes = b"plugin payload",
+-    digest: str | None = None,
+-    signature: PluginSignature | None = None,
+-) -> PluginArtifact:
+-    """构造测试用制品。"""
+-    return PluginArtifact(
+-        name="forgemesh.plugin.example",
+-        version="1.0.0",
+-        digest=digest if digest is not None else PluginSigner.compute_digest(content),
+-        signature=signature,
+-        content=content,
+-    )
++_PRIVATE_KEY = generate_private_key()
++_TRUSTED = load_trusted_keys([public_key_pem(_PRIVATE_KEY)])
++_MANIFEST = PluginManifest(
++    metadata=PluginMeta(id="forgemesh.plugin.example", version="1.0.0"),
++    spec=PluginSpec(category="policy"),
++)
+ 
+ 
+ # --------------------------------------------------------------------------- #
+@@ -126,10 +118,8 @@ def test_restricted_rpc_no_direct_db() -> None:
+ @pytest.mark.unit
+ def test_unsigned_plugin_rejected() -> None:
+     """未签名插件被拒绝加载：verify 抛 SigningError("unsigned plugin rejected")。"""
+-    artifact = _make_artifact(signature=None)
+-
+     with pytest.raises(SigningError, match="unsigned plugin rejected"):
+-        _SIGNER.verify(artifact, _KEY)
++        _SIGNER.verify(b"plugin payload", _MANIFEST, None, _TRUSTED)
+ 
+ 
+ # --------------------------------------------------------------------------- #
+@@ -139,13 +129,11 @@ def test_unsigned_plugin_rejected() -> None:
+ 
+ @pytest.mark.unit
+ def test_digest_mismatch_rejected() -> None:
+-    """摘要不符的插件被拒绝加载：verify 抛 SigningError("digest mismatch")。"""
+-    # 构造一个摘要与内容不符的制品
+-    artifact = _make_artifact(digest="sha256:deadbeef00000000")
+-    artifact.signature = _SIGNER.sign(artifact, _KEY)
++    """签名后被篡改的制品被拒绝加载：verify 从内容重算摘要，抛 SigningError。"""
++    signature = _SIGNER.sign(b"plugin payload", _MANIFEST, _PRIVATE_KEY)
+ 
+-    with pytest.raises(SigningError, match="digest mismatch"):
+-        _SIGNER.verify(artifact, _KEY)
++    with pytest.raises(SigningError, match="artifact digest mismatch"):
++        _SIGNER.verify(b"tampered payload", _MANIFEST, signature, _TRUSTED)
+ 
+ 
+ # --------------------------------------------------------------------------- #
+diff --git a/tests/unit/plugins/test_signing.py b/tests/unit/plugins/test_signing.py
+index 8e55e3c..aa991ea 100644
+--- a/tests/unit/plugins/test_signing.py
++++ b/tests/unit/plugins/test_signing.py
+@@ -1,142 +1,242 @@
+-"""插件签名与摘要校验单元测试（对齐 development-plan 5.7 供应链安全）。
++"""插件签名与校验单元测试（Ed25519，对齐 development-plan 5.7 供应链安全）。
+ 
+ 覆盖：
+-* sign + verify 成功；
+-* 未签名拒绝（SigningError）；
+-* 摘要不符拒绝 / 摘要相符通过；
+-* 签名不符拒绝；
+-* compute_digest 一致性。
++* sign + verify 成功，返回签名公钥的 key id；
++* 未签名、算法不符、公钥不受信任被拒绝；
++* 篡改制品内容 / 清单 / 签名被拒绝，签名文档中伪造的摘要不被信任；
++* 清单摘要的规范化；
++* 密钥加载与受信任公钥整理。
+ """
+ 
+ from __future__ import annotations
+ 
++import base64
++
+ import pytest
++from cryptography.hazmat.primitives import serialization
++from cryptography.hazmat.primitives.asymmetric import ec
++from forgemesh.plugin.manifest import PluginManifest, PluginMeta, PluginSpec
+ from forgemesh.plugin.signing import (
+-    PluginArtifact,
++    SIGNATURE_ALGORITHM,
+     PluginSignature,
+     PluginSigner,
+     SigningError,
++    generate_private_key,
++    load_private_key,
++    load_public_key,
++    load_trusted_keys,
++    public_key_id,
++    public_key_pem,
+ )
++from pydantic import ValidationError
+ 
+ _SIGNER = PluginSigner()
+-_KEY = b"test-secret-key"
+-
+-
+-def _make_artifact(
+-    content: bytes = b"plugin payload",
+-    digest: str | None = None,
+-    signature: PluginSignature | None = None,
+-) -> PluginArtifact:
+-    """构造测试用制品。"""
+-    return PluginArtifact(
+-        name="forgemesh.plugin.example",
+-        version="1.0.0",
+-        digest=digest if digest is not None else PluginSigner.compute_digest(content),
+-        signature=signature,
+-        content=content,
++_PRIVATE_KEY = generate_private_key()
++_OTHER_PRIVATE_KEY = generate_private_key()
++_TRUSTED = load_trusted_keys([public_key_pem(_PRIVATE_KEY)])
++_CONTENT = b"plugin payload"
++
++
++def _manifest(permissions: list[str] | None = None) -> PluginManifest:
++    return PluginManifest(
++        metadata=PluginMeta(id="forgemesh.example.plugin", version="1.0.0"),
++        spec=PluginSpec(category="policy", permissions=permissions or ["resource.read"]),
+     )
+ 
+ 
++def _key_id(private_key: bytes) -> str:
++    return public_key_id(load_public_key(public_key_pem(private_key)))
++
++
+ class TestSignAndVerify:
+     """签名与验证成功路径。"""
+ 
+-    def test_sign_then_verify_succeeds(self) -> None:
+-        artifact = _make_artifact()
+-        artifact.signature = _SIGNER.sign(artifact, _KEY)
++    def test_sign_then_verify_returns_key_id(self) -> None:
++        signature = _SIGNER.sign(_CONTENT, _manifest(), _PRIVATE_KEY)
+ 
+-        assert _SIGNER.verify(artifact, _KEY) is True
++        assert _SIGNER.verify(_CONTENT, _manifest(), signature, _TRUSTED) == _key_id(_PRIVATE_KEY)
+ 
+-    def test_signed_artifact_has_algorithm(self) -> None:
+-        artifact = _make_artifact()
+-        sig = _SIGNER.sign(artifact, _KEY)
++    def test_signature_document_fields(self) -> None:
++        signature = _SIGNER.sign(_CONTENT, _manifest(), _PRIVATE_KEY)
+ 
+-        assert sig.algorithm == "HMAC-SHA256"
+-        assert isinstance(sig.signature, bytes)
+-        assert len(sig.signature) > 0
+-        assert sig.signer  # 非空
++        assert signature.algorithm == SIGNATURE_ALGORITHM == "ed25519"
++        assert signature.key_id == _key_id(_PRIVATE_KEY)
++        assert signature.artifact_digest == PluginSigner.compute_digest(_CONTENT)
++        assert signature.manifest_digest == PluginSigner.compute_manifest_digest(_manifest())
++        assert len(base64.b64decode(signature.signature)) == 64
+ 
++    def test_signature_document_json_round_trip(self) -> None:
++        signature = _SIGNER.sign(_CONTENT, _manifest(), _PRIVATE_KEY)
++        document = signature.model_dump_json(by_alias=True)
+ 
+-class TestUnsignedRejected:
+-    """未签名制品拒绝。"""
++        assert '"keyId"' in document and '"artifactDigest"' in document
++        assert PluginSignature.model_validate_json(document) == signature
+ 
+-    def test_unsigned_raises(self) -> None:
+-        artifact = _make_artifact(signature=None)
++    def test_signature_document_rejects_unknown_fields(self) -> None:
++        data = _SIGNER.sign(_CONTENT, _manifest(), _PRIVATE_KEY).model_dump(by_alias=True)
++        data["signer"] = "someone"
+ 
+-        with pytest.raises(SigningError, match="unsigned plugin rejected"):
+-            _SIGNER.verify(artifact, _KEY)
++        with pytest.raises(ValidationError):
++            PluginSignature.model_validate(data)
+ 
+ 
+-class TestDigestMismatch:
+-    """摘要校验。"""
++class TestRejected:
++    """任一校验失败都抛出 SigningError。"""
++
++    def test_unsigned_rejected(self) -> None:
++        with pytest.raises(SigningError, match="unsigned plugin rejected"):
++            _SIGNER.verify(_CONTENT, _manifest(), None, _TRUSTED)
+ 
+-    def test_digest_mismatch_raises(self) -> None:
+-        artifact = _make_artifact(digest="sha256:deadbeef")
+-        artifact.signature = _SIGNER.sign(artifact, _KEY)
++    @pytest.mark.parametrize("algorithm", ["HMAC-SHA256", "ED25519", "rsa-pss", ""])
++    def test_algorithm_mismatch_rejected(self, algorithm: str) -> None:
++        signature = _SIGNER.sign(_CONTENT, _manifest(), _PRIVATE_KEY)
++        forged = signature.model_copy(update={"algorithm": algorithm})
+ 
+-        with pytest.raises(SigningError, match="digest mismatch"):
+-            _SIGNER.verify(artifact, _KEY)
++        with pytest.raises(SigningError, match="unsupported signature algorithm"):
++            _SIGNER.verify(_CONTENT, _manifest(), forged, _TRUSTED)
+ 
+-    def test_digest_match_passes(self) -> None:
+-        content = b"correct payload"
+-        artifact = _make_artifact(content=content)
+-        artifact.signature = _SIGNER.sign(artifact, _KEY)
++    def test_untrusted_key_rejected(self) -> None:
++        signature = _SIGNER.sign(_CONTENT, _manifest(), _OTHER_PRIVATE_KEY)
+ 
+-        assert _SIGNER.verify(artifact, _KEY) is True
++        with pytest.raises(SigningError, match="is not trusted"):
++            _SIGNER.verify(_CONTENT, _manifest(), signature, _TRUSTED)
+ 
+-    def test_no_content_skips_digest_check(self) -> None:
+-        """制品不携带内容时跳过摘要重算，仅校验签名。"""
+-        artifact = _make_artifact(content=b"original")
+-        artifact.signature = _SIGNER.sign(artifact, _KEY)
+-        artifact.content = None  # 移除内容，保留正确摘要与签名
++    def test_no_trusted_keys_rejects_everything(self) -> None:
++        signature = _SIGNER.sign(_CONTENT, _manifest(), _PRIVATE_KEY)
+ 
+-        assert _SIGNER.verify(artifact, _KEY) is True
++        with pytest.raises(SigningError, match="is not trusted"):
++            _SIGNER.verify(_CONTENT, _manifest(), signature, {})
+ 
++    def test_tampered_artifact_rejected(self) -> None:
++        signature = _SIGNER.sign(_CONTENT, _manifest(), _PRIVATE_KEY)
+ 
+-class TestSignatureMismatch:
+-    """签名不符拒绝。"""
++        with pytest.raises(SigningError, match="artifact digest mismatch"):
++            _SIGNER.verify(b"tampered payload", _manifest(), signature, _TRUSTED)
+ 
+-    def test_wrong_key_raises(self) -> None:
+-        artifact = _make_artifact()
+-        artifact.signature = _SIGNER.sign(artifact, _KEY)
++    def test_forged_digest_in_signature_document_not_trusted(self) -> None:
++        """篡改内容后同步改写签名文档中的摘要，签名仍针对重新计算的摘要校验。"""
++        tampered = b"tampered payload"
++        signature = _SIGNER.sign(_CONTENT, _manifest(), _PRIVATE_KEY)
++        forged = signature.model_copy(
++            update={"artifact_digest": PluginSigner.compute_digest(tampered)}
++        )
+ 
+         with pytest.raises(SigningError, match="signature verification failed"):
+-            _SIGNER.verify(artifact, b"different-key")
+-
+-    def test_tampered_signature_raises(self) -> None:
+-        artifact = _make_artifact()
+-        sig = _SIGNER.sign(artifact, _KEY)
+-        # 篡改签名字节
+-        tampered = PluginSignature(
+-            algorithm=sig.algorithm,
+-            signature=bytes(b ^ 0xFF for b in sig.signature),
+-            signer=sig.signer,
+-            signed_at=sig.signed_at,
++            _SIGNER.verify(tampered, _manifest(), forged, _TRUSTED)
++
++    def test_tampered_manifest_rejected(self) -> None:
++        signature = _SIGNER.sign(_CONTENT, _manifest(), _PRIVATE_KEY)
++        escalated = _manifest(["resource.read", "platform.admin"])
++
++        with pytest.raises(SigningError, match="manifest digest mismatch"):
++            _SIGNER.verify(_CONTENT, escalated, signature, _TRUSTED)
++
++    def test_tampered_signature_bytes_rejected(self) -> None:
++        signature = _SIGNER.sign(_CONTENT, _manifest(), _PRIVATE_KEY)
++        flipped = bytes(b ^ 0xFF for b in base64.b64decode(signature.signature))
++        forged = signature.model_copy(
++            update={"signature": base64.b64encode(flipped).decode("ascii")}
+         )
+-        artifact.signature = tampered
+ 
+         with pytest.raises(SigningError, match="signature verification failed"):
+-            _SIGNER.verify(artifact, _KEY)
++            _SIGNER.verify(_CONTENT, _manifest(), forged, _TRUSTED)
+ 
++    @pytest.mark.parametrize("value", ["not base64!", "QUJD", "签名"])
++    def test_malformed_signature_rejected(self, value: str) -> None:
++        signature = _SIGNER.sign(_CONTENT, _manifest(), _PRIVATE_KEY)
++        forged = signature.model_copy(update={"signature": value})
+ 
+-class TestComputeDigest:
+-    """compute_digest 一致性。"""
++        with pytest.raises(SigningError, match="signature verification failed"):
++            _SIGNER.verify(_CONTENT, _manifest(), forged, _TRUSTED)
+ 
+-    def test_same_content_same_digest(self) -> None:
+-        content = b"identical payload"
+-        d1 = PluginSigner.compute_digest(content)
+-        d2 = PluginSigner.compute_digest(content)
++    def test_signature_by_other_key_under_trusted_key_id_rejected(self) -> None:
++        signature = _SIGNER.sign(_CONTENT, _manifest(), _OTHER_PRIVATE_KEY)
++        forged = signature.model_copy(update={"key_id": _key_id(_PRIVATE_KEY)})
+ 
+-        assert d1 == d2
++        with pytest.raises(SigningError, match="signature verification failed"):
++            _SIGNER.verify(_CONTENT, _manifest(), forged, _TRUSTED)
+ 
+-    def test_different_content_different_digest(self) -> None:
+-        d1 = PluginSigner.compute_digest(b"payload-a")
+-        d2 = PluginSigner.compute_digest(b"payload-b")
+ 
+-        assert d1 != d2
++class TestDigests:
++    """制品摘要与清单摘要。"""
+ 
+-    def test_digest_format(self) -> None:
++    def test_digest_format_and_determinism(self) -> None:
+         digest = PluginSigner.compute_digest(b"x")
+ 
++        assert digest == PluginSigner.compute_digest(b"x")
++        assert digest != PluginSigner.compute_digest(b"y")
+         assert digest.startswith("sha256:")
+-        hex_part = digest.removeprefix("sha256:")
+-        assert len(hex_part) == 64  # SHA-256 hex 长度
++        assert len(digest.removeprefix("sha256:")) == 64
++
++    def test_manifest_digest_ignores_explicit_defaults(self) -> None:
++        explicit = PluginManifest.model_validate(
++            {
++                "apiVersion": "forgemesh.io/v1alpha1",
++                "kind": "PluginManifest",
++                "metadata": {"id": "forgemesh.example.plugin", "version": "1.0.0"},
++                "spec": {
++                    "category": "policy",
++                    "permissions": ["resource.read"],
++                    "provides": [],
++                    "configuration": {},
++                },
++            }
++        )
++
++        assert PluginSigner.compute_manifest_digest(
++            explicit
++        ) == PluginSigner.compute_manifest_digest(_manifest())
++
++    def test_manifest_digest_covers_permissions(self) -> None:
++        assert PluginSigner.compute_manifest_digest(
++            _manifest(["resource.read"])
++        ) != PluginSigner.compute_manifest_digest(_manifest(["resource.write"]))
++
++
++class TestKeys:
++    """密钥生成、加载与受信任公钥。"""
++
++    def test_generated_private_key_is_pkcs8_pem(self) -> None:
++        assert _PRIVATE_KEY.startswith(b"-----BEGIN PRIVATE KEY-----")
++        assert public_key_pem(_PRIVATE_KEY).startswith(b"-----BEGIN PUBLIC KEY-----")
++
++    def test_load_public_key_accepts_str(self) -> None:
++        pem = public_key_pem(_PRIVATE_KEY).decode("ascii")
++
++        assert public_key_id(load_public_key(pem)) == _key_id(_PRIVATE_KEY)
++
++    @pytest.mark.parametrize("pem", [b"", b"garbage", b"-----BEGIN PUBLIC KEY-----\nAA==\n"])
++    def test_invalid_public_key_rejected(self, pem: bytes) -> None:
++        with pytest.raises(SigningError, match="invalid public key"):
++            load_public_key(pem)
++
++    def test_invalid_private_key_rejected(self) -> None:
++        with pytest.raises(SigningError, match="invalid private key"):
++            load_private_key(b"garbage")
++
++    def test_non_ed25519_keys_rejected(self) -> None:
++        ec_key = ec.generate_private_key(ec.SECP256R1())
++        ec_private = ec_key.private_bytes(
++            serialization.Encoding.PEM,
++            serialization.PrivateFormat.PKCS8,
++            serialization.NoEncryption(),
++        )
++        ec_public = ec_key.public_key().public_bytes(
++            serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
++        )
++
++        with pytest.raises(SigningError, match="not an Ed25519 key"):
++            load_private_key(ec_private)
++        with pytest.raises(SigningError, match="not an Ed25519 key"):
++            load_public_key(ec_public)
++
++    def test_trusted_keys_indexed_by_key_id(self) -> None:
++        keys = load_trusted_keys([public_key_pem(_PRIVATE_KEY), public_key_pem(_OTHER_PRIVATE_KEY)])
++
++        assert set(keys) == {_key_id(_PRIVATE_KEY), _key_id(_OTHER_PRIVATE_KEY)}
++
++    def test_duplicate_trusted_key_rejected(self) -> None:
++        pem = public_key_pem(_PRIVATE_KEY)
++
++        with pytest.raises(SigningError, match="duplicate trusted key"):
++            load_trusted_keys([pem, pem])
+diff --git a/tests/unit/plugins/test_signtool.py b/tests/unit/plugins/test_signtool.py
+new file mode 100644
+index 0000000..6c55dff
+--- /dev/null
++++ b/tests/unit/plugins/test_signtool.py
+@@ -0,0 +1,119 @@
++"""``python -m forgemesh.plugin.signtool`` 命令行工具测试。"""
++
++from __future__ import annotations
++
++import json
++import stat
++from pathlib import Path
++
++import pytest
++from forgemesh.plugin.signing import load_trusted_keys
++from forgemesh.plugin.signtool import main
++
++_MANIFEST = """\
++apiVersion: forgemesh.io/v1alpha1
++kind: PluginManifest
++metadata:
++  id: forgemesh.example.plugin
++  version: 1.0.0
++spec:
++  category: policy
++  permissions:
++    - resource.read
++"""
++
++
++@pytest.fixture
++def plugin(tmp_path: Path) -> Path:
++    (tmp_path / "manifest.yaml").write_text(_MANIFEST, encoding="utf-8")
++    (tmp_path / "plugin.tar.gz").write_bytes(b"artifact bytes")
++    return tmp_path
++
++
++def _keygen(directory: Path, name: str = "author.key") -> Path:
++    assert main(["keygen", "--private-key", str(directory / name)]) == 0
++    return directory / name
++
++
++def _sign_args(plugin: Path, key: Path) -> list[str]:
++    return [
++        "sign",
++        "--private-key",
++        str(key),
++        "--manifest",
++        str(plugin / "manifest.yaml"),
++        "--artifact",
++        str(plugin / "plugin.tar.gz"),
++    ]
++
++
++def _verify_args(plugin: Path, public_key: Path) -> list[str]:
++    return [
++        "verify",
++        "--public-key",
++        str(public_key),
++        "--manifest",
++        str(plugin / "manifest.yaml"),
++        "--artifact",
++        str(plugin / "plugin.tar.gz"),
++    ]
++
++
++@pytest.mark.unit
++def test_keygen_writes_private_key_owner_only_and_prints_trusted_entry(
++    tmp_path: Path, capsys: pytest.CaptureFixture[str]
++) -> None:
++    key = _keygen(tmp_path)
++
++    assert stat.S_IMODE(key.stat().st_mode) == 0o600
++    assert key.read_bytes().startswith(b"-----BEGIN PRIVATE KEY-----")
++    public_pem = (tmp_path / "author.key.pub").read_text(encoding="ascii")
++    entry = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
++    assert entry == public_pem
++    assert len(load_trusted_keys([entry])) == 1
++
++
++@pytest.mark.unit
++def test_keygen_refuses_to_overwrite(tmp_path: Path) -> None:
++    key = _keygen(tmp_path)
++    original = key.read_bytes()
++
++    assert main(["keygen", "--private-key", str(key)]) == 2
++    assert key.read_bytes() == original
++
++
++@pytest.mark.unit
++def test_sign_then_verify(plugin: Path, capsys: pytest.CaptureFixture[str]) -> None:
++    key = _keygen(plugin)
++
++    assert main(_sign_args(plugin, key)) == 0
++    document = json.loads((plugin / "plugin.tar.gz.sig").read_text(encoding="utf-8"))
++    assert document["algorithm"] == "ed25519"
++    assert main(_verify_args(plugin, plugin / "author.key.pub")) == 0
++    assert "is signed by key" in capsys.readouterr().out
++
++
++@pytest.mark.unit
++def test_verify_rejects_tampered_artifact(plugin: Path, capsys: pytest.CaptureFixture[str]) -> None:
++    key = _keygen(plugin)
++    assert main(_sign_args(plugin, key)) == 0
++    (plugin / "plugin.tar.gz").write_bytes(b"tampered bytes")
++
++    assert main(_verify_args(plugin, plugin / "author.key.pub")) == 1
++    assert "artifact digest mismatch" in capsys.readouterr().err
++
++
++@pytest.mark.unit
++def test_verify_rejects_other_public_key(plugin: Path, capsys: pytest.CaptureFixture[str]) -> None:
++    key = _keygen(plugin)
++    _keygen(plugin, "other.key")
++    assert main(_sign_args(plugin, key)) == 0
++
++    assert main(_verify_args(plugin, plugin / "other.key.pub")) == 1
++    assert "is not trusted" in capsys.readouterr().err
++
++
++@pytest.mark.unit
++def test_sign_reports_missing_files(plugin: Path, capsys: pytest.CaptureFixture[str]) -> None:
++    assert main(_sign_args(plugin, plugin / "missing.key")) == 1
++    assert "cannot read" in capsys.readouterr().err
+-- 
+2.43.0
+

@@ -1,0 +1,1126 @@
+From 17d25d8862071d4272313c513ce9d071d8a733a0 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 12 Oct 2026 12:46:52 +0000
+Subject: [PATCH 4/8] feat(plugins): load plugins through module:Class
+ entrypoints
+
+Every shipped manifest declared `python -m forgemesh_<name>` as its
+entrypoint, but no such module exists, so nothing could load a plugin
+from its manifest. The CI smoke script ignored the declared value and
+guessed which file to import instead, so the broken entrypoints went
+unnoticed.
+
+Entrypoints now use one form, `<module>:<Class>`, where the module is
+resolved inside the plugin package (the plugin directory must contain
+__init__.py; workflow-reference gains a docstring-only one). PluginSpec
+validates the format and the JSON Schema uses the same pattern.
+forgemesh.plugin.loader.load_entrypoint loads the package under a
+private module name derived from its path, imports the declared module
+and accepts only a class defined inside the plugin package, so the
+entrypoint itself cannot name objects outside the plugin (for example
+os:system). Loading still runs plugin code in-process.
+
+All ten manifests, the single-node example and the scaffold template
+now declare real entrypoints. scripts/plugin_entrypoint_smoke.py loads
+every plugin through its declared entrypoint, instantiates the class
+when its constructor needs no host-provided dependencies, and fails on
+a missing or broken entrypoint instead of skipping it.
+
+Breaking: manifests using other entrypoint forms (module commands, bare
+class names) are rejected by PluginSpec and by the schema.
+---
+ api/schemas/plugin-manifest.schema.json       |   6 +-
+ examples/single-node/plugin-vllm.yaml         |   2 +-
+ .../plugin-sdk/src/forgemesh/plugin/loader.py | 133 +++++++
+ .../src/forgemesh/plugin/manifest.py          |  24 +-
+ .../src/forgemesh/plugin/scaffold.py          |   2 +-
+ .../plugin-sdk/src/forgemesh/plugin/sdk.py    |   2 +-
+ plugins/decision-jev/manifest.yaml            |   2 +-
+ plugins/decision-rules/manifest.yaml          |   2 +-
+ plugins/decision-typesafe-jev/manifest.yaml   |   2 +-
+ plugins/gpu-nvidia/manifest.yaml              |   2 +-
+ plugins/metering-basic/manifest.yaml          |   2 +-
+ plugins/qos-basic/manifest.yaml               |   2 +-
+ plugins/runtime-tgi/manifest.yaml             |   2 +-
+ plugins/runtime-vllm/manifest.yaml            |   2 +-
+ plugins/workflow-reference/__init__.py        |   5 +
+ plugins/workflow-reference/manifest.yaml      |   2 +-
+ plugins/workflow-temporal/manifest.yaml       |   2 +-
+ scripts/plugin_entrypoint_smoke.py            | 143 +++-----
+ scripts/validate_manifests.py                 |   3 +-
+ tests/contract/test_cross_representation.py   |  44 ++-
+ tests/contract/test_plugin_contract_suite.py  |  18 +-
+ tests/unit/plugins/test_loader.py             | 327 ++++++++++++++++++
+ 22 files changed, 617 insertions(+), 112 deletions(-)
+ create mode 100644 packages/plugin-sdk/src/forgemesh/plugin/loader.py
+ create mode 100644 plugins/workflow-reference/__init__.py
+ create mode 100644 tests/unit/plugins/test_loader.py
+
+diff --git a/api/schemas/plugin-manifest.schema.json b/api/schemas/plugin-manifest.schema.json
+index 84c3997..eb8c5fb 100644
+--- a/api/schemas/plugin-manifest.schema.json
++++ b/api/schemas/plugin-manifest.schema.json
+@@ -91,7 +91,11 @@
+           "enum": ["in-process", "restricted-rpc", "sandbox"],
+           "description": "隔离级别（ADR-006）。"
+         },
+-        "entrypoint": {"type": "string"},
++        "entrypoint": {
++          "type": "string",
++          "pattern": "^[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)*:[A-Za-z_][A-Za-z0-9_]*$",
++          "description": "入口点 <模块>:<类>（如 provider:RulesProvider），模块路径相对于插件包，插件目录须含 __init__.py。"
++        },
+         "artifactDigest": {
+           "type": "string",
+           "description": "制品摘要，如 sha256:...（供应链安全）。"
+diff --git a/examples/single-node/plugin-vllm.yaml b/examples/single-node/plugin-vllm.yaml
+index b69d050..3836be7 100644
+--- a/examples/single-node/plugin-vllm.yaml
++++ b/examples/single-node/plugin-vllm.yaml
+@@ -21,7 +21,7 @@ spec:
+     - inference.deploy
+     - inference.inspect
+   isolation: restricted-rpc        # 按信任级别隔离（ADR-006）
+-  entrypoint: "python -m forgemesh_runtime_vllm"
++  entrypoint: "deploy:VLLMDeployer"
+   artifactDigest: sha256:ab12...
+   signature: cosign:...
+   configuration:
+diff --git a/packages/plugin-sdk/src/forgemesh/plugin/loader.py b/packages/plugin-sdk/src/forgemesh/plugin/loader.py
+new file mode 100644
+index 0000000..8a3c747
+--- /dev/null
++++ b/packages/plugin-sdk/src/forgemesh/plugin/loader.py
+@@ -0,0 +1,133 @@
++"""按清单 ``spec.entrypoint`` 进程内加载插件入口类（对齐 development-plan 5.7）。
++
++入口点形如 ``<模块>:<类>``（如 ``provider:RulesProvider``、``discovery:GPUDiscoverer``），
++模块路径相对于插件包：插件目录必须含 ``__init__.py``，目录名可以带连字符。插件包以按
++目录绝对路径派生的私有名称注册到 ``sys.modules``，同一目录只执行一次，不同目录互不冲突。
++
++入口点只能指向插件包内定义的类，不能借此导入插件目录之外的模块或对象。加载会在当前
++进程中执行插件代码，本模块不提供任何隔离。
++"""
++
++from __future__ import annotations
++
++import hashlib
++import importlib
++import importlib.util
++import re
++import sys
++from pathlib import Path
++from types import ModuleType
++
++from forgemesh.plugin.manifest import ENTRYPOINT_PATTERN
++
++try:  # 优先复用核心包统一异常体系
++    from forgemesh.core.errors import ForgeMeshError
++except ImportError:  # pragma: no cover - 仅在核心包未就绪时触发
++
++    class ForgeMeshError(Exception):  # type: ignore[no-redef]
++        """兜底：核心包未就绪时的统一异常基类。"""
++
++
++class EntrypointError(ForgeMeshError):
++    """入口点格式非法，或无法从插件包加载入口类。"""
++
++
++def plugin_package_name(plugin_dir: str | Path) -> str:
++    """返回插件目录在 ``sys.modules`` 中注册的包名。"""
++    resolved = Path(plugin_dir).resolve()
++    slug = re.sub(r"\W", "_", resolved.name, flags=re.ASCII)
++    digest = hashlib.sha256(str(resolved).encode("utf-8")).hexdigest()[:12]
++    return f"_forgemesh_plugin_{slug}_{digest}"
++
++
++def load_plugin_package(plugin_dir: str | Path) -> ModuleType:
++    """把插件目录作为 Python 包加载（已加载时直接返回）。
++
++    Raises:
++        EntrypointError: 目录缺少 ``__init__.py``，或执行 ``__init__.py`` 失败。
++    """
++    root = Path(plugin_dir).resolve()
++    name = plugin_package_name(root)
++    loaded = sys.modules.get(name)
++    if loaded is not None:
++        return loaded
++    init = root / "__init__.py"
++    if not init.is_file():
++        raise EntrypointError(
++            f"plugin directory {plugin_dir} is not a Python package (no __init__.py)"
++        )
++    spec = importlib.util.spec_from_file_location(
++        name, init, submodule_search_locations=[str(root)]
++    )
++    if spec is None or spec.loader is None:
++        raise EntrypointError(f"cannot create an import spec for plugin {plugin_dir}")
++    package = importlib.util.module_from_spec(spec)
++    sys.modules[name] = package
++    try:
++        spec.loader.exec_module(package)
++    except Exception as exc:
++        sys.modules.pop(name, None)
++        raise EntrypointError(
++            f"cannot import plugin package {plugin_dir}: {type(exc).__name__}: {exc}"
++        ) from exc
++    return package
++
++
++def load_entrypoint(plugin_dir: str | Path, entrypoint: str) -> type:
++    """按入口点 ``<模块>:<类>`` 从插件包加载入口类。
++
++    Args:
++        plugin_dir: 插件目录（含 ``__init__.py`` 与 ``manifest.yaml``）。
++        entrypoint: 清单 ``spec.entrypoint``。
++
++    Returns:
++        插件包内定义的入口类（未实例化）。
++
++    Raises:
++        EntrypointError: 入口点格式非法、模块无法导入、属性不存在、不是类，或类定义在
++            插件包之外。
++    """
++    if re.fullmatch(ENTRYPOINT_PATTERN, entrypoint) is None:
++        raise EntrypointError(
++            f"invalid entrypoint {entrypoint!r}: expected '<module>:<Class>' relative to the "
++            "plugin package"
++        )
++    module_path, attr = entrypoint.split(":")
++    package = load_plugin_package(plugin_dir)
++    qualified = f"{package.__name__}.{module_path}"
++    try:
++        module = importlib.import_module(qualified)
++    except ModuleNotFoundError as exc:
++        # 缺失的是入口模块自身（或其上级包），而不是插件代码依赖的其他模块。
++        if exc.name is not None and f"{qualified}.".startswith(f"{exc.name}."):
++            raise EntrypointError(f"plugin {plugin_dir} has no module {module_path!r}") from exc
++        raise EntrypointError(
++            f"cannot import module {module_path!r} of plugin {plugin_dir}: {exc}"
++        ) from exc
++    except Exception as exc:
++        raise EntrypointError(
++            f"cannot import module {module_path!r} of plugin {plugin_dir}: "
++            f"{type(exc).__name__}: {exc}"
++        ) from exc
++    try:
++        entry = getattr(module, attr)
++    except AttributeError as exc:
++        raise EntrypointError(
++            f"module {module_path!r} of plugin {plugin_dir} has no {attr!r}"
++        ) from exc
++    if not isinstance(entry, type):
++        raise EntrypointError(f"entrypoint {entrypoint!r} of plugin {plugin_dir} is not a class")
++    if not f"{entry.__module__}.".startswith(f"{package.__name__}."):
++        raise EntrypointError(
++            f"entrypoint {entrypoint!r} of plugin {plugin_dir} names "
++            f"{entry.__module__}.{entry.__qualname__}, which is not defined in the plugin package"
++        )
++    return entry
++
++
++__all__ = [
++    "EntrypointError",
++    "load_entrypoint",
++    "load_plugin_package",
++    "plugin_package_name",
++]
+diff --git a/packages/plugin-sdk/src/forgemesh/plugin/manifest.py b/packages/plugin-sdk/src/forgemesh/plugin/manifest.py
+index 641e9c3..2e503b9 100644
+--- a/packages/plugin-sdk/src/forgemesh/plugin/manifest.py
++++ b/packages/plugin-sdk/src/forgemesh/plugin/manifest.py
+@@ -9,6 +9,8 @@
+   :class:`~forgemesh.plugin.permissions.Permission` 词表且不得重复；清单不能给自己授权，
+   实际授予由管理员决定。
+ * **隔离分级**：隔离模式按信任级别由安装器裁决（ADR-006），Manifest 可声明。
++* **入口点**：``entrypoint`` 形如 ``<模块>:<类>``，模块路径相对于插件包（插件目录须含
++  ``__init__.py``），由 :func:`forgemesh.plugin.loader.load_entrypoint` 加载。
+ * **供应链**：``artifact_digest`` / ``signature`` 支持制品摘要与签名校验。
+ 
+ 非法生命周期转移抛出 :class:`forgemesh.core.errors.InvalidStateTransition`；
+@@ -17,6 +19,7 @@
+ 
+ from __future__ import annotations
+ 
++import re
+ from enum import StrEnum
+ from typing import Any
+ 
+@@ -87,6 +90,10 @@ PLUGIN_TRANSITIONS: dict[PluginLifecycleState, set[PluginLifecycleState]] = {
+     PluginLifecycleState.UNINSTALLED: set(),
+ }
+ 
++#: 入口点格式 ``<模块>:<类>``：模块是相对于插件包的点分路径，类是单个标识符。
++#: ``api/schemas/plugin-manifest.schema.json`` 使用同一正则。
++ENTRYPOINT_PATTERN = r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*:[A-Za-z_][A-Za-z0-9_]*$"
++
+ 
+ class PluginMeta(BaseModel):
+     """插件元数据。
+@@ -110,7 +117,8 @@ class PluginSpec(BaseModel):
+         requires: 依赖的能力标识。
+         permissions: 申请的权限（:class:`Permission` 词表，不得重复）；实际授予由管理员决定。
+         isolation: 隔离级别（in-process/restricted-rpc/sandbox，ADR-006）。
+-        entrypoint: 入口点标识。
++        entrypoint: 入口点 ``<模块>:<类>``（如 ``provider:RulesProvider``），模块路径相对于
++            插件包。
+         artifactDigest: 制品摘要（如 sha256:...），供应链安全。
+         signature: 制品签名（如 cosign:...），供应链安全。
+         configuration: 配置 schema 引用/默认值。
+@@ -126,7 +134,9 @@ class PluginSpec(BaseModel):
+     requires: list[str] = Field(default_factory=list)
+     permissions: list[Permission] = Field(default_factory=list)
+     isolation: str | None = Field(default=None, description="隔离级别（in-process/restricted-rpc/sandbox，ADR-006）")
+-    entrypoint: str | None = Field(default=None, description="入口点标识")
++    entrypoint: str | None = Field(
++        default=None, description="入口点 <模块>:<类>，模块路径相对于插件包"
++    )
+     artifactDigest: str | None = Field(default=None, description="制品摘要（如 sha256:...），供应链安全")
+     signature: str | None = Field(default=None, description="制品签名（如 cosign:...），供应链安全")
+     configuration: dict[str, Any] = Field(default_factory=dict)
+@@ -140,6 +150,15 @@ class PluginSpec(BaseModel):
+             raise ValueError(f"duplicate permissions: {duplicates}")
+         return value
+ 
++    @field_validator("entrypoint")
++    @classmethod
++    def _entrypoint_format(cls, value: str | None) -> str | None:
++        if value is not None and re.fullmatch(ENTRYPOINT_PATTERN, value) is None:
++            raise ValueError(
++                f"entrypoint must be '<module>:<Class>' relative to the plugin package, got {value!r}"
++            )
++        return value
++
+ 
+ class PluginManifest(BaseModel):
+     """插件清单（声明式、随插件制品分发）。
+@@ -191,6 +210,7 @@ def validate_plugin_transition(
+ 
+ 
+ __all__ = [
++    "ENTRYPOINT_PATTERN",
+     "PluginCategory",
+     "PluginMeta",
+     "PluginSpec",
+diff --git a/packages/plugin-sdk/src/forgemesh/plugin/scaffold.py b/packages/plugin-sdk/src/forgemesh/plugin/scaffold.py
+index e22a72f..899cb02 100644
+--- a/packages/plugin-sdk/src/forgemesh/plugin/scaffold.py
++++ b/packages/plugin-sdk/src/forgemesh/plugin/scaffold.py
+@@ -98,7 +98,7 @@ spec:
+   requires: []
+   permissions: []
+   isolation: restricted-rpc
+-  entrypoint: {{ class_name }}
++  entrypoint: "provider:{{ class_name }}"
+ """
+ 
+ # 各 kind 的 provider.py 模板。
+diff --git a/packages/plugin-sdk/src/forgemesh/plugin/sdk.py b/packages/plugin-sdk/src/forgemesh/plugin/sdk.py
+index 1800812..4509574 100644
+--- a/packages/plugin-sdk/src/forgemesh/plugin/sdk.py
++++ b/packages/plugin-sdk/src/forgemesh/plugin/sdk.py
+@@ -179,7 +179,7 @@ class PluginSdk:
+         if spec.isolation is None:
+             warnings.append("spec.isolation is unset; installer will default to restricted-rpc")
+         if spec.entrypoint is None:
+-            warnings.append("spec.entrypoint is unset; runtime may fail to locate provider")
++            warnings.append("spec.entrypoint is unset; the plugin cannot be loaded")
+         if not spec.compatibility:
+             warnings.append("spec.compatibility is empty; core API version pinning recommended")
+ 
+diff --git a/plugins/decision-jev/manifest.yaml b/plugins/decision-jev/manifest.yaml
+index a22d2f4..94d0cee 100644
+--- a/plugins/decision-jev/manifest.yaml
++++ b/plugins/decision-jev/manifest.yaml
+@@ -17,7 +17,7 @@ spec:
+     - resource.read
+     - decision.evaluate
+   isolation: restricted-rpc
+-  entrypoint: "python -m forgemesh_decision_jev"
++  entrypoint: "provider:JEVProvider"
+   healthCheck:
+     mode: rpc
+     timeoutMs: 3000
+diff --git a/plugins/decision-rules/manifest.yaml b/plugins/decision-rules/manifest.yaml
+index 9577ecc..ee2f048 100644
+--- a/plugins/decision-rules/manifest.yaml
++++ b/plugins/decision-rules/manifest.yaml
+@@ -17,7 +17,7 @@ spec:
+     - resource.read
+     - decision.evaluate
+   isolation: restricted-rpc
+-  entrypoint: "python -m forgemesh_decision_rules"
++  entrypoint: "provider:RulesProvider"
+   healthCheck:
+     mode: rpc
+     timeoutMs: 2000
+diff --git a/plugins/decision-typesafe-jev/manifest.yaml b/plugins/decision-typesafe-jev/manifest.yaml
+index b3e8a74..1e56b72 100644
+--- a/plugins/decision-typesafe-jev/manifest.yaml
++++ b/plugins/decision-typesafe-jev/manifest.yaml
+@@ -18,7 +18,7 @@ spec:
+     - decision.evaluate
+     - network.egress
+   isolation: restricted-rpc
+-  entrypoint: "python -m forgemesh_decision_typesafe_jev"
++  entrypoint: "provider:TypeSafeJevProvider"
+   healthCheck:
+     mode: http
+     timeoutMs: 3000
+\ No newline at end of file
+diff --git a/plugins/gpu-nvidia/manifest.yaml b/plugins/gpu-nvidia/manifest.yaml
+index 4e06692..e422b9a 100644
+--- a/plugins/gpu-nvidia/manifest.yaml
++++ b/plugins/gpu-nvidia/manifest.yaml
+@@ -18,7 +18,7 @@ spec:
+     - device.read
+     - device.partition
+   isolation: restricted-rpc
+-  entrypoint: "python -m forgemesh_gpu_nvidia"
++  entrypoint: "discovery:GPUDiscoverer"
+   healthCheck:
+     mode: rpc
+     timeoutMs: 2000
+diff --git a/plugins/metering-basic/manifest.yaml b/plugins/metering-basic/manifest.yaml
+index 8d3fb7b..3eabdbb 100644
+--- a/plugins/metering-basic/manifest.yaml
++++ b/plugins/metering-basic/manifest.yaml
+@@ -17,7 +17,7 @@ spec:
+     - metering.read
+     - event.subscribe
+   isolation: restricted-rpc
+-  entrypoint: "python -m forgemesh_metering_basic"
++  entrypoint: "provider:MeteringProvider"
+   healthCheck:
+     mode: rpc
+     timeoutMs: 2000
+diff --git a/plugins/qos-basic/manifest.yaml b/plugins/qos-basic/manifest.yaml
+index 9dcc86a..c43e0e6 100644
+--- a/plugins/qos-basic/manifest.yaml
++++ b/plugins/qos-basic/manifest.yaml
+@@ -17,7 +17,7 @@ spec:
+     - resource.read
+     - policy.evaluate
+   isolation: restricted-rpc
+-  entrypoint: "python -m forgemesh_qos_basic"
++  entrypoint: "provider:QoSProvider"
+   healthCheck:
+     mode: rpc
+     timeoutMs: 2000
+diff --git a/plugins/runtime-tgi/manifest.yaml b/plugins/runtime-tgi/manifest.yaml
+index 0dd9f60..2434475 100644
+--- a/plugins/runtime-tgi/manifest.yaml
++++ b/plugins/runtime-tgi/manifest.yaml
+@@ -19,7 +19,7 @@ spec:
+     - inference.deploy
+     - inference.inspect
+   isolation: restricted-rpc
+-  entrypoint: "python -m forgemesh_runtime_tgi"
++  entrypoint: "provider:TgiRuntimeProvider"
+   healthCheck:
+     mode: rpc
+     timeoutMs: 2000
+diff --git a/plugins/runtime-vllm/manifest.yaml b/plugins/runtime-vllm/manifest.yaml
+index 23767c9..aba8641 100644
+--- a/plugins/runtime-vllm/manifest.yaml
++++ b/plugins/runtime-vllm/manifest.yaml
+@@ -18,7 +18,7 @@ spec:
+     - inference.deploy
+     - inference.inspect
+   isolation: restricted-rpc
+-  entrypoint: "python -m forgemesh_runtime_vllm"
++  entrypoint: "deploy:VLLMDeployer"
+   healthCheck:
+     mode: rpc
+     timeoutMs: 2000
+diff --git a/plugins/workflow-reference/__init__.py b/plugins/workflow-reference/__init__.py
+new file mode 100644
+index 0000000..210d8c1
+--- /dev/null
++++ b/plugins/workflow-reference/__init__.py
+@@ -0,0 +1,5 @@
++"""forgemesh.workflow.reference 插件包（参考工作流运行时）。
++
++目录使用连字符命名（``workflow-reference``）以符合 manifest 约定；宿主按 manifest 的
++``entrypoint`` 经 :mod:`forgemesh.plugin.loader` 把本目录作为包加载。
++"""
+diff --git a/plugins/workflow-reference/manifest.yaml b/plugins/workflow-reference/manifest.yaml
+index a757271..955a4d5 100644
+--- a/plugins/workflow-reference/manifest.yaml
++++ b/plugins/workflow-reference/manifest.yaml
+@@ -18,7 +18,7 @@ spec:
+     - resource.write
+     - workflow.execute
+   isolation: restricted-rpc
+-  entrypoint: "python -m forgemesh_workflow_reference"
++  entrypoint: "provider:ReferenceWorkflowRuntime"
+   healthCheck:
+     mode: rpc
+     timeoutMs: 2000
+diff --git a/plugins/workflow-temporal/manifest.yaml b/plugins/workflow-temporal/manifest.yaml
+index a39ce55..b26b1d4 100644
+--- a/plugins/workflow-temporal/manifest.yaml
++++ b/plugins/workflow-temporal/manifest.yaml
+@@ -22,7 +22,7 @@ spec:
+     - resource.read
+     - workflow.execute
+   isolation: restricted-rpc
+-  entrypoint: "python -m forgemesh_workflow_temporal"
++  entrypoint: "provider:TemporalWorkflowProvider"
+   healthCheck:
+     mode: rpc
+     timeoutMs: 2000
+diff --git a/scripts/plugin_entrypoint_smoke.py b/scripts/plugin_entrypoint_smoke.py
+index 2319255..5fc2ca3 100644
+--- a/scripts/plugin_entrypoint_smoke.py
++++ b/scripts/plugin_entrypoint_smoke.py
+@@ -1,27 +1,25 @@
+-"""插件入口冒烟测试（进程内 importlib 加载，CI WP-A2）。
++"""插件入口冒烟测试（进程内加载，CI architecture-docs job 调用）。
+ 
+-加载机制与 ``tests/unit/plugins/conftest.py`` 同款：
++对 ``plugins/*/manifest.yaml`` 逐个执行：
+ 
+-- 遍历 ``plugins/*/manifest.yaml``，读取 ``spec.entrypoint``（缺失则 SKIP 计数）；
+-- 目录含 ``provider.py`` 且无相对导入（``from .`` / ``import .``）→ 按文件路径加载
+-  provider.py；
+-- 否则含 ``__init__.py`` → 作为包加载（``submodule_search_locations`` 指向插件目录，
+-  使 ``from .submodule import ...`` 相对导入可用，如 metering-basic 的 provider.py
+-  依赖 ``.usage``）；
+-- 断言模块可加载、且存在至少一个公有类（``inspect.isclass`` 且不以下划线开头）。
++1. 用 :class:`forgemesh.plugin.manifest.PluginManifest` 解析清单（含权限词表与入口点
++   格式校验）；
++2. ``spec.entrypoint`` 必须声明，并经 :func:`forgemesh.plugin.loader.load_entrypoint`
++   按声明加载入口类：插件目录作为包加载，入口类必须定义在插件包内；
++3. 基本健康检查：入口类构造器没有必填参数时实例化一次；需要宿主注入依赖（客户端、
++   存储、配置等）时不实例化，只报告需要哪些参数。
+ 
+-加载前把 ``packages/*/src`` 前置注入 ``sys.path``（PEP 420 命名空间包，
+-与根级 conftest.py 一致），使插件可导入 ``forgemesh.*`` 契约包。
++逐插件输出 OK/FAIL 明细与汇总，任一插件失败即以退出码 1 结束。
++
++加载前把 ``packages/*/src`` 前置注入 ``sys.path``（PEP 420 命名空间包，与根级
++conftest.py 一致），使插件可导入 ``forgemesh.*`` 契约包。
+ """
+ 
+ from __future__ import annotations
+ 
+-import importlib.util
+ import inspect
+-import re
+ import sys
+ from pathlib import Path
+-from typing import Any
+ 
+ import yaml
+ 
+@@ -42,102 +40,65 @@ def _inject_package_sources() -> None:
+                 sys.path.insert(0, resolved)
+ 
+ 
+-RELATIVE_IMPORT_RE = re.compile(r"^\s*(?:from|import)\s*\.", re.MULTILINE)
++def _display(path: Path) -> str:
++    try:
++        return str(path.relative_to(REPO_ROOT))
++    except ValueError:
++        return str(path)
+ 
+ 
+-def _load_plugin(plugin_dir: Path, module_name: str) -> Any:
+-    """按 conftest 同款机制加载插件主模块。
++def _required_parameters(entry: type) -> list[str]:
++    """入口类构造器中没有默认值的参数名。"""
++    parameters = inspect.signature(entry).parameters.values()
++    return [
++        p.name
++        for p in parameters
++        if p.default is inspect.Parameter.empty
++        and p.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
++    ]
+ 
+-    策略：provider.py 无相对导入时按单文件加载；含相对导入（如
+-    metering-basic 依赖 ``.usage``）或无 provider.py 时按包加载。
+ 
+-    Raises:
+-        ImportError: 目录无可加载入口，或加载过程失败。
+-    """
+-    provider = plugin_dir / "provider.py"
+-    init = plugin_dir / "__init__.py"
+-    if provider.is_file() and not RELATIVE_IMPORT_RE.search(provider.read_text(encoding="utf-8")):
+-        spec = importlib.util.spec_from_file_location(module_name, provider)
+-    elif init.is_file():
+-        spec = importlib.util.spec_from_file_location(
+-            module_name, init, submodule_search_locations=[str(plugin_dir)]
++def _check_plugin(plugin_dir: Path) -> str:
++    """加载并检查一个插件，返回检查结论；任何问题都以异常报告。"""
++    from forgemesh.plugin.loader import load_entrypoint
++    from forgemesh.plugin.manifest import PluginManifest
++
++    raw = yaml.safe_load((plugin_dir / "manifest.yaml").read_text(encoding="utf-8"))
++    entrypoint = PluginManifest.model_validate(raw).spec.entrypoint
++    if entrypoint is None:
++        raise ValueError("spec.entrypoint is not declared")
++    entry = load_entrypoint(plugin_dir, entrypoint)
++    required = _required_parameters(entry)
++    if required:
++        return (
++            f"{entrypoint} loaded; not instantiated, constructor needs host-provided "
++            f"{', '.join(required)}"
+         )
+-    else:
+-        raise ImportError(f"插件目录无可加载入口（provider.py/__init__.py）: {plugin_dir}")
+-    if spec is None or spec.loader is None:
+-        raise ImportError(f"无法为插件创建导入 spec: {plugin_dir}")
+-    module = importlib.util.module_from_spec(spec)
+-    sys.modules[module_name] = module
+-    spec.loader.exec_module(module)
+-    return module
+-
+-
+-def _public_classes(module: Any) -> list[str]:
+-    """返回模块内可见的公有类名。
+-
+-    优先列出本模块（含其子模块）定义的类；纯 re-export 的包 ``__init__``
+-    回退为列出全部公有类（满足"存在任一公有类"的冒烟断言）。
+-    """
+-    all_public = sorted(
+-        name
+-        for name, obj in vars(module).items()
+-        if inspect.isclass(obj) and not name.startswith("_")
+-    )
+-    own = [
+-        name
+-        for name in all_public
+-        if str(getattr(vars(module)[name], "__module__", "")).startswith(module.__name__)
+-    ]
+-    return own or all_public
++    entry()
++    return f"{entrypoint} loaded and instantiated"
+ 
+ 
+-def main() -> int:
+-    """入口：逐插件输出 OK/FAIL/SKIP 明细，任一 FAIL 以退出码 1 结束。"""
++def main(plugins_dir: Path = PLUGINS_DIR) -> int:
++    """入口：逐插件输出 OK/FAIL 明细，任一 FAIL 以退出码 1 结束。"""
+     _inject_package_sources()
+     plugin_dirs = sorted(
+-        d for d in PLUGINS_DIR.iterdir() if d.is_dir() and (d / "manifest.yaml").is_file()
++        d for d in plugins_dir.iterdir() if d.is_dir() and (d / "manifest.yaml").is_file()
+     )
+     if not plugin_dirs:
+-        print(f"ERROR: {PLUGINS_DIR.relative_to(REPO_ROOT)}/ 下未找到任何插件 manifest",
+-              file=sys.stderr)
++        print(f"ERROR: {_display(plugins_dir)}/ 下未找到任何插件 manifest", file=sys.stderr)
+         return 1
+ 
+     failed = 0
+-    skipped = 0
+     for plugin_dir in plugin_dirs:
+-        rel = plugin_dir.relative_to(REPO_ROOT)
+-        try:
+-            manifest = yaml.safe_load((plugin_dir / "manifest.yaml").read_text(encoding="utf-8"))
+-        except (OSError, yaml.YAMLError) as exc:
+-            print(f"FAIL: {rel}: manifest 读取失败: {exc}")
+-            failed += 1
+-            continue
+-
+-        entrypoint = ""
+-        if isinstance(manifest, dict):
+-            spec = manifest.get("spec")
+-            if isinstance(spec, dict) and isinstance(spec.get("entrypoint"), str):
+-                entrypoint = spec["entrypoint"].strip()
+-        if not entrypoint:
+-            print(f"SKIP: {rel}: spec.entrypoint 缺失，跳过冒烟")
+-            skipped += 1
+-            continue
+-
+-        module_name = plugin_dir.name.replace("-", "_") + "_smoke"
+         try:
+-            module = _load_plugin(plugin_dir, module_name)
+-            classes = _public_classes(module)
+-            if not classes:
+-                raise ImportError("模块加载成功但未定义任何公有类")
++            outcome = _check_plugin(plugin_dir)
+         except Exception as exc:
+-            print(f"FAIL: {rel} (entrypoint={entrypoint!r}): {type(exc).__name__}: {exc}")
++            print(f"FAIL: {_display(plugin_dir)}: {type(exc).__name__}: {exc}")
+             failed += 1
+-            continue
+-        shown = ", ".join(classes[:5]) + ("..." if len(classes) > 5 else "")
+-        print(f"OK: {rel} (entrypoint={entrypoint!r}): 已加载 {module_name}，公有类: {shown}")
++        else:
++            print(f"OK: {_display(plugin_dir)}: {outcome}")
+ 
+-    passed = len(plugin_dirs) - failed - skipped
+-    print(f"summary: {passed} passed, {skipped} skipped, {failed} failed")
++    print(f"summary: {len(plugin_dirs) - failed} passed, {failed} failed")
+     return 1 if failed else 0
+ 
+ 
+diff --git a/scripts/validate_manifests.py b/scripts/validate_manifests.py
+index 89c41d4..94eb04f 100644
+--- a/scripts/validate_manifests.py
++++ b/scripts/validate_manifests.py
+@@ -13,7 +13,8 @@
+ 
+ schema 之外追加两条平台约定检查（manifest 必须满足而 schema 未强制）：
+ 
+-- ``spec.entrypoint`` 必填且为非空字符串（插件入口冒烟的依据）；
++- ``spec.entrypoint`` 必填且为非空字符串（插件入口冒烟按它加载；``<模块>:<类>``
++  格式由 schema 的 pattern 约束）；
+ - ``metadata.version`` 必须是语义化版本 MAJOR.MINOR.PATCH（可选预发布/构建后缀）。
+ 
+ 任一失败打印"文件名 + 校验错误路径"并以退出码 1 结束；
+diff --git a/tests/contract/test_cross_representation.py b/tests/contract/test_cross_representation.py
+index 82a48f4..51f1e95 100644
+--- a/tests/contract/test_cross_representation.py
++++ b/tests/contract/test_cross_representation.py
+@@ -25,7 +25,7 @@ import yaml
+ from forgemesh.core.errors import ForgeMeshError, GovernanceBypassError
+ from forgemesh.core.objects import ObjectMeta
+ from forgemesh.decision.provider import DecisionRequest
+-from forgemesh.plugin.manifest import PluginSpec
++from forgemesh.plugin.manifest import ENTRYPOINT_PATTERN, PluginSpec
+ from forgemesh.plugin.permissions import Permission
+ from forgemesh.policy.api import PolicyDecision
+ from forgemesh.resource.inference import (
+@@ -147,13 +147,13 @@ def test_plugin_spec_supply_chain_fields() -> None:
+     spec = PluginSpec(
+         category="provider",
+         isolation="sandbox",
+-        entrypoint="main",
++        entrypoint="provider:Main",
+         artifactDigest="sha256:abc",
+         signature="cosign:xyz",
+     )
+     dumped = spec.model_dump(by_alias=True)
+     assert dumped["isolation"] == "sandbox"
+-    assert dumped["entrypoint"] == "main"
++    assert dumped["entrypoint"] == "provider:Main"
+     assert dumped["artifactDigest"] == "sha256:abc"
+     assert dumped["signature"] == "cosign:xyz"
+     # 所有供应链字段都在输出 dict 中
+@@ -221,6 +221,44 @@ def test_plugin_permissions_rejected_by_model_and_schema(permissions: list[str])
+         PluginSpec.model_validate(manifest["spec"])
+ 
+ 
++@pytest.mark.contract
++def test_plugin_entrypoint_schema_pattern_matches_model() -> None:
++    """Schema 的入口点正则与模型使用的 ENTRYPOINT_PATTERN 相同。"""
++    schema = _load_json(SCHEMAS_DIR / "plugin-manifest.schema.json")
++    entrypoint = schema["properties"]["spec"]["properties"]["entrypoint"]
++    assert entrypoint["pattern"] == ENTRYPOINT_PATTERN
++
++
++@pytest.mark.contract
++@pytest.mark.parametrize(
++    ("entrypoint", "valid"),
++    [
++        ("provider:RulesProvider", True),
++        ("deploy:VLLMDeployer", True),
++        ("sub.module:Entry", True),
++        ("python -m forgemesh_decision_rules", False),
++        ("RulesProvider", False),
++        ("provider:", False),
++        (":RulesProvider", False),
++        ("provider:Rules.Provider", False),
++        ("../provider:RulesProvider", False),
++    ],
++)
++def test_plugin_entrypoint_format_same_in_model_and_schema(entrypoint: str, valid: bool) -> None:
++    """模型与 Schema 对入口点格式的裁决一致。"""
++    validator = Draft202012Validator(_load_json(SCHEMAS_DIR / "plugin-manifest.schema.json"))
++    manifest = _plugin_manifest_with_permissions(["resource.read"])
++    manifest["spec"]["entrypoint"] = entrypoint
++
++    schema_accepts = not list(validator.iter_errors(manifest))
++    assert schema_accepts is valid
++    if valid:
++        PluginSpec.model_validate(manifest["spec"])
++    else:
++        with pytest.raises(ValidationError, match="entrypoint must be '<module>:<Class>'"):
++            PluginSpec.model_validate(manifest["spec"])
++
++
+ # ---------------------------------------------------------------------------
+ # 4. PolicyDecision 三态一致性
+ # ---------------------------------------------------------------------------
+diff --git a/tests/contract/test_plugin_contract_suite.py b/tests/contract/test_plugin_contract_suite.py
+index b038e20..13ce463 100644
+--- a/tests/contract/test_plugin_contract_suite.py
++++ b/tests/contract/test_plugin_contract_suite.py
+@@ -23,6 +23,7 @@ from forgemesh.plugin.isolation import (
+     IsolationMode,
+     TrustLevel,
+ )
++from forgemesh.plugin.loader import load_entrypoint
+ from forgemesh.plugin.manifest import (
+     PLUGIN_TRANSITIONS,
+     PluginCategory,
+@@ -67,7 +68,7 @@ def _make_manifest(**spec_overrides: Any) -> PluginManifest:
+         "provides": ["test-plugin"],
+         "permissions": ["metering.read"],
+         "isolation": "restricted-rpc",
+-        "entrypoint": "TestPlugin",
++        "entrypoint": "provider:TestPlugin",
+     }
+     spec_fields.update(spec_overrides)
+     return PluginManifest(
+@@ -175,6 +176,21 @@ class TestProviderContract:
+         raw = yaml.safe_load((root / "manifest.yaml").read_text(encoding="utf-8"))
+         assert raw["spec"]["category"] == KIND_CATEGORY_MAP[kind]
+ 
++    @pytest.mark.contract
++    @pytest.mark.parametrize("kind", SUPPORTED_KINDS, ids=SUPPORTED_KINDS)
++    def test_scaffold_entrypoint_loads(self, kind: str, tmp_path: Path) -> None:
++        """生成的 manifest 声明的入口点应能按声明加载并实例化。"""
++        root = ScaffoldGenerator().generate(f"test-{kind}-plugin", kind, tmp_path)
++        import yaml
++
++        raw = yaml.safe_load((root / "manifest.yaml").read_text(encoding="utf-8"))
++        manifest = PluginManifest.model_validate(raw)
++        assert manifest.spec.entrypoint == f"provider:Test{kind.capitalize()}Plugin"
++
++        entry = load_entrypoint(root, manifest.spec.entrypoint)
++        assert entry.__name__ == f"Test{kind.capitalize()}Plugin"
++        entry()
++
+     @pytest.mark.contract
+     @pytest.mark.parametrize("kind", SUPPORTED_KINDS, ids=SUPPORTED_KINDS)
+     def test_provider_contract_methods(self, kind: str, tmp_path: Path) -> None:
+diff --git a/tests/unit/plugins/test_loader.py b/tests/unit/plugins/test_loader.py
+new file mode 100644
+index 0000000..1ae4f7c
+--- /dev/null
++++ b/tests/unit/plugins/test_loader.py
+@@ -0,0 +1,327 @@
++"""插件入口点加载单元测试（对齐 development-plan 5.7）。
++
++覆盖：
++
++* 仓库内全部插件都能按清单声明的入口点加载，入口类定义在各自插件包内；
++* 清单入口点格式：拒绝 ``python -m ...``、裸类名等写法；
++* 加载器：连字符目录、插件内相对导入、子包模块、同一目录只加载一次、同名目录互不冲突；
++* 拒绝：缺 ``__init__.py``、模块不存在、入口点指向插件外的模块或类、属性不存在、不是类、
++  插件代码导入失败（失败的插件包不留在 ``sys.modules``）；
++* CI 冒烟脚本：全部插件通过时退出码 0，任一入口点损坏或构造失败时退出码 1。
++"""
++
++from __future__ import annotations
++
++import importlib.util
++import sys
++from collections.abc import Iterator
++from pathlib import Path
++from types import ModuleType
++
++import pytest
++import yaml
++from forgemesh.plugin.loader import (
++    EntrypointError,
++    load_entrypoint,
++    load_plugin_package,
++    plugin_package_name,
++)
++from forgemesh.plugin.manifest import PluginManifest, PluginSpec
++from pydantic import ValidationError
++
++_REPO_ROOT = Path(__file__).resolve().parents[3]
++_PLUGIN_DIRS = sorted(p.parent for p in (_REPO_ROOT / "plugins").glob("*/manifest.yaml"))
++_ENTRY = "class Entry:\n    pass\n"
++
++
++@pytest.fixture(autouse=True)
++def _forget_loaded_plugins() -> Iterator[None]:
++    before = set(sys.modules)
++    yield
++    for name in set(sys.modules) - before:
++        if name.startswith("_forgemesh_plugin_"):
++            del sys.modules[name]
++
++
++def _write_plugin(root: Path, files: dict[str, str]) -> Path:
++    for relative, content in files.items():
++        path = root / relative
++        path.parent.mkdir(parents=True, exist_ok=True)
++        path.write_text(content, encoding="utf-8")
++    return root
++
++
++def _manifest_yaml(entrypoint: str | None) -> str:
++    spec: dict[str, object] = {"category": "policy", "permissions": ["resource.read"]}
++    if entrypoint is not None:
++        spec["entrypoint"] = entrypoint
++    return yaml.safe_dump(
++        {
++            "apiVersion": "forgemesh.io/v1alpha1",
++            "kind": "PluginManifest",
++            "metadata": {"id": "forgemesh.policy.example", "version": "0.1.0"},
++            "spec": spec,
++        }
++    )
++
++
++class TestShippedPlugins:
++    """仓库内插件按清单声明的入口点加载。"""
++
++    def test_all_plugins_found(self) -> None:
++        assert len(_PLUGIN_DIRS) == 10
++
++    @pytest.mark.parametrize("plugin_dir", _PLUGIN_DIRS, ids=lambda p: p.name)
++    def test_declared_entrypoint_loads(self, plugin_dir: Path) -> None:
++        raw = yaml.safe_load((plugin_dir / "manifest.yaml").read_text(encoding="utf-8"))
++        entrypoint = PluginManifest.model_validate(raw).spec.entrypoint
++        assert entrypoint is not None
++
++        entry = load_entrypoint(plugin_dir, entrypoint)
++
++        module_path, class_name = entrypoint.split(":")
++        assert entry.__name__ == class_name
++        assert entry.__module__ == f"{plugin_package_name(plugin_dir)}.{module_path}"
++
++
++class TestManifestEntrypointFormat:
++    """清单 ``spec.entrypoint`` 的格式校验。"""
++
++    @pytest.mark.parametrize(
++        "entrypoint", ["provider:RulesProvider", "impl.core:Entry", "_private:_Entry"]
++    )
++    def test_module_colon_class_accepted(self, entrypoint: str) -> None:
++        assert PluginSpec(category="policy", entrypoint=entrypoint).entrypoint == entrypoint
++
++    @pytest.mark.parametrize(
++        "entrypoint",
++        [
++            "python -m forgemesh_decision_rules",
++            "RulesProvider",
++            "provider.RulesProvider",
++            "provider:Rules-Provider",
++            "plugins/provider:Entry",
++            "provider:RulesProvider\n",
++            "",
++        ],
++    )
++    def test_other_forms_rejected(self, entrypoint: str) -> None:
++        with pytest.raises(ValidationError, match="entrypoint must be '<module>:<Class>'"):
++            PluginSpec(category="policy", entrypoint=entrypoint)
++
++    def test_entrypoint_optional_in_model(self) -> None:
++        assert PluginSpec(category="policy").entrypoint is None
++
++
++class TestLoadEntrypoint:
++    """加载器的正常路径。"""
++
++    def test_hyphenated_directory_with_relative_import(self, tmp_path: Path) -> None:
++        plugin = _write_plugin(
++            tmp_path / "my-plugin",
++            {
++                "__init__.py": "",
++                "helpers.py": "VALUE = 42\n",
++                "provider.py": "from .helpers import VALUE\n\n\nclass Entry:\n    value = VALUE\n",
++            },
++        )
++
++        assert load_entrypoint(plugin, "provider:Entry").value == 42
++
++    def test_module_in_subpackage(self, tmp_path: Path) -> None:
++        plugin = _write_plugin(
++            tmp_path / "plugin",
++            {"__init__.py": "", "impl/__init__.py": "", "impl/core.py": _ENTRY},
++        )
++
++        assert load_entrypoint(plugin, "impl.core:Entry").__name__ == "Entry"
++
++    def test_same_directory_loaded_once(self, tmp_path: Path) -> None:
++        plugin = _write_plugin(tmp_path / "plugin", {"__init__.py": "", "provider.py": _ENTRY})
++
++        first = load_entrypoint(plugin, "provider:Entry")
++
++        assert load_entrypoint(plugin, "provider:Entry") is first
++        assert load_plugin_package(plugin) is sys.modules[plugin_package_name(plugin)]
++
++    def test_directories_with_same_name_do_not_collide(self, tmp_path: Path) -> None:
++        first = _write_plugin(
++            tmp_path / "a" / "plugin",
++            {"__init__.py": "", "provider.py": "class Entry:\n    origin = 'a'\n"},
++        )
++        second = _write_plugin(
++            tmp_path / "b" / "plugin",
++            {"__init__.py": "", "provider.py": "class Entry:\n    origin = 'b'\n"},
++        )
++
++        assert plugin_package_name(first) != plugin_package_name(second)
++        assert load_entrypoint(first, "provider:Entry").origin == "a"
++        assert load_entrypoint(second, "provider:Entry").origin == "b"
++
++
++class TestLoadEntrypointRejected:
++    """加载器拒绝的情形。"""
++
++    @pytest.fixture
++    def plugin(self, tmp_path: Path) -> Path:
++        return _write_plugin(
++            tmp_path / "plugin",
++            {
++                "__init__.py": "",
++                "provider.py": (
++                    "from collections import OrderedDict\n\n\n"
++                    "def factory():\n    return None\n\n\n" + _ENTRY
++                ),
++            },
++        )
++
++    @pytest.mark.parametrize(
++        "entrypoint", ["python -m forgemesh_x", "Entry", "provider:", "../provider:Entry"]
++    )
++    def test_invalid_format(self, plugin: Path, entrypoint: str) -> None:
++        with pytest.raises(EntrypointError, match="invalid entrypoint"):
++            load_entrypoint(plugin, entrypoint)
++
++    def test_directory_without_init(self, tmp_path: Path) -> None:
++        plugin = _write_plugin(tmp_path / "plugin", {"provider.py": _ENTRY})
++
++        with pytest.raises(EntrypointError, match=r"not a Python package \(no __init__.py\)"):
++            load_entrypoint(plugin, "provider:Entry")
++
++    def test_missing_module(self, plugin: Path) -> None:
++        with pytest.raises(EntrypointError, match="has no module 'missing'"):
++            load_entrypoint(plugin, "missing:Entry")
++
++    def test_module_outside_plugin_not_reachable(self, plugin: Path) -> None:
++        """模块路径只在插件包内解析，``os:system`` 不会解析到标准库 os。"""
++        with pytest.raises(EntrypointError, match="has no module 'os'"):
++            load_entrypoint(plugin, "os:system")
++
++    def test_class_defined_outside_plugin(self, plugin: Path) -> None:
++        with pytest.raises(EntrypointError, match="collections.OrderedDict, which is not defined"):
++            load_entrypoint(plugin, "provider:OrderedDict")
++
++    def test_missing_attribute(self, plugin: Path) -> None:
++        with pytest.raises(EntrypointError, match="has no 'Missing'"):
++            load_entrypoint(plugin, "provider:Missing")
++
++    def test_not_a_class(self, plugin: Path) -> None:
++        with pytest.raises(EntrypointError, match="is not a class"):
++            load_entrypoint(plugin, "provider:factory")
++
++    def test_missing_dependency_of_plugin_code(self, tmp_path: Path) -> None:
++        plugin = _write_plugin(
++            tmp_path / "plugin",
++            {"__init__.py": "", "provider.py": "import forgemesh_no_such_dependency\n" + _ENTRY},
++        )
++
++        with pytest.raises(
++            EntrypointError, match="cannot import module 'provider'.*forgemesh_no_such_dependency"
++        ) as excinfo:
++            load_entrypoint(plugin, "provider:Entry")
++        assert isinstance(excinfo.value.__cause__, ModuleNotFoundError)
++
++    def test_error_raised_by_plugin_module(self, tmp_path: Path) -> None:
++        plugin = _write_plugin(
++            tmp_path / "plugin", {"__init__.py": "", "provider.py": "raise LookupError('boom')\n"}
++        )
++
++        with pytest.raises(EntrypointError, match="LookupError: boom"):
++            load_entrypoint(plugin, "provider:Entry")
++
++    def test_failed_package_not_cached(self, tmp_path: Path) -> None:
++        plugin = _write_plugin(
++            tmp_path / "plugin",
++            {"__init__.py": "raise ValueError('broken init')\n", "provider.py": _ENTRY},
++        )
++
++        with pytest.raises(EntrypointError, match="cannot import plugin package.*broken init"):
++            load_entrypoint(plugin, "provider:Entry")
++        assert plugin_package_name(plugin) not in sys.modules
++
++        (plugin / "__init__.py").write_text("", encoding="utf-8")
++        assert load_entrypoint(plugin, "provider:Entry").__name__ == "Entry"
++
++
++def _smoke_script() -> ModuleType:
++    path = _REPO_ROOT / "scripts" / "plugin_entrypoint_smoke.py"
++    spec = importlib.util.spec_from_file_location("_plugin_entrypoint_smoke", path)
++    assert spec is not None and spec.loader is not None
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    return module
++
++
++class TestEntrypointSmokeScript:
++    """``scripts/plugin_entrypoint_smoke.py``（CI 插件入口冒烟）。"""
++
++    @pytest.fixture(autouse=True)
++    def _restore_sys_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
++        monkeypatch.setattr(sys, "path", list(sys.path))
++
++    def test_shipped_plugins_pass(self, capsys: pytest.CaptureFixture[str]) -> None:
++        assert _smoke_script().main() == 0
++
++        out = capsys.readouterr().out
++        assert "summary: 10 passed, 0 failed" in out
++        assert "OK: plugins/decision-rules: provider:RulesProvider loaded and instantiated" in out
++        assert "needs host-provided client" in out
++
++    def test_broken_or_missing_entrypoint_fails(
++        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
++    ) -> None:
++        for name, entrypoint in (("good", "provider:Entry"), ("broken", "provider:Missing")):
++            _write_plugin(
++                tmp_path / name,
++                {
++                    "__init__.py": "",
++                    "provider.py": _ENTRY,
++                    "manifest.yaml": _manifest_yaml(entrypoint),
++                },
++            )
++        _write_plugin(
++            tmp_path / "unset", {"__init__.py": "", "manifest.yaml": _manifest_yaml(None)}
++        )
++
++        assert _smoke_script().main(tmp_path) == 1
++
++        out = capsys.readouterr().out
++        assert f"OK: {tmp_path / 'good'}: provider:Entry loaded and instantiated" in out
++        assert f"FAIL: {tmp_path / 'broken'}: EntrypointError:" in out
++        assert f"FAIL: {tmp_path / 'unset'}: ValueError: spec.entrypoint is not declared" in out
++        assert "summary: 1 passed, 2 failed" in out
++
++    def test_constructor_failure_fails(
++        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
++    ) -> None:
++        _write_plugin(
++            tmp_path / "plugin",
++            {
++                "__init__.py": "",
++                "provider.py": (
++                    "class Entry:\n    def __init__(self):\n        raise LookupError('no backend')\n"
++                ),
++                "manifest.yaml": _manifest_yaml("provider:Entry"),
++            },
++        )
++
++        assert _smoke_script().main(tmp_path) == 1
++        assert "LookupError: no backend" in capsys.readouterr().out
++
++    def test_host_dependencies_not_instantiated(
++        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
++    ) -> None:
++        _write_plugin(
++            tmp_path / "plugin",
++            {
++                "__init__.py": "",
++                "provider.py": (
++                    "class Entry:\n    def __init__(self, store, *, clock=None):\n"
++                    "        raise AssertionError('must not be constructed')\n"
++                ),
++                "manifest.yaml": _manifest_yaml("provider:Entry"),
++            },
++        )
++
++        assert _smoke_script().main(tmp_path) == 0
++        assert "not instantiated, constructor needs host-provided store" in capsys.readouterr().out
+-- 
+2.43.0
+

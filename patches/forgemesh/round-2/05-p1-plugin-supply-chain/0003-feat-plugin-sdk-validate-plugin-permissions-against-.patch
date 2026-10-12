@@ -1,0 +1,1071 @@
+From 78a62dce6dd62c389a2afab82cb26ee316c5e0d5 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 12 Oct 2026 12:35:58 +0000
+Subject: [PATCH 3/8] feat(plugin-sdk): validate plugin permissions against one
+ vocabulary
+
+Manifests request dotted permissions such as network.egress and
+resource.write, while IsolationGuard compared free-form names like
+"database", "network" and "admin". The two vocabularies never met: a
+manifest requesting network.egress passed the restricted-rpc check, an
+UNTRUSTED plugin could request platform.admin, and a manifest could list
+any string at all.
+
+Add forgemesh.plugin.permissions.Permission as the single vocabulary.
+PluginSpec.permissions is now list[Permission] and rejects unknown and
+duplicate names. The plugin-manifest JSON Schema enumerates the same
+values (a contract test keeps the enum equal to the Python vocabulary),
+so scripts/validate_manifests.py enforces it through the schema.
+IsolationGuard.check_access and validate_manifest take vocabulary names
+and raise IsolationError for names outside it instead of letting them
+through as harmless.
+
+Breaking: manifests and callers that use free-form names (metrics:read,
+database, admin, ...) must switch to the dotted names. All ten shipped
+manifests already use vocabulary names.
+---
+ api/schemas/plugin-manifest.schema.json       | 25 +++++-
+ .../src/forgemesh/plugin/__init__.py          |  3 +
+ .../src/forgemesh/plugin/isolation.py         | 73 ++++++++++------
+ .../src/forgemesh/plugin/manifest.py          | 19 +++-
+ .../src/forgemesh/plugin/permissions.py       | 51 +++++++++++
+ scripts/validate_manifests.py                 |  2 +
+ tests/compat/test_plugin_compatibility.py     | 32 +++----
+ tests/compat/test_plugin_conformance_v11.py   | 15 ++--
+ tests/contract/test_cross_representation.py   | 39 ++++++++-
+ tests/contract/test_plugin_contract_suite.py  | 56 ++++++++----
+ tests/security/test_plugin_permissions.py     | 64 +++++++++-----
+ .../unit/controlplane/test_plugin_manager.py  | 18 ++--
+ tests/unit/plugins/test_isolation.py          | 82 ++++++++++-------
+ tests/unit/plugins/test_permissions.py        | 87 +++++++++++++++++++
+ 14 files changed, 424 insertions(+), 142 deletions(-)
+ create mode 100644 packages/plugin-sdk/src/forgemesh/plugin/permissions.py
+ create mode 100644 tests/unit/plugins/test_permissions.py
+
+diff --git a/api/schemas/plugin-manifest.schema.json b/api/schemas/plugin-manifest.schema.json
+index ab21a6a..84c3997 100644
+--- a/api/schemas/plugin-manifest.schema.json
++++ b/api/schemas/plugin-manifest.schema.json
+@@ -2,7 +2,7 @@
+   "$schema": "https://json-schema.org/draft/2020-12/schema",
+   "$id": "https://forgemesh.io/schemas/plugin-manifest.schema.json",
+   "title": "PluginManifest",
+-  "description": "ForgeMesh 插件清单。对齐 architecture 8.2 与 development-plan 5.7 / 6.3。声明能力(provides)与依赖(requires)及最小权限集合；声明能力≠实际具备，运行时须经探测与验证（ADR-006 隔离）。",
++  "description": "ForgeMesh 插件清单。对齐 architecture 8.2 与 development-plan 5.7 / 6.3。声明能力(provides)、依赖(requires)与权限申请(permissions，实际授予由管理员决定)；声明能力≠实际具备，运行时须经探测与验证（ADR-006 隔离）。",
+   "type": "object",
+   "required": ["apiVersion", "kind", "metadata", "spec"],
+   "additionalProperties": false,
+@@ -55,8 +55,27 @@
+         },
+         "permissions": {
+           "type": "array",
+-          "description": "最小权限集合（按信任级别授予，ADR-006）。",
+-          "items": {"type": "string", "minLength": 1},
++          "description": "插件申请的权限，取值与 forgemesh.plugin.permissions.Permission 词表一致；清单不能给自己授权，实际授予由管理员的授予记录决定。",
++          "items": {
++            "type": "string",
++            "enum": [
++              "resource.read",
++              "resource.write",
++              "decision.evaluate",
++              "policy.evaluate",
++              "workflow.execute",
++              "inference.deploy",
++              "inference.inspect",
++              "device.read",
++              "device.partition",
++              "metering.read",
++              "event.subscribe",
++              "network.egress",
++              "filesystem.access",
++              "database.access",
++              "platform.admin"
++            ]
++          },
+           "uniqueItems": true
+         },
+         "compatibility": {
+diff --git a/packages/plugin-sdk/src/forgemesh/plugin/__init__.py b/packages/plugin-sdk/src/forgemesh/plugin/__init__.py
+index 447e15b..ef974a2 100644
+--- a/packages/plugin-sdk/src/forgemesh/plugin/__init__.py
++++ b/packages/plugin-sdk/src/forgemesh/plugin/__init__.py
+@@ -4,6 +4,7 @@
+ 
+ * :class:`PluginManifest`        —— 声明式插件清单（类别/兼容性/能力/权限/隔离）。
+ * :class:`PluginLifecycleState`  —— 插件生命周期状态机。
++* :class:`Permission`            —— 权限词表（清单申请、管理员授予与隔离检查共用）。
+ 
+ 核心原则：**安装状态与健康状态分离**。``Installed/Enabled`` 描述的是治理
+ 生命周期，不代表运行健康；运行健康由独立健康检查（Healthy/Degraded/Unhealthy）
+@@ -21,8 +22,10 @@ from .manifest import (
+     PluginSpec,
+     validate_plugin_transition,
+ )
++from .permissions import Permission
+ 
+ __all__ = [
++    "Permission",
+     "PluginCategory",
+     "PluginMeta",
+     "PluginSpec",
+diff --git a/packages/plugin-sdk/src/forgemesh/plugin/isolation.py b/packages/plugin-sdk/src/forgemesh/plugin/isolation.py
+index 350c456..9b1832d 100644
+--- a/packages/plugin-sdk/src/forgemesh/plugin/isolation.py
++++ b/packages/plugin-sdk/src/forgemesh/plugin/isolation.py
+@@ -6,14 +6,18 @@
+   隔离模式。
+ * **隔离模式**：
+ 
+-  - ``IN_PROCESS``——进程内执行，允许所有资源访问。
+-  - ``RESTRICTED_RPC``——受限 RPC，禁止直连 ``database`` / ``filesystem`` /
+-    ``network``，无直连 DB。
++  - ``IN_PROCESS``——进程内执行，允许全部权限。
++  - ``RESTRICTED_RPC``——受限 RPC，不允许绕过宿主 API 直接访问宿主资源的权限
++    （``network.egress`` / ``filesystem.access`` / ``database.access``）。
+ 
+-* **权限校验**：``UNTRUSTED`` 插件不得声明 ``database`` / ``admin`` 权限。
++* **权限校验**：``UNTRUSTED`` 插件不得申请 ``database.access`` / ``platform.admin``。
+ * **升级兼容（IVT-8）**：语义版本兼容检查；升级不静默改变既有工作流实例的
+   执行定义——运行实例始终按其记录的插件版本执行，新版本仅作用于后续新建实例。
+ 
++权限名与插件清单共用 :class:`~forgemesh.plugin.permissions.Permission` 词表，未知的
++权限名直接报错。本模块只回答「某个信任级别的插件能否使用某项权限」，不建立任何进程
++边界：``RESTRICTED_RPC`` 尚无实现，插件代码实际能访问什么不受这里的检查约束。
++
+ ``IsolationError`` 复用 :class:`forgemesh.core.errors.ForgeMeshError` 统一异常体系；
+ 若核心包未就绪，则回退到本地兜底基类。
+ """
+@@ -21,8 +25,10 @@
+ from __future__ import annotations
+ 
+ import re
++from collections.abc import Iterable
+ from enum import IntEnum
+ 
++from forgemesh.plugin.permissions import Permission
+ from pydantic import BaseModel
+ 
+ try:  # 优先复用核心包统一异常体系
+@@ -60,10 +66,21 @@ class IsolationMode(IntEnum):
+     RESTRICTED_RPC = 1
+ 
+ 
+-# 受限 RPC 下禁止直接访问的资源。
+-_RESTRICTED_RESOURCES: frozenset[str] = frozenset({"database", "filesystem", "network"})
+-# UNTRUSTED 插件禁止声明的权限。
+-_UNTRUSTED_FORBIDDEN_PERMISSIONS: frozenset[str] = frozenset({"database", "admin"})
++# 受限 RPC 下不可用的权限：它们绕过宿主 API，直接访问宿主资源。
++_DIRECT_ACCESS_PERMISSIONS: frozenset[Permission] = frozenset(
++    {Permission.NETWORK_EGRESS, Permission.FILESYSTEM_ACCESS, Permission.DATABASE_ACCESS}
++)
++# UNTRUSTED 插件禁止申请的权限。
++_UNTRUSTED_FORBIDDEN_PERMISSIONS: frozenset[Permission] = frozenset(
++    {Permission.DATABASE_ACCESS, Permission.PLATFORM_ADMIN}
++)
++
++
++def _to_permission(value: Permission | str) -> Permission:
++    try:
++        return Permission(value)
++    except ValueError as exc:
++        raise IsolationError(f"unknown permission {value!r}") from exc
+ 
+ 
+ class IsolationPolicy:
+@@ -98,41 +115,41 @@ class IsolationGuard:
+         """获取信任级别对应的隔离模式。"""
+         return self.policy.resolve(trust_level)
+ 
+-    def check_access(self, trust_level: TrustLevel, resource: str) -> None:
+-        """检查插件对指定资源的访问权限。
++    def check_access(self, trust_level: TrustLevel, permission: Permission | str) -> None:
++        """检查指定信任级别的插件能否使用某项权限。
+ 
+         Args:
+             trust_level: 插件信任级别。
+-            resource: 资源标识（如 ``database`` / ``filesystem`` / ``network``）。
++            permission: :class:`Permission` 词表中的权限名（如 ``network.egress``）。
+ 
+         Raises:
+-            IsolationError: ``RESTRICTED_RPC`` 模式下访问受限资源。
++            IsolationError: 权限名未知，或 ``RESTRICTED_RPC`` 模式下使用直接访问宿主资源
++                的权限。
+         """
+-        mode = self.get_mode(trust_level)
+-        if mode == IsolationMode.IN_PROCESS:
+-            return  # 进程内执行：允许所有资源
+-        # RESTRICTED_RPC：禁止直连 database/filesystem/network
+-        if resource in _RESTRICTED_RESOURCES:
+-            raise IsolationError(
+-                f"resource {resource!r} not accessible in RESTRICTED_RPC mode",
+-            )
++        perm = _to_permission(permission)
++        if self.get_mode(trust_level) == IsolationMode.IN_PROCESS:
++            return
++        if perm in _DIRECT_ACCESS_PERMISSIONS:
++            raise IsolationError(f"permission {perm.value!r} not available in RESTRICTED_RPC mode")
+ 
+-    def validate_manifest(self, trust_level: TrustLevel, permissions: list[str]) -> None:
+-        """校验插件权限声明是否与其信任级别相符。
++    def validate_manifest(
++        self, trust_level: TrustLevel, permissions: Iterable[Permission | str]
++    ) -> None:
++        """校验插件申请的权限是否与其信任级别相符。
+ 
+         Args:
+             trust_level: 插件信任级别。
+-            permissions: 插件声明的权限列表。
++            permissions: 插件清单申请的权限。
+ 
+         Raises:
+-            IsolationError: ``UNTRUSTED`` 插件声明了 ``database`` 或 ``admin`` 权限。
++            IsolationError: 权限名未知，或 ``UNTRUSTED`` 插件申请了 ``database.access`` /
++                ``platform.admin``。
+         """
++        requested = {_to_permission(p) for p in permissions}
+         if trust_level == TrustLevel.UNTRUSTED:
+-            forbidden = _UNTRUSTED_FORBIDDEN_PERMISSIONS & set(permissions)
++            forbidden = sorted(p.value for p in requested & _UNTRUSTED_FORBIDDEN_PERMISSIONS)
+             if forbidden:
+-                raise IsolationError(
+-                    f"UNTRUSTED plugin cannot declare permissions: {sorted(forbidden)}",
+-                )
++                raise IsolationError(f"UNTRUSTED plugin cannot request permissions: {forbidden}")
+ 
+ 
+ # ---------------------------------------------------------------------------
+diff --git a/packages/plugin-sdk/src/forgemesh/plugin/manifest.py b/packages/plugin-sdk/src/forgemesh/plugin/manifest.py
+index aea4646..641e9c3 100644
+--- a/packages/plugin-sdk/src/forgemesh/plugin/manifest.py
++++ b/packages/plugin-sdk/src/forgemesh/plugin/manifest.py
+@@ -5,7 +5,9 @@
+ * **安装状态与健康状态分离**：:class:`PluginLifecycleState` 只描述治理生命周期
+   （发现→校验→安装→启用/禁用→卸载）；运行健康（Healthy/Degraded/Unhealthy）
+   由独立健康检查表达，二者不得复用同一字段。
+-* **最小权限**：``permissions`` 声明插件所需的最小权限集合，供安装时校验与运行时限制。
++* **权限申请**：``permissions`` 是插件申请的权限，取值限于
++  :class:`~forgemesh.plugin.permissions.Permission` 词表且不得重复；清单不能给自己授权，
++  实际授予由管理员决定。
+ * **隔离分级**：隔离模式按信任级别由安装器裁决（ADR-006），Manifest 可声明。
+ * **供应链**：``artifact_digest`` / ``signature`` 支持制品摘要与签名校验。
+ 
+@@ -18,7 +20,8 @@ from __future__ import annotations
+ from enum import StrEnum
+ from typing import Any
+ 
+-from pydantic import BaseModel, ConfigDict, Field
++from forgemesh.plugin.permissions import Permission
++from pydantic import BaseModel, ConfigDict, Field, field_validator
+ 
+ try:  # 优先复用核心包统一异常体系
+     from forgemesh.core.errors import InvalidStateTransition
+@@ -105,7 +108,7 @@ class PluginSpec(BaseModel):
+         compatibility: 兼容性声明（如 ``{"coreApi": "v1alpha1"}``）。
+         provides: 提供的能力标识。
+         requires: 依赖的能力标识。
+-        permissions: 所需最小权限集合。
++        permissions: 申请的权限（:class:`Permission` 词表，不得重复）；实际授予由管理员决定。
+         isolation: 隔离级别（in-process/restricted-rpc/sandbox，ADR-006）。
+         entrypoint: 入口点标识。
+         artifactDigest: 制品摘要（如 sha256:...），供应链安全。
+@@ -121,7 +124,7 @@ class PluginSpec(BaseModel):
+     compatibility: dict[str, str] = Field(default_factory=dict)
+     provides: list[str] = Field(default_factory=list)
+     requires: list[str] = Field(default_factory=list)
+-    permissions: list[str] = Field(default_factory=list)
++    permissions: list[Permission] = Field(default_factory=list)
+     isolation: str | None = Field(default=None, description="隔离级别（in-process/restricted-rpc/sandbox，ADR-006）")
+     entrypoint: str | None = Field(default=None, description="入口点标识")
+     artifactDigest: str | None = Field(default=None, description="制品摘要（如 sha256:...），供应链安全")
+@@ -129,6 +132,14 @@ class PluginSpec(BaseModel):
+     configuration: dict[str, Any] = Field(default_factory=dict)
+     healthCheck: dict[str, Any] = Field(default_factory=dict)
+ 
++    @field_validator("permissions")
++    @classmethod
++    def _unique_permissions(cls, value: list[Permission]) -> list[Permission]:
++        duplicates = sorted({p.value for p in value if value.count(p) > 1})
++        if duplicates:
++            raise ValueError(f"duplicate permissions: {duplicates}")
++        return value
++
+ 
+ class PluginManifest(BaseModel):
+     """插件清单（声明式、随插件制品分发）。
+diff --git a/packages/plugin-sdk/src/forgemesh/plugin/permissions.py b/packages/plugin-sdk/src/forgemesh/plugin/permissions.py
+new file mode 100644
+index 0000000..aff7075
+--- /dev/null
++++ b/packages/plugin-sdk/src/forgemesh/plugin/permissions.py
+@@ -0,0 +1,51 @@
++"""插件权限词表（对齐 development-plan 5.7 / ADR-006）。
++
++插件清单的 ``spec.permissions``、管理员的权限授予记录（见
++:mod:`forgemesh.controlplane.plugin_manager`）与隔离检查（:mod:`forgemesh.plugin.isolation`）
++共用这一份词表；``api/schemas/plugin-manifest.schema.json`` 中的权限枚举与它一致。
++
++权限名的形式为 ``<域>.<动作>``。清单中的权限只是插件的申请，插件实际拥有的权限是
++申请与管理员授予的交集。
++"""
++
++from __future__ import annotations
++
++from enum import StrEnum
++
++
++class Permission(StrEnum):
++    """插件可以申请的权限。"""
++
++    #: 经宿主 API 读取资源对象。
++    RESOURCE_READ = "resource.read"
++    #: 经宿主 API 写入资源对象。
++    RESOURCE_WRITE = "resource.write"
++    #: 作为决策 Provider 产出候选。
++    DECISION_EVALUATE = "decision.evaluate"
++    #: 参与策略（如 QoS 准入）评估。
++    POLICY_EVALUATE = "policy.evaluate"
++    #: 执行工作流。
++    WORKFLOW_EXECUTE = "workflow.execute"
++    #: 部署与释放推理实例。
++    INFERENCE_DEPLOY = "inference.deploy"
++    #: 查询推理实例状态。
++    INFERENCE_INSPECT = "inference.inspect"
++    #: 读取本机设备信息。
++    DEVICE_READ = "device.read"
++    #: 对设备分区（如 MIG）。
++    DEVICE_PARTITION = "device.partition"
++    #: 读取计量数据。
++    METERING_READ = "metering.read"
++    #: 订阅平台事件流。
++    EVENT_SUBSCRIBE = "event.subscribe"
++    #: 直接向外部发起网络连接。
++    NETWORK_EGRESS = "network.egress"
++    #: 直接读写宿主文件系统。
++    FILESYSTEM_ACCESS = "filesystem.access"
++    #: 直接连接控制平面数据库。
++    DATABASE_ACCESS = "database.access"
++    #: 平台管理权限。
++    PLATFORM_ADMIN = "platform.admin"
++
++
++__all__ = ["Permission"]
+diff --git a/scripts/validate_manifests.py b/scripts/validate_manifests.py
+index 5493abe..89c41d4 100644
+--- a/scripts/validate_manifests.py
++++ b/scripts/validate_manifests.py
+@@ -8,6 +8,8 @@
+    未声明时缺省 Draft 2020-12。
+ 2. 实例校验：用 ``api/schemas/plugin-manifest.schema.json`` 逐个校验
+    ``plugins/*/manifest.yaml``（yaml.safe_load 后经 jsonschema 校验）。
++   ``spec.permissions`` 由 schema 的枚举限定在权限词表内；该枚举与
++   ``forgemesh.plugin.permissions.Permission`` 一致（契约测试保证）。
+ 
+ schema 之外追加两条平台约定检查（manifest 必须满足而 schema 未强制）：
+ 
+diff --git a/tests/compat/test_plugin_compatibility.py b/tests/compat/test_plugin_compatibility.py
+index 7c4ae34..162f751 100644
+--- a/tests/compat/test_plugin_compatibility.py
++++ b/tests/compat/test_plugin_compatibility.py
+@@ -234,44 +234,46 @@ class TestSigningSecurity:
+ 
+ 
+ class TestIsolationBoundary:
+-    """隔离边界安全认证：资源访问边界 + 权限声明边界。"""
++    """隔离边界安全认证：权限使用边界 + 权限申请边界。"""
+ 
+     @_compat
+     def test_trusted_in_process_allows_database(self) -> None:
+-        """TRUSTED（IN_PROCESS）允许访问 database。"""
++        """TRUSTED（IN_PROCESS）允许使用 database.access。"""
+         guard = IsolationGuard()
+-        guard.check_access(TrustLevel.TRUSTED, "database")  # 不抛异常
++        guard.check_access(TrustLevel.TRUSTED, "database.access")  # 不抛异常
+ 
+     @_compat
+     @pytest.mark.parametrize("trust", [TrustLevel.VERIFIED, TrustLevel.UNTRUSTED])
+     def test_non_trusted_blocks_database(self, trust: TrustLevel) -> None:
+         """VERIFIED/UNTRUSTED 应禁止直连 database。"""
+         guard = IsolationGuard()
+-        with pytest.raises(IsolationError):
+-            guard.check_access(trust, "database")
++        with pytest.raises(IsolationError, match="'database.access' not available"):
++            guard.check_access(trust, "database.access")
+ 
+     @_compat
+     @pytest.mark.parametrize("trust", [TrustLevel.VERIFIED, TrustLevel.UNTRUSTED])
+     def test_non_trusted_blocks_filesystem(self, trust: TrustLevel) -> None:
+         """VERIFIED/UNTRUSTED 应禁止直连 filesystem。"""
+         guard = IsolationGuard()
+-        with pytest.raises(IsolationError):
+-            guard.check_access(trust, "filesystem")
++        with pytest.raises(IsolationError, match="'filesystem.access' not available"):
++            guard.check_access(trust, "filesystem.access")
+ 
+     @_compat
+     @pytest.mark.parametrize("trust", [TrustLevel.VERIFIED, TrustLevel.UNTRUSTED])
+     def test_non_trusted_blocks_network(self, trust: TrustLevel) -> None:
+-        """VERIFIED/UNTRUSTED 应禁止直连 network。"""
++        """VERIFIED/UNTRUSTED 应禁止直接对外发起网络连接。"""
+         guard = IsolationGuard()
+-        with pytest.raises(IsolationError):
+-            guard.check_access(trust, "network")
++        with pytest.raises(IsolationError, match="'network.egress' not available"):
++            guard.check_access(trust, "network.egress")
+ 
+     @_compat
+     def test_untrusted_combined_forbidden_permissions_rejected(self) -> None:
+-        """UNTRUSTED 同时声明 database + admin 应被拒绝。"""
++        """UNTRUSTED 同时申请 database.access + platform.admin 应被拒绝。"""
+         guard = IsolationGuard()
+-        with pytest.raises(IsolationError):
+-            guard.validate_manifest(TrustLevel.UNTRUSTED, ["metrics:read", "database", "admin"])
++        with pytest.raises(IsolationError, match=r"\['database\.access', 'platform\.admin'\]"):
++            guard.validate_manifest(
++                TrustLevel.UNTRUSTED, ["metering.read", "database.access", "platform.admin"]
++            )
+ 
+     @_compat
+     def test_custom_isolation_policy(self) -> None:
+@@ -285,8 +287,8 @@ class TestIsolationBoundary:
+         )
+         guard = IsolationGuard(policy=custom_policy)
+         # 自定义策略下 TRUSTED 也走 RESTRICTED_RPC
+-        with pytest.raises(IsolationError):
+-            guard.check_access(TrustLevel.TRUSTED, "database")
++        with pytest.raises(IsolationError, match="not available in RESTRICTED_RPC mode"):
++            guard.check_access(TrustLevel.TRUSTED, "database.access")
+ 
+ 
+ # ===========================================================================
+diff --git a/tests/compat/test_plugin_conformance_v11.py b/tests/compat/test_plugin_conformance_v11.py
+index 3b8f1a4..7c12cf9 100644
+--- a/tests/compat/test_plugin_conformance_v11.py
++++ b/tests/compat/test_plugin_conformance_v11.py
+@@ -31,7 +31,6 @@ from __future__ import annotations
+ import asyncio
+ import importlib.util
+ import json
+-import re
+ import sys
+ from collections.abc import Awaitable, Callable
+ from pathlib import Path
+@@ -48,6 +47,7 @@ from forgemesh.plugin.manifest import (
+     PluginLifecycleState,
+     PluginManifest,
+ )
++from forgemesh.plugin.permissions import Permission
+ from forgemesh.workflow.runtime import Step, WorkflowDefinition, WorkflowRuntime
+ from forgemesh.workflow.states import WorkflowStatus
+ from jsonschema import Draft202012Validator
+@@ -77,8 +77,8 @@ ALL_PLUGIN_DIRS: list[str] = [
+ #: manifest 允许的隔离级别枚举（对齐 schema enum 与 ADR-006）。
+ _ALLOWED_ISOLATION = {"in-process", "restricted-rpc", "sandbox"}
+ 
+-#: 最小权限形式：至少两段点分的小写标识（如 ``resource.read``）。
+-_PERMISSION_RE = re.compile(r"^[a-z0-9-]+(\.[a-z0-9-]+)+$")
++#: 插件可申请的权限词表。
++_PERMISSION_VOCABULARY = {p.value for p in Permission}
+ 
+ #: 10 插件 manifest schema（模块级加载一次，供第 1 节复用）。
+ _MANIFEST_SCHEMA: dict[str, Any] = json.loads(
+@@ -240,15 +240,12 @@ class TestManifestAndIsolationConformance:
+         [pytest.param(p, id=p) for p in ALL_PLUGIN_DIRS],
+     )
+     def test_permissions_nonempty_and_parseable(self, plugin_dir: str) -> None:
+-        """spec.permissions 非空，且每项均为可解析的最小权限点分形式。"""
++        """spec.permissions 非空，且每项都在 Permission 词表中。"""
+         permissions = _load_manifest_dict(plugin_dir)["spec"]["permissions"]
+         assert permissions, f"{plugin_dir}: permissions 不得为空"
+         for perm in permissions:
+-            assert isinstance(perm, str) and perm, (
+-                f"{plugin_dir}: 权限项须为非空字符串: {perm!r}"
+-            )
+-            assert _PERMISSION_RE.fullmatch(perm), (
+-                f"{plugin_dir}: 权限项 {perm!r} 不符合 '域.动作' 最小权限形式"
++            assert perm in _PERMISSION_VOCABULARY, (
++                f"{plugin_dir}: 权限项 {perm!r} 不在 Permission 词表中"
+             )
+ 
+ 
+diff --git a/tests/contract/test_cross_representation.py b/tests/contract/test_cross_representation.py
+index 8d9bde3..82a48f4 100644
+--- a/tests/contract/test_cross_representation.py
++++ b/tests/contract/test_cross_representation.py
+@@ -5,7 +5,7 @@
+ 
+ * :class:`InferenceService` —— 资源包裹层 ``spec.resources.accelerator`` 结构；
+ * :class:`ObjectMeta` —— 多租户字段 snake_case / camelCase alias 双向一致；
+-* :class:`PluginManifest` / :class:`PluginSpec` —— 供应链安全字段与健康检查类型；
++* :class:`PluginManifest` / :class:`PluginSpec` —— 供应链安全字段、健康检查类型与权限词表；
+ * :class:`PolicyDecision` —— 三态（allow / deny / degraded）枚举；
+ * :class:`DecisionRequest` —— 风险等级与决策时限字段；
+ * :class:`Step` —— 补偿、审批与 ``with`` alias 字段；
+@@ -26,6 +26,7 @@ from forgemesh.core.errors import ForgeMeshError, GovernanceBypassError
+ from forgemesh.core.objects import ObjectMeta
+ from forgemesh.decision.provider import DecisionRequest
+ from forgemesh.plugin.manifest import PluginSpec
++from forgemesh.plugin.permissions import Permission
+ from forgemesh.policy.api import PolicyDecision
+ from forgemesh.resource.inference import (
+     InferenceService,
+@@ -184,6 +185,42 @@ def test_plugin_manifest_schema_has_supply_chain_fields() -> None:
+     assert hc["timeoutMs"]["type"] == "integer", "Schema 中 timeoutMs 应为 integer"
+ 
+ 
++@pytest.mark.contract
++def test_plugin_permissions_schema_matches_vocabulary() -> None:
++    """Schema 的权限枚举与 Permission 词表逐项一致，且不允许重复。"""
++    schema = _load_json(SCHEMAS_DIR / "plugin-manifest.schema.json")
++    permissions = schema["properties"]["spec"]["properties"]["permissions"]
++    assert permissions["items"]["enum"] == [p.value for p in Permission]
++    assert permissions["uniqueItems"] is True
++
++
++def _plugin_manifest_with_permissions(permissions: list[str]) -> dict[str, Any]:
++    return {
++        "apiVersion": "forgemesh.io/v1alpha1",
++        "kind": "PluginManifest",
++        "metadata": {"id": "forgemesh.policy.example", "version": "0.1.0"},
++        "spec": {"category": "policy", "provides": [], "requires": [], "permissions": permissions},
++    }
++
++
++@pytest.mark.contract
++@pytest.mark.parametrize(
++    "permissions",
++    [["admin"], ["metrics:read"], ["Resource.Read"], ["resource.read", "resource.read"]],
++)
++def test_plugin_permissions_rejected_by_model_and_schema(permissions: list[str]) -> None:
++    """词表外或重复的权限，Python 模型与 Schema 都拒绝。"""
++    validator = Draft202012Validator(_load_json(SCHEMAS_DIR / "plugin-manifest.schema.json"))
++    assert not list(validator.iter_errors(_plugin_manifest_with_permissions(["resource.read"])))
++
++    manifest = _plugin_manifest_with_permissions(permissions)
++    errors = list(validator.iter_errors(manifest))
++    assert errors
++    assert all("permissions" in error.absolute_path for error in errors)
++    with pytest.raises(ValidationError, match="permissions"):
++        PluginSpec.model_validate(manifest["spec"])
++
++
+ # ---------------------------------------------------------------------------
+ # 4. PolicyDecision 三态一致性
+ # ---------------------------------------------------------------------------
+diff --git a/tests/contract/test_plugin_contract_suite.py b/tests/contract/test_plugin_contract_suite.py
+index e0ccfb2..b038e20 100644
+--- a/tests/contract/test_plugin_contract_suite.py
++++ b/tests/contract/test_plugin_contract_suite.py
+@@ -32,6 +32,7 @@ from forgemesh.plugin.manifest import (
+     PluginSpec,
+     validate_plugin_transition,
+ )
++from forgemesh.plugin.permissions import Permission
+ from forgemesh.plugin.scaffold import KIND_CATEGORY_MAP, SUPPORTED_KINDS, ScaffoldGenerator
+ from pydantic import ValidationError
+ 
+@@ -64,7 +65,7 @@ def _make_manifest(**spec_overrides: Any) -> PluginManifest:
+         "category": PluginCategory.POLICY,
+         "compatibility": {"coreApi": "v1alpha1"},
+         "provides": ["test-plugin"],
+-        "permissions": ["metrics:read"],
++        "permissions": ["metering.read"],
+         "isolation": "restricted-rpc",
+         "entrypoint": "TestPlugin",
+     }
+@@ -315,40 +316,59 @@ class TestPermissionModel:
+ 
+     @pytest.mark.contract
+     def test_untrusted_cannot_declare_database_permission(self) -> None:
+-        """UNTRUSTED 插件声明 database 权限应被拒绝。"""
++        """UNTRUSTED 插件申请 database.access 应被拒绝。"""
+         guard = IsolationGuard()
+-        with pytest.raises(IsolationError):
+-            guard.validate_manifest(TrustLevel.UNTRUSTED, ["database"])
++        with pytest.raises(IsolationError, match="cannot request permissions"):
++            guard.validate_manifest(TrustLevel.UNTRUSTED, ["database.access"])
+ 
+     @pytest.mark.contract
+     def test_untrusted_cannot_declare_admin_permission(self) -> None:
+-        """UNTRUSTED 插件声明 admin 权限应被拒绝。"""
++        """UNTRUSTED 插件申请 platform.admin 应被拒绝。"""
+         guard = IsolationGuard()
+-        with pytest.raises(IsolationError):
+-            guard.validate_manifest(TrustLevel.UNTRUSTED, ["admin"])
++        with pytest.raises(IsolationError, match="cannot request permissions"):
++            guard.validate_manifest(TrustLevel.UNTRUSTED, ["platform.admin"])
+ 
+     @pytest.mark.contract
+     def test_untrusted_can_declare_safe_permission(self) -> None:
+-        """UNTRUSTED 插件声明安全权限（如 metrics:read）应通过。"""
++        """UNTRUSTED 插件申请安全权限（如 metering.read）应通过。"""
+         guard = IsolationGuard()
+-        guard.validate_manifest(TrustLevel.UNTRUSTED, ["metrics:read"])  # 不抛异常
++        guard.validate_manifest(TrustLevel.UNTRUSTED, ["metering.read"])  # 不抛异常
+ 
+     @pytest.mark.contract
+     def test_trusted_can_declare_any_permission(self) -> None:
+-        """TRUSTED 插件可声明任意权限。"""
++        """TRUSTED 插件可申请词表中的任意权限。"""
+         guard = IsolationGuard()
+-        guard.validate_manifest(TrustLevel.TRUSTED, ["database", "admin"])  # 不抛异常
++        guard.validate_manifest(TrustLevel.TRUSTED, list(Permission))  # 不抛异常
+ 
+     @pytest.mark.contract
+-    @pytest.mark.parametrize("resource", ["database", "filesystem", "network"])
+-    def test_restricted_rpc_blocks_direct_resources(self, resource: str) -> None:
+-        """RESTRICTED_RPC 模式应禁止直连 database/filesystem/network。"""
++    def test_permission_outside_vocabulary_rejected(self) -> None:
++        """词表外的权限名在任何信任级别下都应被拒绝。"""
+         guard = IsolationGuard()
+-        with pytest.raises(IsolationError):
+-            guard.check_access(TrustLevel.UNTRUSTED, resource)
++        with pytest.raises(IsolationError, match="unknown permission 'admin'"):
++            guard.validate_manifest(TrustLevel.TRUSTED, ["admin"])
++
++    @pytest.mark.contract
++    @pytest.mark.parametrize(
++        "permission", ["database.access", "filesystem.access", "network.egress"]
++    )
++    def test_restricted_rpc_blocks_direct_resources(self, permission: str) -> None:
++        """RESTRICTED_RPC 模式应禁止直接访问宿主资源的权限。"""
++        guard = IsolationGuard()
++        with pytest.raises(IsolationError, match="not available in RESTRICTED_RPC mode"):
++            guard.check_access(TrustLevel.UNTRUSTED, permission)
+ 
+     @pytest.mark.contract
+     def test_in_process_allows_all_resources(self) -> None:
+-        """IN_PROCESS 模式应允许所有资源访问。"""
++        """IN_PROCESS 模式应允许全部权限。"""
+         guard = IsolationGuard()
+-        guard.check_access(TrustLevel.TRUSTED, "database")  # 不抛异常
++        for permission in Permission:
++            guard.check_access(TrustLevel.TRUSTED, permission)  # 不抛异常
++
++    @pytest.mark.contract
++    def test_manifest_permissions_limited_to_vocabulary(self) -> None:
++        """清单只能申请词表中的权限，且不得重复。"""
++        assert _make_manifest().spec.permissions == [Permission.METERING_READ]
++        with pytest.raises(ValidationError, match="permissions"):
++            _make_manifest(permissions=["metrics:read"])
++        with pytest.raises(ValidationError, match="duplicate permissions"):
++            _make_manifest(permissions=["resource.read", "resource.read"])
+diff --git a/tests/security/test_plugin_permissions.py b/tests/security/test_plugin_permissions.py
+index 1ba13ee..06d3457 100644
+--- a/tests/security/test_plugin_permissions.py
++++ b/tests/security/test_plugin_permissions.py
+@@ -2,9 +2,11 @@
+ 
+ 验证插件权限隔离机制，覆盖供应链安全与运行时隔离边界：
+ 
+-* **UNTRUSTED 插件**：不能访问 database，不能声明 admin 权限。
+-* **TRUSTED 插件**：拥有完整访问权限（IN_PROCESS 模式，所有资源可访问）。
+-* **RESTRICTED_RPC 模式**：无直连 DB / filesystem / network。
++* **UNTRUSTED 插件**：不能使用 ``database.access``，不能申请 ``platform.admin``。
++* **TRUSTED 插件**：拥有完整访问权限（IN_PROCESS 模式，全部权限可用）。
++* **RESTRICTED_RPC 模式**：不可使用 ``database.access`` / ``filesystem.access`` /
++  ``network.egress``。
++* **权限名**：只接受 Permission 词表中的名称。
+ * **未签名插件**：被拒绝加载（SigningError）。
+ * **摘要不符插件**：被拒绝加载（SigningError）。
+ * **升级不变量（IVT-8）**：升级不改变既有实例的执行定义。
+@@ -23,6 +25,7 @@ from forgemesh.plugin.isolation import (
+     TrustLevel,
+ )
+ from forgemesh.plugin.manifest import PluginManifest, PluginMeta, PluginSpec
++from forgemesh.plugin.permissions import Permission
+ from forgemesh.plugin.signing import (
+     PluginSigner,
+     SigningError,
+@@ -47,20 +50,33 @@ _MANIFEST = PluginManifest(
+ 
+ @pytest.mark.unit
+ def test_untrusted_plugin_no_database_access() -> None:
+-    """UNTRUSTED 插件不能访问 database：check_access 抛 IsolationError。"""
++    """UNTRUSTED 插件不能使用 database.access：check_access 抛 IsolationError。"""
+     guard = IsolationGuard()
+ 
+-    with pytest.raises(IsolationError, match="database"):
+-        guard.check_access(TrustLevel.UNTRUSTED, "database")
++    with pytest.raises(IsolationError, match="'database.access' not available"):
++        guard.check_access(TrustLevel.UNTRUSTED, "database.access")
+ 
+ 
+ @pytest.mark.unit
+ def test_untrusted_plugin_no_admin_permission() -> None:
+-    """UNTRUSTED 插件不能声明 admin 权限：validate_manifest 抛 IsolationError。"""
++    """UNTRUSTED 插件不能申请 platform.admin：validate_manifest 抛 IsolationError。"""
+     guard = IsolationGuard()
+ 
+-    with pytest.raises(IsolationError, match="admin"):
+-        guard.validate_manifest(TrustLevel.UNTRUSTED, ["read", "admin"])
++    with pytest.raises(IsolationError, match=r"cannot request .*'platform\.admin'"):
++        guard.validate_manifest(TrustLevel.UNTRUSTED, ["resource.read", "platform.admin"])
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize("legacy_name", ["database", "admin", "network", "metrics:read"])
++def test_free_form_permission_names_rejected(legacy_name: str) -> None:
++    """词表外的权限名（含旧版自由命名）在任何信任级别下都报错，不会被当作普通权限放行。"""
++    guard = IsolationGuard()
++
++    for trust_level in TrustLevel:
++        with pytest.raises(IsolationError, match="unknown permission"):
++            guard.check_access(trust_level, legacy_name)
++        with pytest.raises(IsolationError, match="unknown permission"):
++            guard.validate_manifest(trust_level, [legacy_name])
+ 
+ 
+ # --------------------------------------------------------------------------- #
+@@ -70,18 +86,20 @@ def test_untrusted_plugin_no_admin_permission() -> None:
+ 
+ @pytest.mark.unit
+ def test_trusted_plugin_full_access() -> None:
+-    """TRUSTED 插件有完整访问权限：IN_PROCESS 模式，所有资源可访问，任意权限可声明。"""
++    """TRUSTED 插件有完整访问权限：IN_PROCESS 模式，全部权限可用，任意权限可申请。"""
+     guard = IsolationGuard()
+ 
+     # TRUSTED → IN_PROCESS 模式
+     assert guard.get_mode(TrustLevel.TRUSTED) == IsolationMode.IN_PROCESS
+ 
+-    # 可访问所有受限资源
+-    for resource in ("database", "filesystem", "network", "config"):
+-        guard.check_access(TrustLevel.TRUSTED, resource)  # 不抛异常
++    # 可使用全部权限（含直接访问宿主资源的权限）
++    for permission in Permission:
++        guard.check_access(TrustLevel.TRUSTED, permission)  # 不抛异常
+ 
+-    # 可声明任意权限（含 database / admin）
+-    guard.validate_manifest(TrustLevel.TRUSTED, ["database", "admin", "read"])
++    # 可申请任意权限（含 database.access / platform.admin）
++    guard.validate_manifest(
++        TrustLevel.TRUSTED, ["database.access", "platform.admin", "resource.read"]
++    )
+ 
+ 
+ # --------------------------------------------------------------------------- #
+@@ -91,7 +109,7 @@ def test_trusted_plugin_full_access() -> None:
+ 
+ @pytest.mark.unit
+ def test_restricted_rpc_no_direct_db() -> None:
+-    """RESTRICTED_RPC 模式无直连 DB：UNTRUSTED / VERIFIED 均禁止 database/filesystem/network。"""
++    """RESTRICTED_RPC 模式无直连 DB：UNTRUSTED / VERIFIED 均禁止直接访问宿主资源的权限。"""
+     guard = IsolationGuard()
+ 
+     # UNTRUSTED → RESTRICTED_RPC
+@@ -99,15 +117,15 @@ def test_restricted_rpc_no_direct_db() -> None:
+     # VERIFIED → RESTRICTED_RPC
+     assert guard.get_mode(TrustLevel.VERIFIED) == IsolationMode.RESTRICTED_RPC
+ 
+-    # 两个受限信任级别均禁止直连 DB / filesystem / network
++    # 两个受限信任级别均禁止 database.access / filesystem.access / network.egress
+     for trust_level in (TrustLevel.UNTRUSTED, TrustLevel.VERIFIED):
+-        for resource in ("database", "filesystem", "network"):
+-            with pytest.raises(IsolationError, match=resource):
+-                guard.check_access(trust_level, resource)
++        for permission in ("database.access", "filesystem.access", "network.egress"):
++            with pytest.raises(IsolationError, match=f"'{permission}' not available"):
++                guard.check_access(trust_level, permission)
+ 
+-    # 非受限资源仍可访问
+-    guard.check_access(TrustLevel.UNTRUSTED, "config")
+-    guard.check_access(TrustLevel.VERIFIED, "metrics")
++    # 经宿主 API 的权限仍可使用
++    guard.check_access(TrustLevel.UNTRUSTED, "resource.read")
++    guard.check_access(TrustLevel.VERIFIED, "metering.read")
+ 
+ 
+ # --------------------------------------------------------------------------- #
+diff --git a/tests/unit/controlplane/test_plugin_manager.py b/tests/unit/controlplane/test_plugin_manager.py
+index 742f00e..46a7dbf 100644
+--- a/tests/unit/controlplane/test_plugin_manager.py
++++ b/tests/unit/controlplane/test_plugin_manager.py
+@@ -45,7 +45,7 @@ def _make_manifest(
+         spec=PluginSpec(
+             category=category,
+             provides=provides if provides is not None else ["gpu.discovery"],
+-            permissions=permissions if permissions is not None else ["device:read"],
++            permissions=permissions if permissions is not None else ["device.read"],
+             compatibility=compatibility if compatibility is not None else {},
+         ),
+     )
+@@ -308,13 +308,13 @@ def test_check_permissions_granted() -> None:
+     """拥有所需权限返回 True。"""
+     mgr = PluginManager()
+     pid = mgr.register(
+-        _make_manifest(permissions=["device:read", "device:write", "metrics:scrape"])
++        _make_manifest(permissions=["device.read", "device.partition", "metering.read"])
+     )
+-    assert mgr.check_permissions(pid, {"device:read"}) is True
+-    assert mgr.check_permissions(pid, {"device:read", "device:write"}) is True
++    assert mgr.check_permissions(pid, {"device.read"}) is True
++    assert mgr.check_permissions(pid, {"device.read", "device.partition"}) is True
+     # 全部权限
+     assert mgr.check_permissions(
+-        pid, {"device:read", "device:write", "metrics:scrape"}
++        pid, {"device.read", "device.partition", "metering.read"}
+     ) is True
+ 
+ 
+@@ -322,9 +322,9 @@ def test_check_permissions_granted() -> None:
+ def test_check_permissions_denied() -> None:
+     """缺少所需权限返回 False。"""
+     mgr = PluginManager()
+-    pid = mgr.register(_make_manifest(permissions=["device:read"]))
+-    assert mgr.check_permissions(pid, {"device:write"}) is False
+-    assert mgr.check_permissions(pid, {"device:read", "device:write"}) is False
++    pid = mgr.register(_make_manifest(permissions=["device.read"]))
++    assert mgr.check_permissions(pid, {"device.partition"}) is False
++    assert mgr.check_permissions(pid, {"device.read", "device.partition"}) is False
+ 
+ 
+ @pytest.mark.unit
+@@ -340,7 +340,7 @@ def test_check_permissions_not_found() -> None:
+     """对未注册插件校验权限抛 NotFoundError。"""
+     mgr = PluginManager()
+     with pytest.raises(NotFoundError):
+-        mgr.check_permissions("ghost:0.0.0", {"device:read"})
++        mgr.check_permissions("ghost:0.0.0", {"device.read"})
+ 
+ 
+ # ---------------------------------------------------------------------- #
+diff --git a/tests/unit/plugins/test_isolation.py b/tests/unit/plugins/test_isolation.py
+index 033081e..326f04a 100644
+--- a/tests/unit/plugins/test_isolation.py
++++ b/tests/unit/plugins/test_isolation.py
+@@ -4,8 +4,9 @@
+ * TrustLevel / IsolationMode 枚举；
+ * IsolationPolicy 映射（TRUSTED→IN_PROCESS, UNTRUSTED→RESTRICTED_RPC）；
+ * IsolationGuard.check_access（IN_PROCESS 允许全部, RESTRICTED_RPC 禁止
+-  database/filesystem/network）；
+-* validate_manifest（UNTRUSTED 不允许 database/admin 权限）；
++  network.egress/filesystem.access/database.access）；
++* validate_manifest（UNTRUSTED 不允许 database.access/platform.admin）；
++* 权限名与清单共用 Permission 词表，未知名称报错；
+ * PluginVersionCompat.is_compatible（兼容/不兼容）；
+ * check_upgrade（非破坏性/破坏性升级）；
+ * IVT-8：升级后既有实例按原版本执行。
+@@ -23,6 +24,7 @@ from forgemesh.plugin.isolation import (
+     TrustLevel,
+     UpgradeCheck,
+ )
++from forgemesh.plugin.permissions import Permission
+ 
+ 
+ class TestEnums:
+@@ -68,38 +70,46 @@ class TestIsolationPolicy:
+ 
+ 
+ class TestIsolationGuardCheckAccess:
+-    """资源访问校验。"""
++    """权限使用校验。"""
+ 
+-    def test_in_process_allows_all_resources(self) -> None:
++    def test_in_process_allows_all_permissions(self) -> None:
+         guard = IsolationGuard()
+ 
+-        for resource in ("database", "filesystem", "network", "config", "anything"):
+-            guard.check_access(TrustLevel.TRUSTED, resource)  # 不抛异常
++        for permission in Permission:
++            guard.check_access(TrustLevel.TRUSTED, permission)  # 不抛异常
+ 
+-    def test_restricted_rpc_blocks_database(self) -> None:
++    def test_restricted_rpc_blocks_database_access(self) -> None:
+         guard = IsolationGuard()
+ 
+-        with pytest.raises(IsolationError, match="database"):
+-            guard.check_access(TrustLevel.UNTRUSTED, "database")
++        with pytest.raises(IsolationError, match="database.access"):
++            guard.check_access(TrustLevel.UNTRUSTED, "database.access")
+ 
+-    def test_restricted_rpc_blocks_filesystem(self) -> None:
++    def test_restricted_rpc_blocks_filesystem_access(self) -> None:
+         guard = IsolationGuard()
+ 
+-        with pytest.raises(IsolationError, match="filesystem"):
+-            guard.check_access(TrustLevel.UNTRUSTED, "filesystem")
++        with pytest.raises(IsolationError, match="filesystem.access"):
++            guard.check_access(TrustLevel.UNTRUSTED, "filesystem.access")
+ 
+-    def test_restricted_rpc_blocks_network(self) -> None:
++    def test_restricted_rpc_blocks_network_egress(self) -> None:
+         guard = IsolationGuard()
+ 
+-        with pytest.raises(IsolationError, match="network"):
+-            guard.check_access(TrustLevel.UNTRUSTED, "network")
++        with pytest.raises(IsolationError, match="network.egress"):
++            guard.check_access(TrustLevel.UNTRUSTED, "network.egress")
+ 
+-    def test_restricted_rpc_allows_other_resources(self) -> None:
++    def test_restricted_rpc_allows_host_api_permissions(self) -> None:
+         guard = IsolationGuard()
+ 
+-        guard.check_access(TrustLevel.UNTRUSTED, "config")
+-        guard.check_access(TrustLevel.UNTRUSTED, "metrics")
+-        guard.check_access(TrustLevel.VERIFIED, "config")
++        guard.check_access(TrustLevel.UNTRUSTED, "resource.read")
++        guard.check_access(TrustLevel.UNTRUSTED, Permission.METERING_READ)
++        guard.check_access(TrustLevel.VERIFIED, "resource.write")
++
++    @pytest.mark.parametrize("name", ["database", "network", "admin", "metrics:read", ""])
++    def test_unknown_permission_rejected_in_every_mode(self, name: str) -> None:
++        guard = IsolationGuard()
++
++        for trust_level in TrustLevel:
++            with pytest.raises(IsolationError, match="unknown permission"):
++                guard.check_access(trust_level, name)
+ 
+     def test_get_mode(self) -> None:
+         guard = IsolationGuard()
+@@ -110,35 +120,43 @@ class TestIsolationGuardCheckAccess:
+ 
+ 
+ class TestValidateManifest:
+-    """权限声明校验。"""
++    """权限申请校验。"""
+ 
+-    def test_untrusted_cannot_declare_database(self) -> None:
++    def test_untrusted_cannot_request_database_access(self) -> None:
+         guard = IsolationGuard()
+ 
+-        with pytest.raises(IsolationError, match="database"):
+-            guard.validate_manifest(TrustLevel.UNTRUSTED, ["database", "read"])
++        with pytest.raises(IsolationError, match="database.access"):
++            guard.validate_manifest(TrustLevel.UNTRUSTED, ["database.access", "resource.read"])
+ 
+-    def test_untrusted_cannot_declare_admin(self) -> None:
++    def test_untrusted_cannot_request_platform_admin(self) -> None:
+         guard = IsolationGuard()
+ 
+-        with pytest.raises(IsolationError, match="admin"):
+-            guard.validate_manifest(TrustLevel.UNTRUSTED, ["admin"])
++        with pytest.raises(IsolationError, match="platform.admin"):
++            guard.validate_manifest(TrustLevel.UNTRUSTED, ["platform.admin"])
+ 
+-    def test_untrusted_can_declare_safe_permissions(self) -> None:
++    def test_untrusted_can_request_safe_permissions(self) -> None:
+         guard = IsolationGuard()
+ 
+-        guard.validate_manifest(TrustLevel.UNTRUSTED, ["read", "metrics", "log"])
++        guard.validate_manifest(
++            TrustLevel.UNTRUSTED, ["resource.read", "metering.read", "event.subscribe"]
++        )
+ 
+-    def test_trusted_can_declare_any_permission(self) -> None:
++    def test_trusted_can_request_any_permission(self) -> None:
+         guard = IsolationGuard()
+ 
+-        guard.validate_manifest(TrustLevel.TRUSTED, ["database", "admin"])
++        guard.validate_manifest(TrustLevel.TRUSTED, list(Permission))
+ 
+-    def test_verified_can_declare_database(self) -> None:
++    def test_verified_can_request_database_access(self) -> None:
+         """VERIFIED 级别不受 UNTRUSTED 权限限制。"""
+         guard = IsolationGuard()
+ 
+-        guard.validate_manifest(TrustLevel.VERIFIED, ["database"])
++        guard.validate_manifest(TrustLevel.VERIFIED, ["database.access"])
++
++    def test_unknown_permission_rejected(self) -> None:
++        guard = IsolationGuard()
++
++        with pytest.raises(IsolationError, match="unknown permission 'admin'"):
++            guard.validate_manifest(TrustLevel.TRUSTED, ["resource.read", "admin"])
+ 
+ 
+ class TestIsCompatible:
+diff --git a/tests/unit/plugins/test_permissions.py b/tests/unit/plugins/test_permissions.py
+new file mode 100644
+index 0000000..5371850
+--- /dev/null
++++ b/tests/unit/plugins/test_permissions.py
+@@ -0,0 +1,87 @@
++"""插件权限词表与清单权限校验单元测试。
++
++覆盖：
++
++* 词表取值形如 ``<域>.<动作>``，且与成员名一一对应；
++* PluginSpec 只接受词表中的权限，拒绝旧版自由命名、大小写变体与重复项；
++* 仓库内全部插件清单（``plugins/`` 与 ``examples/``）都满足词表约束。
++"""
++
++from __future__ import annotations
++
++import re
++from pathlib import Path
++from typing import Any
++
++import pytest
++import yaml
++from forgemesh.plugin.manifest import PluginManifest, PluginSpec
++from forgemesh.plugin.permissions import Permission
++from pydantic import ValidationError
++
++_REPO_ROOT = Path(__file__).resolve().parents[3]
++
++
++def _shipped_manifests() -> list[tuple[str, dict[str, Any]]]:
++    found: list[tuple[str, dict[str, Any]]] = []
++    for pattern in ("plugins/*/manifest.yaml", "examples/**/*.yaml"):
++        for path in sorted(_REPO_ROOT.glob(pattern)):
++            for doc in yaml.safe_load_all(path.read_text(encoding="utf-8")):
++                if isinstance(doc, dict) and doc.get("kind") == "PluginManifest":
++                    found.append((str(path.relative_to(_REPO_ROOT)), doc))
++    return found
++
++
++_SHIPPED_MANIFESTS = _shipped_manifests()
++
++
++class TestVocabulary:
++    """词表本身的形式约束。"""
++
++    def test_values_are_dotted_and_match_member_names(self) -> None:
++        for permission in Permission:
++            assert re.fullmatch(r"[a-z]+\.[a-z]+", permission.value)
++            assert permission.name == permission.value.replace(".", "_").upper()
++
++    def test_values_are_unique(self) -> None:
++        values = [p.value for p in Permission]
++        assert len(values) == len(set(values))
++
++
++class TestPluginSpecPermissions:
++    """清单 ``spec.permissions`` 的取值校验。"""
++
++    def test_vocabulary_names_parsed_as_permissions(self) -> None:
++        spec = PluginSpec(category="policy", permissions=["resource.read", "network.egress"])
++
++        assert spec.permissions == [Permission.RESOURCE_READ, Permission.NETWORK_EGRESS]
++        assert spec.model_dump(mode="json")["permissions"] == ["resource.read", "network.egress"]
++
++    @pytest.mark.parametrize(
++        "name", ["admin", "database", "metrics:read", "device:write", "Resource.Read", ""]
++    )
++    def test_name_outside_vocabulary_rejected(self, name: str) -> None:
++        with pytest.raises(ValidationError, match="permissions"):
++            PluginSpec(category="policy", permissions=["resource.read", name])
++
++    def test_duplicate_permissions_rejected(self) -> None:
++        with pytest.raises(ValidationError, match=r"duplicate permissions: \['resource\.read'\]"):
++            PluginSpec(
++                category="policy",
++                permissions=["resource.read", "decision.evaluate", "resource.read"],
++            )
++
++
++def test_repository_has_plugin_manifests() -> None:
++    """防止清单收集为空时下方参数化用例静默通过。"""
++    assert len([name for name, _ in _SHIPPED_MANIFESTS if name.startswith("plugins/")]) == 10
++    assert any(name.startswith("examples/") for name, _ in _SHIPPED_MANIFESTS)
++
++
++@pytest.mark.parametrize(
++    ("name", "doc"), [pytest.param(name, doc, id=name) for name, doc in _SHIPPED_MANIFESTS]
++)
++def test_shipped_manifest_permissions_in_vocabulary(name: str, doc: dict[str, Any]) -> None:
++    manifest = PluginManifest.model_validate(doc)
++
++    assert [p.value for p in manifest.spec.permissions] == doc["spec"]["permissions"]
+-- 
+2.43.0
+

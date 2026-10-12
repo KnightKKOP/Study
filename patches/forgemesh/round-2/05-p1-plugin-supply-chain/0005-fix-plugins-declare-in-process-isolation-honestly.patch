@@ -1,0 +1,530 @@
+From a301a424e5f6e9aa4ca36f4104f4cde72cdea6d5 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 12 Oct 2026 12:50:40 +0000
+Subject: [PATCH 5/8] fix(plugins): declare in-process isolation honestly
+
+Every shipped manifest declared `isolation: restricted-rpc`, but the
+host has no process boundary: plugins are imported into the control
+plane process and IsolationGuard is only a policy table that plugin
+code is never forced through. decision-typesafe-jev made the mismatch
+concrete by calling the TypeSafe API with urllib while claiming a mode
+that forbids direct network access.
+
+Until a real boundary exists (subprocess plus RPC, or containers),
+PluginSpec and the plugin-manifest schema accept only `in-process`
+(unset still means in-process) and reject restricted-rpc and sandbox
+with an explanation. All ten manifests, the single-node example and
+the scaffold template now declare in-process; typesafe-jev keeps
+requesting network.egress, which matches what it does. The SDK
+warning for an unset isolation no longer promises a restricted-rpc
+default, and the v1.1 conformance test checks in-process plugins by
+loading their declared entrypoint.
+
+This does not add any isolation; it only stops manifests from claiming
+one.
+
+Breaking: manifests declaring restricted-rpc or sandbox are rejected.
+---
+ api/schemas/plugin-manifest.schema.json       |  4 +-
+ examples/single-node/plugin-vllm.yaml         |  2 +-
+ .../src/forgemesh/plugin/manifest.py          | 22 ++++++++--
+ .../src/forgemesh/plugin/scaffold.py          |  2 +-
+ .../plugin-sdk/src/forgemesh/plugin/sdk.py    |  2 +-
+ plugins/decision-jev/manifest.yaml            |  2 +-
+ plugins/decision-rules/manifest.yaml          |  2 +-
+ plugins/decision-typesafe-jev/manifest.yaml   |  2 +-
+ plugins/gpu-nvidia/manifest.yaml              |  2 +-
+ plugins/metering-basic/manifest.yaml          |  2 +-
+ plugins/qos-basic/manifest.yaml               |  2 +-
+ plugins/runtime-tgi/manifest.yaml             |  2 +-
+ plugins/runtime-vllm/manifest.yaml            |  2 +-
+ plugins/workflow-reference/manifest.yaml      |  2 +-
+ plugins/workflow-temporal/manifest.yaml       |  2 +-
+ tests/compat/test_plugin_conformance_v11.py   | 40 ++++--------------
+ tests/contract/test_cross_representation.py   | 22 ++++++++--
+ tests/contract/test_plugin_contract_suite.py  |  9 +++-
+ tests/unit/plugins/test_isolation.py          | 42 +++++++++++++++++++
+ 19 files changed, 112 insertions(+), 53 deletions(-)
+
+diff --git a/api/schemas/plugin-manifest.schema.json b/api/schemas/plugin-manifest.schema.json
+index eb8c5fb..0cf4f28 100644
+--- a/api/schemas/plugin-manifest.schema.json
++++ b/api/schemas/plugin-manifest.schema.json
+@@ -88,8 +88,8 @@
+         },
+         "isolation": {
+           "type": "string",
+-          "enum": ["in-process", "restricted-rpc", "sandbox"],
+-          "description": "隔离级别（ADR-006）。"
++          "enum": ["in-process"],
++          "description": "隔离级别。插件都在宿主进程内运行，目前只能声明 in-process；restricted-rpc / sandbox 需要真实的进程边界（ADR-006），实现之前不得声明。"
+         },
+         "entrypoint": {
+           "type": "string",
+diff --git a/examples/single-node/plugin-vllm.yaml b/examples/single-node/plugin-vllm.yaml
+index 3836be7..fdb4a29 100644
+--- a/examples/single-node/plugin-vllm.yaml
++++ b/examples/single-node/plugin-vllm.yaml
+@@ -20,7 +20,7 @@ spec:
+     - resource.read
+     - inference.deploy
+     - inference.inspect
+-  isolation: restricted-rpc        # 按信任级别隔离（ADR-006）
++  isolation: in-process            # 插件在宿主进程内运行，目前没有进程隔离
+   entrypoint: "deploy:VLLMDeployer"
+   artifactDigest: sha256:ab12...
+   signature: cosign:...
+diff --git a/packages/plugin-sdk/src/forgemesh/plugin/manifest.py b/packages/plugin-sdk/src/forgemesh/plugin/manifest.py
+index 2e503b9..4995e61 100644
+--- a/packages/plugin-sdk/src/forgemesh/plugin/manifest.py
++++ b/packages/plugin-sdk/src/forgemesh/plugin/manifest.py
+@@ -8,7 +8,9 @@
+ * **权限申请**：``permissions`` 是插件申请的权限，取值限于
+   :class:`~forgemesh.plugin.permissions.Permission` 词表且不得重复；清单不能给自己授权，
+   实际授予由管理员决定。
+-* **隔离分级**：隔离模式按信任级别由安装器裁决（ADR-006），Manifest 可声明。
++* **隔离**：插件都在宿主进程内运行，``isolation`` 只能声明 ``in-process``（未设置同样按
++  进程内运行）；``restricted-rpc`` / ``sandbox`` 需要真实的进程边界（ADR-006），实现之前
++  清单不得声明。
+ * **入口点**：``entrypoint`` 形如 ``<模块>:<类>``，模块路径相对于插件包（插件目录须含
+   ``__init__.py``），由 :func:`forgemesh.plugin.loader.load_entrypoint` 加载。
+ * **供应链**：``artifact_digest`` / ``signature`` 支持制品摘要与签名校验。
+@@ -94,6 +96,9 @@ PLUGIN_TRANSITIONS: dict[PluginLifecycleState, set[PluginLifecycleState]] = {
+ #: ``api/schemas/plugin-manifest.schema.json`` 使用同一正则。
+ ENTRYPOINT_PATTERN = r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*:[A-Za-z_][A-Za-z0-9_]*$"
+ 
++#: 清单可声明的隔离级别。宿主没有为插件建立任何进程边界，所以只有 ``in-process`` 名副其实。
++SUPPORTED_ISOLATION: tuple[str, ...] = ("in-process",)
++
+ 
+ class PluginMeta(BaseModel):
+     """插件元数据。
+@@ -116,7 +121,7 @@ class PluginSpec(BaseModel):
+         provides: 提供的能力标识。
+         requires: 依赖的能力标识。
+         permissions: 申请的权限（:class:`Permission` 词表，不得重复）；实际授予由管理员决定。
+-        isolation: 隔离级别（in-process/restricted-rpc/sandbox，ADR-006）。
++        isolation: 隔离级别，目前只能是 ``in-process``（未设置同样按进程内运行）。
+         entrypoint: 入口点 ``<模块>:<类>``（如 ``provider:RulesProvider``），模块路径相对于
+             插件包。
+         artifactDigest: 制品摘要（如 sha256:...），供应链安全。
+@@ -133,7 +138,7 @@ class PluginSpec(BaseModel):
+     provides: list[str] = Field(default_factory=list)
+     requires: list[str] = Field(default_factory=list)
+     permissions: list[Permission] = Field(default_factory=list)
+-    isolation: str | None = Field(default=None, description="隔离级别（in-process/restricted-rpc/sandbox，ADR-006）")
++    isolation: str | None = Field(default=None, description="隔离级别，目前只能是 in-process")
+     entrypoint: str | None = Field(
+         default=None, description="入口点 <模块>:<类>，模块路径相对于插件包"
+     )
+@@ -150,6 +155,16 @@ class PluginSpec(BaseModel):
+             raise ValueError(f"duplicate permissions: {duplicates}")
+         return value
+ 
++    @field_validator("isolation")
++    @classmethod
++    def _supported_isolation(cls, value: str | None) -> str | None:
++        if value is not None and value not in SUPPORTED_ISOLATION:
++            raise ValueError(
++                f"isolation {value!r} is not supported: plugins run inside the host process "
++                "without a process boundary, declare 'in-process'"
++            )
++        return value
++
+     @field_validator("entrypoint")
+     @classmethod
+     def _entrypoint_format(cls, value: str | None) -> str | None:
+@@ -217,5 +232,6 @@ __all__ = [
+     "PluginManifest",
+     "PluginLifecycleState",
+     "PLUGIN_TRANSITIONS",
++    "SUPPORTED_ISOLATION",
+     "validate_plugin_transition",
+ ]
+diff --git a/packages/plugin-sdk/src/forgemesh/plugin/scaffold.py b/packages/plugin-sdk/src/forgemesh/plugin/scaffold.py
+index 899cb02..c0746ac 100644
+--- a/packages/plugin-sdk/src/forgemesh/plugin/scaffold.py
++++ b/packages/plugin-sdk/src/forgemesh/plugin/scaffold.py
+@@ -97,7 +97,7 @@ spec:
+     - {{ name }}
+   requires: []
+   permissions: []
+-  isolation: restricted-rpc
++  isolation: in-process
+   entrypoint: "provider:{{ class_name }}"
+ """
+ 
+diff --git a/packages/plugin-sdk/src/forgemesh/plugin/sdk.py b/packages/plugin-sdk/src/forgemesh/plugin/sdk.py
+index 4509574..45cacb3 100644
+--- a/packages/plugin-sdk/src/forgemesh/plugin/sdk.py
++++ b/packages/plugin-sdk/src/forgemesh/plugin/sdk.py
+@@ -177,7 +177,7 @@ class PluginSdk:
+         if not spec.permissions:
+             warnings.append("spec.permissions is empty; plugin will run with no capabilities")
+         if spec.isolation is None:
+-            warnings.append("spec.isolation is unset; installer will default to restricted-rpc")
++            warnings.append("spec.isolation is unset; the plugin runs in-process")
+         if spec.entrypoint is None:
+             warnings.append("spec.entrypoint is unset; the plugin cannot be loaded")
+         if not spec.compatibility:
+diff --git a/plugins/decision-jev/manifest.yaml b/plugins/decision-jev/manifest.yaml
+index 94d0cee..4e35931 100644
+--- a/plugins/decision-jev/manifest.yaml
++++ b/plugins/decision-jev/manifest.yaml
+@@ -16,7 +16,7 @@ spec:
+   permissions:
+     - resource.read
+     - decision.evaluate
+-  isolation: restricted-rpc
++  isolation: in-process
+   entrypoint: "provider:JEVProvider"
+   healthCheck:
+     mode: rpc
+diff --git a/plugins/decision-rules/manifest.yaml b/plugins/decision-rules/manifest.yaml
+index ee2f048..71b29b3 100644
+--- a/plugins/decision-rules/manifest.yaml
++++ b/plugins/decision-rules/manifest.yaml
+@@ -16,7 +16,7 @@ spec:
+   permissions:
+     - resource.read
+     - decision.evaluate
+-  isolation: restricted-rpc
++  isolation: in-process
+   entrypoint: "provider:RulesProvider"
+   healthCheck:
+     mode: rpc
+diff --git a/plugins/decision-typesafe-jev/manifest.yaml b/plugins/decision-typesafe-jev/manifest.yaml
+index 1e56b72..ba7e79f 100644
+--- a/plugins/decision-typesafe-jev/manifest.yaml
++++ b/plugins/decision-typesafe-jev/manifest.yaml
+@@ -17,7 +17,7 @@ spec:
+     - resource.read
+     - decision.evaluate
+     - network.egress
+-  isolation: restricted-rpc
++  isolation: in-process
+   entrypoint: "provider:TypeSafeJevProvider"
+   healthCheck:
+     mode: http
+diff --git a/plugins/gpu-nvidia/manifest.yaml b/plugins/gpu-nvidia/manifest.yaml
+index e422b9a..a077c07 100644
+--- a/plugins/gpu-nvidia/manifest.yaml
++++ b/plugins/gpu-nvidia/manifest.yaml
+@@ -17,7 +17,7 @@ spec:
+   permissions:
+     - device.read
+     - device.partition
+-  isolation: restricted-rpc
++  isolation: in-process
+   entrypoint: "discovery:GPUDiscoverer"
+   healthCheck:
+     mode: rpc
+diff --git a/plugins/metering-basic/manifest.yaml b/plugins/metering-basic/manifest.yaml
+index 3eabdbb..f779d7f 100644
+--- a/plugins/metering-basic/manifest.yaml
++++ b/plugins/metering-basic/manifest.yaml
+@@ -16,7 +16,7 @@ spec:
+   permissions:
+     - metering.read
+     - event.subscribe
+-  isolation: restricted-rpc
++  isolation: in-process
+   entrypoint: "provider:MeteringProvider"
+   healthCheck:
+     mode: rpc
+diff --git a/plugins/qos-basic/manifest.yaml b/plugins/qos-basic/manifest.yaml
+index c43e0e6..4aa0af9 100644
+--- a/plugins/qos-basic/manifest.yaml
++++ b/plugins/qos-basic/manifest.yaml
+@@ -16,7 +16,7 @@ spec:
+   permissions:
+     - resource.read
+     - policy.evaluate
+-  isolation: restricted-rpc
++  isolation: in-process
+   entrypoint: "provider:QoSProvider"
+   healthCheck:
+     mode: rpc
+diff --git a/plugins/runtime-tgi/manifest.yaml b/plugins/runtime-tgi/manifest.yaml
+index 2434475..c622db3 100644
+--- a/plugins/runtime-tgi/manifest.yaml
++++ b/plugins/runtime-tgi/manifest.yaml
+@@ -18,7 +18,7 @@ spec:
+     - resource.read
+     - inference.deploy
+     - inference.inspect
+-  isolation: restricted-rpc
++  isolation: in-process
+   entrypoint: "provider:TgiRuntimeProvider"
+   healthCheck:
+     mode: rpc
+diff --git a/plugins/runtime-vllm/manifest.yaml b/plugins/runtime-vllm/manifest.yaml
+index aba8641..ec0baf7 100644
+--- a/plugins/runtime-vllm/manifest.yaml
++++ b/plugins/runtime-vllm/manifest.yaml
+@@ -17,7 +17,7 @@ spec:
+     - resource.read
+     - inference.deploy
+     - inference.inspect
+-  isolation: restricted-rpc
++  isolation: in-process
+   entrypoint: "deploy:VLLMDeployer"
+   healthCheck:
+     mode: rpc
+diff --git a/plugins/workflow-reference/manifest.yaml b/plugins/workflow-reference/manifest.yaml
+index 955a4d5..0386b72 100644
+--- a/plugins/workflow-reference/manifest.yaml
++++ b/plugins/workflow-reference/manifest.yaml
+@@ -17,7 +17,7 @@ spec:
+     - resource.read
+     - resource.write
+     - workflow.execute
+-  isolation: restricted-rpc
++  isolation: in-process
+   entrypoint: "provider:ReferenceWorkflowRuntime"
+   healthCheck:
+     mode: rpc
+diff --git a/plugins/workflow-temporal/manifest.yaml b/plugins/workflow-temporal/manifest.yaml
+index b26b1d4..d8c4fdd 100644
+--- a/plugins/workflow-temporal/manifest.yaml
++++ b/plugins/workflow-temporal/manifest.yaml
+@@ -21,7 +21,7 @@ spec:
+   permissions:
+     - resource.read
+     - workflow.execute
+-  isolation: restricted-rpc
++  isolation: in-process
+   entrypoint: "provider:TemporalWorkflowProvider"
+   healthCheck:
+     mode: rpc
+diff --git a/tests/compat/test_plugin_conformance_v11.py b/tests/compat/test_plugin_conformance_v11.py
+index 7c12cf9..20b6990 100644
+--- a/tests/compat/test_plugin_conformance_v11.py
++++ b/tests/compat/test_plugin_conformance_v11.py
+@@ -43,6 +43,7 @@ from forgemesh.core.errors import (
+     InvalidStateTransition,
+     NotFoundError,
+ )
++from forgemesh.plugin.loader import load_entrypoint
+ from forgemesh.plugin.manifest import (
+     PluginLifecycleState,
+     PluginManifest,
+@@ -74,8 +75,8 @@ ALL_PLUGIN_DIRS: list[str] = [
+     "metering-basic",
+ ]
+ 
+-#: manifest 允许的隔离级别枚举（对齐 schema enum 与 ADR-006）。
+-_ALLOWED_ISOLATION = {"in-process", "restricted-rpc", "sandbox"}
++#: manifest 允许的隔离级别（对齐 schema enum）：插件都在宿主进程内运行，没有进程边界。
++_ALLOWED_ISOLATION = {"in-process"}
+ 
+ #: 插件可申请的权限词表。
+ _PERMISSION_VOCABULARY = {p.value for p in Permission}
+@@ -192,7 +193,7 @@ class TestManifestAndIsolationConformance:
+     def test_isolation_declaration_within_allowed_enum(
+         self, plugin_dir: str
+     ) -> None:
+-        """isolation 声明值须落在允许枚举 {in-process, restricted-rpc, sandbox} 内。"""
++        """isolation 只能声明 in-process（restricted-rpc / sandbox 尚无进程边界实现）。"""
+         isolation = _load_manifest_dict(plugin_dir)["spec"]["isolation"]
+         assert isolation in _ALLOWED_ISOLATION, (
+             f"{plugin_dir}: 非法 isolation 声明 {isolation!r}"
+@@ -204,35 +205,12 @@ class TestManifestAndIsolationConformance:
+         [pytest.param(p, id=p) for p in ALL_PLUGIN_DIRS],
+     )
+     def test_isolation_matches_directory_shape(self, plugin_dir: str) -> None:
+-        """isolation 声明须与目录形态一致。
++        """声明 ``in-process`` 的插件须能在进程内按清单入口点加载。"""
++        spec = _load_manifest_dict(plugin_dir)["spec"]
++        assert spec["isolation"] == "in-process"
+ 
+-        * 声明 ``in-process``：目录须有可加载入口（provider.py 或
+-          ``__init__.py``），且进程内实际加载成功；
+-        * 声明 ``restricted-rpc`` / ``sandbox``：允许仅有清单（不强求沙箱
+-          运行时存在），枚举合法性由前一用例保证。
+-        """
+-        manifest = _load_manifest_dict(plugin_dir)
+-        isolation = manifest["spec"]["isolation"]
+-        plugin_path = _PLUGINS_ROOT / plugin_dir
+-
+-        if isolation == "in-process":
+-            has_entry = (plugin_path / "provider.py").is_file() or (
+-                plugin_path / "__init__.py"
+-            ).is_file()
+-            assert has_entry, (
+-                f"{plugin_dir} 声明 in-process 但缺少可加载入口"
+-                "（provider.py 或 __init__.py）"
+-            )
+-            # 进程内加载须成功（幂等注册到 sys.modules）。
+-            if (plugin_path / "provider.py").is_file():
+-                _ensure_plugin_module(
+-                    f"_conformance_{plugin_dir.replace('-', '_')}", plugin_dir
+-                )
+-            else:
+-                _ensure_plugin_package(
+-                    f"_conformance_{plugin_dir.replace('-', '_')}", plugin_dir
+-                )
+-        # restricted-rpc / sandbox：不强制沙箱运行时存在，无需目录形态断言。
++        entry = load_entrypoint(_PLUGINS_ROOT / plugin_dir, spec["entrypoint"])
++        assert entry.__name__ == spec["entrypoint"].split(":")[1]
+ 
+     @_compat
+     @pytest.mark.parametrize(
+diff --git a/tests/contract/test_cross_representation.py b/tests/contract/test_cross_representation.py
+index 51f1e95..651b733 100644
+--- a/tests/contract/test_cross_representation.py
++++ b/tests/contract/test_cross_representation.py
+@@ -25,7 +25,7 @@ import yaml
+ from forgemesh.core.errors import ForgeMeshError, GovernanceBypassError
+ from forgemesh.core.objects import ObjectMeta
+ from forgemesh.decision.provider import DecisionRequest
+-from forgemesh.plugin.manifest import ENTRYPOINT_PATTERN, PluginSpec
++from forgemesh.plugin.manifest import ENTRYPOINT_PATTERN, SUPPORTED_ISOLATION, PluginSpec
+ from forgemesh.plugin.permissions import Permission
+ from forgemesh.policy.api import PolicyDecision
+ from forgemesh.resource.inference import (
+@@ -146,13 +146,13 @@ def test_plugin_spec_supply_chain_fields() -> None:
+     """PluginSpec：供应链安全字段（isolation/entrypoint/artifactDigest/signature）一致。"""
+     spec = PluginSpec(
+         category="provider",
+-        isolation="sandbox",
++        isolation="in-process",
+         entrypoint="provider:Main",
+         artifactDigest="sha256:abc",
+         signature="cosign:xyz",
+     )
+     dumped = spec.model_dump(by_alias=True)
+-    assert dumped["isolation"] == "sandbox"
++    assert dumped["isolation"] == "in-process"
+     assert dumped["entrypoint"] == "provider:Main"
+     assert dumped["artifactDigest"] == "sha256:abc"
+     assert dumped["signature"] == "cosign:xyz"
+@@ -221,6 +221,22 @@ def test_plugin_permissions_rejected_by_model_and_schema(permissions: list[str])
+         PluginSpec.model_validate(manifest["spec"])
+ 
+ 
++@pytest.mark.contract
++def test_plugin_isolation_schema_matches_model() -> None:
++    """Schema 的隔离级别枚举与模型一致：只允许 in-process。"""
++    schema = _load_json(SCHEMAS_DIR / "plugin-manifest.schema.json")
++    isolation = schema["properties"]["spec"]["properties"]["isolation"]
++    assert isolation["enum"] == list(SUPPORTED_ISOLATION) == ["in-process"]
++
++    validator = Draft202012Validator(schema)
++    for value in ("restricted-rpc", "sandbox"):
++        manifest = _plugin_manifest_with_permissions(["resource.read"])
++        manifest["spec"]["isolation"] = value
++        assert list(validator.iter_errors(manifest))
++        with pytest.raises(ValidationError, match="isolation"):
++            PluginSpec.model_validate(manifest["spec"])
++
++
+ @pytest.mark.contract
+ def test_plugin_entrypoint_schema_pattern_matches_model() -> None:
+     """Schema 的入口点正则与模型使用的 ENTRYPOINT_PATTERN 相同。"""
+diff --git a/tests/contract/test_plugin_contract_suite.py b/tests/contract/test_plugin_contract_suite.py
+index 13ce463..75bb51b 100644
+--- a/tests/contract/test_plugin_contract_suite.py
++++ b/tests/contract/test_plugin_contract_suite.py
+@@ -67,7 +67,7 @@ def _make_manifest(**spec_overrides: Any) -> PluginManifest:
+         "compatibility": {"coreApi": "v1alpha1"},
+         "provides": ["test-plugin"],
+         "permissions": ["metering.read"],
+-        "isolation": "restricted-rpc",
++        "isolation": "in-process",
+         "entrypoint": "provider:TestPlugin",
+     }
+     spec_fields.update(spec_overrides)
+@@ -137,6 +137,13 @@ class TestPluginManifestSchema:
+         assert manifest.metadata.version == "1.0.0"
+         assert manifest.spec.isolation == "in-process"
+ 
++    @pytest.mark.contract
++    @pytest.mark.parametrize("isolation", ["restricted-rpc", "sandbox"])
++    def test_unimplemented_isolation_rejected(self, isolation: str) -> None:
++        """宿主没有进程边界，清单不得声明 restricted-rpc / sandbox。"""
++        with pytest.raises(ValidationError, match="declare 'in-process'"):
++            _make_manifest(isolation=isolation)
++
+ 
+ # ===========================================================================
+ # 2. Provider 契约一致性
+diff --git a/tests/unit/plugins/test_isolation.py b/tests/unit/plugins/test_isolation.py
+index 326f04a..707738a 100644
+--- a/tests/unit/plugins/test_isolation.py
++++ b/tests/unit/plugins/test_isolation.py
+@@ -7,6 +7,7 @@
+   network.egress/filesystem.access/database.access）；
+ * validate_manifest（UNTRUSTED 不允许 database.access/platform.admin）；
+ * 权限名与清单共用 Permission 词表，未知名称报错；
++* 清单 isolation 只能声明 in-process（没有进程边界），仓库内清单均如实声明；
+ * PluginVersionCompat.is_compatible（兼容/不兼容）；
+ * check_upgrade（非破坏性/破坏性升级）；
+ * IVT-8：升级后既有实例按原版本执行。
+@@ -14,7 +15,10 @@
+ 
+ from __future__ import annotations
+ 
++from pathlib import Path
++
+ import pytest
++import yaml
+ from forgemesh.plugin.isolation import (
+     IsolationError,
+     IsolationGuard,
+@@ -24,7 +28,15 @@ from forgemesh.plugin.isolation import (
+     TrustLevel,
+     UpgradeCheck,
+ )
++from forgemesh.plugin.manifest import PluginSpec
+ from forgemesh.plugin.permissions import Permission
++from pydantic import ValidationError
++
++_REPO_ROOT = Path(__file__).resolve().parents[3]
++_SHIPPED_MANIFESTS = [
++    *sorted(_REPO_ROOT.glob("plugins/*/manifest.yaml")),
++    _REPO_ROOT / "examples" / "single-node" / "plugin-vllm.yaml",
++]
+ 
+ 
+ class TestEnums:
+@@ -159,6 +171,36 @@ class TestValidateManifest:
+             guard.validate_manifest(TrustLevel.TRUSTED, ["resource.read", "admin"])
+ 
+ 
++class TestManifestIsolationDeclaration:
++    """清单 ``spec.isolation``：没有进程边界，只能如实声明 in-process。"""
++
++    @pytest.mark.parametrize("isolation", ["in-process", None])
++    def test_in_process_or_unset_accepted(self, isolation: str | None) -> None:
++        assert PluginSpec(category="policy", isolation=isolation).isolation == isolation
++
++    @pytest.mark.parametrize("isolation", ["restricted-rpc", "sandbox", "RESTRICTED_RPC", ""])
++    def test_other_isolation_rejected(self, isolation: str) -> None:
++        with pytest.raises(ValidationError, match="without a process boundary"):
++            PluginSpec(category="policy", isolation=isolation)
++
++    @pytest.mark.parametrize(
++        "path", _SHIPPED_MANIFESTS, ids=lambda p: str(p.relative_to(_REPO_ROOT))
++    )
++    def test_shipped_manifests_declare_in_process(self, path: Path) -> None:
++        spec = yaml.safe_load(path.read_text(encoding="utf-8"))["spec"]
++
++        assert spec["isolation"] == "in-process"
++
++    def test_typesafe_jev_declares_direct_network_egress(self) -> None:
++        """typesafe-jev 在进程内直接用 urllib 访问外部 API，须如实申请 network.egress。"""
++        plugin = _REPO_ROOT / "plugins" / "decision-typesafe-jev"
++        spec = yaml.safe_load((plugin / "manifest.yaml").read_text(encoding="utf-8"))["spec"]
++
++        assert "urllib.request.urlopen" in (plugin / "provider.py").read_text(encoding="utf-8")
++        assert spec["isolation"] == "in-process"
++        assert "network.egress" in spec["permissions"]
++
++
+ class TestIsCompatible:
+     """语义版本兼容检查。"""
+ 
+-- 
+2.43.0
+

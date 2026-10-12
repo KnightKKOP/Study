@@ -1,0 +1,1144 @@
+From a9e4d3e5698be399edc0aee8fa8e7cfd896694a1 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 12 Oct 2026 13:11:12 +0000
+Subject: [PATCH 6/8] feat(control-plane): verify plugin signatures and grants
+ at registration
+
+PluginManager.register stored any manifest object as it was: nothing
+checked that the artifact or the manifest came from a trusted author,
+and check_permissions treated the permissions a manifest requested as
+already granted, so a plugin could give itself platform.admin by
+listing it.
+
+register now re-validates the manifest (a model mutated after
+construction or built with model_construct is rejected, and the record
+keeps the validated copy) and verifies the detached Ed25519 signature
+against the trusted keys of a plugin policy. Both digests are
+recomputed from the artifact content and the manifest, so a tampered
+artifact, a manifest changed after signing, an unsupported algorithm,
+an untrusted key or a forged signature all raise PluginRejectedError
+and nothing is registered. Unsigned plugins are only accepted when the
+manager is constructed with dev_mode_allow_unsigned=True; the mode is
+off by default, logs a warning, and still verifies signed plugins.
+
+Manifest permissions are now requests. A plugin's effective permissions
+are its requests intersected with the PluginGrant an admin configured
+for its metadata.id, and check_permissions decides by those; names
+outside the Permission vocabulary raise ValueError instead of quietly
+returning False.
+
+The policy file ({"trustedKeys": [...], "grants": [...]}) is validated
+strictly: invalid or duplicate keys, duplicate grants, versioned plugin
+ids and unknown permissions are refused. It is decoded with json.loads
+before validation because model_validate_json silently drops keys that
+are spelled like the Python field names (trusted_keys), which would
+turn a typo into an empty key list.
+
+Breaking: register() needs the artifact content and its signature
+unless development mode is on, and permissions a manifest requests no
+longer take effect without a grant. PluginManager is only used by
+library callers and tests today; the control-plane app does not
+construct one, so there is no new environment variable.
+---
+ .../forgemesh/controlplane/plugin_manager.py  | 267 +++++++++++-
+ tests/compat/test_plugin_conformance_v11.py   |  55 +--
+ .../unit/controlplane/test_plugin_manager.py  | 390 +++++++++++++++---
+ 3 files changed, 603 insertions(+), 109 deletions(-)
+
+diff --git a/packages/control-plane/src/forgemesh/controlplane/plugin_manager.py b/packages/control-plane/src/forgemesh/controlplane/plugin_manager.py
+index 5587093..88ef3e5 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/plugin_manager.py
++++ b/packages/control-plane/src/forgemesh/controlplane/plugin_manager.py
+@@ -1,6 +1,6 @@
+ """ForgeMesh 插件管理器。
+ 
+-对齐 development-plan 8.3 / ADR-006。负责插件注册、生命周期管理、
++对齐 development-plan 8.3 / ADR-006。负责插件注册校验、生命周期管理、
+ 能力发现与权限校验。
+ 
+ 设计约束：
+@@ -9,27 +9,144 @@
+   生命周期状态由治理状态机驱动（Discovered→Validating→Installed→
+   Enabled/Disabled→Uninstalled）；运行健康（Healthy/Degraded/Unhealthy）
+   独立存储于 ``health_status``，二者不得复用同一字段。
+-* **最小权限**：``permissions`` 声明插件所需的最小权限集合，安装时校验、
+-  运行时 ``check_permissions`` 按 ``required ⊆ granted`` 判定。
++* **注册即校验**：:meth:`PluginManager.register` 按 :class:`PluginManifest` 重新校验清单，
++  并用策略中受信任的公钥校验制品签名（:mod:`forgemesh.plugin.signing`）。签名覆盖制品内容
++  与清单，篡改任何一方注册都会被拒绝。未签名的插件只能在显式开启的开发模式
++  （``dev_mode_allow_unsigned=True``，默认关闭）下注册。
++* **最小权限**：清单的 ``permissions`` 只是申请。插件实际拥有的权限是申请与管理员授予
++  （:class:`PluginGrant`）的交集，``check_permissions`` 按 ``required ⊆ 实际权限`` 判定。
+ * **版本固定与并存规则**（ADR-011）：plugin_id 由 ``metadata.id`` 与
+   ``metadata.version`` 组合，不同版本可并存。
+ 
++插件策略文件（JSON，由管理员维护，见 :func:`load_plugin_policy`）::
++
++    {"trustedKeys": ["<Ed25519 公钥 PEM>"],
++     "grants": [{"pluginId": "forgemesh.decision.rules",
++                 "permissions": ["resource.read", "decision.evaluate"]}]}
++
++``trustedKeys`` 是插件作者的签名公钥，``python -m forgemesh.plugin.signtool keygen`` 会输出
++可以直接追加的条目；``grants`` 按插件的 ``metadata.id`` 授权，对该插件的所有版本生效。
++
+ 生命周期转移表直接复用契约 :data:`forgemesh.plugin.manifest.PLUGIN_TRANSITIONS`，
+ 非法转移抛 :class:`forgemesh.core.errors.InvalidStateTransition`。
+ """
+ 
+ from __future__ import annotations
+ 
++import json
++import logging
++import os
++from collections.abc import Iterable
+ from datetime import UTC, datetime
++from pathlib import Path
+ 
+-from forgemesh.core.errors import ConflictError, InvalidStateTransition, NotFoundError
++from forgemesh.core.errors import (
++    ConflictError,
++    ForbiddenError,
++    InvalidStateTransition,
++    NotFoundError,
++)
+ from forgemesh.plugin.manifest import (
+     PLUGIN_TRANSITIONS,
+     PluginCategory,
+     PluginLifecycleState,
+     PluginManifest,
+ )
+-from pydantic import BaseModel, ConfigDict
++from forgemesh.plugin.permissions import Permission
++from forgemesh.plugin.signing import PluginSignature, PluginSigner, SigningError, load_trusted_keys
++from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
++from pydantic_core import PydanticSerializationError
++
++logger = logging.getLogger(__name__)
++
++
++class PluginPolicyError(ValueError):
++    """插件策略配置不可读或非法；宿主应拒绝启动。"""
++
++
++class PluginRejectedError(ForbiddenError):
++    """插件未通过注册校验（清单非法、未签名或签名校验失败），注册被拒绝。"""
++
++
++class PluginGrant(BaseModel):
++    """管理员授予一个插件的权限（策略文件 ``grants`` 中的一条）。
++
++    字段只按 JSON 名（``pluginId``）解析。``pluginId`` 是插件的 ``metadata.id``（不带版本），
++    授权对该插件的所有版本生效。
++    """
++
++    model_config = ConfigDict(extra="forbid", frozen=True)
++
++    plugin_id: str = Field(alias="pluginId", min_length=1)
++    permissions: tuple[Permission, ...]
++
++    @field_validator("plugin_id")
++    @classmethod
++    def _unversioned(cls, value: str) -> str:
++        if ":" in value:
++            raise ValueError(
++                f"pluginId must be a plugin metadata.id without a version, got {value!r}"
++            )
++        return value
++
++    @field_validator("permissions")
++    @classmethod
++    def _unique_permissions(cls, value: tuple[Permission, ...]) -> tuple[Permission, ...]:
++        duplicates = sorted({p.value for p in value if value.count(p) > 1})
++        if duplicates:
++            raise ValueError(f"duplicate permissions: {duplicates}")
++        return value
++
++
++class PluginPolicy(BaseModel):
++    """插件策略：受信任的签名公钥与管理员的权限授予（策略文件格式见模块文档）。
++
++    Attributes:
++        trusted_keys: 受信任的 Ed25519 公钥（PEM）；只有这些公钥签名的插件能够注册。
++        grants: 权限授予，每个插件至多一条。
++    """
++
++    model_config = ConfigDict(extra="forbid", frozen=True)
++
++    trusted_keys: tuple[str, ...] = Field(default=(), alias="trustedKeys")
++    grants: tuple[PluginGrant, ...] = ()
++
++    @field_validator("trusted_keys")
++    @classmethod
++    def _valid_keys(cls, value: tuple[str, ...]) -> tuple[str, ...]:
++        try:
++            load_trusted_keys(value)
++        except SigningError as exc:
++            raise ValueError(str(exc)) from exc
++        return value
++
++    @field_validator("grants")
++    @classmethod
++    def _one_grant_per_plugin(cls, value: tuple[PluginGrant, ...]) -> tuple[PluginGrant, ...]:
++        ids = [grant.plugin_id for grant in value]
++        duplicates = sorted({plugin_id for plugin_id in ids if ids.count(plugin_id) > 1})
++        if duplicates:
++            raise ValueError(f"duplicate grants for plugins: {duplicates}")
++        return value
++
++
++def load_plugin_policy(path: str | os.PathLike[str]) -> PluginPolicy:
++    """读取并校验插件策略文件。
++
++    Raises:
++        PluginPolicyError: 文件不可读，或内容不符合策略文件格式（包括非法或重复的公钥、
++            重复的授予、词表之外的权限）。
++    """
++    try:
++        raw = Path(path).read_text(encoding="utf-8")
++    except (OSError, UnicodeDecodeError) as exc:
++        raise PluginPolicyError(f"cannot read plugin policy file {path}: {exc}") from exc
++    try:
++        # model_validate_json 会静默丢弃与 Python 字段名同名的键（如 ``trusted_keys``），
++        # 先解析为 Python 对象再校验，extra="forbid" 才会拒绝这类拼写错误。
++        return PluginPolicy.model_validate(json.loads(raw))
++    except (json.JSONDecodeError, ValidationError) as exc:
++        raise PluginPolicyError(f"invalid plugin policy file {path}: {exc}") from exc
+ 
+ 
+ class PluginRecord(BaseModel):
+@@ -37,11 +154,13 @@ class PluginRecord(BaseModel):
+ 
+     Attributes:
+         plugin_id: 插件唯一标识（``metadata.id:metadata.version``）。
+-        manifest: 原始插件清单。
++        manifest: 注册时校验过的插件清单（调用方所传清单的副本）。
+         lifecycle_state: 治理生命周期状态，注册后默认 ``Discovered``。
+         health_status: 运行健康状态（Healthy/Degraded/Unhealthy/Unknown），
+             与 ``lifecycle_state`` 独立存储。
+         installed_at: 进入 ``Installed`` 状态的 UTC ISO-8601 时间戳。
++        signing_key_id: 签名公钥的 key id；开发模式下注册的未签名插件为 ``None``。
++        artifact_digest: 注册时校验过的制品摘要（``sha256:<hex>``）；未签名插件为 ``None``。
+     """
+ 
+     model_config = ConfigDict(extra="forbid")
+@@ -51,23 +170,64 @@ class PluginRecord(BaseModel):
+     lifecycle_state: PluginLifecycleState = PluginLifecycleState.DISCOVERED
+     health_status: str = "Unknown"
+     installed_at: str | None = None
++    signing_key_id: str | None = None
++    artifact_digest: str | None = None
+ 
+ 
+ class PluginManager:
+-    """插件管理器：注册、生命周期、能力发现、权限校验。
++    """插件管理器：注册校验、生命周期、能力发现、权限校验。
+ 
+     线程安全性由调用方保证；本类为单进程内存注册表。
++
++    Args:
++        policy: 受信任的签名公钥与权限授予；``None`` 表示两者都为空，此时没有任何签名
++            被接受，也没有任何权限生效。
++        dev_mode_allow_unsigned: 开发模式，允许注册未签名的插件，只用于本地开发，默认关闭。
++            带签名的插件在开发模式下照常校验。
+     """
+ 
+-    def __init__(self) -> None:
++    def __init__(
++        self, policy: PluginPolicy | None = None, *, dev_mode_allow_unsigned: bool = False
++    ) -> None:
++        policy = policy if policy is not None else PluginPolicy()
++        self._trusted_keys = load_trusted_keys(policy.trusted_keys)
++        self._grants: dict[str, frozenset[Permission]] = {
++            grant.plugin_id: frozenset(grant.permissions) for grant in policy.grants
++        }
++        self._dev_mode_allow_unsigned = dev_mode_allow_unsigned
++        self._signer = PluginSigner()
+         self._plugins: dict[str, PluginRecord] = {}
++        if dev_mode_allow_unsigned:
++            logger.warning(
++                "plugin development mode is on: unsigned plugins are accepted at registration; "
++                "use it for local development only"
++            )
++
++    @classmethod
++    def from_policy_file(
++        cls, path: str | os.PathLike[str], *, dev_mode_allow_unsigned: bool = False
++    ) -> PluginManager:
++        """按策略文件构造插件管理器（见 :func:`load_plugin_policy`）。"""
++        return cls(load_plugin_policy(path), dev_mode_allow_unsigned=dev_mode_allow_unsigned)
+ 
+     # ------------------------------------------------------------------ #
+     # 注册与发现
+     # ------------------------------------------------------------------ #
+ 
+-    def register(self, manifest: PluginManifest) -> str:
+-        """注册插件 Manifest，返回 plugin_id。
++    def register(
++        self,
++        manifest: PluginManifest,
++        *,
++        artifact: bytes | None = None,
++        signature: PluginSignature | None = None,
++    ) -> str:
++        """校验并注册插件，返回 plugin_id。
++
++        注册前先按 :class:`PluginManifest` 重新校验清单（构造后被改动、或未经校验构造的
++        清单同样会被拒绝），记录中保存的是校验后的副本；再用受信任的公钥校验签名：重新
++        计算制品内容与清单的摘要，并校验算法与签名本身（见
++        :meth:`forgemesh.plugin.signing.PluginSigner.verify`）。没有签名的插件只在开发模式下
++        注册，并记录告警。
+ 
+         plugin_id 由 ``metadata.id`` 与 ``metadata.version`` 组合，
+         支持同一插件多版本并存（ADR-011）。重复注册同一 plugin_id 抛
+@@ -75,17 +235,63 @@ class PluginManager:
+ 
+         Args:
+             manifest: 插件清单。
++            artifact: 制品内容字节（从制品存储读取）；有签名时必须提供。
++            signature: 随制品分发的签名文档；``None`` 表示未签名。
+ 
+         Returns:
+             plugin_id 字符串。
++
++        Raises:
++            PluginRejectedError: 清单非法；插件未签名且未开启开发模式；有签名但没有制品内容；
++                或签名校验失败。
++            ConflictError: 同一 plugin_id 已注册。
+         """
+-        plugin_id = f"{manifest.metadata.id}:{manifest.metadata.version}"
++        try:
++            checked = PluginManifest.model_validate(
++                manifest.model_dump(mode="json", warnings=False)
++            )
++        except (ValidationError, PydanticSerializationError) as exc:
++            raise PluginRejectedError(f"invalid plugin manifest: {exc}") from exc
++        plugin_id = f"{checked.metadata.id}:{checked.metadata.version}"
++        signing_key_id, artifact_digest = self._verify_signature(
++            plugin_id, checked, artifact, signature
++        )
+         if plugin_id in self._plugins:
+             raise ConflictError(f"plugin already registered: {plugin_id}")
+-        record = PluginRecord(plugin_id=plugin_id, manifest=manifest)
++        record = PluginRecord(
++            plugin_id=plugin_id,
++            manifest=checked,
++            signing_key_id=signing_key_id,
++            artifact_digest=artifact_digest,
++        )
+         self._plugins[plugin_id] = record
+         return plugin_id
+ 
++    def _verify_signature(
++        self,
++        plugin_id: str,
++        manifest: PluginManifest,
++        artifact: bytes | None,
++        signature: PluginSignature | None,
++    ) -> tuple[str | None, str | None]:
++        if signature is None:
++            if not self._dev_mode_allow_unsigned:
++                raise PluginRejectedError(
++                    f"plugin {plugin_id} rejected: it is unsigned and development mode is off"
++                )
++            logger.warning("registering unsigned plugin %s (development mode)", plugin_id)
++            return None, None
++        if artifact is None:
++            raise PluginRejectedError(
++                f"plugin {plugin_id} rejected: the artifact content is required to verify "
++                "its signature"
++            )
++        try:
++            key_id = self._signer.verify(artifact, manifest, signature, self._trusted_keys)
++        except SigningError as exc:
++            raise PluginRejectedError(f"plugin {plugin_id} rejected: {exc}") from exc
++        return key_id, signature.artifact_digest
++
+     def get(self, plugin_id: str) -> PluginRecord:
+         """获取插件注册记录。
+ 
+@@ -191,22 +397,35 @@ class PluginManager:
+     # 权限校验（最小权限原则）
+     # ------------------------------------------------------------------ #
+ 
+-    def check_permissions(self, plugin_id: str, required: set[str]) -> bool:
++    def effective_permissions(self, plugin_id: str) -> frozenset[Permission]:
++        """插件实际拥有的权限：清单申请、并且管理员已授予（:class:`PluginGrant`）的权限。
++
++        Raises:
++            NotFoundError: 插件未注册。
++        """
++        manifest = self.get(plugin_id).manifest
++        granted = self._grants.get(manifest.metadata.id, frozenset())
++        return frozenset(manifest.spec.permissions) & granted
++
++    def check_permissions(self, plugin_id: str, required: Iterable[str]) -> bool:
+         """校验插件是否拥有所需权限。
+ 
+-        按 ``required ⊆ granted`` 判定，其中 ``granted`` 取自
+-        ``spec.permissions``。空 ``required`` 恒通过。
++        按 ``required ⊆ 实际权限`` 判定，实际权限见 :meth:`effective_permissions`：
++        清单自己申请、但管理员没有授予的权限不生效。空 ``required`` 恒通过。
+ 
+         Args:
+             plugin_id: 插件标识。
+-            required: 运行时所需权限集合。
++            required: 运行时所需权限（:class:`Permission` 词表中的名称）。
+ 
+         Returns:
+             ``True`` 表示权限充足。
++
++        Raises:
++            NotFoundError: 插件未注册。
++            ValueError: ``required`` 中有词表之外的权限名。
+         """
+-        record = self.get(plugin_id)
+-        granted = set(record.manifest.spec.permissions)
+-        return required.issubset(granted)
++        effective = self.effective_permissions(plugin_id)
++        return {Permission(name) for name in required} <= effective
+ 
+     # ------------------------------------------------------------------ #
+     # 版本管理
+@@ -256,4 +475,12 @@ class PluginManager:
+         ]
+ 
+ 
+-__all__ = ["PluginManager", "PluginRecord"]
++__all__ = [
++    "PluginGrant",
++    "PluginManager",
++    "PluginPolicy",
++    "PluginPolicyError",
++    "PluginRecord",
++    "PluginRejectedError",
++    "load_plugin_policy",
++]
+diff --git a/tests/compat/test_plugin_conformance_v11.py b/tests/compat/test_plugin_conformance_v11.py
+index 20b6990..3fcf471 100644
+--- a/tests/compat/test_plugin_conformance_v11.py
++++ b/tests/compat/test_plugin_conformance_v11.py
+@@ -38,6 +38,7 @@ from typing import Any
+ 
+ import pytest
+ import yaml
++from forgemesh.controlplane.plugin_manager import PluginManager, PluginPolicy
+ from forgemesh.core.errors import (
+     ConflictError,
+     InvalidStateTransition,
+@@ -49,6 +50,7 @@ from forgemesh.plugin.manifest import (
+     PluginManifest,
+ )
+ from forgemesh.plugin.permissions import Permission
++from forgemesh.plugin.signing import PluginSigner, generate_private_key, public_key_pem
+ from forgemesh.workflow.runtime import Step, WorkflowDefinition, WorkflowRuntime
+ from forgemesh.workflow.states import WorkflowStatus
+ from jsonschema import Draft202012Validator
+@@ -1001,6 +1003,23 @@ def _manifest_model(plugin_dir: str, *, version: str | None = None) -> PluginMan
+     return PluginManifest.model_validate(data)
+ 
+ 
++#: 第 5 节的插件作者私钥：每次运行时生成，不写入磁盘。
++_AUTHOR_KEY = generate_private_key()
++
++
++def _plugin_manager() -> PluginManager:
++    """只信任 ``_AUTHOR_KEY`` 的插件管理器。"""
++    trusted = public_key_pem(_AUTHOR_KEY).decode("ascii")
++    return PluginManager(PluginPolicy(trustedKeys=[trusted]))
++
++
++def _register(manager: PluginManager, manifest: PluginManifest) -> str:
++    """签名后注册；制品内容用占位字节，签名校验只关心内容与签名是否一致。"""
++    artifact = f"{manifest.metadata.id}-{manifest.metadata.version}.tar.gz".encode()
++    signature = PluginSigner().sign(artifact, manifest, _AUTHOR_KEY)
++    return manager.register(manifest, artifact=artifact, signature=signature)
++
++
+ class TestUpgradeAndUnloadSafety:
+     """升级/卸载安全：运行中引用下的卸载语义与版本并存规则。
+ 
+@@ -1028,10 +1047,8 @@ class TestUpgradeAndUnloadSafety:
+ 
+         期望行为（未实现）：应被拒绝或进入 Draining，见类 docstring。
+         """
+-        from forgemesh.controlplane.plugin_manager import PluginManager
+-
+-        manager = PluginManager()
+-        pid = manager.register(_manifest_model("decision-rules"))
++        manager = _plugin_manager()
++        pid = _register(manager, _manifest_model("decision-rules"))
+ 
+         # 走完合法安装链路：Discovered → Validating → Installed → Enabled。
+         for target in (
+@@ -1055,8 +1072,6 @@ class TestUpgradeAndUnloadSafety:
+     @_compat
+     def test_uninstall_unknown_plugin_rejected(self) -> None:
+         """卸载未注册插件须被拒绝（NotFoundError）。"""
+-        from forgemesh.controlplane.plugin_manager import PluginManager
+-
+         manager = PluginManager()
+         with pytest.raises(NotFoundError):
+             manager.transition(
+@@ -1066,10 +1081,8 @@ class TestUpgradeAndUnloadSafety:
+     @_compat
+     def test_disorderly_transition_rejected(self) -> None:
+         """无序转移被拒：Discovered 不能直接 Enabled/Uninstalled 之外的越级跳转。"""
+-        from forgemesh.controlplane.plugin_manager import PluginManager
+-
+-        manager = PluginManager()
+-        pid = manager.register(_manifest_model("qos-basic"))
++        manager = _plugin_manager()
++        pid = _register(manager, _manifest_model("qos-basic"))
+ 
+         # 越级：Discovered → Enabled（须先 Validating → Installed）。
+         with pytest.raises(InvalidStateTransition):
+@@ -1081,10 +1094,8 @@ class TestUpgradeAndUnloadSafety:
+     @_compat
+     def test_uninstalled_is_terminal_no_revive(self) -> None:
+         """Uninstalled 为终态：已卸载插件不可再转移（不可复活/重启用）。"""
+-        from forgemesh.controlplane.plugin_manager import PluginManager
+-
+-        manager = PluginManager()
+-        pid = manager.register(_manifest_model("metering-basic"))
++        manager = _plugin_manager()
++        pid = _register(manager, _manifest_model("metering-basic"))
+         manager.transition(pid, PluginLifecycleState.VALIDATING)
+         manager.transition(pid, PluginLifecycleState.UNINSTALLED)
+ 
+@@ -1094,14 +1105,12 @@ class TestUpgradeAndUnloadSafety:
+     @_compat
+     def test_same_id_different_versions_coexist(self) -> None:
+         """版本并存（ADR-011）：同 id 不同版本以 id:version 复合键并存。"""
+-        from forgemesh.controlplane.plugin_manager import PluginManager
+-
+-        manager = PluginManager()
++        manager = _plugin_manager()
+         m_v1 = _manifest_model("decision-rules", version="0.0.1")
+         m_v2 = _manifest_model("decision-rules", version="0.1.0")
+ 
+-        pid1 = manager.register(m_v1)
+-        pid2 = manager.register(m_v2)
++        pid1 = _register(manager, m_v1)
++        pid2 = _register(manager, m_v2)
+ 
+         assert pid1 != pid2, "不同版本应有不同 plugin_id（id:version）"
+         same_id = [
+@@ -1118,9 +1127,7 @@ class TestUpgradeAndUnloadSafety:
+     @_compat
+     def test_duplicate_exact_version_registration_conflicts(self) -> None:
+         """重复注册同一 id:version 须抛 ConflictError（并存≠重复注册）。"""
+-        from forgemesh.controlplane.plugin_manager import PluginManager
+-
+-        manager = PluginManager()
+-        manager.register(_manifest_model("workflow-reference"))
++        manager = _plugin_manager()
++        _register(manager, _manifest_model("workflow-reference"))
+         with pytest.raises(ConflictError, match="already registered"):
+-            manager.register(_manifest_model("workflow-reference"))
++            _register(manager, _manifest_model("workflow-reference"))
+diff --git a/tests/unit/controlplane/test_plugin_manager.py b/tests/unit/controlplane/test_plugin_manager.py
+index 46a7dbf..867af30 100644
+--- a/tests/unit/controlplane/test_plugin_manager.py
++++ b/tests/unit/controlplane/test_plugin_manager.py
+@@ -2,19 +2,31 @@
+ 
+ 覆盖 PluginManager 契约实现的核心语义：
+ 
++* 注册校验（签名、篡改检测、开发模式、清单重新校验）与插件策略文件；
+ * 注册与发现（register / get / discover）；
+ * 生命周期状态机（合法转移 / 非法转移抛 InvalidStateTransition / 终态）；
+ * 能力发现（get_capabilities）；
+ * 健康状态与生命周期分离（set_health / get_health）；
+-* 权限校验（最小权限原则：required ⊆ granted）；
++* 权限校验（最小权限原则：required ⊆ 申请 ∩ 授予）；
+ * 版本管理（get_version / is_compatible）；
+ * 已安装列表（list_installed）。
+ """
+ 
+ from __future__ import annotations
+ 
++import json
++import logging
++
+ import pytest
+-from forgemesh.controlplane.plugin_manager import PluginManager, PluginRecord
++from forgemesh.controlplane.plugin_manager import (
++    PluginGrant,
++    PluginManager,
++    PluginPolicy,
++    PluginPolicyError,
++    PluginRecord,
++    PluginRejectedError,
++    load_plugin_policy,
++)
+ from forgemesh.core.errors import ConflictError, InvalidStateTransition, NotFoundError
+ from forgemesh.plugin.manifest import (
+     PluginCategory,
+@@ -23,11 +35,24 @@ from forgemesh.plugin.manifest import (
+     PluginMeta,
+     PluginSpec,
+ )
++from forgemesh.plugin.permissions import Permission
++from forgemesh.plugin.signing import (
++    PluginSignature,
++    PluginSigner,
++    generate_private_key,
++    load_public_key,
++    public_key_id,
++    public_key_pem,
++)
+ 
+ # ---------------------------------------------------------------------- #
+ # 测试辅助
+ # ---------------------------------------------------------------------- #
+ 
++#: 测试用的插件作者私钥：每次运行时生成，不写入磁盘。
++_AUTHOR_KEY = generate_private_key()
++_TRUSTED_KEY = public_key_pem(_AUTHOR_KEY).decode("ascii")
++
+ 
+ def _make_manifest(
+     plugin_id: str = "forgemesh.hardware.gpu-nvidia",
+@@ -51,6 +76,246 @@ def _make_manifest(
+     )
+ 
+ 
++def _manager(*grants: PluginGrant, dev_mode_allow_unsigned: bool = False) -> PluginManager:
++    """构造只信任 ``_AUTHOR_KEY`` 的插件管理器。"""
++    policy = PluginPolicy(trustedKeys=[_TRUSTED_KEY], grants=grants)
++    return PluginManager(policy, dev_mode_allow_unsigned=dev_mode_allow_unsigned)
++
++
++def _grant(plugin_id: str, *permissions: str) -> PluginGrant:
++    return PluginGrant(pluginId=plugin_id, permissions=permissions)
++
++
++def _artifact(manifest: PluginManifest) -> bytes:
++    """制品内容的占位字节：签名校验只关心内容与签名是否一致。"""
++    return f"{manifest.metadata.id}-{manifest.metadata.version}.tar.gz".encode()
++
++
++def _sign(manifest: PluginManifest, key: bytes = _AUTHOR_KEY) -> PluginSignature:
++    return PluginSigner().sign(_artifact(manifest), manifest, key)
++
++
++def _register(mgr: PluginManager, manifest: PluginManifest) -> str:
++    """按正常发布路径注册：制品内容与签名一起提交。"""
++    return mgr.register(manifest, artifact=_artifact(manifest), signature=_sign(manifest))
++
++
++# ---------------------------------------------------------------------- #
++# 注册校验：签名、开发模式与清单校验
++# ---------------------------------------------------------------------- #
++
++
++@pytest.mark.unit
++def test_register_records_signing_key_and_artifact_digest() -> None:
++    """签名校验通过后，记录签名公钥的 key id 与制品摘要。"""
++    mgr = _manager()
++    manifest = _make_manifest()
++    record = mgr.get(_register(mgr, manifest))
++    assert record.signing_key_id == public_key_id(load_public_key(_TRUSTED_KEY))
++    assert record.artifact_digest == PluginSigner.compute_digest(_artifact(manifest))
++
++
++@pytest.mark.unit
++def test_register_rejects_tampered_artifact() -> None:
++    """签名之后改动制品内容，注册被拒绝，插件不会进入注册表。"""
++    mgr = _manager()
++    manifest = _make_manifest()
++    tampered = _artifact(manifest) + b"\x00"
++    with pytest.raises(PluginRejectedError, match="artifact digest mismatch"):
++        mgr.register(manifest, artifact=tampered, signature=_sign(manifest))
++    assert mgr.discover() == []
++
++
++@pytest.mark.unit
++def test_register_rejects_manifest_changed_after_signing() -> None:
++    """签名之后在清单里追加权限申请，清单摘要不符，注册被拒绝。"""
++    mgr = _manager()
++    signed = _make_manifest()
++    widened = _make_manifest(permissions=["device.read", "platform.admin"])
++    with pytest.raises(PluginRejectedError, match="manifest digest mismatch"):
++        mgr.register(widened, artifact=_artifact(signed), signature=_sign(signed))
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize("algorithm", ["hmac-sha256", "ED25519", "ed448"])
++def test_register_rejects_unsupported_signature_algorithm(algorithm: str) -> None:
++    """签名文档声明的算法不是 ed25519，注册被拒绝。"""
++    mgr = _manager()
++    manifest = _make_manifest()
++    document = {**_sign(manifest).model_dump(by_alias=True), "algorithm": algorithm}
++    signature = PluginSignature.model_validate(document)
++    with pytest.raises(PluginRejectedError, match="unsupported signature algorithm"):
++        mgr.register(manifest, artifact=_artifact(manifest), signature=signature)
++
++
++@pytest.mark.unit
++def test_register_rejects_untrusted_signing_key() -> None:
++    """不受信任的公钥签名的插件被拒绝。"""
++    mgr = _manager()
++    manifest = _make_manifest()
++    signature = _sign(manifest, key=generate_private_key())
++    with pytest.raises(PluginRejectedError, match="is not trusted"):
++        mgr.register(manifest, artifact=_artifact(manifest), signature=signature)
++
++
++@pytest.mark.unit
++def test_register_rejects_forged_signature() -> None:
++    """摘要与当前制品相符、签名却属于另一个制品，注册被拒绝。"""
++    mgr = _manager()
++    manifest = _make_manifest()
++    other = _sign(_make_manifest(version="9.9.9"))
++    forged = _sign(manifest).model_copy(update={"signature": other.signature})
++    with pytest.raises(PluginRejectedError, match="signature verification failed"):
++        mgr.register(manifest, artifact=_artifact(manifest), signature=forged)
++
++
++@pytest.mark.unit
++def test_register_requires_artifact_content_with_signature() -> None:
++    """只有签名、没有制品内容时无法重新计算摘要，注册被拒绝。"""
++    mgr = _manager()
++    manifest = _make_manifest()
++    with pytest.raises(PluginRejectedError, match="artifact content is required"):
++        mgr.register(manifest, signature=_sign(manifest))
++
++
++@pytest.mark.unit
++def test_unsigned_plugin_rejected_by_default() -> None:
++    """开发模式默认关闭：未签名的插件被拒绝，带不带制品内容都一样。"""
++    manifest = _make_manifest()
++    for mgr in (PluginManager(), _manager()):
++        with pytest.raises(PluginRejectedError, match="unsigned"):
++            mgr.register(manifest)
++        with pytest.raises(PluginRejectedError, match="unsigned"):
++            mgr.register(manifest, artifact=_artifact(manifest))
++        assert mgr.discover() == []
++
++
++@pytest.mark.unit
++def test_default_policy_trusts_no_key() -> None:
++    """不传策略时没有受信任的公钥，签名的插件同样被拒绝。"""
++    with pytest.raises(PluginRejectedError, match="is not trusted"):
++        _register(PluginManager(), _make_manifest())
++
++
++@pytest.mark.unit
++def test_dev_mode_registers_unsigned_plugins(caplog: pytest.LogCaptureFixture) -> None:
++    """开发模式下未签名的插件可以注册，开启开发模式和每次注册都会记录告警。"""
++    with caplog.at_level(logging.WARNING, logger="forgemesh.controlplane.plugin_manager"):
++        mgr = _manager(dev_mode_allow_unsigned=True)
++        record = mgr.get(mgr.register(_make_manifest()))
++    assert record.signing_key_id is None
++    assert record.artifact_digest is None
++    messages = [r.getMessage() for r in caplog.records]
++    assert any("development mode is on" in m for m in messages)
++    assert any("unsigned plugin forgemesh.hardware.gpu-nvidia:0.1.0" in m for m in messages)
++
++
++@pytest.mark.unit
++def test_dev_mode_still_verifies_signatures() -> None:
++    """开发模式只放行未签名的插件；带签名的插件照常校验，篡改依旧被拒绝。"""
++    mgr = _manager(dev_mode_allow_unsigned=True)
++    manifest = _make_manifest()
++    with pytest.raises(PluginRejectedError, match="artifact digest mismatch"):
++        mgr.register(manifest, artifact=b"tampered", signature=_sign(manifest))
++
++
++@pytest.mark.unit
++def test_register_revalidates_manifest() -> None:
++    """构造后被改动、或未经校验构造的清单在注册时被拒绝，开发模式下同样如此。"""
++    mgr = _manager(dev_mode_allow_unsigned=True)
++    mutated = _make_manifest()
++    mutated.spec.permissions.append("admin")
++    with pytest.raises(PluginRejectedError, match=r"invalid plugin manifest[\s\S]*permissions"):
++        mgr.register(mutated)
++    unchecked = PluginManifest.model_construct(
++        metadata=PluginMeta(id="forgemesh.policy.example", version="0.1.0"),
++        spec=PluginSpec.model_construct(category=PluginCategory.POLICY, isolation="restricted-rpc"),
++    )
++    with pytest.raises(PluginRejectedError, match="isolation 'restricted-rpc' is not supported"):
++        mgr.register(unchecked)
++    assert mgr.discover() == []
++
++
++@pytest.mark.unit
++def test_registered_manifest_is_a_checked_copy() -> None:
++    """记录保存校验过的副本：注册后再改调用方的清单，不影响记录和实际权限。"""
++    mgr = _manager(_grant("forgemesh.hardware.gpu-nvidia", "device.read", "device.partition"))
++    manifest = _make_manifest(permissions=["device.read"])
++    pid = _register(mgr, manifest)
++    manifest.spec.permissions.append(Permission.DEVICE_PARTITION)
++    assert mgr.get(pid).manifest.spec.permissions == [Permission.DEVICE_READ]
++    assert mgr.effective_permissions(pid) == {Permission.DEVICE_READ}
++
++
++# ---------------------------------------------------------------------- #
++# 插件策略文件
++# ---------------------------------------------------------------------- #
++
++
++@pytest.mark.unit
++def test_manager_from_policy_file(tmp_path) -> None:
++    """策略文件配置受信任公钥与授予：签名的插件可以注册，授予的权限生效。"""
++    policy_file = tmp_path / "plugin-policy.json"
++    grant = {"pluginId": "forgemesh.hardware.gpu-nvidia", "permissions": ["device.read"]}
++    policy = {"trustedKeys": [_TRUSTED_KEY], "grants": [grant]}
++    policy_file.write_text(json.dumps(policy), encoding="utf-8")
++    mgr = PluginManager.from_policy_file(policy_file)
++    pid = _register(mgr, _make_manifest(permissions=["device.read", "device.partition"]))
++    assert mgr.effective_permissions(pid) == {Permission.DEVICE_READ}
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize(
++    "policy",
++    [
++        pytest.param("not json", id="not-json"),
++        pytest.param({"trustedKeys": ["not a key"]}, id="invalid-key"),
++        pytest.param({"trustedKeys": [_TRUSTED_KEY, _TRUSTED_KEY]}, id="duplicate-key"),
++        pytest.param({"trusted_keys": [_TRUSTED_KEY]}, id="snake-case-field"),
++        pytest.param({"trustedKeys": [], "admins": []}, id="unknown-field"),
++        pytest.param(
++            {"grants": [{"pluginId": "forgemesh.a.b", "permissions": ["admin"]}]},
++            id="unknown-permission",
++        ),
++        pytest.param(
++            {"grants": [{"pluginId": "forgemesh.a.b", "permissions": ["device.read"] * 2}]},
++            id="duplicate-permission",
++        ),
++        pytest.param({"grants": [{"pluginId": "forgemesh.a.b"}]}, id="grant-without-permissions"),
++        pytest.param(
++            {"grants": [{"pluginId": "forgemesh.a.b", "plugin_id": "x.y", "permissions": []}]},
++            id="snake-case-grant-field",
++        ),
++        pytest.param(
++            {"grants": [{"pluginId": "forgemesh.a.b:1.0.0", "permissions": []}]},
++            id="versioned-plugin-id",
++        ),
++        pytest.param(
++            {"grants": [{"pluginId": "forgemesh.a.b", "permissions": []}] * 2},
++            id="duplicate-grant",
++        ),
++    ],
++)
++def test_load_plugin_policy_rejects_invalid_files(tmp_path, policy) -> None:
++    policy_file = tmp_path / "plugin-policy.json"
++    content = policy if isinstance(policy, str) else json.dumps(policy)
++    policy_file.write_text(content, encoding="utf-8")
++    with pytest.raises(PluginPolicyError, match="invalid plugin policy file"):
++        load_plugin_policy(policy_file)
++    with pytest.raises(PluginPolicyError):
++        PluginManager.from_policy_file(policy_file)
++
++
++@pytest.mark.unit
++def test_load_plugin_policy_reports_unreadable_files(tmp_path) -> None:
++    with pytest.raises(PluginPolicyError, match="cannot read plugin policy file"):
++        load_plugin_policy(tmp_path / "missing.json")
++    not_utf8 = tmp_path / "latin1.json"
++    not_utf8.write_bytes('{"grants": [], "note": "é"}'.encode("latin-1"))
++    with pytest.raises(PluginPolicyError, match="cannot read plugin policy file"):
++        load_plugin_policy(not_utf8)
++
++
+ # ---------------------------------------------------------------------- #
+ # 注册与发现
+ # ---------------------------------------------------------------------- #
+@@ -59,34 +324,34 @@ def _make_manifest(
+ @pytest.mark.unit
+ def test_register_and_get() -> None:
+     """注册后可通过 plugin_id 获取记录，且初始状态为 Discovered。"""
+-    mgr = PluginManager()
++    mgr = _manager()
+     manifest = _make_manifest()
+-    pid = mgr.register(manifest)
++    pid = _register(mgr, manifest)
+     assert pid == "forgemesh.hardware.gpu-nvidia:0.1.0"
+ 
+     record = mgr.get(pid)
+     assert record.plugin_id == pid
+-    assert record.manifest is manifest
++    assert record.manifest == manifest
+     assert record.lifecycle_state == PluginLifecycleState.DISCOVERED
+ 
+ 
+ @pytest.mark.unit
+ def test_register_duplicate_conflict() -> None:
+     """重复注册同一 plugin_id 抛 ConflictError。"""
+-    mgr = PluginManager()
++    mgr = _manager()
+     manifest = _make_manifest()
+-    mgr.register(manifest)
++    _register(mgr, manifest)
+ 
+     with pytest.raises(ConflictError):
+-        mgr.register(manifest)
++        _register(mgr, manifest)
+ 
+ 
+ @pytest.mark.unit
+ def test_register_multi_version_coexist() -> None:
+     """同一插件不同版本可并存（ADR-011）。"""
+-    mgr = PluginManager()
+-    pid_a = mgr.register(_make_manifest(version="0.1.0"))
+-    pid_b = mgr.register(_make_manifest(version="0.2.0"))
++    mgr = _manager()
++    pid_a = _register(mgr, _make_manifest(version="0.1.0"))
++    pid_b = _register(mgr, _make_manifest(version="0.2.0"))
+     assert pid_a != pid_b
+     assert mgr.get(pid_a).manifest.metadata.version == "0.1.0"
+     assert mgr.get(pid_b).manifest.metadata.version == "0.2.0"
+@@ -103,12 +368,10 @@ def test_get_not_found() -> None:
+ @pytest.mark.unit
+ def test_discover_by_category() -> None:
+     """按类别过滤已注册插件。"""
+-    mgr = PluginManager()
+-    mgr.register(_make_manifest(plugin_id="hw", category=PluginCategory.HARDWARE))
+-    mgr.register(_make_manifest(plugin_id="rt", category=PluginCategory.RUNTIME))
+-    mgr.register(
+-        _make_manifest(plugin_id="obs", category=PluginCategory.OBSERVABILITY)
+-    )
++    mgr = _manager()
++    _register(mgr, _make_manifest(plugin_id="hw", category=PluginCategory.HARDWARE))
++    _register(mgr, _make_manifest(plugin_id="rt", category=PluginCategory.RUNTIME))
++    _register(mgr, _make_manifest(plugin_id="obs", category=PluginCategory.OBSERVABILITY))
+ 
+     hw = mgr.discover(PluginCategory.HARDWARE)
+     assert len(hw) == 1
+@@ -125,9 +388,9 @@ def test_discover_by_category() -> None:
+ @pytest.mark.unit
+ def test_discover_all() -> None:
+     """不传 category 返回全部已注册插件。"""
+-    mgr = PluginManager()
+-    mgr.register(_make_manifest(plugin_id="a"))
+-    mgr.register(_make_manifest(plugin_id="b", category=PluginCategory.RUNTIME))
++    mgr = _manager()
++    _register(mgr, _make_manifest(plugin_id="a"))
++    _register(mgr, _make_manifest(plugin_id="b", category=PluginCategory.RUNTIME))
+ 
+     all_plugins = mgr.discover()
+     assert len(all_plugins) == 2
+@@ -141,8 +404,8 @@ def test_discover_all() -> None:
+ @pytest.mark.unit
+ def test_lifecycle_valid_transition() -> None:
+     """合法转移链 Discovered→Validating→Installed→Enabled。"""
+-    mgr = PluginManager()
+-    pid = mgr.register(_make_manifest())
++    mgr = _manager()
++    pid = _register(mgr, _make_manifest())
+ 
+     r1 = mgr.transition(pid, PluginLifecycleState.VALIDATING)
+     assert r1.lifecycle_state == PluginLifecycleState.VALIDATING
+@@ -158,8 +421,8 @@ def test_lifecycle_valid_transition() -> None:
+ @pytest.mark.unit
+ def test_lifecycle_invalid_transition() -> None:
+     """非法转移 Discovered→Enabled 抛 InvalidStateTransition。"""
+-    mgr = PluginManager()
+-    pid = mgr.register(_make_manifest())
++    mgr = _manager()
++    pid = _register(mgr, _make_manifest())
+ 
+     with pytest.raises(InvalidStateTransition):
+         mgr.transition(pid, PluginLifecycleState.ENABLED)
+@@ -168,8 +431,8 @@ def test_lifecycle_invalid_transition() -> None:
+ @pytest.mark.unit
+ def test_lifecycle_invalid_transition_installed_to_discovered() -> None:
+     """非法转移 Installed→Discovered 抛 InvalidStateTransition。"""
+-    mgr = PluginManager()
+-    pid = mgr.register(_make_manifest())
++    mgr = _manager()
++    pid = _register(mgr, _make_manifest())
+     mgr.transition(pid, PluginLifecycleState.VALIDATING)
+     mgr.transition(pid, PluginLifecycleState.INSTALLED)
+ 
+@@ -180,8 +443,8 @@ def test_lifecycle_invalid_transition_installed_to_discovered() -> None:
+ @pytest.mark.unit
+ def test_lifecycle_disable_enable() -> None:
+     """Enabled→Disabled→Enabled 往返。"""
+-    mgr = PluginManager()
+-    pid = mgr.register(_make_manifest())
++    mgr = _manager()
++    pid = _register(mgr, _make_manifest())
+     mgr.transition(pid, PluginLifecycleState.VALIDATING)
+     mgr.transition(pid, PluginLifecycleState.INSTALLED)
+     mgr.transition(pid, PluginLifecycleState.ENABLED)
+@@ -196,8 +459,8 @@ def test_lifecycle_disable_enable() -> None:
+ @pytest.mark.unit
+ def test_lifecycle_uninstall_terminal() -> None:
+     """Uninstalled 为终态，不可再转移。"""
+-    mgr = PluginManager()
+-    pid = mgr.register(_make_manifest())
++    mgr = _manager()
++    pid = _register(mgr, _make_manifest())
+     mgr.transition(pid, PluginLifecycleState.VALIDATING)
+     mgr.transition(pid, PluginLifecycleState.INSTALLED)
+     mgr.transition(pid, PluginLifecycleState.ENABLED)
+@@ -213,8 +476,8 @@ def test_lifecycle_uninstall_terminal() -> None:
+ @pytest.mark.unit
+ def test_lifecycle_uninstall_from_disabled() -> None:
+     """Disabled→Uninstalled 合法。"""
+-    mgr = PluginManager()
+-    pid = mgr.register(_make_manifest())
++    mgr = _manager()
++    pid = _register(mgr, _make_manifest())
+     mgr.transition(pid, PluginLifecycleState.VALIDATING)
+     mgr.transition(pid, PluginLifecycleState.INSTALLED)
+     mgr.transition(pid, PluginLifecycleState.ENABLED)
+@@ -239,10 +502,8 @@ def test_lifecycle_transition_not_found() -> None:
+ @pytest.mark.unit
+ def test_capabilities() -> None:
+     """获取插件声明的能力集合（spec.provides）。"""
+-    mgr = PluginManager()
+-    pid = mgr.register(
+-        _make_manifest(provides=["gpu.discovery", "gpu.alloc", "gpu.alloc"])
+-    )
++    mgr = _manager()
++    pid = _register(mgr, _make_manifest(provides=["gpu.discovery", "gpu.alloc", "gpu.alloc"]))
+     caps = mgr.get_capabilities(pid)
+     assert caps == {"gpu.discovery", "gpu.alloc"}  # 去重
+ 
+@@ -250,8 +511,8 @@ def test_capabilities() -> None:
+ @pytest.mark.unit
+ def test_capabilities_empty() -> None:
+     """无能力声明时返回空集合。"""
+-    mgr = PluginManager()
+-    pid = mgr.register(_make_manifest(provides=[]))
++    mgr = _manager()
++    pid = _register(mgr, _make_manifest(provides=[]))
+     assert mgr.get_capabilities(pid) == set()
+ 
+ 
+@@ -263,8 +524,8 @@ def test_capabilities_empty() -> None:
+ @pytest.mark.unit
+ def test_health_separate_from_lifecycle() -> None:
+     """set_health 不影响 lifecycle_state，反之亦然。"""
+-    mgr = PluginManager()
+-    pid = mgr.register(_make_manifest())
++    mgr = _manager()
++    pid = _register(mgr, _make_manifest())
+     mgr.transition(pid, PluginLifecycleState.VALIDATING)
+     mgr.transition(pid, PluginLifecycleState.INSTALLED)
+     mgr.transition(pid, PluginLifecycleState.ENABLED)
+@@ -285,8 +546,8 @@ def test_health_separate_from_lifecycle() -> None:
+ @pytest.mark.unit
+ def test_get_health_default() -> None:
+     """注册后默认健康状态为 Unknown。"""
+-    mgr = PluginManager()
+-    pid = mgr.register(_make_manifest())
++    mgr = _manager()
++    pid = _register(mgr, _make_manifest())
+     assert mgr.get_health(pid) == "Unknown"
+ 
+ 
+@@ -305,11 +566,10 @@ def test_set_health_not_found() -> None:
+ 
+ @pytest.mark.unit
+ def test_check_permissions_granted() -> None:
+-    """拥有所需权限返回 True。"""
+-    mgr = PluginManager()
+-    pid = mgr.register(
+-        _make_manifest(permissions=["device.read", "device.partition", "metering.read"])
+-    )
++    """申请并且已获授予的权限返回 True。"""
++    permissions = ["device.read", "device.partition", "metering.read"]
++    mgr = _manager(_grant("forgemesh.hardware.gpu-nvidia", *permissions))
++    pid = _register(mgr, _make_manifest(permissions=permissions))
+     assert mgr.check_permissions(pid, {"device.read"}) is True
+     assert mgr.check_permissions(pid, {"device.read", "device.partition"}) is True
+     # 全部权限
+@@ -321,8 +581,8 @@ def test_check_permissions_granted() -> None:
+ @pytest.mark.unit
+ def test_check_permissions_denied() -> None:
+     """缺少所需权限返回 False。"""
+-    mgr = PluginManager()
+-    pid = mgr.register(_make_manifest(permissions=["device.read"]))
++    mgr = _manager(_grant("forgemesh.hardware.gpu-nvidia", "device.read"))
++    pid = _register(mgr, _make_manifest(permissions=["device.read"]))
+     assert mgr.check_permissions(pid, {"device.partition"}) is False
+     assert mgr.check_permissions(pid, {"device.read", "device.partition"}) is False
+ 
+@@ -330,8 +590,8 @@ def test_check_permissions_denied() -> None:
+ @pytest.mark.unit
+ def test_check_permissions_empty_required() -> None:
+     """空 required 恒通过（最小权限：无需求即无授予需求）。"""
+-    mgr = PluginManager()
+-    pid = mgr.register(_make_manifest(permissions=[]))
++    mgr = _manager()
++    pid = _register(mgr, _make_manifest(permissions=[]))
+     assert mgr.check_permissions(pid, set()) is True
+ 
+ 
+@@ -351,16 +611,16 @@ def test_check_permissions_not_found() -> None:
+ @pytest.mark.unit
+ def test_get_version() -> None:
+     """获取插件版本号（metadata.version）。"""
+-    mgr = PluginManager()
+-    pid = mgr.register(_make_manifest(version="1.2.3"))
++    mgr = _manager()
++    pid = _register(mgr, _make_manifest(version="1.2.3"))
+     assert mgr.get_version(pid) == "1.2.3"
+ 
+ 
+ @pytest.mark.unit
+ def test_is_compatible_via_api_version() -> None:
+     """未声明 compatibility.coreApi 时回退到 manifest.apiVersion 精确匹配。"""
+-    mgr = PluginManager()
+-    pid = mgr.register(_make_manifest())  # apiVersion=forgemesh.io/v1alpha1
++    mgr = _manager()
++    pid = _register(mgr, _make_manifest())  # apiVersion=forgemesh.io/v1alpha1
+     assert mgr.is_compatible(pid, "forgemesh.io/v1alpha1") is True
+     assert mgr.is_compatible(pid, "forgemesh.io/v1beta1") is False
+ 
+@@ -368,8 +628,8 @@ def test_is_compatible_via_api_version() -> None:
+ @pytest.mark.unit
+ def test_is_compatible_via_core_api() -> None:
+     """声明 compatibility.coreApi 时优先用它判定。"""
+-    mgr = PluginManager()
+-    pid = mgr.register(_make_manifest(compatibility={"coreApi": "v1alpha1"}))
++    mgr = _manager()
++    pid = _register(mgr, _make_manifest(compatibility={"coreApi": "v1alpha1"}))
+     assert mgr.is_compatible(pid, "v1alpha1") is True
+     assert mgr.is_compatible(pid, "v1beta1") is False
+ 
+@@ -382,10 +642,10 @@ def test_is_compatible_via_core_api() -> None:
+ @pytest.mark.unit
+ def test_list_installed() -> None:
+     """list_installed 只列出 Installed/Enabled/Disabled 的插件。"""
+-    mgr = PluginManager()
+-    pid_a = mgr.register(_make_manifest(plugin_id="a"))
+-    pid_b = mgr.register(_make_manifest(plugin_id="b"))
+-    pid_c = mgr.register(_make_manifest(plugin_id="c"))
++    mgr = _manager()
++    pid_a = _register(mgr, _make_manifest(plugin_id="a"))
++    pid_b = _register(mgr, _make_manifest(plugin_id="b"))
++    pid_c = _register(mgr, _make_manifest(plugin_id="c"))
+ 
+     # a: Discovered（未安装）
+     # b: →Validating→Installed
+@@ -407,8 +667,8 @@ def test_list_installed() -> None:
+ @pytest.mark.unit
+ def test_list_installed_includes_disabled() -> None:
+     """Disabled 状态也属于已安装。"""
+-    mgr = PluginManager()
+-    pid = mgr.register(_make_manifest())
++    mgr = _manager()
++    pid = _register(mgr, _make_manifest())
+     mgr.transition(pid, PluginLifecycleState.VALIDATING)
+     mgr.transition(pid, PluginLifecycleState.INSTALLED)
+     mgr.transition(pid, PluginLifecycleState.ENABLED)
+@@ -422,8 +682,8 @@ def test_list_installed_includes_disabled() -> None:
+ @pytest.mark.unit
+ def test_plugin_record_is_pydantic_model() -> None:
+     """PluginRecord 是 pydantic BaseModel，支持模型操作。"""
+-    mgr = PluginManager()
+-    pid = mgr.register(_make_manifest())
++    mgr = _manager()
++    pid = _register(mgr, _make_manifest())
+     record = mgr.get(pid)
+     assert isinstance(record, PluginRecord)
+     # 可序列化
+-- 
+2.43.0
+

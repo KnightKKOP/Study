@@ -1,0 +1,233 @@
+From 0f0ac594035db3e462e77f052b8a669bb81ed773 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 12 Oct 2026 13:13:36 +0000
+Subject: [PATCH 7/8] fix(plugin-sdk): deprecate the unverified manifest
+ signature fields
+
+The manifest's artifactDigest and signature fields were described as
+supply-chain security in the model and the JSON Schema, and the example
+manifest filled them with placeholders, but nothing ever read them. They
+cannot work either: the manifest is packed into the artifact it would
+have to describe, and a signature cannot sign the document it is part
+of. Signatures are now detached documents that PluginManager verifies
+at registration.
+
+Keep both fields so existing manifests still validate, but describe
+them as deprecated and unverified, mark them "deprecated" in the
+schema, warn about them in PluginSdk.validate_manifest with a pointer
+to the signtool, and drop them from the example manifest. A test pins
+that registration neither accepts them in place of a signature nor
+compares them with the artifact.
+
+Both fields are planned for removal in 2.0.0: the deprecation policy
+removes interfaces only in a major release and gives the plugin
+protocol at least three minor releases of warning.
+---
+ api/schemas/plugin-manifest.schema.json       |  6 ++++--
+ examples/single-node/plugin-vllm.yaml         |  3 +--
+ .../src/forgemesh/plugin/manifest.py          | 21 ++++++++++++++-----
+ .../plugin-sdk/src/forgemesh/plugin/sdk.py    |  6 ++++++
+ tests/compat/test_plugin_compatibility.py     | 19 +++++++++++++++++
+ tests/contract/test_cross_representation.py   | 16 ++++++++++++++
+ .../unit/controlplane/test_plugin_manager.py  | 14 +++++++++++++
+ 7 files changed, 76 insertions(+), 9 deletions(-)
+
+diff --git a/api/schemas/plugin-manifest.schema.json b/api/schemas/plugin-manifest.schema.json
+index 0cf4f28..86ba79d 100644
+--- a/api/schemas/plugin-manifest.schema.json
++++ b/api/schemas/plugin-manifest.schema.json
+@@ -98,11 +98,13 @@
+         },
+         "artifactDigest": {
+           "type": "string",
+-          "description": "制品摘要，如 sha256:...（供应链安全）。"
++          "deprecated": true,
++          "description": "已弃用，不参与任何校验，计划在 2.0.0 移除。制品摘要记录在随制品分发的独立签名文档中（python -m forgemesh.plugin.signtool sign），注册时由插件管理器校验。"
+         },
+         "signature": {
+           "type": "string",
+-          "description": "制品签名，如 cosign:...（供应链安全）。"
++          "deprecated": true,
++          "description": "已弃用，不参与任何校验，计划在 2.0.0 移除。签名是随制品分发的独立签名文档（python -m forgemesh.plugin.signtool sign），注册时由插件管理器校验。"
+         },
+         "configuration": {
+           "type": "object",
+diff --git a/examples/single-node/plugin-vllm.yaml b/examples/single-node/plugin-vllm.yaml
+index fdb4a29..1391443 100644
+--- a/examples/single-node/plugin-vllm.yaml
++++ b/examples/single-node/plugin-vllm.yaml
+@@ -1,6 +1,7 @@
+ # ForgeMesh PluginManifest 示例（vLLM 运行时）
+ # 契约：api/schemas/plugin-manifest.schema.json
+ # 对齐 docs/architecture/development-plan.md 6.3 与 architecture 8.2。
++# 签名不写进清单：python -m forgemesh.plugin.signtool sign 生成随制品分发的签名文档。
+ apiVersion: forgemesh.io/v1alpha1
+ kind: PluginManifest
+ metadata:
+@@ -22,8 +23,6 @@ spec:
+     - inference.inspect
+   isolation: in-process            # 插件在宿主进程内运行，目前没有进程隔离
+   entrypoint: "deploy:VLLMDeployer"
+-  artifactDigest: sha256:ab12...
+-  signature: cosign:...
+   configuration:
+     schema: ./config.schema.json
+   healthCheck:
+diff --git a/packages/plugin-sdk/src/forgemesh/plugin/manifest.py b/packages/plugin-sdk/src/forgemesh/plugin/manifest.py
+index 4995e61..24e1fe4 100644
+--- a/packages/plugin-sdk/src/forgemesh/plugin/manifest.py
++++ b/packages/plugin-sdk/src/forgemesh/plugin/manifest.py
+@@ -13,7 +13,9 @@
+   清单不得声明。
+ * **入口点**：``entrypoint`` 形如 ``<模块>:<类>``，模块路径相对于插件包（插件目录须含
+   ``__init__.py``），由 :func:`forgemesh.plugin.loader.load_entrypoint` 加载。
+-* **供应链**：``artifact_digest`` / ``signature`` 支持制品摘要与签名校验。
++* **供应链**：签名是随制品分发的独立文档（:mod:`forgemesh.plugin.signing`），由插件管理器
++  在注册时校验；清单中的 ``artifactDigest`` / ``signature`` 字段已弃用，不参与任何校验，
++  计划在 2.0.0 移除。
+ 
+ 非法生命周期转移抛出 :class:`forgemesh.core.errors.InvalidStateTransition`；
+ 若核心包未就绪，则回退到本地同名兜底异常类。
+@@ -124,11 +126,16 @@ class PluginSpec(BaseModel):
+         isolation: 隔离级别，目前只能是 ``in-process``（未设置同样按进程内运行）。
+         entrypoint: 入口点 ``<模块>:<类>``（如 ``provider:RulesProvider``），模块路径相对于
+             插件包。
+-        artifactDigest: 制品摘要（如 sha256:...），供应链安全。
+-        signature: 制品签名（如 cosign:...），供应链安全。
++        artifactDigest: 已弃用，不参与任何校验（见下方弃用说明）。
++        signature: 已弃用，不参与任何校验（见下方弃用说明）。
+         configuration: 配置 schema 引用/默认值。
+         healthCheck: 健康检查配置（如 ``{"mode": "rpc", "timeoutMs": 2000}``，
+             值可为字符串或整数等混合类型）。
++
++    .. deprecated:: 1.1.0
++       ``artifactDigest`` / ``signature`` 不参与任何校验，计划在 2.0.0 移除。制品摘要与签名
++       记录在随制品分发的独立签名文档中（:mod:`forgemesh.plugin.signing`），用
++       ``python -m forgemesh.plugin.signtool sign`` 生成。
+     """
+ 
+     model_config = ConfigDict(extra="forbid")
+@@ -142,8 +149,12 @@ class PluginSpec(BaseModel):
+     entrypoint: str | None = Field(
+         default=None, description="入口点 <模块>:<类>，模块路径相对于插件包"
+     )
+-    artifactDigest: str | None = Field(default=None, description="制品摘要（如 sha256:...），供应链安全")
+-    signature: str | None = Field(default=None, description="制品签名（如 cosign:...），供应链安全")
++    artifactDigest: str | None = Field(
++        default=None, description="已弃用，不参与任何校验，计划在 2.0.0 移除"
++    )
++    signature: str | None = Field(
++        default=None, description="已弃用，不参与任何校验，计划在 2.0.0 移除"
++    )
+     configuration: dict[str, Any] = Field(default_factory=dict)
+     healthCheck: dict[str, Any] = Field(default_factory=dict)
+ 
+diff --git a/packages/plugin-sdk/src/forgemesh/plugin/sdk.py b/packages/plugin-sdk/src/forgemesh/plugin/sdk.py
+index 45cacb3..1008414 100644
+--- a/packages/plugin-sdk/src/forgemesh/plugin/sdk.py
++++ b/packages/plugin-sdk/src/forgemesh/plugin/sdk.py
+@@ -180,6 +180,12 @@ class PluginSdk:
+             warnings.append("spec.isolation is unset; the plugin runs in-process")
+         if spec.entrypoint is None:
+             warnings.append("spec.entrypoint is unset; the plugin cannot be loaded")
++        if spec.artifactDigest is not None or spec.signature is not None:
++            warnings.append(
++                "spec.artifactDigest / spec.signature are deprecated, never verified and will "
++                "be removed in 2.0.0; sign the artifact with python -m forgemesh.plugin.signtool "
++                "instead (see docs/plugin-development/guide.md)"
++            )
+         if not spec.compatibility:
+             warnings.append("spec.compatibility is empty; core API version pinning recommended")
+ 
+diff --git a/tests/compat/test_plugin_compatibility.py b/tests/compat/test_plugin_compatibility.py
+index 162f751..694f819 100644
+--- a/tests/compat/test_plugin_compatibility.py
++++ b/tests/compat/test_plugin_compatibility.py
+@@ -17,6 +17,7 @@ import hashlib
+ from pathlib import Path
+ 
+ import pytest
++import yaml
+ from forgemesh.plugin.isolation import (
+     IsolationError,
+     IsolationGuard,
+@@ -363,6 +364,24 @@ class TestSdkPackPublishCompat:
+         assert result.valid is True
+         assert result.errors == []
+ 
++    @_compat
++    def test_validate_manifest_warns_about_inline_signature(self, tmp_path: Path) -> None:
++        """清单仍写 artifactDigest / signature 时给出弃用告警：两个字段都不参与任何校验。"""
++        sdk = PluginSdk()
++        plugin_dir = sdk.generate_scaffold("legacy-plugin", "decision", tmp_path)
++        manifest_path = plugin_dir / "manifest.yaml"
++        assert not [w for w in sdk.validate_manifest(manifest_path).warnings if "deprecated" in w]
++
++        data = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
++        data["spec"].update(artifactDigest="sha256:ab12", signature="cosign:xyz")
++        manifest_path.write_text(yaml.safe_dump(data), encoding="utf-8")
++        result = sdk.validate_manifest(manifest_path)
++        assert result.valid is True
++        deprecated = [w for w in result.warnings if "deprecated" in w]
++        assert len(deprecated) == 1
++        assert "forgemesh.plugin.signtool" in deprecated[0]
++        assert "2.0.0" in deprecated[0]
++
+     @_compat
+     def test_validate_manifest_missing_file(self, tmp_path: Path) -> None:
+         """缺失 manifest 文件应返回 valid=False。"""
+diff --git a/tests/contract/test_cross_representation.py b/tests/contract/test_cross_representation.py
+index 651b733..a31aed4 100644
+--- a/tests/contract/test_cross_representation.py
++++ b/tests/contract/test_cross_representation.py
+@@ -185,6 +185,22 @@ def test_plugin_manifest_schema_has_supply_chain_fields() -> None:
+     assert hc["timeoutMs"]["type"] == "integer", "Schema 中 timeoutMs 应为 integer"
+ 
+ 
++@pytest.mark.contract
++@pytest.mark.parametrize("field", ["artifactDigest", "signature"])
++def test_plugin_inline_signature_fields_deprecated(field: str) -> None:
++    """清单内的 artifactDigest / signature 不参与校验。
++
++    Schema 标为弃用，Schema 与模型的描述都写明计划移除版本。
++    """
++    schema = _load_json(SCHEMAS_DIR / "plugin-manifest.schema.json")
++    prop = schema["properties"]["spec"]["properties"][field]
++    assert prop["deprecated"] is True
++    assert "2.0.0" in prop["description"]
++    description = PluginSpec.model_fields[field].description
++    assert description.startswith("已弃用")
++    assert "2.0.0" in description
++
++
+ @pytest.mark.contract
+ def test_plugin_permissions_schema_matches_vocabulary() -> None:
+     """Schema 的权限枚举与 Permission 词表逐项一致，且不允许重复。"""
+diff --git a/tests/unit/controlplane/test_plugin_manager.py b/tests/unit/controlplane/test_plugin_manager.py
+index 867af30..5627ed3 100644
+--- a/tests/unit/controlplane/test_plugin_manager.py
++++ b/tests/unit/controlplane/test_plugin_manager.py
+@@ -197,6 +197,20 @@ def test_default_policy_trusts_no_key() -> None:
+         _register(PluginManager(), _make_manifest())
+ 
+ 
++@pytest.mark.unit
++def test_inline_manifest_signature_fields_are_ignored() -> None:
++    """清单内已弃用的 artifactDigest / signature 代替不了签名文档，注册时也不比对。"""
++    mgr = _manager()
++    manifest = _make_manifest()
++    manifest.spec.artifactDigest = PluginSigner.compute_digest(_artifact(manifest))
++    manifest.spec.signature = "cosign:xyz"
++    with pytest.raises(PluginRejectedError, match="unsigned"):
++        mgr.register(manifest, artifact=_artifact(manifest))
++    manifest.spec.artifactDigest = "sha256:" + "0" * 64
++    record = mgr.get(_register(mgr, manifest))
++    assert record.artifact_digest == PluginSigner.compute_digest(_artifact(manifest))
++
++
+ @pytest.mark.unit
+ def test_dev_mode_registers_unsigned_plugins(caplog: pytest.LogCaptureFixture) -> None:
+     """开发模式下未签名的插件可以注册，开启开发模式和每次注册都会记录告警。"""
+-- 
+2.43.0
+

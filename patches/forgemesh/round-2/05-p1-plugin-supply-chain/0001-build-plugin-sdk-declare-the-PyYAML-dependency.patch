@@ -1,0 +1,33 @@
+From e007509d313a12f5d08263218d26593609db7946 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 12 Oct 2026 13:56:07 +0000
+Subject: [PATCH 1/8] build(plugin-sdk): declare the PyYAML dependency
+
+forgemesh.plugin.sdk imports yaml at module level to read manifest
+files, but forgemesh-plugin-sdk never declared PyYAML. Importing the
+SDK from a standalone install, such as the control-plane image, fails
+with ModuleNotFoundError; the tests did not notice because
+requirements-dev.txt installs PyYAML for the whole repository.
+
+Declare pyyaml>=6.0.1, the first release with wheels for Python 3.12.
+It is already a development requirement, so development and CI
+environments install nothing new.
+---
+ packages/plugin-sdk/pyproject.toml | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/packages/plugin-sdk/pyproject.toml b/packages/plugin-sdk/pyproject.toml
+index 9ab8a2a..502272c 100644
+--- a/packages/plugin-sdk/pyproject.toml
++++ b/packages/plugin-sdk/pyproject.toml
+@@ -9,6 +9,7 @@ description = "ForgeMesh plugin SDK contract (PluginManifest, lifecycle, permiss
+ requires-python = ">=3.12"
+ dependencies = [
+     "pydantic>=2,<3",
++    "pyyaml>=6.0.1",
+     "forgemesh-core",
+ ]
+ 
+-- 
+2.43.0
+
