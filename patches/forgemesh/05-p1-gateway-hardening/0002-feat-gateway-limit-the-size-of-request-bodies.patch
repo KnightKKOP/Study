@@ -1,0 +1,470 @@
+From 9da5d6abdb8f218d5931882e8bc3a2fac7c18b05 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 12 Oct 2026 05:46:44 +0000
+Subject: [PATCH 2/7] feat(gateway): limit the size of request bodies
+
+Request bodies were forwarded without any bound. LimitRequestBody, the
+innermost middleware, answers 413 REQUEST_TOO_LARGE when the declared
+Content-Length exceeds GATEWAY_MAX_REQUEST_BODY_BYTES (10 MiB by
+default) and caps chunked bodies with http.MaxBytesReader; the reverse
+proxy and the stream proxy turn the resulting read error into 413
+without counting an instance failure.
+---
+ gateway/internal/config/config.go             | 15 ++++
+ gateway/internal/config/config_test.go        | 20 ++++++
+ gateway/internal/middleware/bodylimit.go      | 25 +++++++
+ gateway/internal/middleware/bodylimit_test.go | 69 +++++++++++++++++++
+ gateway/internal/middleware/chain_test.go     |  3 +-
+ gateway/internal/middleware/middleware.go     |  5 +-
+ gateway/internal/router/router.go             | 11 ++-
+ gateway/internal/router/router_test.go        | 53 ++++++++++++++
+ gateway/internal/stream/proxy.go              |  7 ++
+ gateway/internal/stream/proxy_test.go         | 28 ++++++++
+ gateway/internal/upstream/client.go           | 10 +++
+ 11 files changed, 241 insertions(+), 5 deletions(-)
+ create mode 100644 gateway/internal/middleware/bodylimit.go
+ create mode 100644 gateway/internal/middleware/bodylimit_test.go
+
+diff --git a/gateway/internal/config/config.go b/gateway/internal/config/config.go
+index ef4b282..abd9b24 100644
+--- a/gateway/internal/config/config.go
++++ b/gateway/internal/config/config.go
+@@ -28,8 +28,12 @@ const (
+ 	envAuthMode                 = "GATEWAY_AUTH_MODE"
+ 	envAPIKeysFile              = "GATEWAY_API_KEYS_FILE"
+ 	envInstanceAllowedCIDRs     = "GATEWAY_INSTANCE_ALLOWED_CIDRS"
++	envMaxRequestBodyBytes      = "GATEWAY_MAX_REQUEST_BODY_BYTES"
+ )
+ 
++// DefaultMaxRequestBodyBytes 是请求体大小上限的默认值（10 MiB）。
++const DefaultMaxRequestBodyBytes int64 = 10 << 20
++
+ // 认证模式（GATEWAY_AUTH_MODE）。
+ const (
+ 	// AuthModeAPIKey 校验 `Authorization: Bearer <key>`，key 绑定租户（默认）。
+@@ -76,6 +80,8 @@ type Config struct {
+ 	// InstanceAllowedCIDRs 流式代理允许连接的推理实例网段；为空时拒绝回环、链路本地与
+ 	// 元数据服务地址，允许其余地址（见 stream.AddressPolicy）。
+ 	InstanceAllowedCIDRs []netip.Prefix
++	// MaxRequestBodyBytes 单个请求体的大小上限（字节），超出返回 413。
++	MaxRequestBodyBytes int64
+ }
+ 
+ // Load 从环境变量读取配置；未设置项使用默认值。
+@@ -124,6 +130,15 @@ func Load() (Config, error) {
+ 	}
+ 	cfg.UnhealthyCooldownSeconds = cooldownSec
+ 
++	maxBody, err := getIntEnv(envMaxRequestBodyBytes, int(DefaultMaxRequestBodyBytes))
++	if err != nil {
++		return Config{}, err
++	}
++	if maxBody <= 0 {
++		return Config{}, fmt.Errorf("config: %s 必须为正整数，当前为 %d", envMaxRequestBodyBytes, maxBody)
++	}
++	cfg.MaxRequestBodyBytes = int64(maxBody)
++
+ 	// 归一化上游地址：去掉结尾斜杠，避免与请求路径拼接时出现双斜杠。
+ 	cfg.UpstreamURL = strings.TrimRight(strings.TrimSpace(cfg.UpstreamURL), "/")
+ 	if cfg.UpstreamURL == "" {
+diff --git a/gateway/internal/config/config_test.go b/gateway/internal/config/config_test.go
+index e16e838..4a7d226 100644
+--- a/gateway/internal/config/config_test.go
++++ b/gateway/internal/config/config_test.go
+@@ -22,12 +22,16 @@ func TestLoad_Defaults(t *testing.T) {
+ 	t.Setenv(envRateLimitBurst, "")
+ 	t.Setenv(envResolverTTLSeconds, "")
+ 	t.Setenv(envUnhealthyCooldownSeconds, "")
++	t.Setenv(envMaxRequestBodyBytes, "")
+ 	setAPIKeyAuthEnv(t)
+ 
+ 	cfg, err := Load()
+ 	if err != nil {
+ 		t.Fatalf("Load 默认应成功: %v", err)
+ 	}
++	if cfg.MaxRequestBodyBytes != DefaultMaxRequestBodyBytes {
++		t.Fatalf("MaxRequestBodyBytes 默认应为 %d，实际 %d", DefaultMaxRequestBodyBytes, cfg.MaxRequestBodyBytes)
++	}
+ 	if cfg.ResolverTTLSeconds != defaultResolverTTLSeconds {
+ 		t.Fatalf("ResolverTTLSeconds 默认应为 %d，实际 %d", defaultResolverTTLSeconds, cfg.ResolverTTLSeconds)
+ 	}
+@@ -99,6 +103,20 @@ func TestLoad_ResolverOverrides(t *testing.T) {
+ 	}
+ }
+ 
++// TestLoad_MaxRequestBodyBytesOverride 验证环境变量可覆盖请求体上限。
++func TestLoad_MaxRequestBodyBytesOverride(t *testing.T) {
++	setAPIKeyAuthEnv(t)
++	t.Setenv(envMaxRequestBodyBytes, "1048576")
++
++	cfg, err := Load()
++	if err != nil {
++		t.Fatalf("Load 应成功: %v", err)
++	}
++	if cfg.MaxRequestBodyBytes != 1<<20 {
++		t.Fatalf("MaxRequestBodyBytes 应为 1048576，实际 %d", cfg.MaxRequestBodyBytes)
++	}
++}
++
+ // TestLoad_InvalidResolverValues 验证非正数取值被拒绝。
+ func TestLoad_InvalidResolverValues(t *testing.T) {
+ 	cases := []struct {
+@@ -113,6 +131,8 @@ func TestLoad_InvalidResolverValues(t *testing.T) {
+ 		{"冷却零", envUnhealthyCooldownSeconds, "0", envUnhealthyCooldownSeconds},
+ 		{"冷却负数", envUnhealthyCooldownSeconds, "-1", envUnhealthyCooldownSeconds},
+ 		{"冷却非数字", envUnhealthyCooldownSeconds, "x", envUnhealthyCooldownSeconds},
++		{"请求体上限零", envMaxRequestBodyBytes, "0", envMaxRequestBodyBytes},
++		{"请求体上限非数字", envMaxRequestBodyBytes, "10MiB", envMaxRequestBodyBytes},
+ 	}
+ 	for _, tc := range cases {
+ 		t.Run(tc.name, func(t *testing.T) {
+diff --git a/gateway/internal/middleware/bodylimit.go b/gateway/internal/middleware/bodylimit.go
+new file mode 100644
+index 0000000..1892f09
+--- /dev/null
++++ b/gateway/internal/middleware/bodylimit.go
+@@ -0,0 +1,25 @@
++package middleware
++
++import (
++	"fmt"
++	"net/http"
++)
++
++// LimitRequestBody 限制请求体大小。声明的 Content-Length 超过 limit 时直接返回 413；
++// 未声明长度（分块传输）的请求体读到超出 limit 的部分时返回 *http.MaxBytesError，
++// 由转发处理器据此返回 413。没有请求体的请求原样放行。
++func LimitRequestBody(limit int64) Middleware {
++	return func(next http.Handler) http.Handler {
++		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++			if r.ContentLength > limit {
++				WriteError(w, r, http.StatusRequestEntityTooLarge, "REQUEST_TOO_LARGE",
++					fmt.Sprintf("request body exceeds %d bytes", limit))
++				return
++			}
++			if r.Body != nil && r.Body != http.NoBody {
++				r.Body = http.MaxBytesReader(w, r.Body, limit)
++			}
++			next.ServeHTTP(w, r)
++		})
++	}
++}
+diff --git a/gateway/internal/middleware/bodylimit_test.go b/gateway/internal/middleware/bodylimit_test.go
+new file mode 100644
+index 0000000..bdb0897
+--- /dev/null
++++ b/gateway/internal/middleware/bodylimit_test.go
+@@ -0,0 +1,69 @@
++package middleware
++
++import (
++	"errors"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++)
++
++// TestLimitRequestBody_DeclaredLengthOverLimit 验证声明长度超限时直接 413，不进入处理器。
++func TestLimitRequestBody_DeclaredLengthOverLimit(t *testing.T) {
++	called := false
++	h := LimitRequestBody(8)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		called = true
++	}))
++
++	rec := httptest.NewRecorder()
++	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/v1/resources", strings.NewReader("123456789")))
++
++	if rec.Code != http.StatusRequestEntityTooLarge {
++		t.Fatalf("超限应 413，实际 %d", rec.Code)
++	}
++	if !strings.Contains(rec.Body.String(), `"code":"REQUEST_TOO_LARGE"`) {
++		t.Fatalf("错误体应含 REQUEST_TOO_LARGE，实际: %s", rec.Body.String())
++	}
++	if called {
++		t.Fatal("超限请求不应进入处理器")
++	}
++}
++
++// TestLimitRequestBody_ChunkedBodyOverLimit 验证未声明长度的请求体在读取超限时失败。
++func TestLimitRequestBody_ChunkedBodyOverLimit(t *testing.T) {
++	var readErr error
++	h := LimitRequestBody(8)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		_, readErr = io.ReadAll(r.Body)
++	}))
++
++	req := httptest.NewRequest(http.MethodPost, "/api/v1/resources", strings.NewReader("123456789"))
++	req.ContentLength = -1
++	h.ServeHTTP(httptest.NewRecorder(), req)
++
++	var tooLarge *http.MaxBytesError
++	if !errors.As(readErr, &tooLarge) || tooLarge.Limit != 8 {
++		t.Fatalf("读取超限应返回 limit=8 的 *http.MaxBytesError，实际 %v", readErr)
++	}
++}
++
++// TestLimitRequestBody_WithinLimit 验证未超限的请求体完整到达处理器，无请求体的请求原样放行。
++func TestLimitRequestBody_WithinLimit(t *testing.T) {
++	var got string
++	var noBody bool
++	h := LimitRequestBody(8)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		noBody = r.Body == http.NoBody
++		b, _ := io.ReadAll(r.Body)
++		got = string(b)
++	}))
++
++	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/x", strings.NewReader("12345678")))
++	if got != "12345678" {
++		t.Fatalf("未超限的请求体应完整到达，实际 %q", got)
++	}
++
++	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/x", nil))
++	if !noBody {
++		t.Fatal("无请求体的请求应保持 http.NoBody")
++	}
++}
+diff --git a/gateway/internal/middleware/chain_test.go b/gateway/internal/middleware/chain_test.go
+index cd1aac1..f7bca9e 100644
+--- a/gateway/internal/middleware/chain_test.go
++++ b/gateway/internal/middleware/chain_test.go
+@@ -2,7 +2,7 @@
+ //
+ // 链序（与 router.go 实际组装一致，外层 → 内层）：
+ //
+-//		Recovery → Correlation → Authz → RateLimit → Route
++//		Recovery → Correlation → Authz → RateLimit → LimitRequestBody → Route
+ //
+ //	  - Correlation 先于 Authz：认证失败的响应也携带关联 ID；
+ //	  - Authz 先于 RateLimit：被拒请求不产生限流副作用（不耗令牌、不误伤）；
+@@ -32,6 +32,7 @@ func newAPIChain(l *Limiter, route http.Handler) http.Handler {
+ 		Correlation(DefaultCorrelationHeader),
+ 		Authz(DefaultTenantHeader),
+ 		RateLimit(l),
++		LimitRequestBody(1<<20),
+ 	)
+ 	return Recovery(log.New(io.Discard, "", 0))(api)
+ }
+diff --git a/gateway/internal/middleware/middleware.go b/gateway/internal/middleware/middleware.go
+index ef383ce..83d2d04 100644
+--- a/gateway/internal/middleware/middleware.go
++++ b/gateway/internal/middleware/middleware.go
+@@ -2,11 +2,12 @@
+ //
+ // 链的执行顺序（外层 → 内层）：
+ //
+-//	Recovery → Correlation → Authenticate → RateLimit → Route
++//	Recovery → Correlation → Authenticate → RateLimit → LimitRequestBody → Route
+ //
+ // Recovery 位于最外层，保证任何下游 panic 都能被兜底；
+ // Correlation 尽早生成关联 ID，认证失败的响应也能携带；
+-// Authenticate 先于 RateLimit，被拒请求不消耗令牌。
++// Authenticate 先于 RateLimit，被拒请求不消耗令牌；
++// LimitRequestBody 紧挨路由，请求体只在转发时才被读取。
+ package middleware
+ 
+ import "net/http"
+diff --git a/gateway/internal/router/router.go b/gateway/internal/router/router.go
+index 79073c0..c33f748 100644
+--- a/gateway/internal/router/router.go
++++ b/gateway/internal/router/router.go
+@@ -14,7 +14,8 @@
+ //	                                          路径；要求 read 作用域）
+ //	ANY  /api/v1/inference/{svc}/chat          同上，用于不带命名空间的服务
+ //
+-// 中间件链（执行顺序）：Recovery → Correlation → Authenticate → RateLimit → Route。
++// 中间件链（执行顺序）：Recovery → Correlation → Authenticate → RateLimit →
++// LimitRequestBody → Route。
+ // Recovery 作为最外层兜底全量请求；探针刻意不经过认证/限流，保证健康检查可用。
+ // 认证模式见 config.AuthModeAPIKey / config.AuthModeDev 与 ADR-014。
+ package router
+@@ -101,12 +102,18 @@ func New(cfg config.Config, logger *log.Logger) (*Router, error) {
+ 	apiMux.Handle(streamRoutePattern, streamHandler)
+ 	apiMux.Handle(streamWithoutNamespacePattern, streamHandler)
+ 
+-	// API 中间件链：Correlation → Authenticate → RateLimit。
++	maxBody := cfg.MaxRequestBodyBytes
++	if maxBody <= 0 {
++		maxBody = config.DefaultMaxRequestBodyBytes
++	}
++
++	// API 中间件链：Correlation → Authenticate → RateLimit → LimitRequestBody。
+ 	limiter := middleware.NewRateLimiter(cfg.RateLimitRPS, cfg.RateLimitBurst)
+ 	apiHandler := middleware.Chain(apiMux,
+ 		middleware.Correlation(cfg.CorrelationHeader),
+ 		middleware.Authenticate(authn, cfg.TenantHeader),
+ 		middleware.RateLimit(limiter),
++		middleware.LimitRequestBody(maxBody),
+ 	)
+ 
+ 	// 顶层路由：探针不经过鉴权/限流。
+diff --git a/gateway/internal/router/router_test.go b/gateway/internal/router/router_test.go
+index 2169c0e..e237433 100644
+--- a/gateway/internal/router/router_test.go
++++ b/gateway/internal/router/router_test.go
+@@ -131,6 +131,59 @@ func TestApi_UnknownRouteAllowedThroughChain(t *testing.T) {
+ 	}
+ }
+ 
++// TestApi_RequestBodyLimit 验证请求体上限：声明长度超限直接 413、不触达控制平面；
++// 分块上传超限同样 413；恰好等于上限的请求体正常转发。
++func TestApi_RequestBodyLimit(t *testing.T) {
++	var cpHits atomic.Int64
++	controlPlane := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
++		cpHits.Add(1)
++		_, _ = io.Copy(io.Discard, req.Body)
++		w.WriteHeader(http.StatusCreated)
++	}))
++	defer controlPlane.Close()
++
++	r, err := New(config.Config{
++		ListenAddr:          ":0",
++		UpstreamURL:         controlPlane.URL,
++		RateLimitRPS:        1000,
++		RateLimitBurst:      1000,
++		TenantHeader:        "X-Tenant-ID",
++		CorrelationHeader:   "X-Correlation-ID",
++		AuthMode:            config.AuthModeDev,
++		MaxRequestBodyBytes: 16,
++	}, log.New(io.Discard, "", 0))
++	if err != nil {
++		t.Fatalf("New 失败: %v", err)
++	}
++	post := func(body string, chunked bool) *httptest.ResponseRecorder {
++		req := httptest.NewRequest(http.MethodPost, "/api/v1/resources", strings.NewReader(body))
++		if chunked {
++			req.ContentLength = -1
++		}
++		req.Header.Set("X-Tenant-ID", "tenant-a")
++		rec := httptest.NewRecorder()
++		r.ServeHTTP(rec, req)
++		return rec
++	}
++
++	if rec := post(strings.Repeat("x", 17), false); rec.Code != http.StatusRequestEntityTooLarge {
++		t.Fatalf("声明长度超限应 413，实际 %d（body=%s）", rec.Code, rec.Body.String())
++	}
++	if got := cpHits.Load(); got != 0 {
++		t.Fatalf("声明长度超限的请求不应触达控制平面，实际 %d 次", got)
++	}
++	rec := post(strings.Repeat("x", 64), true)
++	if rec.Code != http.StatusRequestEntityTooLarge {
++		t.Fatalf("分块上传超限应 413，实际 %d（body=%s）", rec.Code, rec.Body.String())
++	}
++	if !strings.Contains(rec.Body.String(), `"code":"REQUEST_TOO_LARGE"`) {
++		t.Fatalf("错误体应含 REQUEST_TOO_LARGE，实际: %s", rec.Body.String())
++	}
++	if rec := post(strings.Repeat("x", 16), false); rec.Code != http.StatusCreated {
++		t.Fatalf("等于上限的请求体应正常转发，实际 %d（body=%s）", rec.Code, rec.Body.String())
++	}
++}
++
+ // TestInferenceChat_ResolvesEndpoint 端到端验证推理路由：
+ // 控制平面返回 Ready + 实例 endpoint，SSE 请求应被转发到该实例并透传流式响应。
+ func TestInferenceChat_ResolvesEndpoint(t *testing.T) {
+diff --git a/gateway/internal/stream/proxy.go b/gateway/internal/stream/proxy.go
+index 1723c8c..b9a209b 100644
+--- a/gateway/internal/stream/proxy.go
++++ b/gateway/internal/stream/proxy.go
+@@ -20,6 +20,7 @@ import (
+ 	"context"
+ 	"encoding/json"
+ 	"errors"
++	"fmt"
+ 	"io"
+ 	"log"
+ 	"net"
+@@ -150,6 +151,12 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, upstreamURL, end
+ 
+ 	resp, err := p.client.Do(req)
+ 	if err != nil {
++		var tooLarge *http.MaxBytesError
++		if errors.As(err, &tooLarge) {
++			writeJSONError(w, http.StatusRequestEntityTooLarge, "REQUEST_TOO_LARGE",
++				fmt.Sprintf("请求体超过 %d 字节", tooLarge.Limit))
++			return
++		}
+ 		p.logger.Printf("stream upstream error: corr=%s path=%s endpoint=%s err=%v",
+ 			r.Header.Get("X-Correlation-ID"), r.URL.Path, endpoint, err)
+ 		p.resolver.ReportFailure(endpoint)
+diff --git a/gateway/internal/stream/proxy_test.go b/gateway/internal/stream/proxy_test.go
+index b831ffc..a88a023 100644
+--- a/gateway/internal/stream/proxy_test.go
++++ b/gateway/internal/stream/proxy_test.go
+@@ -4,6 +4,7 @@ import (
+ 	"context"
+ 	"errors"
+ 	"fmt"
++	"io"
+ 	"net"
+ 	"net/http"
+ 	"net/http/httptest"
+@@ -594,6 +595,33 @@ func TestProxy_RefusesDisallowedInstanceAddress(t *testing.T) {
+ 	}
+ }
+ 
++// TestProxy_RequestBodyTooLarge 验证分块请求体超过上限（由 LimitRequestBody 包装）时
++// 返回 413，且不计实例失败。
++func TestProxy_RequestBodyTooLarge(t *testing.T) {
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		_, _ = io.Copy(io.Discard, r.Body)
++	}))
++	defer srv.Close()
++
++	res := newFakeResolver([]string{srv.URL}, nil)
++	rec := httptest.NewRecorder()
++	req := newChatRequest("svc-a")
++	req.Method = http.MethodPost
++	req.Body = http.MaxBytesReader(rec, io.NopCloser(strings.NewReader(strings.Repeat("x", 64))), 16)
++	req.ContentLength = -1
++	New(res, "X-Tenant-ID", allowLoopback, nil).ServeHTTP(rec, req)
++
++	if rec.Code != http.StatusRequestEntityTooLarge {
++		t.Fatalf("请求体超限应 413，实际 %d（body=%s）", rec.Code, rec.Body.String())
++	}
++	if !strings.Contains(rec.Body.String(), `"code":"REQUEST_TOO_LARGE"`) {
++		t.Fatalf("错误体应含 REQUEST_TOO_LARGE，实际: %s", rec.Body.String())
++	}
++	if got := res.failureCount(srv.URL); got != 0 {
++		t.Fatalf("请求体超限属客户端问题，不应计实例失败，实际 %d", got)
++	}
++}
++
+ // TestProxy_Upstream5xxCountsFailure 验证实例返回 5xx 时计一次失败（响应仍透传）。
+ func TestProxy_Upstream5xxCountsFailure(t *testing.T) {
+ 	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+diff --git a/gateway/internal/upstream/client.go b/gateway/internal/upstream/client.go
+index 82670c0..28a15f4 100644
+--- a/gateway/internal/upstream/client.go
++++ b/gateway/internal/upstream/client.go
+@@ -5,10 +5,14 @@
+ package upstream
+ 
+ import (
++	"errors"
++	"fmt"
+ 	"log"
+ 	"net/http"
+ 	"net/http/httputil"
+ 	"net/url"
++
++	"github.com/Mekoforge/ForgeMesh/gateway/internal/middleware"
+ )
+ 
+ // Client 是对 httputil.ReverseProxy 的薄封装，实现 http.Handler。
+@@ -57,6 +61,12 @@ func New(target *url.URL, correlationHeader, tenantHeader string, logger *log.Lo
+ 			}
+ 		},
+ 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
++			var tooLarge *http.MaxBytesError
++			if errors.As(err, &tooLarge) {
++				middleware.WriteError(w, r, http.StatusRequestEntityTooLarge, "REQUEST_TOO_LARGE",
++					fmt.Sprintf("request body exceeds %d bytes", tooLarge.Limit))
++				return
++			}
+ 			logger.Printf("upstream proxy error: corr=%s path=%s err=%v", r.Header.Get(c.correlationHeader), r.URL.Path, err)
+ 			http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
+ 		},
+-- 
+2.43.0
+

@@ -18,6 +18,7 @@
 | 2 | `02-p0-auth-tenant-binding` / `cursor/p0-auth-tenant-binding-b108` | 8 | P0-9：绑定租户的 API key 认证（网关与控制平面各自校验）、scope、统一错误信封、凭证不再转发给推理实例、按已验证租户限流；ADR-014 与文档 |
 | 3 | `03-p0-controller-loop` / `cursor/p0-controller-loop-b108` | 8 | P0-10：控制器随应用启动，增量读取变更记录、按资源排队与退避、经 status 子资源（CAS）回写协调结果、写入成功后才登记去重键；缺少调度器时报告 `Ready=False`（`SchedulerUnavailable`），不再误报 `Ready=True` |
 | 4 | `04-p1-inference-routing` / `cursor/p1-inference-routing-b108` | 4 | P1-1：`status.endpoints` 定义为 `{url, ready, instanceId, protocol}` 并进入资源模型、Schema 与 OpenAPI；status 子资源可写入实例地址；网关新增带命名空间的推理路由，只转发到 ready 实例，并按 `protocol` 映射实例上的推理路径（不再原样拼接入站路径） |
+| 5 | `05-p1-gateway-hardening` / `cursor/p1-gateway-hardening-b108` | 7 | P1-8 / P2-2：网关在拨号时检查实例地址（`GATEWAY_INSTANCE_ALLOWED_CIDRS`，默认拒绝回环、链路本地与云元数据地址）、请求体上限（`413`）、放宽空闲连接池、解析器合并并发回源并短暂缓存"不存在 / 未就绪"、`/readyz` 改为请求控制平面的 `/readyz`、实例错误响应保留 `Content-Type` |
 
 ## 推送到你的 fork
 
@@ -39,7 +40,7 @@ cd ForgeMesh
 
 ```bash
 make install    # 默认的 python3 低于 3.12 时：make install PY=python3.12
-make test       # 四个分支都应用后：1234 passed（基线为 1115）
+make test       # 五个分支都应用后：1234 passed（基线为 1115；第 5 个分支只改网关）
 make lint
 (cd gateway && go vet ./... && go test -race ./...)
 for s in validate_manifests openapi_semantic_check check_metadata_consistency plugin_entrypoint_smoke; do

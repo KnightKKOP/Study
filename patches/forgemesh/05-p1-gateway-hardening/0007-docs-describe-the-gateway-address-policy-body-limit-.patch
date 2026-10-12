@@ -1,0 +1,192 @@
+From a2288147f65a6895330aad27cf9ba118ea42bae9 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 12 Oct 2026 06:02:50 +0000
+Subject: [PATCH 7/7] docs: describe the gateway address policy, body limit and
+ readiness probe
+
+The gateway README documents GATEWAY_INSTANCE_ALLOWED_CIDRS and
+GATEWAY_MAX_REQUEST_BODY_BYTES, the instance address policy, the
+LimitRequestBody middleware, resolver coalescing and miss caching,
+the HTTP readiness probe and the content type of error responses. The
+root README notes that local instances need an explicit allowlist, and
+the changelog and module mapping list the changes.
+---
+ CHANGELOG.md                        | 10 +++++++-
+ README.md                           |  2 ++
+ docs/architecture/module-mapping.md |  2 +-
+ gateway/README.md                   | 37 +++++++++++++++++++++++------
+ 4 files changed, 42 insertions(+), 9 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index eaaaddf..f5b0d53 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -22,6 +22,7 @@
+ - `ReconciliationController` 新增 `record_dedup_keys` 参数与 `mark_processed()`：调用方可以在持久化 `status` 之后再登记去重键。
+ - `InferenceServiceStatus.endpoints`：每个实例包含 `url`（http/https 基地址，不含凭证、查询串与片段）、`ready`（默认 `true`）、可选的 `instanceId` 与 `protocol`（`openai-chat` / `tgi-generate`），资源模型、JSON Schema 与 OpenAPI 一致；`update_status` 可以整体替换 `endpoints`，写入前逐项校验。
+ - 网关新增带命名空间的推理路由 `/api/v1/namespaces/{ns}/inference/{svc}/chat`：Resolver 以 `?namespace=` 查询控制平面，缓存按租户与命名空间隔离；`/api/v1/inference/{svc}/chat` 继续解析不带命名空间的服务。
++- 网关请求体上限 `GATEWAY_MAX_REQUEST_BODY_BYTES`（默认 10 MiB）：声明的 `Content-Length` 超限时直接返回 `413 REQUEST_TOO_LARGE`，不访问上游；分块传输的请求体读到上限时同样返回 `413`，不计实例失败。
+ 
+ ### Changed
+ 
+@@ -36,6 +37,9 @@
+ - 控制平面全部错误响应统一为错误信封：框架层 404 / 405 不再返回 `{"detail": ...}`，请求校验失败由 `422` 改为 `400`，未捕获异常返回不含内部细节的 `500 INTERNAL_ERROR`（细节写入日志）。
+ - 网关接受任意大小写的 `Bearer` scheme（如 `bearer`）。
+ - **破坏性**：网关消费的 `status.endpoints` 由字符串数组改为对象数组（见 Added），只使用 `ready` 且协议已知的实例；JSON Schema 中资源模型从未实现的单数 `status.endpoint` 一并移除。
++- **破坏性**：网关默认不连接回环、链路本地、未指定、组播地址与已知云元数据服务地址上的推理实例（见 Security）；实例运行在本机时需设置 `GATEWAY_INSTANCE_ALLOWED_CIDRS`（`make run-dev` 已允许 `127.0.0.0/8,::1/128`）。
++- 网关连接池：流式代理与控制平面客户端每个主机最多保留 64 个空闲连接（此前为 `net/http` 默认的 2 个，一波并发请求之后大部分连接被关闭，下一波重新建连）；资源反代等待控制平面响应头最多 30 秒。
++- 网关 Resolver 合并同一服务的并发未命中，只查询一次控制平面，查询不随发起它的请求取消；"服务不存在 / 未就绪 / 无可用实例"缓存 1 秒（不超过 `GATEWAY_RESOLVER_TTL_SECONDS`），`403`、其他控制平面错误与网络错误仍不缓存。
+ 
+ ### Deprecated
+ 
+@@ -56,13 +60,17 @@
+ - 调和器在没有注入调度器或工作流运行时的情况下跳过分配与部署、登记去重键并报告 `Ready=True`（`Reconciled`），实际什么都没做：现在任何副作用之前检查，返回 `Ready=False`，原因为 `SchedulerUnavailable` 或 `WorkflowRuntimeUnavailable`，且不登记去重键。目前仓库没有调度器实现，默认部署中新建的服务会停在 `Pending` 并带有 `Ready=False`（`SchedulerUnavailable`）。
+ - 网关把入站路径原样拼接到实例地址，请求以 `/api/v1/inference/{svc}/chat` 到达推理运行时，而 vLLM 与 TGI 都不提供这个路径：现按实例的 `protocol` 转发到 `/v1/chat/completions`（`openai-chat`）或 `/generate_stream`（`tgi-generate`），查询串保留。
+ - 网关解析推理服务时不带命名空间，控制平面因此只查找不带命名空间的服务，带命名空间的服务无法经网关调用：现由带命名空间的路由解析（见 Added）。
++- 网关 `/readyz` 只对上游做 TCP 拨号，控制平面的权威存储不可用（其 `/readyz` 返回 `503`）或端口被其他进程占用时仍报告就绪：现请求控制平面的 `/readyz`，返回 `200` 才就绪，否则返回 `503`（`upstream not ready` / `upstream unreachable`）。
++- 推理实例返回错误（如 vLLM 对非法参数返回 `400` JSON）时，网关把响应的 `Content-Type` 改成 `text/event-stream`：现只对 2xx 响应这样设置，错误响应保留实例的 `Content-Type`。
+ 
+ ### Security
+ 
+-- Go 网关多租户安全验证：跨租户拒绝、伪造 `X-Tenant-Id` 不得提权、SSE 客户端取消 / 上游断开连接释放、中间件链序（Recovery→Correlation→Authenticate→RateLimit→Route）测试；网关 README 新增 header 转发 / 剥离策略表。
++- Go 网关多租户安全验证：跨租户拒绝、伪造 `X-Tenant-Id` 不得提权、SSE 客户端取消 / 上游断开连接释放、中间件链序（Recovery→Correlation→Authenticate→RateLimit→LimitRequestBody→Route）测试；网关 README 新增 header 转发 / 剥离策略表。
+ - 租户身份改由凭证绑定（ADR-014）：此前网关只检查 `X-Tenant-ID` 是否存在，控制平面直接信任该请求头且可被直连，任何调用方都能读写任意租户的资源。控制平面现自行校验凭证，不依赖请求必经网关；网关对推理路由检查 `read` scope，命中 Resolver 缓存的请求同样受约束。
+ - 网关不再把调用方的 `Authorization` / `Cookie` 转发给推理实例（此前原样透传，凭证会泄露给实例）；资源反代与 Resolver 查询仍向控制平面转发 `Authorization`，由控制平面复核。
+ - 网关限流改按已验证的租户计数，不再读取客户端可控的租户头或 `X-Forwarded-For`（此前更换头值即可获得新的令牌桶）。
++- 网关只连接允许网段内的推理实例：此前流式代理会连接 `status.endpoints` 中的任意地址，实例地址被写成 `169.254.169.254` 或内网服务时，网关就成了访问它们的跳板。现在拨号时逐个检查解析出的 IP（主机名之后解析到别处同样生效）；`GATEWAY_INSTANCE_ALLOWED_CIDRS` 列出允许的网段，未设置时拒绝回环、链路本地、未指定、组播地址与已知云元数据服务地址；被拒绝的连接返回 `502 INSTANCE_ADDRESS_NOT_ALLOWED`，并计一次实例失败。
++- 网关请求体此前不设上限，原样转发给控制平面与推理实例：现限制为 `GATEWAY_MAX_REQUEST_BODY_BYTES`（见 Added）。
+ 
+ ## [1.0.1] - 2026-10-11
+ 
+diff --git a/README.md b/README.md
+index c7df41f..85896ad 100644
+--- a/README.md
++++ b/README.md
+@@ -173,6 +173,8 @@ GATEWAY_API_KEYS_FILE=../api-keys.json make run   # 默认 apikey 模式，监
+ make run-dev        # dev 模式：信任租户请求头，只监听 127.0.0.1:8081
+ ```
+ 
++> 网关默认不连接回环、链路本地与云元数据地址上的推理实例。实例运行在本机时设置 `GATEWAY_INSTANCE_ALLOWED_CIDRS=127.0.0.0/8,::1/128`（`make run-dev` 已设置），见 [gateway/README.md](gateway/README.md)「实例地址限制」。
++
+ ---
+ 
+ ## 4. 功能概览（v1.0.0）
+diff --git a/docs/architecture/module-mapping.md b/docs/architecture/module-mapping.md
+index 744dff6..8e9927f 100644
+--- a/docs/architecture/module-mapping.md
++++ b/docs/architecture/module-mapping.md
+@@ -76,7 +76,7 @@
+ |---|---|
+ | 架构模块 | Data Plane Gateway（L1 推理流量入口，architecture.md 3.1 L1 / Dev-5） |
+ | 当前代码路径 | `gateway/cmd/gateway/main.go`；`gateway/internal/{config,health,middleware,router,stream,upstream}/`（共 20 个 `.go` 文件，glob 核对）；`gateway/go.mod`（`github.com/Mekoforge/ForgeMesh/gateway`，go 1.22）；`gateway/Makefile`、`gateway/README.md` |
+-| 核心契约 | `/api/v1/` REST + SSE 流式转发（见 openapi.yaml）；中间件链 `Recovery → Correlation → Authenticate → RateLimit → Route`；API key 认证（ADR-014，`middleware/{authz,apikey}.go`）；上游解析 `upstream/resolver.go`（按命名空间解析 ready 实例、`protocol` → 实例推理路径、健康摘流） |
++| 核心契约 | `/api/v1/` REST + SSE 流式转发（见 openapi.yaml）；中间件链 `Recovery → Correlation → Authenticate → RateLimit → LimitRequestBody → Route`；API key 认证（ADR-014，`middleware/{authz,apikey}.go`）；上游解析 `upstream/resolver.go`（按命名空间解析 ready 实例、`protocol` → 实例推理路径、合并回源、健康摘流）；实例地址限制 `stream/addrpolicy.go` |
+ | 运行形态 | 独立进程（Go 二进制），经 `FORGEMESH_UPSTREAM` 转发至控制平面 |
+ | 数据所有权 | 无权威数据（运行态转发；端点解析缓存为派生数据） |
+ | 允许依赖 | 控制平面 HTTP API（上游）、Go 标准库 |
+diff --git a/gateway/README.md b/gateway/README.md
+index f7eb7d6..826fedb 100644
+--- a/gateway/README.md
++++ b/gateway/README.md
+@@ -33,7 +33,7 @@ ForgeMesh 的**统一外部入口**与**高性能流式代理**。与 Python 控
+ | 方法 | 路径 | 处理器 | 中间件 |
+ | --- | --- | --- | --- |
+ | GET | `/healthz` | 存活探针（始终 200） | 仅 Recovery |
+-| GET | `/readyz` | 就绪探针（TCP 探测上游，不可达 503） | 仅 Recovery |
++| GET | `/readyz` | 就绪探针（请求控制平面 `/readyz`，非 200 或不可达时 503） | 仅 Recovery |
+ | ANY | `/api/v1/resources[/...]` | 反代 → Python 控制平面 | 全链 |
+ | ANY | `/api/v1/inference-services[/...]` | 反代 → Python 控制平面 | 全链 |
+ | ANY | `/api/v1/workflows[/...]` | 反代 → Python 控制平面 | 全链 |
+@@ -54,19 +54,35 @@ ForgeMesh 的**统一外部入口**与**高性能流式代理**。与 Python 控
+ 
+ 网关不转换请求体，客户端按服务实例的协议格式发送请求。
+ 
++同一服务的并发未命中只查询一次控制平面；"服务不存在 / 未就绪 / 无可用实例"缓存 1 秒
++（不超过 `GATEWAY_RESOLVER_TTL_SECONDS`），`403`、其他控制平面错误与网络错误不缓存。
++
++### 实例地址限制
++
++`status.endpoints` 中的地址由控制平面写入，网关在拨号时逐个检查解析出的 IP，主机名之后
++解析到别处同样生效：
++
++- 设置了 `GATEWAY_INSTANCE_ALLOWED_CIDRS` 时，只连接其中列出的网段；
++- 未设置时拒绝回环、链路本地（含 `169.254.169.254`）、未指定地址、组播，以及已知的云
++  元数据服务地址（`100.100.100.200`、`fd00:ec2::254`）。
++
++被拒绝的连接返回 `502 INSTANCE_ADDRESS_NOT_ALLOWED`，并计一次实例失败。实例运行在本机时
++需要显式允许回环网段，`make run-dev` 已设置 `GATEWAY_INSTANCE_ALLOWED_CIDRS=127.0.0.0/8,::1/128`。
++
+ ### 中间件链
+ 
+ 执行顺序（外层 → 内层，与 `router.go` 实际组装一致，并由
+ `internal/middleware/chain_test.go` 验证）：
+ 
+ ```
+-Recovery → Correlation → Authenticate → RateLimit → Route
++Recovery → Correlation → Authenticate → RateLimit → LimitRequestBody → Route
+ ```
+ 
+ - **Recovery**：兜底 panic → 500，记录堆栈，进程不退出（最外层，覆盖全量请求）。
+ - **Correlation**：缺失则用 `crypto/rand` 生成 128-bit hex 关联 ID，注入 context 与响应头；已携带则透传。
+ - **Authenticate**：按 `GATEWAY_AUTH_MODE` 校验凭证——`apikey`（默认）以 `Authorization: Bearer <key>` 的 SHA-256 摘要查 key 文件，`dev` 直接信任租户头。已验证的主体（subject / 租户 / scope）注入 context，并以已验证的租户**覆写**入站租户头。缺少或无效凭证返回 `401`（带 `WWW-Authenticate: Bearer realm="forgemesh"`），租户头与 key 绑定的租户不一致返回 `403`，响应体均为 JSON 错误信封。
+ - **RateLimit**：按已验证租户的令牌桶限流，超限 `429 + Retry-After`；位于 Authenticate 之后，被拒请求不消耗令牌；不读取租户头或 `X-Forwarded-For`。
++- **LimitRequestBody**：请求体上限为 `GATEWAY_MAX_REQUEST_BODY_BYTES`（默认 10 MiB）。声明的 `Content-Length` 超限时直接返回 `413 REQUEST_TOO_LARGE`，不访问上游；分块传输的请求体读到上限时，反代与流式代理同样返回 `413`，不计实例失败。
+ 
+ > 说明：探针刻意不经过认证/限流，保证负载均衡健康检查始终可用。
+ 
+@@ -96,8 +112,9 @@ Recovery → Correlation → Authenticate → RateLimit → Route
+ | `Host`、`Content-Length` | 剥离后重写 | 同方向一 |
+ | hop-by-hop 头（双向） | 剥离 | 请求与响应两个方向均过滤 |
+ 
+-**响应方向（上游/实例 → 客户端）**：非 hop-by-hop 头透传；流式响应强制
+-`Content-Type: text/event-stream`、`Cache-Control: no-cache`、`X-Accel-Buffering: no`。
++**响应方向（上游/实例 → 客户端）**：非 hop-by-hop 头透传；流式代理的 2xx 响应强制
++`Content-Type: text/event-stream`，错误响应保留实例的 `Content-Type`（如 JSON 错误体）；
++流式代理的响应一律设置 `Cache-Control: no-cache`、`X-Accel-Buffering: no`。
+ 
+ **安全缺陷记录（WP-D1，已修复）**：修复前 Authz 仅校验租户头存在性、不回写
+ 请求头，下游（反代/流式代理/限流 key）重新读取客户端**原始头**——多值头
+@@ -128,6 +145,8 @@ Recovery → Correlation → Authenticate → RateLimit → Route
+ | `GATEWAY_CORRELATION_HEADER` | `X-Correlation-ID` | 链路关联 ID 请求头 |
+ | `GATEWAY_RESOLVER_TTL_SECONDS` | `5` | 推理服务→实例列表缓存 TTL（秒） |
+ | `GATEWAY_UNHEALTHY_COOLDOWN_SECONDS` | `10` | 实例连续 3 次失败被摘流后的冷却时长（秒） |
++| `GATEWAY_INSTANCE_ALLOWED_CIDRS` | — | 推理实例允许所在的网段，逗号分隔（如 `10.0.0.0/8,fd00::/8`）；未设置时拒绝回环、链路本地与云元数据地址（见「实例地址限制」）；取值非法时拒绝启动 |
++| `GATEWAY_MAX_REQUEST_BODY_BYTES` | `10485760`（10 MiB） | 请求体上限（字节），超出返回 `413 REQUEST_TOO_LARGE`；必须为正整数 |
+ 
+ ---
+ 
+@@ -147,10 +166,12 @@ gateway/
+     │   ├── ratelimit.go            # 按已验证租户的令牌桶（自实现）
+     │   ├── authz.go                # Authenticate / RequireScope、Principal、dev 模式认证器
+     │   ├── apikey.go               # key 文件解析与 API key 认证器
++    │   ├── bodylimit.go            # 请求体上限
+     │   └── errors.go               # JSON 错误信封
+     ├── upstream/client.go          # httputil.ReverseProxy 反代
+-    ├── upstream/resolver.go        # 推理服务 → 实例 endpoint 解析（TTL 缓存、健康摘流）
++    ├── upstream/resolver.go        # 推理服务 → 实例 endpoint 解析（TTL 缓存、合并回源、健康摘流）
+     ├── stream/proxy.go             # SSE 流式代理（逐块 Flush，断连取消上游）
++    ├── stream/addrpolicy.go        # 实例地址限制（拨号时检查）
+     ├── health/health.go            # /healthz、/readyz
+     └── router/router.go            # 路由表 + 中间件链
+ ```
+@@ -207,13 +228,15 @@ flowchart LR
+     AZ -->|401 / 403| C
+     AZ --> RL[RateLimit\n已验证租户令牌桶]
+     RL -->|429| C
+-    RL --> RT{Route}
++    RL --> BL[LimitRequestBody\n请求体上限]
++    BL -->|413| C
++    BL --> RT{Route}
+     RT -->|/healthz /readyz| H[Probe]
+     RT -->|/api/v1/resources 等| UP[ReverseProxy]
+     RT -->|/api/v1/namespaces/{ns}/inference/{svc}/chat 等| SP[SSE StreamProxy]
+     UP --> CP[(Python 控制平面)]
+     SP -->|解析 status.endpoints| CP
+-    SP -->|按 protocol 映射路径| INS[(推理实例)]
++    SP -->|按 protocol 映射路径，只连接允许的地址| INS[(推理实例)]
+ ```
+ 
+ ---
+-- 
+2.43.0
+

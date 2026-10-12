@@ -1,0 +1,375 @@
+From 44ee75b402e5389483b38542775f56307a82994b Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 12 Oct 2026 05:58:50 +0000
+Subject: [PATCH 5/7] fix(gateway): check control-plane readiness over HTTP
+
+The gateway's /readyz only opened a TCP connection to the upstream. It
+reported ready while the control plane was running but its registry
+was unavailable (the control plane's own /readyz answers 503 then), or
+when any other process listened on that port.
+
+It now sends GET {upstream}/readyz with a two-second timeout and is
+ready only when the control plane answers 200. Other status codes
+return 503 "upstream not ready"; connection errors and timeouts return
+503 "upstream unreachable".
+---
+ gateway/internal/health/health.go      |  77 ++++++-----
+ gateway/internal/health/health_test.go | 169 +++++++++++++------------
+ gateway/internal/router/router.go      |   2 +-
+ 3 files changed, 128 insertions(+), 120 deletions(-)
+
+diff --git a/gateway/internal/health/health.go b/gateway/internal/health/health.go
+index 80c431a..8154680 100644
+--- a/gateway/internal/health/health.go
++++ b/gateway/internal/health/health.go
+@@ -1,36 +1,46 @@
+ // Package health 提供网关的存活/就绪探针。
+ //
+ //   - /healthz (liveness)：进程可服务即 200，不依赖外部组件。
+-//   - /readyz  (readiness)：探测上游可达性；不可达时返回 503，
+-//     以便负载均衡器将本实例摘除（配合优雅停机）。
++//   - /readyz  (readiness)：请求控制平面的 /readyz，控制平面返回 200 才算就绪，
++//     否则返回 503，以便负载均衡器将本实例摘除（配合优雅停机）。控制平面的
++//     /readyz 会探测权威存储，进程在线但存储不可用时同样返回 503。
+ package health
+ 
+ import (
+-	"net"
++	"io"
+ 	"net/http"
+ 	"net/url"
+ 	"time"
+ )
+ 
+-// dialTimeout 是就绪探针连接上游的超时时间。
+-const dialTimeout = 2 * time.Second
++// probeTimeout 是就绪探针请求控制平面的超时时间。
++const probeTimeout = 2 * time.Second
++
++// maxProbeBodySize 限制读取并丢弃的控制平面响应体大小；读完响应体连接才能复用。
++const maxProbeBodySize = 64 << 10
+ 
+ // Checker 提供健康检查处理器。
+ type Checker struct {
+-	upstream *url.URL
+-	timeout  time.Duration
+-	// dial 可注入，便于单元测试替换 TCP 探测行为。
+-	dial func(network, address string, timeout time.Duration) (net.Conn, error)
++	readyURL string // 控制平面 /readyz 的地址；上游地址非法时为空
++	client   *http.Client
+ }
+ 
+-// New 基于上游地址构造健康检查器。upstreamURL 非法时，就绪探针将始终返回 503。
++// New 基于上游（控制平面）地址构造健康检查器。upstreamURL 非法时，就绪探针将始终返回 503。
+ func New(upstreamURL string) *Checker {
+-	u, _ := url.Parse(upstreamURL)
+ 	return &Checker{
+-		upstream: u,
+-		timeout:  dialTimeout,
+-		dial:     net.DialTimeout,
++		readyURL: readyURL(upstreamURL),
++		client:   &http.Client{Timeout: probeTimeout},
++	}
++}
++
++// readyURL 返回控制平面 /readyz 的地址，保留上游地址的路径前缀（与反向代理拼接路径的
++// 方式一致）；upstreamURL 不是 http(s) 绝对地址时返回空串。
++func readyURL(upstreamURL string) string {
++	u, err := url.Parse(upstreamURL)
++	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
++		return ""
+ 	}
++	return u.JoinPath("readyz").String()
+ }
+ 
+ // Live 处理存活探针，始终返回 200。
+@@ -38,45 +48,32 @@ func (c *Checker) Live(w http.ResponseWriter, r *http.Request) {
+ 	writeJSON(w, http.StatusOK, `{"status":"ok"}`)
+ }
+ 
+-// Ready 处理就绪探针：TCP 探测上游可达性。
++// Ready 处理就绪探针：请求控制平面的 /readyz，只有 200 视为就绪。
+ func (c *Checker) Ready(w http.ResponseWriter, r *http.Request) {
+-	target := c.upstreamHostPort()
+-	if target == "" {
++	if c.readyURL == "" {
+ 		writeJSON(w, http.StatusServiceUnavailable, `{"status":"unavailable","reason":"invalid upstream"}`)
+ 		return
+ 	}
+-
+-	dial := c.dial
+-	if dial == nil {
+-		dial = net.DialTimeout
++	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, c.readyURL, nil)
++	if err != nil {
++		writeJSON(w, http.StatusServiceUnavailable, `{"status":"unavailable","reason":"invalid upstream"}`)
++		return
+ 	}
+-	conn, err := dial("tcp", target, c.timeout)
++	resp, err := c.client.Do(req)
+ 	if err != nil {
+ 		writeJSON(w, http.StatusServiceUnavailable, `{"status":"unavailable","reason":"upstream unreachable"}`)
+ 		return
+ 	}
+-	_ = conn.Close()
++	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxProbeBodySize))
++	_ = resp.Body.Close()
++	if resp.StatusCode != http.StatusOK {
++		writeJSON(w, http.StatusServiceUnavailable, `{"status":"unavailable","reason":"upstream not ready"}`)
++		return
++	}
+ 
+ 	writeJSON(w, http.StatusOK, `{"status":"ready"}`)
+ }
+ 
+-// upstreamHostPort 返回上游的 host:port；缺省端口时按 scheme 补全。
+-func (c *Checker) upstreamHostPort() string {
+-	if c.upstream == nil || c.upstream.Host == "" {
+-		return ""
+-	}
+-	if c.upstream.Port() != "" {
+-		return c.upstream.Host
+-	}
+-	host := c.upstream.Hostname()
+-	switch c.upstream.Scheme {
+-	case "https":
+-		return net.JoinHostPort(host, "443")
+-	default:
+-		return net.JoinHostPort(host, "80")
+-	}
+-}
+-
+ func writeJSON(w http.ResponseWriter, status int, body string) {
+ 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+ 	w.WriteHeader(status)
+diff --git a/gateway/internal/health/health_test.go b/gateway/internal/health/health_test.go
+index 263a070..520fa84 100644
+--- a/gateway/internal/health/health_test.go
++++ b/gateway/internal/health/health_test.go
+@@ -1,24 +1,30 @@
+ package health
+ 
+ import (
+-	"errors"
+-	"net"
+ 	"net/http"
+ 	"net/http/httptest"
+ 	"testing"
+ 	"time"
+ )
+ 
+-// mockDialSuccess 模拟上游可达：返回一个可关闭的连接。
+-func mockDialSuccess(network, address string, timeout time.Duration) (net.Conn, error) {
+-	a, b := net.Pipe()
+-	_ = b.Close() // 关闭不需要的一端，避免泄漏。
+-	return a, nil
++// newControlPlane 启动模拟控制平面：GET /readyz 返回 status。
++func newControlPlane(t *testing.T, status int) *httptest.Server {
++	t.Helper()
++	mux := http.NewServeMux()
++	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
++		w.WriteHeader(status)
++		_, _ = w.Write([]byte(`{"status":"ok"}`))
++	})
++	srv := httptest.NewServer(mux)
++	t.Cleanup(srv.Close)
++	return srv
+ }
+ 
+-// mockDialFailure 模拟上游不可达：始终返回错误。
+-func mockDialFailure(network, address string, timeout time.Duration) (net.Conn, error) {
+-	return nil, errors.New("connection refused")
++// probe 调用就绪探针，返回状态码与响应体。
++func probe(c *Checker) (int, string) {
++	rec := httptest.NewRecorder()
++	c.Ready(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
++	return rec.Code, rec.Body.String()
+ }
+ 
+ // TestLive_AlwaysOK 验证存活探针始终返回 200 {"status":"ok"}。
+@@ -40,95 +46,100 @@ func TestLive_AlwaysOK(t *testing.T) {
+ 	}
+ }
+ 
+-// TestReady_UpstreamReachable 验证上游可达时返回 200 {"status":"ready"}。
+-func TestReady_UpstreamReachable(t *testing.T) {
+-	c := New("http://upstream:8080")
+-	c.dial = mockDialSuccess // 注入 mock dial
+-
+-	rec := httptest.NewRecorder()
+-	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+-	c.Ready(rec, req)
++// TestReady_UpstreamReady 验证控制平面 /readyz 返回 200 时就绪探针返回 200 {"status":"ready"}。
++func TestReady_UpstreamReady(t *testing.T) {
++	srv := newControlPlane(t, http.StatusOK)
+ 
+-	if rec.Code != http.StatusOK {
+-		t.Fatalf("上游可达时应返回 200，实际 %d", rec.Code)
++	code, body := probe(New(srv.URL))
++	if code != http.StatusOK {
++		t.Fatalf("控制平面就绪时应返回 200，实际 %d", code)
+ 	}
+-	if got := rec.Body.String(); got != `{"status":"ready"}` {
+-		t.Fatalf("就绪探针响应体应为 {\"status\":\"ready\"}，实际 %q", got)
++	if body != `{"status":"ready"}` {
++		t.Fatalf("就绪探针响应体应为 {\"status\":\"ready\"}，实际 %q", body)
+ 	}
+ }
+ 
+-// TestReady_UpstreamUnreachable 验证上游不可达时返回 503。
+-func TestReady_UpstreamUnreachable(t *testing.T) {
+-	c := New("http://upstream:8080")
+-	c.dial = mockDialFailure // 注入 mock dial
++// TestReady_UpstreamNotReady 验证控制平面在线但未就绪（如权威存储不可用）时返回 503。
++func TestReady_UpstreamNotReady(t *testing.T) {
++	srv := newControlPlane(t, http.StatusServiceUnavailable)
+ 
+-	rec := httptest.NewRecorder()
+-	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+-	c.Ready(rec, req)
+-
+-	if rec.Code != http.StatusServiceUnavailable {
+-		t.Fatalf("上游不可达时应返回 503，实际 %d", rec.Code)
++	code, body := probe(New(srv.URL))
++	if code != http.StatusServiceUnavailable {
++		t.Fatalf("控制平面未就绪时应返回 503，实际 %d", code)
+ 	}
+-	if got := rec.Body.String(); got != `{"status":"unavailable","reason":"upstream unreachable"}` {
+-		t.Fatalf("不可达响应体不符，实际 %q", got)
++	if body != `{"status":"unavailable","reason":"upstream not ready"}` {
++		t.Fatalf("未就绪响应体不符，实际 %q", body)
+ 	}
+ }
+ 
+-// TestReady_InvalidUpstream 验证 upstreamURL 为空时返回 503。
+-func TestReady_InvalidUpstream(t *testing.T) {
+-	c := New("") // 空 URL → upstream 为 nil 或 Host 为空
+-
+-	rec := httptest.NewRecorder()
+-	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+-	c.Ready(rec, req)
++// TestReady_UpstreamUnreachable 验证控制平面不可达时返回 503。
++func TestReady_UpstreamUnreachable(t *testing.T) {
++	srv := httptest.NewServer(http.NotFoundHandler())
++	srv.Close()
+ 
+-	if rec.Code != http.StatusServiceUnavailable {
+-		t.Fatalf("无效上游时应返回 503，实际 %d", rec.Code)
++	code, body := probe(New(srv.URL))
++	if code != http.StatusServiceUnavailable {
++		t.Fatalf("控制平面不可达时应返回 503，实际 %d", code)
+ 	}
+-	if got := rec.Body.String(); got != `{"status":"unavailable","reason":"invalid upstream"}` {
+-		t.Fatalf("无效上游响应体不符，实际 %q", got)
++	if body != `{"status":"unavailable","reason":"upstream unreachable"}` {
++		t.Fatalf("不可达响应体不符，实际 %q", body)
+ 	}
+ }
+ 
+-// TestReady_DefaultPortHTTP 验证 HTTP scheme 缺省端口补全为 80。
+-func TestReady_DefaultPortHTTP(t *testing.T) {
+-	c := New("http://upstream") // 无显式端口
+-	c.dial = mockDialSuccess
+-
+-	rec := httptest.NewRecorder()
+-	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+-	c.Ready(rec, req)
+-
+-	if rec.Code != http.StatusOK {
+-		t.Fatalf("HTTP 缺省 80 端口应可达(200)，实际 %d", rec.Code)
++// TestReady_UpstreamTimeout 验证控制平面迟迟不响应时按不可达处理。
++func TestReady_UpstreamTimeout(t *testing.T) {
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		select {
++		case <-r.Context().Done():
++		case <-time.After(5 * time.Second):
++		}
++	}))
++	t.Cleanup(srv.Close)
++	c := New(srv.URL)
++	c.client.Timeout = 50 * time.Millisecond
++
++	code, body := probe(c)
++	if code != http.StatusServiceUnavailable {
++		t.Fatalf("控制平面超时应返回 503，实际 %d", code)
++	}
++	if body != `{"status":"unavailable","reason":"upstream unreachable"}` {
++		t.Fatalf("超时响应体不符，实际 %q", body)
+ 	}
+ }
+ 
+-// TestReady_DefaultPortHTTPS 验证 HTTPS scheme 缺省端口补全为 443。
+-func TestReady_DefaultPortHTTPS(t *testing.T) {
+-	c := New("https://upstream") // 无显式端口
+-	c.dial = mockDialSuccess
+-
+-	rec := httptest.NewRecorder()
+-	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+-	c.Ready(rec, req)
+-
+-	if rec.Code != http.StatusOK {
+-		t.Fatalf("HTTPS 缺省 443 端口应可达(200)，实际 %d", rec.Code)
++// TestReady_InvalidUpstream 验证上游地址不是 http(s) 绝对地址时返回 503。
++func TestReady_InvalidUpstream(t *testing.T) {
++	for _, upstream := range []string{"", "control-plane:8080", "ftp://control-plane", "http://"} {
++		code, body := probe(New(upstream))
++		if code != http.StatusServiceUnavailable {
++			t.Fatalf("上游地址 %q 非法时应返回 503，实际 %d", upstream, code)
++		}
++		if body != `{"status":"unavailable","reason":"invalid upstream"}` {
++			t.Fatalf("上游地址 %q 非法时响应体不符，实际 %q", upstream, body)
++		}
+ 	}
+ }
+ 
+-// TestReady_NilDialFallback 验证 dial 为 nil 时回退到 net.DialTimeout（对不可达地址返回 503）。
+-func TestReady_NilDialFallback(t *testing.T) {
+-	c := New("http://127.0.0.1:1")     // 端口 1 通常无服务
+-	c.dial = nil                       // 强制走回退路径
+-	c.timeout = 100 * time.Millisecond // 缩短超时，避免测试卡顿
+-
+-	rec := httptest.NewRecorder()
+-	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+-	c.Ready(rec, req)
+-
+-	if rec.Code != http.StatusServiceUnavailable {
+-		t.Fatalf("nil dial 回退后不可达地址应 503，实际 %d", rec.Code)
++// TestReady_KeepsUpstreamPathPrefix 验证就绪探针请求 {上游地址}/readyz，保留路径前缀。
++func TestReady_KeepsUpstreamPathPrefix(t *testing.T) {
++	var got string
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		got = r.Method + " " + r.URL.Path
++	}))
++	t.Cleanup(srv.Close)
++
++	for suffix, want := range map[string]string{
++		"":     "GET /readyz",
++		"/":    "GET /readyz",
++		"/cp":  "GET /cp/readyz",
++		"/cp/": "GET /cp/readyz",
++	} {
++		got = ""
++		if code, _ := probe(New(srv.URL + suffix)); code != http.StatusOK {
++			t.Fatalf("上游地址 %q 应返回 200，实际 %d", srv.URL+suffix, code)
++		}
++		if got != want {
++			t.Fatalf("上游地址 %q 应请求 %q，实际 %q", srv.URL+suffix, want, got)
++		}
+ 	}
+ }
+diff --git a/gateway/internal/router/router.go b/gateway/internal/router/router.go
+index c33f748..4049580 100644
+--- a/gateway/internal/router/router.go
++++ b/gateway/internal/router/router.go
+@@ -3,7 +3,7 @@
+ // 路由表（对外统一入口，版本前缀 /api/v1/）：
+ //
+ //	GET  /healthz                              存活探针（无中间件）
+-//	GET  /readyz                               就绪探针（探测上游可达，无中间件）
++//	GET  /readyz                               就绪探针（请求控制平面 /readyz，无中间件）
+ //	ANY  /api/v1/resources[/...]               反代到 Python 控制平面
+ //	ANY  /api/v1/inference-services[/...]      反代到 Python 控制平面
+ //	ANY  /api/v1/workflows[/...]               反代到 Python 控制平面
+-- 
+2.43.0
+

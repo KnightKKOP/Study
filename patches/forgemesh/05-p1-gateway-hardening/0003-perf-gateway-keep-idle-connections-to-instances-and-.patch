@@ -1,0 +1,232 @@
+From a5e69bfe9076e646b9855445cc555e9cab526c39 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 12 Oct 2026 05:48:39 +0000
+Subject: [PATCH 3/7] perf(gateway): keep idle connections to instances and the
+ control plane
+
+The stream proxy and the control-plane clients kept at most two idle
+connections per host (the net/http default), so after a burst of
+concurrent requests most connections were closed and the next burst
+had to dial again. Both now keep up to 64 idle connections per host.
+The control-plane reverse proxy and the resolver use their own
+transport based on http.DefaultTransport, and the reverse proxy stops
+waiting for response headers after 30s.
+---
+ gateway/internal/stream/proxy.go         | 12 +++++
+ gateway/internal/stream/proxy_test.go    | 58 ++++++++++++++++++++++++
+ gateway/internal/upstream/client.go      | 16 +++++++
+ gateway/internal/upstream/client_test.go | 46 +++++++++++++++++++
+ gateway/internal/upstream/resolver.go    |  4 +-
+ 5 files changed, 134 insertions(+), 2 deletions(-)
+ create mode 100644 gateway/internal/upstream/client_test.go
+
+diff --git a/gateway/internal/stream/proxy.go b/gateway/internal/stream/proxy.go
+index b9a209b..f7fb3d7 100644
+--- a/gateway/internal/stream/proxy.go
++++ b/gateway/internal/stream/proxy.go
+@@ -36,6 +36,14 @@ import (
+ // readBufferSize 是单次读取上游响应体的缓冲区大小。
+ const readBufferSize = 32 * 1024
+ 
++// 实例连接池：Go 默认每个主机只保留 2 个空闲连接，一波并发流式请求结束后多数连接
++// 会被关闭，下一波请求只能重新建连。
++const (
++	maxIdleConns        = 512
++	maxIdleConnsPerHost = 64
++	idleConnTimeout     = 90 * time.Second
++)
++
+ // Resolver 抽象「推理服务 → 实例 endpoint 列表」的解析与健康上报，
+ // 由 upstream.Resolver 实现；以接口注入便于测试替换。
+ type Resolver interface {
+@@ -85,6 +93,10 @@ func New(resolver Resolver, tenantHeader string, policy AddressPolicy, logger *l
+ 					KeepAlive: 30 * time.Second,
+ 					Control:   policy.control,
+ 				}).DialContext,
++				MaxIdleConns:        maxIdleConns,
++				MaxIdleConnsPerHost: maxIdleConnsPerHost,
++				IdleConnTimeout:     idleConnTimeout,
++				TLSHandshakeTimeout: 10 * time.Second,
+ 				// 关闭响应压缩，避免代理层引入额外缓冲/转换。
+ 				DisableCompression: true,
+ 			},
+diff --git a/gateway/internal/stream/proxy_test.go b/gateway/internal/stream/proxy_test.go
+index a88a023..e1aa7ce 100644
+--- a/gateway/internal/stream/proxy_test.go
++++ b/gateway/internal/stream/proxy_test.go
+@@ -382,6 +382,64 @@ func TestProxy_PassesNamespaceToResolver(t *testing.T) {
+ 	}
+ }
+ 
++// TestProxy_ReusesConnectionsAcrossConcurrentStreams 验证一波并发流式请求结束后连接留在池中，
++// 下一波同样并发度的请求不再新建连接（Go 默认每个主机只保留 2 个空闲连接）。
++func TestProxy_ReusesConnectionsAcrossConcurrentStreams(t *testing.T) {
++	const concurrency = 8
++	var newConns atomic.Int64
++	var mu sync.Mutex
++	var gate chan struct{}
++	var arrived sync.WaitGroup
++	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		mu.Lock()
++		g := gate
++		mu.Unlock()
++		arrived.Done()
++		<-g // 整波请求同时在途，每个请求各占一个连接
++		_, _ = w.Write([]byte("data: ok\n\n"))
++	}))
++	srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
++		if state == http.StateNew {
++			newConns.Add(1)
++		}
++	}
++	srv.Start()
++	defer srv.Close()
++
++	proxy := New(newFakeResolver([]string{srv.URL}, nil), "X-Tenant-ID", allowLoopback, nil)
++	wave := func() {
++		mu.Lock()
++		gate = make(chan struct{})
++		g := gate
++		mu.Unlock()
++		arrived.Add(concurrency)
++		var done sync.WaitGroup
++		for i := 0; i < concurrency; i++ {
++			done.Add(1)
++			go func() {
++				defer done.Done()
++				rec := httptest.NewRecorder()
++				proxy.ServeHTTP(rec, newChatRequest("svc-a"))
++				if rec.Code != http.StatusOK {
++					t.Errorf("请求应 200，实际 %d", rec.Code)
++				}
++			}()
++		}
++		arrived.Wait()
++		close(g)
++		done.Wait()
++	}
++
++	wave()
++	if got := newConns.Load(); got != concurrency {
++		t.Fatalf("第一波应建立 %d 个连接，实际 %d", concurrency, got)
++	}
++	wave()
++	if got := newConns.Load(); got != concurrency {
++		t.Fatalf("第二波应复用空闲连接，实际新建了 %d 个", got-concurrency)
++	}
++}
++
+ // TestProxy_HopByHopHeadersFiltered 验证实例响应中的 hop-by-hop 头被过滤不转发给客户端。
+ func TestProxy_HopByHopHeadersFiltered(t *testing.T) {
+ 	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+diff --git a/gateway/internal/upstream/client.go b/gateway/internal/upstream/client.go
+index 28a15f4..3e42c04 100644
+--- a/gateway/internal/upstream/client.go
++++ b/gateway/internal/upstream/client.go
+@@ -11,10 +11,25 @@ import (
+ 	"net/http"
+ 	"net/http/httputil"
+ 	"net/url"
++	"time"
+ 
+ 	"github.com/Mekoforge/ForgeMesh/gateway/internal/middleware"
+ )
+ 
++// controlPlaneResponseHeaderTimeout 是等待控制平面响应头的上限；控制平面的接口都是
++// 短请求（决策请求的单个 Provider 默认限时 5s）。
++const controlPlaneResponseHeaderTimeout = 30 * time.Second
++
++// newControlPlaneTransport 返回连接控制平面的 Transport：沿用 http.DefaultTransport 的
++// 设置，放宽每个主机的空闲连接数（默认 2），并限制等待响应头的时间。
++func newControlPlaneTransport() *http.Transport {
++	t := http.DefaultTransport.(*http.Transport).Clone()
++	t.MaxIdleConns = 256
++	t.MaxIdleConnsPerHost = 64
++	t.ResponseHeaderTimeout = controlPlaneResponseHeaderTimeout
++	return t
++}
++
+ // Client 是对 httputil.ReverseProxy 的薄封装，实现 http.Handler。
+ type Client struct {
+ 	proxy             *httputil.ReverseProxy
+@@ -40,6 +55,7 @@ func New(target *url.URL, correlationHeader, tenantHeader string, logger *log.Lo
+ 	}
+ 
+ 	c.proxy = &httputil.ReverseProxy{
++		Transport: newControlPlaneTransport(),
+ 		// Rewrite 是 Go 1.20+ 推荐的请求改写入口（与 Director 互斥）。
+ 		Rewrite: func(pr *httputil.ProxyRequest) {
+ 			// 将请求路由到上游并保留原始路径 /api/v1/*。
+diff --git a/gateway/internal/upstream/client_test.go b/gateway/internal/upstream/client_test.go
+new file mode 100644
+index 0000000..70a38ed
+--- /dev/null
++++ b/gateway/internal/upstream/client_test.go
+@@ -0,0 +1,46 @@
++package upstream
++
++import (
++	"net/http"
++	"testing"
++)
++
++// TestNewControlPlaneTransport 验证控制平面 Transport 沿用默认设置（含环境变量代理），
++// 放宽每个主机的空闲连接数，并限制等待响应头的时间。
++func TestNewControlPlaneTransport(t *testing.T) {
++	transport := newControlPlaneTransport()
++	defaults := http.DefaultTransport.(*http.Transport)
++
++	if transport.MaxIdleConnsPerHost <= http.DefaultMaxIdleConnsPerHost {
++		t.Fatalf("每个主机的空闲连接数应高于默认的 %d，实际 %d",
++			http.DefaultMaxIdleConnsPerHost, transport.MaxIdleConnsPerHost)
++	}
++	if transport.MaxIdleConns < transport.MaxIdleConnsPerHost {
++		t.Fatalf("MaxIdleConns（%d）不应小于 MaxIdleConnsPerHost（%d）",
++			transport.MaxIdleConns, transport.MaxIdleConnsPerHost)
++	}
++	if transport.ResponseHeaderTimeout != controlPlaneResponseHeaderTimeout {
++		t.Fatalf("ResponseHeaderTimeout 应为 %v，实际 %v",
++			controlPlaneResponseHeaderTimeout, transport.ResponseHeaderTimeout)
++	}
++	if transport.Proxy == nil || transport.IdleConnTimeout != defaults.IdleConnTimeout ||
++		transport.TLSHandshakeTimeout != defaults.TLSHandshakeTimeout {
++		t.Fatal("其余设置应沿用 http.DefaultTransport")
++	}
++	if transport == defaults {
++		t.Fatal("不应修改共享的 http.DefaultTransport")
++	}
++}
++
++// TestNewResolver_DefaultClientUsesControlPlaneTransport 验证 Resolver 的默认客户端使用
++// 放宽了连接池的 Transport，而不是共享的 http.DefaultTransport。
++func TestNewResolver_DefaultClientUsesControlPlaneTransport(t *testing.T) {
++	r := NewResolver("http://cp:8080", nil, 0, 0, nil)
++	transport, ok := r.client.Transport.(*http.Transport)
++	if !ok || transport == http.DefaultTransport {
++		t.Fatalf("默认客户端应使用独立的 *http.Transport，实际 %T", r.client.Transport)
++	}
++	if transport.MaxIdleConnsPerHost <= http.DefaultMaxIdleConnsPerHost {
++		t.Fatalf("每个主机的空闲连接数应高于默认值，实际 %d", transport.MaxIdleConnsPerHost)
++	}
++}
+diff --git a/gateway/internal/upstream/resolver.go b/gateway/internal/upstream/resolver.go
+index 91be87e..e02e655 100644
+--- a/gateway/internal/upstream/resolver.go
++++ b/gateway/internal/upstream/resolver.go
+@@ -160,11 +160,11 @@ type Resolver struct {
+ // NewResolver 构造解析器。
+ //
+ // controlPlaneURL 为控制平面基地址（如 "http://control-plane:8080"）；
+-// client 为 nil 时使用带 5s 超时的默认客户端；ttl / cooldown 非正数时
++// client 为 nil 时使用带 5s 超时、连接池放宽的默认客户端；ttl / cooldown 非正数时
+ // 使用 DefaultResolverTTL / DefaultUnhealthyCooldown；logger 为 nil 时用 log.Default()。
+ func NewResolver(controlPlaneURL string, client *http.Client, ttl, cooldown time.Duration, logger *log.Logger) *Resolver {
+ 	if client == nil {
+-		client = &http.Client{Timeout: resolveHTTPTimeout}
++		client = &http.Client{Timeout: resolveHTTPTimeout, Transport: newControlPlaneTransport()}
+ 	}
+ 	if ttl <= 0 {
+ 		ttl = DefaultResolverTTL
+-- 
+2.43.0
+

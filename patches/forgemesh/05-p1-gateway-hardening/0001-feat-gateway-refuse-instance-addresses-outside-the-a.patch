@@ -1,0 +1,719 @@
+From 633e6f942fd32d834dd8f34d8acb824ce9312d4b Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 12 Oct 2026 05:43:28 +0000
+Subject: [PATCH 1/7] feat(gateway): refuse instance addresses outside the
+ allowed networks
+
+The stream proxy dialed any address written to status.endpoints, so an
+endpoint pointing at 169.254.169.254 or an internal service turned the
+gateway into a proxy for it.
+
+The proxy now checks every resolved IP right before connecting
+(net.Dialer.Control), which also holds when a host name later resolves
+somewhere else. GATEWAY_INSTANCE_ALLOWED_CIDRS lists the networks
+instances may live in; without it the gateway refuses loopback,
+link-local (including the common metadata address), unspecified,
+multicast and known metadata service addresses. Refused connections
+return 502 INSTANCE_ADDRESS_NOT_ALLOWED and count as an instance
+failure. make run-dev allows loopback instances.
+---
+ gateway/Makefile                           |  7 +-
+ gateway/internal/config/config.go          | 25 +++++++
+ gateway/internal/config/config_test.go     | 31 +++++++++
+ gateway/internal/router/auth_test.go       | 17 ++---
+ gateway/internal/router/resolver_test.go   |  1 +
+ gateway/internal/router/router.go          |  2 +-
+ gateway/internal/router/router_test.go     | 65 ++++++++++++++++--
+ gateway/internal/stream/addrpolicy.go      | 66 ++++++++++++++++++
+ gateway/internal/stream/addrpolicy_test.go | 78 ++++++++++++++++++++++
+ gateway/internal/stream/proxy.go           | 13 +++-
+ gateway/internal/stream/proxy_test.go      | 68 +++++++++++++++----
+ gateway/internal/stream/sse_cancel_test.go |  2 +-
+ 12 files changed, 338 insertions(+), 37 deletions(-)
+ create mode 100644 gateway/internal/stream/addrpolicy.go
+ create mode 100644 gateway/internal/stream/addrpolicy_test.go
+
+diff --git a/gateway/Makefile b/gateway/Makefile
+index 3377311..3e937b2 100644
+--- a/gateway/Makefile
++++ b/gateway/Makefile
+@@ -4,7 +4,7 @@
+ #   make build   编译网关二进制到 bin/gateway
+ #   make test    运行全部 Go 单元测试（含 -race）
+ #   make run     本地启动网关（默认 apikey 认证，需要 GATEWAY_API_KEYS_FILE）
+-#   make run-dev 以 dev 认证模式在 127.0.0.1:8081 启动网关（信任租户头，仅限本地开发）
++#   make run-dev 以 dev 认证模式在 127.0.0.1:8081 启动网关（信任租户头、只连接本机推理实例，仅限本地开发）
+ #   make fmt     格式化代码
+ #   make vet     静态检查
+ #   make clean   清理构建产物
+@@ -30,9 +30,10 @@ test:
+ run:
+ 	$(GO) run ./cmd/gateway
+ 
+-## run-dev: 以 dev 认证模式在回环地址运行网关（信任租户头，仅限本地开发）
++## run-dev: 以 dev 认证模式在回环地址运行网关（信任租户头、只连接本机推理实例，仅限本地开发）
+ run-dev:
+-	GATEWAY_AUTH_MODE=dev GATEWAY_LISTEN_ADDR=127.0.0.1:8081 $(GO) run ./cmd/gateway
++	GATEWAY_AUTH_MODE=dev GATEWAY_LISTEN_ADDR=127.0.0.1:8081 \
++		GATEWAY_INSTANCE_ALLOWED_CIDRS=127.0.0.0/8,::1/128 $(GO) run ./cmd/gateway
+ 
+ ## fmt: 格式化所有 Go 源文件
+ fmt:
+diff --git a/gateway/internal/config/config.go b/gateway/internal/config/config.go
+index 30583b6..ef4b282 100644
+--- a/gateway/internal/config/config.go
++++ b/gateway/internal/config/config.go
+@@ -9,6 +9,7 @@ package config
+ import (
+ 	"fmt"
+ 	"net"
++	"net/netip"
+ 	"os"
+ 	"strconv"
+ 	"strings"
+@@ -26,6 +27,7 @@ const (
+ 	envUnhealthyCooldownSeconds = "GATEWAY_UNHEALTHY_COOLDOWN_SECONDS"
+ 	envAuthMode                 = "GATEWAY_AUTH_MODE"
+ 	envAPIKeysFile              = "GATEWAY_API_KEYS_FILE"
++	envInstanceAllowedCIDRs     = "GATEWAY_INSTANCE_ALLOWED_CIDRS"
+ )
+ 
+ // 认证模式（GATEWAY_AUTH_MODE）。
+@@ -71,6 +73,9 @@ type Config struct {
+ 	AuthMode string
+ 	// APIKeysFile AuthModeAPIKey 下的 key 文件路径（与控制平面 FORGEMESH_API_KEYS_FILE 格式相同）。
+ 	APIKeysFile string
++	// InstanceAllowedCIDRs 流式代理允许连接的推理实例网段；为空时拒绝回环、链路本地与
++	// 元数据服务地址，允许其余地址（见 stream.AddressPolicy）。
++	InstanceAllowedCIDRs []netip.Prefix
+ }
+ 
+ // Load 从环境变量读取配置；未设置项使用默认值。
+@@ -146,9 +151,29 @@ func Load() (Config, error) {
+ 			envAuthMode, cfg.AuthMode, AuthModeAPIKey, AuthModeDev)
+ 	}
+ 
++	if cfg.InstanceAllowedCIDRs, err = parseCIDRs(os.Getenv(envInstanceAllowedCIDRs)); err != nil {
++		return Config{}, fmt.Errorf("config: %s %w", envInstanceAllowedCIDRs, err)
++	}
++
+ 	return cfg, nil
+ }
+ 
++// parseCIDRs 解析逗号分隔的网段列表（如 "10.0.0.0/8, fd00::/8"）；空串返回 nil。
++func parseCIDRs(raw string) ([]netip.Prefix, error) {
++	var prefixes []netip.Prefix
++	for _, item := range strings.Split(raw, ",") {
++		if item = strings.TrimSpace(item); item == "" {
++			continue
++		}
++		prefix, err := netip.ParsePrefix(item)
++		if err != nil {
++			return nil, fmt.Errorf("取值非法 %q（需要 CIDR，如 10.0.0.0/8）: %w", item, err)
++		}
++		prefixes = append(prefixes, prefix.Masked())
++	}
++	return prefixes, nil
++}
++
+ // isLoopbackAddr 报告监听地址是否只绑定回环接口；未指定主机（如 ":8081"）表示绑定全部接口。
+ func isLoopbackAddr(addr string) bool {
+ 	host, _, err := net.SplitHostPort(addr)
+diff --git a/gateway/internal/config/config_test.go b/gateway/internal/config/config_test.go
+index c55898a..e16e838 100644
+--- a/gateway/internal/config/config_test.go
++++ b/gateway/internal/config/config_test.go
+@@ -128,3 +128,34 @@ func TestLoad_InvalidResolverValues(t *testing.T) {
+ 		})
+ 	}
+ }
++
++// TestLoad_InstanceAllowedCIDRs 验证实例允许网段的解析：未设置为空，逗号分隔、忽略空白与空项，
++// 网段按掩码归一化；非 CIDR 取值被拒绝。
++func TestLoad_InstanceAllowedCIDRs(t *testing.T) {
++	setAPIKeyAuthEnv(t)
++	t.Setenv(envInstanceAllowedCIDRs, "")
++	cfg, err := Load()
++	if err != nil {
++		t.Fatalf("Load 应成功: %v", err)
++	}
++	if len(cfg.InstanceAllowedCIDRs) != 0 {
++		t.Fatalf("未设置时应为空，实际 %v", cfg.InstanceAllowedCIDRs)
++	}
++
++	t.Setenv(envInstanceAllowedCIDRs, " 10.20.0.0/16, 127.0.0.1/8 ,,fd00::/8")
++	if cfg, err = Load(); err != nil {
++		t.Fatalf("Load 应成功: %v", err)
++	}
++	got := make([]string, 0, len(cfg.InstanceAllowedCIDRs))
++	for _, prefix := range cfg.InstanceAllowedCIDRs {
++		got = append(got, prefix.String())
++	}
++	if want := "10.20.0.0/16 127.0.0.0/8 fd00::/8"; strings.Join(got, " ") != want {
++		t.Fatalf("网段应为 %s，实际 %v", want, got)
++	}
++
++	t.Setenv(envInstanceAllowedCIDRs, "10.0.0.5")
++	if _, err = Load(); err == nil || !strings.Contains(err.Error(), envInstanceAllowedCIDRs) {
++		t.Fatalf("非 CIDR 取值应被拒绝并提及 %s，实际 %v", envInstanceAllowedCIDRs, err)
++	}
++}
+diff --git a/gateway/internal/router/auth_test.go b/gateway/internal/router/auth_test.go
+index f8a114e..d047be7 100644
+--- a/gateway/internal/router/auth_test.go
++++ b/gateway/internal/router/auth_test.go
+@@ -46,14 +46,15 @@ func apiKeyConfig(t *testing.T, upstreamURL string) config.Config {
+ 		t.Fatalf("写入 key 文件失败: %v", err)
+ 	}
+ 	return config.Config{
+-		ListenAddr:        ":0",
+-		UpstreamURL:       upstreamURL,
+-		RateLimitRPS:      1000,
+-		RateLimitBurst:    1000,
+-		TenantHeader:      "X-Tenant-ID",
+-		CorrelationHeader: "X-Correlation-ID",
+-		AuthMode:          config.AuthModeAPIKey,
+-		APIKeysFile:       path,
++		ListenAddr:           ":0",
++		UpstreamURL:          upstreamURL,
++		RateLimitRPS:         1000,
++		RateLimitBurst:       1000,
++		TenantHeader:         "X-Tenant-ID",
++		CorrelationHeader:    "X-Correlation-ID",
++		AuthMode:             config.AuthModeAPIKey,
++		APIKeysFile:          path,
++		InstanceAllowedCIDRs: loopbackOnly,
+ 	}
+ }
+ 
+diff --git a/gateway/internal/router/resolver_test.go b/gateway/internal/router/resolver_test.go
+index d508ec3..7b119d5 100644
+--- a/gateway/internal/router/resolver_test.go
++++ b/gateway/internal/router/resolver_test.go
+@@ -86,6 +86,7 @@ func newResolverEnv(t *testing.T, ttlSec, cooldownSec int, eps ...string) *resol
+ 		ResolverTTLSeconds:       ttlSec,
+ 		UnhealthyCooldownSeconds: cooldownSec,
+ 		AuthMode:                 config.AuthModeDev,
++		InstanceAllowedCIDRs:     loopbackOnly,
+ 	}
+ 	r, err := New(cfg, log.New(io.Discard, "", 0))
+ 	if err != nil {
+diff --git a/gateway/internal/router/router.go b/gateway/internal/router/router.go
+index 23312ef..79073c0 100644
+--- a/gateway/internal/router/router.go
++++ b/gateway/internal/router/router.go
+@@ -87,7 +87,7 @@ func New(cfg config.Config, logger *log.Logger) (*Router, error) {
+ 		unhealthyCooldown = upstream.DefaultUnhealthyCooldown
+ 	}
+ 	resolver := upstream.NewResolver(cfg.UpstreamURL, nil, resolverTTL, unhealthyCooldown, logger)
+-	streamProxy := stream.New(resolver, cfg.TenantHeader, logger)
++	streamProxy := stream.New(resolver, cfg.TenantHeader, stream.NewAddressPolicy(cfg.InstanceAllowedCIDRs), logger)
+ 
+ 	// 精细路由仅在 API 前缀内匹配（顶层已按 /api/v1/ 分流）。
+ 	apiMux := http.NewServeMux()
+diff --git a/gateway/internal/router/router_test.go b/gateway/internal/router/router_test.go
+index 383a17c..2169c0e 100644
+--- a/gateway/internal/router/router_test.go
++++ b/gateway/internal/router/router_test.go
+@@ -6,23 +6,29 @@ import (
+ 	"log"
+ 	"net/http"
+ 	"net/http/httptest"
++	"net/netip"
+ 	"strings"
++	"sync/atomic"
+ 	"testing"
+ 
+ 	"github.com/Mekoforge/ForgeMesh/gateway/internal/config"
+ )
+ 
++// loopbackOnly 只允许连接回环地址：测试中的推理实例都运行在 127.0.0.1。
++var loopbackOnly = []netip.Prefix{netip.MustParsePrefix("127.0.0.0/8")}
++
+ // newTestRouter 构造 dev 认证模式的测试用网关处理器；upstreamURL 指向被测的模拟上游。
+ func newTestRouter(t *testing.T, upstreamURL string) *Router {
+ 	t.Helper()
+ 	cfg := config.Config{
+-		ListenAddr:        ":0",
+-		UpstreamURL:       upstreamURL,
+-		RateLimitRPS:      1000,
+-		RateLimitBurst:    1000,
+-		TenantHeader:      "X-Tenant-ID",
+-		CorrelationHeader: "X-Correlation-ID",
+-		AuthMode:          config.AuthModeDev,
++		ListenAddr:           ":0",
++		UpstreamURL:          upstreamURL,
++		RateLimitRPS:         1000,
++		RateLimitBurst:       1000,
++		TenantHeader:         "X-Tenant-ID",
++		CorrelationHeader:    "X-Correlation-ID",
++		AuthMode:             config.AuthModeDev,
++		InstanceAllowedCIDRs: loopbackOnly,
+ 	}
+ 	r, err := New(cfg, log.New(io.Discard, "", 0))
+ 	if err != nil {
+@@ -218,6 +224,51 @@ func TestInferenceChat_NamespacedRoute(t *testing.T) {
+ 	}
+ }
+ 
++// TestInferenceChat_DefaultPolicyRefusesLoopbackInstance 验证未配置实例允许网段时，
++// 网关不连接 status.endpoints 中的回环地址，返回 502 INSTANCE_ADDRESS_NOT_ALLOWED。
++func TestInferenceChat_DefaultPolicyRefusesLoopbackInstance(t *testing.T) {
++	var instanceHits atomic.Int64
++	instance := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
++		instanceHits.Add(1)
++	}))
++	defer instance.Close()
++	controlPlane := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
++		w.Header().Set("Content-Type", "application/json")
++		_, _ = io.WriteString(w, fmt.Sprintf(
++			`{"status":{"phase":"Ready","endpoints":[{"url":%q,"protocol":"openai-chat"}]}}`,
++			instance.URL))
++	}))
++	defer controlPlane.Close()
++
++	r, err := New(config.Config{
++		ListenAddr:        ":0",
++		UpstreamURL:       controlPlane.URL,
++		RateLimitRPS:      1000,
++		RateLimitBurst:    1000,
++		TenantHeader:      "X-Tenant-ID",
++		CorrelationHeader: "X-Correlation-ID",
++		AuthMode:          config.AuthModeDev,
++	}, log.New(io.Discard, "", 0))
++	if err != nil {
++		t.Fatalf("New 失败: %v", err)
++	}
++
++	rec := httptest.NewRecorder()
++	req := httptest.NewRequest(http.MethodPost, "/api/v1/inference/svc-a/chat", nil)
++	req.Header.Set("X-Tenant-ID", "tenant-a")
++	r.ServeHTTP(rec, req)
++
++	if rec.Code != http.StatusBadGateway {
++		t.Fatalf("回环实例应被拒绝（502），实际 %d（body=%s）", rec.Code, rec.Body.String())
++	}
++	if !strings.Contains(rec.Body.String(), `"code":"INSTANCE_ADDRESS_NOT_ALLOWED"`) {
++		t.Fatalf("错误体应含 INSTANCE_ADDRESS_NOT_ALLOWED，实际: %s", rec.Body.String())
++	}
++	if got := instanceHits.Load(); got != 0 {
++		t.Fatalf("回环实例不应收到请求，实际 %d 次", got)
++	}
++}
++
+ // TestInferenceChat_ServiceNotFound 验证服务不存在时返回 503 与 NO_HEALTHY_UPSTREAM 信封。
+ func TestInferenceChat_ServiceNotFound(t *testing.T) {
+ 	controlPlane := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+diff --git a/gateway/internal/stream/addrpolicy.go b/gateway/internal/stream/addrpolicy.go
+new file mode 100644
+index 0000000..25b83fc
+--- /dev/null
++++ b/gateway/internal/stream/addrpolicy.go
+@@ -0,0 +1,66 @@
++package stream
++
++import (
++	"errors"
++	"fmt"
++	"net/netip"
++	"syscall"
++)
++
++// ErrAddressNotAllowed 表示推理实例的地址不在允许连接的范围内。
++var ErrAddressNotAllowed = errors.New("instance address is not allowed")
++
++// metadataServices 是链路本地网段之外的云厂商元数据服务地址。
++var metadataServices = []netip.Prefix{
++	netip.MustParsePrefix("100.100.100.200/32"), // 阿里云
++	netip.MustParsePrefix("fd00:ec2::254/128"),  // AWS（IPv6）
++}
++
++// AddressPolicy 决定流式代理可以连接哪些实例地址。
++//
++// 配置了允许网段时只允许其中的地址；零值（未配置）允许除回环、链路本地（含
++// 169.254.169.254 等元数据服务）、未指定地址、组播与 metadataServices 之外的全部地址。
++// 校验发生在建立连接时、针对解析出的 IP，主机名在解析之后改指他处也无法绕过。
++type AddressPolicy struct {
++	allowed []netip.Prefix
++}
++
++// NewAddressPolicy 返回只允许 allowed 网段的策略；allowed 为空时等同零值。
++func NewAddressPolicy(allowed []netip.Prefix) AddressPolicy {
++	return AddressPolicy{allowed: append([]netip.Prefix(nil), allowed...)}
++}
++
++// Allows 报告策略是否允许连接 addr。
++func (p AddressPolicy) Allows(addr netip.Addr) bool {
++	addr = addr.Unmap()
++	if len(p.allowed) > 0 {
++		for _, prefix := range p.allowed {
++			if prefix.Contains(addr) {
++				return true
++			}
++		}
++		return false
++	}
++	if !addr.IsValid() || addr.IsLoopback() || addr.IsLinkLocalUnicast() || addr.IsUnspecified() ||
++		addr.IsMulticast() {
++		return false
++	}
++	for _, prefix := range metadataServices {
++		if prefix.Contains(addr) {
++			return false
++		}
++	}
++	return true
++}
++
++// control 用作 net.Dialer.Control：在连接建立之前校验目标地址。
++func (p AddressPolicy) control(_, address string, _ syscall.RawConn) error {
++	target, err := netip.ParseAddrPort(address)
++	if err != nil {
++		return fmt.Errorf("%w: %s", ErrAddressNotAllowed, address)
++	}
++	if !p.Allows(target.Addr()) {
++		return fmt.Errorf("%w: %s", ErrAddressNotAllowed, target.Addr())
++	}
++	return nil
++}
+diff --git a/gateway/internal/stream/addrpolicy_test.go b/gateway/internal/stream/addrpolicy_test.go
+new file mode 100644
+index 0000000..6fdef52
+--- /dev/null
++++ b/gateway/internal/stream/addrpolicy_test.go
+@@ -0,0 +1,78 @@
++package stream
++
++import (
++	"errors"
++	"net/netip"
++	"testing"
++)
++
++// TestAddressPolicy_Default 验证未配置允许网段时拒绝回环、链路本地、元数据服务等地址。
++func TestAddressPolicy_Default(t *testing.T) {
++	cases := []struct {
++		addr string
++		want bool
++	}{
++		{"10.0.0.5", true},
++		{"192.168.1.20", true},
++		{"203.0.113.7", true},
++		{"2001:db8::10", true},
++		{"127.0.0.1", false},
++		{"127.10.0.1", false},
++		{"::1", false},
++		{"::ffff:127.0.0.1", false},
++		{"169.254.169.254", false},
++		{"::ffff:169.254.169.254", false},
++		{"169.254.0.23", false},
++		{"fe80::1", false},
++		{"100.100.100.200", false},
++		{"fd00:ec2::254", false},
++		{"0.0.0.0", false},
++		{"::", false},
++		{"224.0.0.1", false},
++		{"ff02::1", false},
++	}
++	var policy AddressPolicy
++	for _, tc := range cases {
++		if got := policy.Allows(netip.MustParseAddr(tc.addr)); got != tc.want {
++			t.Errorf("默认策略 Allows(%s) = %v，want %v", tc.addr, got, tc.want)
++		}
++	}
++}
++
++// TestAddressPolicy_AllowedNetworks 验证配置了允许网段时只允许网段内的地址。
++func TestAddressPolicy_AllowedNetworks(t *testing.T) {
++	policy := NewAddressPolicy([]netip.Prefix{
++		netip.MustParsePrefix("10.20.0.0/16"),
++		netip.MustParsePrefix("127.0.0.0/8"),
++	})
++	cases := []struct {
++		addr string
++		want bool
++	}{
++		{"10.20.3.4", true},
++		{"127.0.0.1", true},
++		{"::ffff:10.20.3.4", true},
++		{"10.21.0.1", false},
++		{"192.168.1.20", false},
++		{"169.254.169.254", false},
++		{"::1", false},
++	}
++	for _, tc := range cases {
++		if got := policy.Allows(netip.MustParseAddr(tc.addr)); got != tc.want {
++			t.Errorf("Allows(%s) = %v，want %v", tc.addr, got, tc.want)
++		}
++	}
++}
++
++// TestAddressPolicy_Control 验证拨号前的校验：拒绝时返回 ErrAddressNotAllowed。
++func TestAddressPolicy_Control(t *testing.T) {
++	var policy AddressPolicy
++	if err := policy.control("tcp4", "10.0.0.5:8000", nil); err != nil {
++		t.Fatalf("10.0.0.5 应被允许，实际 %v", err)
++	}
++	for _, address := range []string{"127.0.0.1:8000", "[::1]:8000", "[fe80::1%eth0]:8000", "not-an-address"} {
++		if err := policy.control("tcp", address, nil); !errors.Is(err, ErrAddressNotAllowed) {
++			t.Errorf("control(%q) 应返回 ErrAddressNotAllowed，实际 %v", address, err)
++		}
++	}
++}
+diff --git a/gateway/internal/stream/proxy.go b/gateway/internal/stream/proxy.go
+index 40dbe19..1723c8c 100644
+--- a/gateway/internal/stream/proxy.go
++++ b/gateway/internal/stream/proxy.go
+@@ -12,7 +12,8 @@
+ // （如 openai-chat 为 /v1/chat/completions），查询串原样保留。
+ //
+ // 安全约束（见开发计划 §14.1）：仅做转发，不缓存、不落盘任何响应内容；
+-// 调用方的平台凭证（Authorization、Cookie）不会转发给实例。
++// 调用方的平台凭证（Authorization、Cookie）不会转发给实例；只连接 AddressPolicy
++// 允许的实例地址，status.endpoints 被写成内网或元数据服务地址时不会成为跳板。
+ package stream
+ 
+ import (
+@@ -57,11 +58,11 @@ type Proxy struct {
+ // New 构造流式代理。
+ //
+ // resolver 提供按服务名的实例解析；tenantHeader 为提取租户身份的请求头名
+-// （与认证中间件一致）；logger 为 nil 时使用 log.Default()。
++// （与认证中间件一致）；policy 限定可以连接的实例地址；logger 为 nil 时使用 log.Default()。
+ //
+ // 客户端不设置整体超时（流式连接可能长时间保持），仅对响应头到达设置超时，
+ // 防止上游僵死连接长期占用资源。
+-func New(resolver Resolver, tenantHeader string, logger *log.Logger) *Proxy {
++func New(resolver Resolver, tenantHeader string, policy AddressPolicy, logger *log.Logger) *Proxy {
+ 	if logger == nil {
+ 		logger = log.Default()
+ 	}
+@@ -81,6 +82,7 @@ func New(resolver Resolver, tenantHeader string, logger *log.Logger) *Proxy {
+ 				DialContext: (&net.Dialer{
+ 					Timeout:   10 * time.Second,
+ 					KeepAlive: 30 * time.Second,
++					Control:   policy.control,
+ 				}).DialContext,
+ 				// 关闭响应压缩，避免代理层引入额外缓冲/转换。
+ 				DisableCompression: true,
+@@ -151,6 +153,11 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, upstreamURL, end
+ 		p.logger.Printf("stream upstream error: corr=%s path=%s endpoint=%s err=%v",
+ 			r.Header.Get("X-Correlation-ID"), r.URL.Path, endpoint, err)
+ 		p.resolver.ReportFailure(endpoint)
++		if errors.Is(err, ErrAddressNotAllowed) {
++			writeJSONError(w, http.StatusBadGateway, "INSTANCE_ADDRESS_NOT_ALLOWED",
++				"实例地址不在允许连接的范围内: "+endpoint)
++			return
++		}
+ 		http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
+ 		return
+ 	}
+diff --git a/gateway/internal/stream/proxy_test.go b/gateway/internal/stream/proxy_test.go
+index e71da6a..b831ffc 100644
+--- a/gateway/internal/stream/proxy_test.go
++++ b/gateway/internal/stream/proxy_test.go
+@@ -3,8 +3,11 @@ package stream
+ import (
+ 	"context"
+ 	"errors"
++	"fmt"
++	"net"
+ 	"net/http"
+ 	"net/http/httptest"
++	"net/netip"
+ 	"net/url"
+ 	"strings"
+ 	"sync"
+@@ -15,6 +18,9 @@ import (
+ 	"github.com/Mekoforge/ForgeMesh/gateway/internal/upstream"
+ )
+ 
++// allowLoopback 允许回环地址：测试中的推理实例都运行在 127.0.0.1。
++var allowLoopback = NewAddressPolicy([]netip.Prefix{netip.MustParsePrefix("127.0.0.0/8")})
++
+ // fakeResolver 是测试用的解析器替身：返回固定 endpoint 列表并记录上报调用。
+ type fakeResolver struct {
+ 	mu        sync.Mutex
+@@ -222,7 +228,7 @@ func TestProxy_SSEForwarding(t *testing.T) {
+ 	defer upstreamSrv.Close()
+ 
+ 	res := newFakeResolver([]string{upstreamSrv.URL}, nil)
+-	proxy := New(res, "X-Tenant-ID", nil)
++	proxy := New(res, "X-Tenant-ID", allowLoopback, nil)
+ 
+ 	rec := httptest.NewRecorder()
+ 	proxy.ServeHTTP(rec, newChatRequest("svc-a"))
+@@ -272,7 +278,7 @@ func TestProxy_RoundRobin(t *testing.T) {
+ 	}))
+ 	defer srvB.Close()
+ 
+-	proxy := New(newFakeResolver([]string{srvA.URL, srvB.URL}, nil), "X-Tenant-ID", nil)
++	proxy := New(newFakeResolver([]string{srvA.URL, srvB.URL}, nil), "X-Tenant-ID", allowLoopback, nil)
+ 
+ 	for i := 0; i < 4; i++ {
+ 		rec := httptest.NewRecorder()
+@@ -317,7 +323,7 @@ func TestProxy_MapsProtocolToInstancePath(t *testing.T) {
+ 			req := newChatRequest("svc-a")
+ 			req.URL.RawQuery = "stream=true"
+ 			rec := httptest.NewRecorder()
+-			New(res, "X-Tenant-ID", nil).ServeHTTP(rec, req)
++			New(res, "X-Tenant-ID", allowLoopback, nil).ServeHTTP(rec, req)
+ 
+ 			if rec.Code != http.StatusOK {
+ 				t.Fatalf("转发应返回 200，实际 %d（body=%s）", rec.Code, rec.Body.String())
+@@ -344,7 +350,7 @@ func TestProxy_UnknownProtocol(t *testing.T) {
+ 
+ 	res := newFakeResolverWithEndpoints([]upstream.Endpoint{{URL: srv.URL, Protocol: "grpc"}}, nil)
+ 	rec := httptest.NewRecorder()
+-	New(res, "X-Tenant-ID", nil).ServeHTTP(rec, newChatRequest("svc-a"))
++	New(res, "X-Tenant-ID", allowLoopback, nil).ServeHTTP(rec, newChatRequest("svc-a"))
+ 
+ 	if rec.Code != http.StatusBadGateway {
+ 		t.Fatalf("未知协议应 502，实际 %d", rec.Code)
+@@ -367,7 +373,7 @@ func TestProxy_PassesNamespaceToResolver(t *testing.T) {
+ 	req.SetPathValue("ns", "team-a")
+ 	req.SetPathValue("svc", "svc-a")
+ 	req.Header.Set("X-Tenant-ID", "tenant-a")
+-	New(res, "X-Tenant-ID", nil).ServeHTTP(httptest.NewRecorder(), req)
++	New(res, "X-Tenant-ID", allowLoopback, nil).ServeHTTP(httptest.NewRecorder(), req)
+ 
+ 	want := upstream.ServiceRef{Namespace: "team-a", Name: "svc-a"}
+ 	if res.lastSvc != want {
+@@ -393,7 +399,7 @@ func TestProxy_HopByHopHeadersFiltered(t *testing.T) {
+ 	}))
+ 	defer upstreamSrv.Close()
+ 
+-	proxy := New(newFakeResolver([]string{upstreamSrv.URL}, nil), "X-Tenant-ID", nil)
++	proxy := New(newFakeResolver([]string{upstreamSrv.URL}, nil), "X-Tenant-ID", allowLoopback, nil)
+ 
+ 	rec := httptest.NewRecorder()
+ 	proxy.ServeHTTP(rec, newChatRequest("svc-a"))
+@@ -414,7 +420,7 @@ func TestProxy_HopByHopHeadersFiltered(t *testing.T) {
+ func TestProxy_UpstreamError(t *testing.T) {
+ 	endpoint := "http://127.0.0.1:1" // 不可达端口。
+ 	res := newFakeResolver([]string{endpoint}, nil)
+-	proxy := New(res, "X-Tenant-ID", nil)
++	proxy := New(res, "X-Tenant-ID", allowLoopback, nil)
+ 	// 缩短超时以加速测试。
+ 	proxy.client.Timeout = 200 * time.Millisecond
+ 
+@@ -446,7 +452,7 @@ func TestProxy_ForwardsClientHeaders(t *testing.T) {
+ 	defer upstreamSrv.Close()
+ 
+ 	res := newFakeResolver([]string{upstreamSrv.URL}, nil)
+-	proxy := New(res, "X-Tenant-ID", nil)
++	proxy := New(res, "X-Tenant-ID", allowLoopback, nil)
+ 
+ 	rec := httptest.NewRecorder()
+ 	req := newChatRequest("svc-a")
+@@ -469,7 +475,7 @@ func TestProxy_ForwardsClientHeaders(t *testing.T) {
+ 
+ // TestProxy_NoHealthyUpstream 验证无可用实例时返回 503 与 NO_HEALTHY_UPSTREAM 错误信封。
+ func TestProxy_NoHealthyUpstream(t *testing.T) {
+-	proxy := New(newFakeResolver(nil, nil), "X-Tenant-ID", nil)
++	proxy := New(newFakeResolver(nil, nil), "X-Tenant-ID", allowLoopback, nil)
+ 
+ 	rec := httptest.NewRecorder()
+ 	proxy.ServeHTTP(rec, newChatRequest("svc-a"))
+@@ -497,7 +503,7 @@ func TestProxy_ResolveSentinelErrors(t *testing.T) {
+ 		upstream.ErrNoHealthyEndpoints,
+ 	}
+ 	for _, sentinel := range sentinels {
+-		proxy := New(newFakeResolver(nil, sentinel), "X-Tenant-ID", nil)
++		proxy := New(newFakeResolver(nil, sentinel), "X-Tenant-ID", allowLoopback, nil)
+ 		rec := httptest.NewRecorder()
+ 		proxy.ServeHTTP(rec, newChatRequest("svc-a"))
+ 		if rec.Code != http.StatusServiceUnavailable {
+@@ -511,7 +517,7 @@ func TestProxy_ResolveSentinelErrors(t *testing.T) {
+ 
+ // TestProxy_ResolveTransientError 验证解析的网络/控制平面错误映射为 502。
+ func TestProxy_ResolveTransientError(t *testing.T) {
+-	proxy := New(newFakeResolver(nil, errors.New("connection refused")), "X-Tenant-ID", nil)
++	proxy := New(newFakeResolver(nil, errors.New("connection refused")), "X-Tenant-ID", allowLoopback, nil)
+ 
+ 	rec := httptest.NewRecorder()
+ 	proxy.ServeHTTP(rec, newChatRequest("svc-a"))
+@@ -526,7 +532,7 @@ func TestProxy_ResolveTransientError(t *testing.T) {
+ 
+ // TestProxy_MissingSvc 验证路径缺少 {svc} 值时返回 400。
+ func TestProxy_MissingSvc(t *testing.T) {
+-	proxy := New(newFakeResolver([]string{"http://127.0.0.1:1"}, nil), "X-Tenant-ID", nil)
++	proxy := New(newFakeResolver([]string{"http://127.0.0.1:1"}, nil), "X-Tenant-ID", allowLoopback, nil)
+ 
+ 	rec := httptest.NewRecorder()
+ 	req := httptest.NewRequest(http.MethodGet, "/api/v1/inference//chat", nil)
+@@ -541,7 +547,7 @@ func TestProxy_MissingSvc(t *testing.T) {
+ func TestProxy_InvalidEndpoint(t *testing.T) {
+ 	endpoint := "://bad-endpoint"
+ 	res := newFakeResolver([]string{endpoint}, nil)
+-	proxy := New(res, "X-Tenant-ID", nil)
++	proxy := New(res, "X-Tenant-ID", allowLoopback, nil)
+ 
+ 	rec := httptest.NewRecorder()
+ 	proxy.ServeHTTP(rec, newChatRequest("svc-a"))
+@@ -554,6 +560,40 @@ func TestProxy_InvalidEndpoint(t *testing.T) {
+ 	}
+ }
+ 
++// TestProxy_RefusesDisallowedInstanceAddress 验证默认策略下不连接回环与元数据服务地址
++// （包括解析到回环地址的主机名）：返回 502 INSTANCE_ADDRESS_NOT_ALLOWED 并计一次失败。
++func TestProxy_RefusesDisallowedInstanceAddress(t *testing.T) {
++	var hits atomic.Int64
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		hits.Add(1)
++	}))
++	defer srv.Close()
++	port := srv.Listener.Addr().(*net.TCPAddr).Port
++
++	for _, endpoint := range []string{
++		srv.URL,
++		fmt.Sprintf("http://localhost:%d", port),
++		"http://169.254.169.254",
++	} {
++		res := newFakeResolver([]string{endpoint}, nil)
++		rec := httptest.NewRecorder()
++		New(res, "X-Tenant-ID", AddressPolicy{}, nil).ServeHTTP(rec, newChatRequest("svc-a"))
++
++		if rec.Code != http.StatusBadGateway {
++			t.Fatalf("%s 应返回 502，实际 %d", endpoint, rec.Code)
++		}
++		if !strings.Contains(rec.Body.String(), `"code":"INSTANCE_ADDRESS_NOT_ALLOWED"`) {
++			t.Fatalf("%s 的错误体应含 INSTANCE_ADDRESS_NOT_ALLOWED，实际: %s", endpoint, rec.Body.String())
++		}
++		if got := res.failureCount(endpoint); got != 1 {
++			t.Fatalf("%s 应上报 1 次失败，实际 %d", endpoint, got)
++		}
++	}
++	if got := hits.Load(); got != 0 {
++		t.Fatalf("被拒绝的实例不应收到请求，实际 %d 次", got)
++	}
++}
++
+ // TestProxy_Upstream5xxCountsFailure 验证实例返回 5xx 时计一次失败（响应仍透传）。
+ func TestProxy_Upstream5xxCountsFailure(t *testing.T) {
+ 	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+@@ -563,7 +603,7 @@ func TestProxy_Upstream5xxCountsFailure(t *testing.T) {
+ 	defer upstreamSrv.Close()
+ 
+ 	res := newFakeResolver([]string{upstreamSrv.URL}, nil)
+-	proxy := New(res, "X-Tenant-ID", nil)
++	proxy := New(res, "X-Tenant-ID", allowLoopback, nil)
+ 
+ 	rec := httptest.NewRecorder()
+ 	proxy.ServeHTTP(rec, newChatRequest("svc-a"))
+diff --git a/gateway/internal/stream/sse_cancel_test.go b/gateway/internal/stream/sse_cancel_test.go
+index 8e0ef76..af571e3 100644
+--- a/gateway/internal/stream/sse_cancel_test.go
++++ b/gateway/internal/stream/sse_cancel_test.go
+@@ -25,7 +25,7 @@ import (
+ // newGatewayServer 将 proxy 挂载到与线上一致的路由模式，返回完整网关 server。
+ func newGatewayServer(t *testing.T, res Resolver) *httptest.Server {
+ 	t.Helper()
+-	proxy := New(res, "X-Tenant-ID", nil)
++	proxy := New(res, "X-Tenant-ID", allowLoopback, nil)
+ 	mux := http.NewServeMux()
+ 	mux.Handle("/api/v1/inference/{svc}/chat", proxy)
+ 	srv := httptest.NewServer(mux)
+-- 
+2.43.0
+
