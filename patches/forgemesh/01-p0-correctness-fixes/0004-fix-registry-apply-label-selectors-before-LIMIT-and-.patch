@@ -1,7 +1,7 @@
 From a8c6bf49d8af9ef2c33e7a2e8928ad5e9ccd0f9e Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Mon, 12 Oct 2026 02:35:50 +0000
-Subject: [PATCH 4/8] fix(registry): apply label selectors before LIMIT and
+Subject: [PATCH 4/9] fix(registry): apply label selectors before LIMIT and
  reject non-positive limits
 
 list() fetched one page with LIMIT and only then filtered labels in Python, so

@@ -1,0 +1,206 @@
+From 8ae2d8993bc5f4d1ef680c2244780d06a99f3dfe Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 12 Oct 2026 04:19:44 +0000
+Subject: [PATCH 7/8] refactor(control-plane): move API key generation to its
+ own module
+
+"python -m forgemesh.controlplane.auth keygen" printed a runpy
+RuntimeWarning on every run: the package __init__ imports app, which
+imports auth, so the module was already loaded before runpy executed it
+as __main__. Move the CLI to forgemesh.controlplane.keygen, which nothing
+imports, and drop the now-redundant subcommand:
+
+    python -m forgemesh.controlplane.keygen --tenant acme --subject ci-bot
+---
+ gateway/internal/middleware/apikey.go         |  2 +-
+ .../src/forgemesh/controlplane/auth.py        | 47 +-------------
+ .../src/forgemesh/controlplane/keygen.py      | 63 +++++++++++++++++++
+ tests/unit/controlplane/test_auth.py          | 10 ++-
+ 4 files changed, 73 insertions(+), 49 deletions(-)
+ create mode 100644 packages/control-plane/src/forgemesh/controlplane/keygen.py
+
+diff --git a/gateway/internal/middleware/apikey.go b/gateway/internal/middleware/apikey.go
+index 0353cbd..8af83f6 100644
+--- a/gateway/internal/middleware/apikey.go
++++ b/gateway/internal/middleware/apikey.go
+@@ -21,7 +21,7 @@ import (
+ //	{"keys": [{"id": "acme-ci", "sha256": "<64 位十六进制>", "tenantId": "acme",
+ //	           "subject": "ci-bot", "scopes": ["read", "write"]}]}
+ //
+-// 新 key 由 `python -m forgemesh.controlplane.auth keygen` 生成。
++// 新 key 由 `python -m forgemesh.controlplane.keygen` 生成。
+ type APIKey struct {
+ 	ID       string
+ 	SHA256   string
+diff --git a/packages/control-plane/src/forgemesh/controlplane/auth.py b/packages/control-plane/src/forgemesh/controlplane/auth.py
+index f12ff38..ebc6bdd 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/auth.py
++++ b/packages/control-plane/src/forgemesh/controlplane/auth.py
+@@ -17,18 +17,15 @@ key 文件格式（与网关的 ``GATEWAY_API_KEYS_FILE`` 共用）::
+     {"keys": [{"id": "acme-ci", "sha256": "<64 位十六进制>", "tenantId": "acme",
+                "subject": "ci-bot", "scopes": ["read", "write"]}]}
+ 
+-生成新 key：``python -m forgemesh.controlplane.auth keygen --tenant acme --subject ci-bot``。
++生成新 key：``python -m forgemesh.controlplane.keygen --tenant acme --subject ci-bot``。
+ """
+ 
+ from __future__ import annotations
+ 
+-import argparse
+ import hashlib
+ import hmac
+-import json
+ import os
+ import secrets
+-import sys
+ from collections.abc import Iterable, Mapping
+ from pathlib import Path
+ from typing import Protocol
+@@ -271,45 +268,3 @@ def authenticator_from_env(environ: Mapping[str, str] | None = None) -> Authenti
+             "local development"
+         )
+     return ApiKeyAuthenticator.from_file(path)
+-
+-
+-def _keygen(args: argparse.Namespace) -> int:
+-    key = generate_api_key()
+-    entry = ApiKeyEntry(
+-        id=args.id or f"{args.tenant}-{args.subject}",
+-        sha256=hash_api_key(key),
+-        tenantId=args.tenant,
+-        subject=args.subject,
+-        scopes=tuple(args.scope) if args.scope else (SCOPE_READ, SCOPE_WRITE),
+-    )
+-    print("API key (store it in a secret manager; it is not shown again):")
+-    print(key)
+-    print('Key file entry (append it to the "keys" array):')
+-    print(json.dumps(entry.model_dump(by_alias=True, mode="json"), ensure_ascii=False))
+-    return 0
+-
+-
+-def main(argv: list[str] | None = None) -> int:
+-    """命令行入口：``keygen`` 生成新 key 及对应的 key 文件条目。"""
+-    parser = argparse.ArgumentParser(prog="python -m forgemesh.controlplane.auth")
+-    commands = parser.add_subparsers(dest="command", required=True)
+-    keygen = commands.add_parser("keygen", help="generate an API key bound to a tenant")
+-    keygen.add_argument("--tenant", required=True, help="tenant bound to the key")
+-    keygen.add_argument("--subject", required=True, help="subject (service account or user)")
+-    keygen.add_argument("--id", help="entry id (default: <tenant>-<subject>)")
+-    keygen.add_argument(
+-        "--scope",
+-        action="append",
+-        choices=sorted(KNOWN_SCOPES),
+-        help="granted scope, repeatable (default: read and write)",
+-    )
+-    args = parser.parse_args(argv)
+-    try:
+-        return _keygen(args)
+-    except ValidationError as exc:
+-        print(f"invalid key parameters: {exc}", file=sys.stderr)
+-        return 2
+-
+-
+-if __name__ == "__main__":
+-    raise SystemExit(main())
+diff --git a/packages/control-plane/src/forgemesh/controlplane/keygen.py b/packages/control-plane/src/forgemesh/controlplane/keygen.py
+new file mode 100644
+index 0000000..7e8aa57
+--- /dev/null
++++ b/packages/control-plane/src/forgemesh/controlplane/keygen.py
+@@ -0,0 +1,63 @@
++"""生成绑定租户的 API key：``python -m forgemesh.controlplane.keygen --tenant acme --subject ci-bot``。
++
++输出明文 key（只显示这一次）与对应的 key 文件条目；把条目追加到
++``FORGEMESH_API_KEYS_FILE`` / ``GATEWAY_API_KEYS_FILE`` 指向的文件的 ``keys`` 数组
++（格式见 :mod:`forgemesh.controlplane.auth`）。
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import sys
++
++from pydantic import ValidationError
++
++from .auth import (
++    KNOWN_SCOPES,
++    SCOPE_READ,
++    SCOPE_WRITE,
++    ApiKeyEntry,
++    generate_api_key,
++    hash_api_key,
++)
++
++
++def main(argv: list[str] | None = None) -> int:
++    """命令行入口；参数非法时返回 2。"""
++    parser = argparse.ArgumentParser(
++        prog="python -m forgemesh.controlplane.keygen",
++        description="Generate an API key bound to a tenant.",
++    )
++    parser.add_argument("--tenant", required=True, help="tenant bound to the key")
++    parser.add_argument("--subject", required=True, help="subject (service account or user)")
++    parser.add_argument("--id", help="entry id (default: <tenant>-<subject>)")
++    parser.add_argument(
++        "--scope",
++        action="append",
++        choices=sorted(KNOWN_SCOPES),
++        help="granted scope, repeatable (default: read and write)",
++    )
++    args = parser.parse_args(argv)
++
++    key = generate_api_key()
++    try:
++        entry = ApiKeyEntry(
++            id=args.id or f"{args.tenant}-{args.subject}",
++            sha256=hash_api_key(key),
++            tenantId=args.tenant,
++            subject=args.subject,
++            scopes=tuple(args.scope) if args.scope else (SCOPE_READ, SCOPE_WRITE),
++        )
++    except ValidationError as exc:
++        print(f"invalid key parameters: {exc}", file=sys.stderr)
++        return 2
++    print("API key (store it in a secret manager; it is not shown again):")
++    print(key)
++    print('Key file entry (append it to the "keys" array):')
++    print(json.dumps(entry.model_dump(by_alias=True, mode="json"), ensure_ascii=False))
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tests/unit/controlplane/test_auth.py b/tests/unit/controlplane/test_auth.py
+index 4ae889e..31a8200 100644
+--- a/tests/unit/controlplane/test_auth.py
++++ b/tests/unit/controlplane/test_auth.py
+@@ -25,7 +25,7 @@ from forgemesh.controlplane.auth import (
+     hash_api_key,
+     load_api_keys,
+ )
+-from forgemesh.controlplane.auth import main as auth_main
++from forgemesh.controlplane.keygen import main as keygen_main
+ 
+ KEY_A = "fmk_key-for-tenant-a"
+ KEY_B = "fmk_key-for-tenant-b"
+@@ -205,9 +205,15 @@ def test_authenticator_from_env(tmp_path) -> None:
+     assert configured.authenticate(_bearer(KEY_A)).tenant_id == "tenant-a"
+ 
+ 
++@pytest.mark.unit
++def test_keygen_rejects_invalid_parameters(capsys) -> None:
++    assert keygen_main(["--tenant", "", "--subject", "ci"]) == 2
++    assert "invalid key parameters" in capsys.readouterr().err
++
++
+ @pytest.mark.unit
+ def test_keygen_prints_a_key_matching_its_entry(capsys) -> None:
+-    assert auth_main(["keygen", "--tenant", "acme", "--subject", "ci", "--scope", "read"]) == 0
++    assert keygen_main(["--tenant", "acme", "--subject", "ci", "--scope", "read"]) == 0
+ 
+     lines = capsys.readouterr().out.strip().splitlines()
+     key, entry = lines[1], ApiKeyEntry.model_validate_json(lines[-1])
+-- 
+2.43.0
+

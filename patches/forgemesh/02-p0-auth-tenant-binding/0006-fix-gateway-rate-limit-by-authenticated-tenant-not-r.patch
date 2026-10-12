@@ -1,0 +1,224 @@
+From 7d907f9202568a244108c11ccb4bde74312a3ca5 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 12 Oct 2026 04:18:21 +0000
+Subject: [PATCH 6/8] fix(gateway): rate limit by authenticated tenant, not
+ request headers
+
+The limiter keyed buckets on the X-Tenant-ID header before the
+authenticated context, and its anonymous fallback trusted the first
+X-Forwarded-For entry. Either way a client could get a fresh token bucket
+per request by rotating a header value.
+
+Key buckets on the tenant that Authenticate stored in the request
+context, and fall back to the TCP peer address only when no tenant is
+present. RateLimit no longer needs the tenant header name.
+---
+ gateway/internal/middleware/chain_test.go     |  2 +-
+ gateway/internal/middleware/ratelimit.go      | 32 +++-------
+ gateway/internal/middleware/ratelimit_test.go | 62 ++++++++++++++-----
+ gateway/internal/router/router.go             |  2 +-
+ 4 files changed, 58 insertions(+), 40 deletions(-)
+
+diff --git a/gateway/internal/middleware/chain_test.go b/gateway/internal/middleware/chain_test.go
+index b87a979..cd1aac1 100644
+--- a/gateway/internal/middleware/chain_test.go
++++ b/gateway/internal/middleware/chain_test.go
+@@ -31,7 +31,7 @@ func newAPIChain(l *Limiter, route http.Handler) http.Handler {
+ 	api := Chain(route,
+ 		Correlation(DefaultCorrelationHeader),
+ 		Authz(DefaultTenantHeader),
+-		RateLimit(l, DefaultTenantHeader),
++		RateLimit(l),
+ 	)
+ 	return Recovery(log.New(io.Discard, "", 0))(api)
+ }
+diff --git a/gateway/internal/middleware/ratelimit.go b/gateway/internal/middleware/ratelimit.go
+index f1f3300..bc925a0 100644
+--- a/gateway/internal/middleware/ratelimit.go
++++ b/gateway/internal/middleware/ratelimit.go
+@@ -5,7 +5,6 @@ import (
+ 	"net"
+ 	"net/http"
+ 	"strconv"
+-	"strings"
+ 	"sync"
+ 	"time"
+ )
+@@ -116,20 +115,18 @@ func (l *Limiter) maybeGC(now time.Time) {
+ 	}
+ }
+ 
+-// RateLimit 返回按租户限流的中间件。
++// RateLimit 返回按租户限流的中间件，须位于 Authenticate 之后。
+ //
+-// key 选取优先使用请求头中的租户身份；若缺失（尚未经过鉴权或匿名流量），
+-// 退化为按客户端 IP 限流，保证入口不被单点打爆。
+-func RateLimit(l *Limiter, tenantHeader string) Middleware {
++// key 取自认证中间件注入 context 的租户（来自已验证的凭证），而不是请求头——否则客户端
++// 每换一个租户头就能得到一个新令牌桶。context 中没有租户时（链上未启用认证）按 TCP 对端
++// 地址限流；X-Forwarded-For 可由客户端任意填写，不参与 key 计算。
++func RateLimit(l *Limiter) Middleware {
+ 	if l == nil {
+ 		panic("middleware: RateLimit 需要非空 Limiter")
+ 	}
+-	if tenantHeader == "" {
+-		tenantHeader = DefaultTenantHeader
+-	}
+ 	return func(next http.Handler) http.Handler {
+ 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+-			key := rateLimitKey(r, tenantHeader)
++			key := rateLimitKey(r)
+ 			allowed, retryAfter := l.Allow(key)
+ 			if !allowed {
+ 				// Retry-After 采用秒级向上取整，最小为 1。
+@@ -146,27 +143,16 @@ func RateLimit(l *Limiter, tenantHeader string) Middleware {
+ 	}
+ }
+ 
+-// rateLimitKey 计算限流 key：租户头 → 上下文租户 → 客户端 IP。
+-func rateLimitKey(r *http.Request, tenantHeader string) string {
+-	if tenant := strings.TrimSpace(r.Header.Get(tenantHeader)); tenant != "" {
+-		return "tenant:" + tenant
+-	}
++// rateLimitKey 计算限流 key：已认证的租户 → TCP 对端地址。
++func rateLimitKey(r *http.Request) string {
+ 	if tenant := TenantFromContext(r.Context()); tenant != "" {
+ 		return "tenant:" + tenant
+ 	}
+ 	return "ip:" + clientIP(r)
+ }
+ 
+-// clientIP 尽力提取客户端 IP；优先 X-Forwarded-For 首段，否则使用 RemoteAddr。
++// clientIP 返回 TCP 对端地址（RemoteAddr 的主机部分）。
+ func clientIP(r *http.Request) string {
+-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+-		if idx := strings.IndexByte(xff, ','); idx >= 0 {
+-			xff = xff[:idx]
+-		}
+-		if ip := strings.TrimSpace(xff); ip != "" {
+-			return ip
+-		}
+-	}
+ 	host, _, err := net.SplitHostPort(r.RemoteAddr)
+ 	if err != nil {
+ 		return r.RemoteAddr
+diff --git a/gateway/internal/middleware/ratelimit_test.go b/gateway/internal/middleware/ratelimit_test.go
+index b69ce1b..e21f517 100644
+--- a/gateway/internal/middleware/ratelimit_test.go
++++ b/gateway/internal/middleware/ratelimit_test.go
+@@ -6,24 +6,27 @@ import (
+ 	"testing"
+ )
+ 
+-// doTenantRequest 以指定租户发送一次请求，返回响应记录器。
++// doTenantRequest 以指定的已认证租户发送一次请求（租户为空表示未认证），返回响应记录器。
+ func doTenantRequest(h http.Handler, tenant string) *httptest.ResponseRecorder {
+ 	rec := httptest.NewRecorder()
+ 	req := httptest.NewRequest(http.MethodGet, "/api/v1/resources", nil)
+ 	if tenant != "" {
+-		req.Header.Set(DefaultTenantHeader, tenant)
++		req = req.WithContext(WithPrincipal(req.Context(), Principal{TenantID: tenant}))
+ 	}
+ 	h.ServeHTTP(rec, req)
+ 	return rec
+ }
+ 
++func newLimitedHandler(rps float64, burst int) http.Handler {
++	return RateLimit(NewRateLimiter(rps, burst))(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.WriteHeader(http.StatusOK)
++	}))
++}
++
+ // TestRateLimit_RejectsOverBurst 验证超出桶容量后返回 429 且带 Retry-After。
+ func TestRateLimit_RejectsOverBurst(t *testing.T) {
+ 	// 极低补充速率，保证测试窗口内令牌不会自然回填。
+-	limiter := NewRateLimiter(0.0001, 2)
+-	h := RateLimit(limiter, DefaultTenantHeader)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+-		w.WriteHeader(http.StatusOK)
+-	}))
++	h := newLimitedHandler(0.0001, 2)
+ 
+ 	for i := 1; i <= 2; i++ {
+ 		if rec := doTenantRequest(h, "tenant-a"); rec.Code != http.StatusOK {
+@@ -42,10 +45,7 @@ func TestRateLimit_RejectsOverBurst(t *testing.T) {
+ 
+ // TestRateLimit_TenantIsolation 验证限流按租户隔离：一个租户耗尽不影响其他租户。
+ func TestRateLimit_TenantIsolation(t *testing.T) {
+-	limiter := NewRateLimiter(0.0001, 1)
+-	h := RateLimit(limiter, DefaultTenantHeader)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+-		w.WriteHeader(http.StatusOK)
+-	}))
++	h := newLimitedHandler(0.0001, 1)
+ 
+ 	if rec := doTenantRequest(h, "tenant-a"); rec.Code != http.StatusOK {
+ 		t.Fatalf("tenant-a 首次应放行，实际 %d", rec.Code)
+@@ -59,12 +59,9 @@ func TestRateLimit_TenantIsolation(t *testing.T) {
+ 	}
+ }
+ 
+-// TestRateLimit_AnonymousFallsBackToIP 验证无租户头时退化为按 IP 限流。
++// TestRateLimit_AnonymousFallsBackToIP 验证无已认证租户时退化为按 IP 限流。
+ func TestRateLimit_AnonymousFallsBackToIP(t *testing.T) {
+-	limiter := NewRateLimiter(0.0001, 1)
+-	h := RateLimit(limiter, DefaultTenantHeader)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+-		w.WriteHeader(http.StatusOK)
+-	}))
++	h := newLimitedHandler(0.0001, 1)
+ 
+ 	if rec := doTenantRequest(h, ""); rec.Code != http.StatusOK {
+ 		t.Fatalf("匿名首次应放行，实际 %d", rec.Code)
+@@ -73,3 +70,38 @@ func TestRateLimit_AnonymousFallsBackToIP(t *testing.T) {
+ 		t.Fatalf("匿名二次应 429，实际 %d", rec.Code)
+ 	}
+ }
++
++// TestRateLimit_IgnoresClientControlledHeaders 验证轮换租户头或 X-Forwarded-For
++// 无法获得新的令牌桶：key 只取已认证的租户与 TCP 对端地址。
++func TestRateLimit_IgnoresClientControlledHeaders(t *testing.T) {
++	cases := map[string]struct {
++		tenant string
++		header string
++	}{
++		"已认证请求轮换租户头": {tenant: "tenant-a", header: DefaultTenantHeader},
++		"匿名请求轮换租户头":  {header: DefaultTenantHeader},
++		"匿名请求轮换 XFF": {header: "X-Forwarded-For"},
++	}
++	for name, tc := range cases {
++		t.Run(name, func(t *testing.T) {
++			h := newLimitedHandler(0.0001, 1)
++			for i, value := range []string{"10.0.0.1", "10.0.0.2"} {
++				rec := httptest.NewRecorder()
++				req := httptest.NewRequest(http.MethodGet, "/api/v1/resources", nil)
++				req.Header.Set(tc.header, value)
++				if tc.tenant != "" {
++					req = req.WithContext(WithPrincipal(req.Context(), Principal{TenantID: tc.tenant}))
++				}
++				h.ServeHTTP(rec, req)
++
++				want := http.StatusOK
++				if i == 1 {
++					want = http.StatusTooManyRequests
++				}
++				if rec.Code != want {
++					t.Fatalf("第 %d 次请求（%s=%s）应 %d，实际 %d", i+1, tc.header, value, want, rec.Code)
++				}
++			}
++		})
++	}
++}
+diff --git a/gateway/internal/router/router.go b/gateway/internal/router/router.go
+index bfb17e7..40d808e 100644
+--- a/gateway/internal/router/router.go
++++ b/gateway/internal/router/router.go
+@@ -99,7 +99,7 @@ func New(cfg config.Config, logger *log.Logger) (*Router, error) {
+ 	apiHandler := middleware.Chain(apiMux,
+ 		middleware.Correlation(cfg.CorrelationHeader),
+ 		middleware.Authenticate(authn, cfg.TenantHeader),
+-		middleware.RateLimit(limiter, cfg.TenantHeader),
++		middleware.RateLimit(limiter),
+ 	)
+ 
+ 	// 顶层路由：探针不经过鉴权/限流。
+-- 
+2.43.0
+

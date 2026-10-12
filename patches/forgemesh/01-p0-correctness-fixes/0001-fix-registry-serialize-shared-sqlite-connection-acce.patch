@@ -1,7 +1,7 @@
 From f6461e7163324836a6637811450d43cd6b63902a Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Mon, 12 Oct 2026 02:31:28 +0000
-Subject: [PATCH 1/8] fix(registry): serialize shared sqlite connection access
+Subject: [PATCH 1/9] fix(registry): serialize shared sqlite connection access
  (R-1)
 
 All SQLiteRegistry methods ran on asyncio.to_thread worker threads against one

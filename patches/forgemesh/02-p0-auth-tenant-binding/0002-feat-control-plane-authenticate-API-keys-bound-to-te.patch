@@ -1,0 +1,1168 @@
+From 48d1f1cee870af69aa368b751757edec8dce6d16 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 12 Oct 2026 04:03:34 +0000
+Subject: [PATCH 2/8] feat(control-plane): authenticate API keys bound to
+ tenants
+
+The API took the tenant from the X-Tenant-Id header, so any caller that
+could reach the control plane could read or write any tenant's resources
+by changing one header; the documented "the gateway verifies it" premise
+did not hold because nothing stopped direct access.
+
+Resolve every /api/v1 request to a verified Principal instead:
+
+* apikey mode (default): Authorization: Bearer <key>. A JSON key file
+  (FORGEMESH_API_KEYS_FILE, SHA-256 digests only, shared with the gateway)
+  binds each key to a tenant, subject and read/write scopes. A tenant
+  header that disagrees with the key's tenant is rejected with 403 rather
+  than silently rewritten.
+* dev mode: trust X-Tenant-Id as before; main() refuses to start it on a
+  non-loopback address and the app logs a warning.
+
+Missing credentials answer 401 with WWW-Authenticate, insufficient scope
+403, and an app without an injected authenticator fails closed with 503.
+Startup fails when apikey mode has no readable key file. Add
+"python -m forgemesh.controlplane.auth keygen" to mint keys.
+---
+ .../controlplane/api/dependencies.py          |  98 +++++-
+ .../src/forgemesh/controlplane/api/routes.py  |  27 +-
+ .../src/forgemesh/controlplane/app.py         |  73 +++-
+ .../src/forgemesh/controlplane/auth.py        | 311 +++++++++++++++++
+ tests/unit/controlplane/conftest.py           |  15 +
+ tests/unit/controlplane/test_api.py           |   8 +-
+ tests/unit/controlplane/test_app.py           |   4 +-
+ tests/unit/controlplane/test_auth.py          | 320 ++++++++++++++++++
+ tests/unit/controlplane/test_routes.py        |   8 +-
+ 9 files changed, 825 insertions(+), 39 deletions(-)
+ create mode 100644 packages/control-plane/src/forgemesh/controlplane/auth.py
+ create mode 100644 tests/unit/controlplane/conftest.py
+ create mode 100644 tests/unit/controlplane/test_auth.py
+
+diff --git a/packages/control-plane/src/forgemesh/controlplane/api/dependencies.py b/packages/control-plane/src/forgemesh/controlplane/api/dependencies.py
+index d248937..1224e14 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/api/dependencies.py
++++ b/packages/control-plane/src/forgemesh/controlplane/api/dependencies.py
+@@ -1,4 +1,4 @@
+-"""API 依赖注入：Registry 实例、运行时组件与租户上下文。
++"""API 依赖注入：Registry 实例、运行时组件与已认证的调用主体。
+ 
+ 组件组装模式（对齐 development-plan 8.2「组装与依赖注入」）：
+ 
+@@ -7,16 +7,29 @@
+   :func:`init_workflow_runtime` / :func:`init_decision_router` 显式注入；
+   未注入时 :func:`get_workflow_runtime` / :func:`get_decision_router` 抛出
+   :class:`ComponentNotReadyError`，对应端点返回 503 错误信封（诚实暴露
+-  组装缺失，而非 404/501 残留）。
++  组装缺失，而非 404/501 残留）；
++* ``Authenticator`` —— 由 :func:`init_authenticator` 注入。未注入时所有业务
++  端点返回 503，绝不退化为信任请求头。
+ """
+ 
+ from __future__ import annotations
+ 
++from collections.abc import Awaitable, Callable
+ from typing import TYPE_CHECKING
+ 
+-from fastapi import Header, HTTPException
++from fastapi import Depends, Request
++from forgemesh.controlplane.auth import (
++    SCOPE_READ,
++    SCOPE_WRITE,
++    AuthenticationError,
++    Authenticator,
++    PermissionDeniedError,
++    Principal,
++)
+ from forgemesh.controlplane.registry import SQLiteRegistry
+ 
++from .errors import ApiError
++
+ if TYPE_CHECKING:  # pragma: no cover - 仅静态类型检查使用，运行时不导入
+     from forgemesh.decision.router import DecisionRouter
+     from forgemesh.workflow.runtime import WorkflowRuntime
+@@ -30,6 +43,12 @@ _workflow_runtime: WorkflowRuntime | None = None
+ #: 全局 DecisionRouter 实例（由 ``init_decision_router`` 注入）。
+ _decision_router: DecisionRouter | None = None
+ 
++#: 全局认证器（由 ``init_authenticator`` 注入）。
++_authenticator: Authenticator | None = None
++
++#: 401 响应附带的质询头（RFC 6750）。
++_BEARER_CHALLENGE = 'Bearer realm="forgemesh"'
++
+ 
+ class ComponentNotReadyError(RuntimeError):
+     """运行时组件未注入（组装方未调用对应的 ``init_*``）。"""
+@@ -111,14 +130,69 @@ def reset_runtime_components() -> None:
+     _decision_router = None
+ 
+ 
+-async def get_tenant_id(
+-    x_tenant_id: str | None = Header(default=None, alias="X-Tenant-Id"),
+-) -> str:
+-    """从请求头 ``X-Tenant-Id`` 提取租户 ID（强制要求）。
++def init_authenticator(authenticator: Authenticator) -> Authenticator:
++    """注入全局认证器（见 :mod:`forgemesh.controlplane.auth`）。
+ 
+-    缺失时返回 HTTP 400。租户上下文为多租户隔离的权威来源，
+-    覆盖请求体中可能携带的租户字段。
++    Returns:
++        注入的实例（便于链式组装）。
+     """
+-    if not x_tenant_id:
+-        raise HTTPException(status_code=400, detail="X-Tenant-Id header is required")
+-    return x_tenant_id
++    global _authenticator
++    _authenticator = authenticator
++    return authenticator
++
++
++def get_authenticator() -> Authenticator:
++    """获取已注入的认证器；未注入时抛 :class:`ComponentNotReadyError`。"""
++    if _authenticator is None:
++        raise ComponentNotReadyError(
++            "Authenticator 未注入：请先调用 init_authenticator(...) 完成组装。"
++        )
++    return _authenticator
++
++
++def reset_authenticator() -> None:
++    """清空已注入的认证器（测试与重组装用）。"""
++    global _authenticator
++    _authenticator = None
++
++
++async def get_principal(request: Request) -> Principal:
++    """校验请求凭证，返回已验证的调用主体。
++
++    认证器未注入返回 503（组装缺失时拒绝而不是放行）；凭证缺失或无效返回 401
++    （附 ``WWW-Authenticate``）；凭证有效但越权（如租户头与凭证不符）返回 403。
++    """
++    try:
++        authenticator = get_authenticator()
++    except ComponentNotReadyError as exc:
++        raise ApiError(503, "AUTHENTICATOR_UNAVAILABLE", str(exc)) from exc
++    try:
++        return authenticator.authenticate(request.headers)
++    except AuthenticationError as exc:
++        raise ApiError(
++            401, "UNAUTHENTICATED", str(exc), headers={"WWW-Authenticate": _BEARER_CHALLENGE}
++        ) from exc
++    except PermissionDeniedError as exc:
++        raise ApiError(403, "FORBIDDEN", str(exc)) from exc
++
++
++async def get_tenant_id(principal: Principal = Depends(get_principal)) -> str:
++    """当前请求的租户：取自已验证的凭证，覆盖请求体中可能携带的租户字段。"""
++    return principal.tenant_id
++
++
++def require_scope(scope: str) -> Callable[..., Awaitable[Principal]]:
++    """构造要求调用主体持有 ``scope`` 的依赖；缺少时返回 403。"""
++
++    async def _require(principal: Principal = Depends(get_principal)) -> Principal:
++        if not principal.has_scope(scope):
++            raise ApiError(403, "FORBIDDEN", f"credentials lack the '{scope}' scope")
++        return principal
++
++    return _require
++
++
++#: 读接口（GET）所需 scope。
++require_read = require_scope(SCOPE_READ)
++#: 写接口（创建、删除、启动工作流、请求决策）所需 scope。
++require_write = require_scope(SCOPE_WRITE)
+diff --git a/packages/control-plane/src/forgemesh/controlplane/api/routes.py b/packages/control-plane/src/forgemesh/controlplane/api/routes.py
+index 6d38220..c335c59 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/api/routes.py
++++ b/packages/control-plane/src/forgemesh/controlplane/api/routes.py
+@@ -12,8 +12,9 @@
+ * ``POST   /decisions``                   —— 结构化决策（决策≠授权，development-plan 5.5）
+ * ``GET    /resources``                   —— 通用资源列表（可选 kind 过滤）
+ 
+-租户上下文通过 ``X-Tenant-Id`` 请求头注入（见 :mod:`.dependencies`），
+-作为多租户隔离的权威来源，覆盖请求体中的租户字段。
++租户取自已验证的凭证（见 :func:`.dependencies.get_principal` 与
++:mod:`forgemesh.controlplane.auth`），作为多租户隔离的权威来源，覆盖请求体中的
++租户字段；读接口要求 ``read`` scope，写接口要求 ``write`` scope。
+ 
+ 运行时端点（workflows / decisions）依赖注入的 ``WorkflowRuntime`` /
+ ``DecisionRouter``（见 :func:`.dependencies.init_workflow_runtime` 等）；
+@@ -43,6 +44,8 @@ from .dependencies import (
+     get_registry,
+     get_tenant_id,
+     get_workflow_runtime,
++    require_read,
++    require_write,
+ )
+ from .errors import validation_details
+ 
+@@ -56,8 +59,8 @@ class ResourceListResponse(BaseModel):
+     count: int
+ 
+ 
+-#: 由服务端维护、创建请求中一律忽略的元数据字段。请求头 ``X-Tenant-Id`` 为租户
+-#: 权威来源，覆盖请求体中的租户字段，防止跨租户伪造。
++#: 由服务端维护、创建请求中一律忽略的元数据字段。已验证凭证中的租户是权威来源，
++#: 覆盖请求体中的租户字段，防止跨租户伪造。
+ _SERVER_OWNED_METADATA = ("tenant_id", "tenantId", "uid", "resourceVersion")
+ 
+ #: 列表接口单页条数上限。
+@@ -109,7 +112,7 @@ def _invalid_limit(limit: int) -> JSONResponse | None:
+ # ------------------------------------------------------------------ #
+ 
+ 
+-@router.post("/inference-services", status_code=201)
++@router.post("/inference-services", status_code=201, dependencies=[Depends(require_write)])
+ async def create_inference_service(
+     body: dict[str, Any],
+     tenant_id: str = Depends(get_tenant_id),
+@@ -139,7 +142,7 @@ async def create_inference_service(
+     return JSONResponse(status_code=201, content=created.model_dump(by_alias=True, mode="json"))
+ 
+ 
+-@router.get("/inference-services")
++@router.get("/inference-services", dependencies=[Depends(require_read)])
+ async def list_inference_services(
+     tenant_id: str = Depends(get_tenant_id),
+     namespace: str | None = None,
+@@ -153,7 +156,7 @@ async def list_inference_services(
+     return {"items": [r.model_dump(by_alias=True) for r in items], "count": len(items)}
+ 
+ 
+-@router.get("/inference-services/{name}")
++@router.get("/inference-services/{name}", dependencies=[Depends(require_read)])
+ async def get_inference_service(
+     name: str,
+     tenant_id: str = Depends(get_tenant_id),
+@@ -168,7 +171,7 @@ async def get_inference_service(
+     return resource.model_dump(by_alias=True)
+ 
+ 
+-@router.delete("/inference-services/{name}")
++@router.delete("/inference-services/{name}", dependencies=[Depends(require_write)])
+ async def delete_inference_service(
+     name: str,
+     tenant_id: str = Depends(get_tenant_id),
+@@ -200,7 +203,7 @@ async def delete_inference_service(
+ # ------------------------------------------------------------------ #
+ 
+ 
+-@router.get("/resources")
++@router.get("/resources", dependencies=[Depends(require_read)])
+ async def list_resources(
+     tenant_id: str = Depends(get_tenant_id),
+     kind: str | None = None,
+@@ -271,7 +274,7 @@ def _error_response(
+     )
+ 
+ 
+-@router.post("/workflows", status_code=202)
++@router.post("/workflows", status_code=202, dependencies=[Depends(require_write)])
+ async def start_workflow(
+     body: dict[str, Any],
+     tenant_id: str = Depends(get_tenant_id),
+@@ -337,7 +340,7 @@ async def start_workflow(
+ class DecisionCallRequest(BaseModel):
+     """决策请求体（对齐 OpenAPI ``DecisionRequest``）。
+ 
+-    OpenAPI 契约未含租户字段，租户一律由 ``X-Tenant-Id`` 请求头注入。
++    OpenAPI 契约未含租户字段，租户一律取自已验证的凭证。
+ 
+     Attributes:
+         question: 决策问题；API 层映射为内部模型的 ``operation`` 语义标识。
+@@ -353,7 +356,7 @@ class DecisionCallRequest(BaseModel):
+     required_capabilities: list[str] | None = Field(default=None, alias="requiredCapabilities")
+ 
+ 
+-@router.post("/decisions")
++@router.post("/decisions", dependencies=[Depends(require_write)])
+ async def request_decision(
+     body: dict[str, Any],
+     tenant_id: str = Depends(get_tenant_id),
+diff --git a/packages/control-plane/src/forgemesh/controlplane/app.py b/packages/control-plane/src/forgemesh/controlplane/app.py
+index 0b2805e..bacbd63 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/app.py
++++ b/packages/control-plane/src/forgemesh/controlplane/app.py
+@@ -8,7 +8,10 @@
+   ``api/openapi/openapi.yaml`` 一致。
+ * **配置**：权威存储路径取自环境变量 ``FORGEMESH_DB_PATH``（默认
+   ``forgemesh.db``）；监听地址取自 ``FORGEMESH_HOST`` / ``FORGEMESH_PORT``
+-  （默认 ``127.0.0.1:8080``，未接入认证前不默认对外暴露）。
++  （默认 ``127.0.0.1:8080``）。
++* **认证**：启动时按 ``FORGEMESH_AUTH_MODE`` 构造认证器（默认 ``apikey``，需要
++  ``FORGEMESH_API_KEYS_FILE``），配置缺失或非法时拒绝启动；``dev`` 模式只允许
++  监听回环地址（见 :mod:`forgemesh.controlplane.auth`）。
+ * **无导入副作用**：数据库在应用启动（lifespan）时才打开，导入本模块不会
+   创建文件。
+ * **探针**：``/healthz``（存活）恒为 ok；``/readyz``（就绪）探测权威存储可用。
+@@ -20,15 +23,28 @@
+ 
+ from __future__ import annotations
+ 
++import ipaddress
+ import json
+ import logging
+ import os
+ from collections.abc import AsyncIterator
+ from contextlib import asynccontextmanager
+-from typing import Any
++from typing import TYPE_CHECKING, Any
+ 
+ from pydantic import BaseModel
+ 
++from .auth import (
++    AUTH_MODE_DEV,
++    AUTH_MODE_ENV,
++    AuthConfigError,
++    HeaderAuthenticator,
++    auth_mode_from_env,
++    authenticator_from_env,
++)
++
++if TYPE_CHECKING:  # pragma: no cover - 仅静态类型检查使用
++    from .auth import Authenticator
++
+ try:  # pragma: no cover - 取决于运行环境是否安装 FastAPI
+     from fastapi import FastAPI
+     from fastapi.responses import JSONResponse
+@@ -101,26 +117,46 @@ def resolve_db_path(db_path: str | None = None) -> str:
+ 
+ if _FASTAPI_AVAILABLE:
+ 
+-    def create_app(db_path: str | None = None) -> FastAPI:
+-        """创建 FastAPI 应用：探针 + 真实 API 路由；注册中心在启动时初始化。
++    def create_app(
++        db_path: str | None = None, authenticator: Authenticator | None = None
++    ) -> FastAPI:
++        """创建 FastAPI 应用：探针 + 真实 API 路由；认证器与注册中心在启动时初始化。
+ 
+         Args:
+             db_path: SQLite 权威存储路径；为空时按 :func:`resolve_db_path` 解析。
++            authenticator: 认证器；为空时在启动时按环境变量构造
++                （见 :func:`forgemesh.controlplane.auth.authenticator_from_env`），
++                配置缺失或非法则启动失败。
+         """
+         # 延迟导入：api.routes 反向依赖本模块的 error_envelope。
+         from .api import create_api_router
+-        from .api.dependencies import get_registry, init_registry
++        from .api.dependencies import (
++            get_registry,
++            init_authenticator,
++            init_registry,
++            reset_authenticator,
++        )
+         from .api.errors import install_exception_handlers
+ 
+         @asynccontextmanager
+         async def lifespan(_: FastAPI) -> AsyncIterator[None]:
++            auth = authenticator if authenticator is not None else authenticator_from_env()
++            if isinstance(auth, HeaderAuthenticator):
++                logger.warning(
++                    "%s=%s: tenant identity is taken from the X-Tenant-Id header without "
++                    "verification; use this mode for local development only",
++                    AUTH_MODE_ENV,
++                    AUTH_MODE_DEV,
++                )
+             path = resolve_db_path(db_path)
+             registry = init_registry(path)
+             logger.info("control plane registry opened: %s", path)
++            init_authenticator(auth)
+             try:
+                 yield
+             finally:
+                 await registry.close()
++                reset_authenticator()
+ 
+         application = FastAPI(
+             title="ForgeMesh Control Plane API",
+@@ -153,7 +189,9 @@ if _FASTAPI_AVAILABLE:
+ 
+ else:  # pragma: no cover - 兜底路径：无 FastAPI 时使用标准库实现
+ 
+-    def create_app(db_path: str | None = None) -> FastAPI:  # type: ignore[valid-type]
++    def create_app(  # type: ignore[valid-type]
++        db_path: str | None = None, authenticator: Authenticator | None = None
++    ) -> FastAPI:
+         """无 FastAPI 环境时的占位工厂（抛出明确错误）。"""
+         raise RuntimeError(
+             "未检测到 FastAPI。请安装可选依赖：pip install 'forgemesh-control-plane[api]'，"
+@@ -198,10 +236,31 @@ else:  # pragma: no cover - 兜底路径：无 FastAPI 时使用标准库实现
+         server.serve_forever()
+ 
+ 
++def _is_loopback(host: str) -> bool:
++    if host == "localhost":
++        return True
++    try:
++        return ipaddress.ip_address(host).is_loopback
++    except ValueError:
++        return False
++
++
+ def main() -> None:
+-    """命令行入口：监听地址取自 ``FORGEMESH_HOST`` / ``FORGEMESH_PORT``。"""
++    """命令行入口：监听地址取自 ``FORGEMESH_HOST`` / ``FORGEMESH_PORT``。
++
++    ``FORGEMESH_AUTH_MODE=dev`` 时只允许监听回环地址，否则拒绝启动。
++    """
+     host = os.environ.get(HOST_ENV, DEFAULT_HOST)
+     port = int(os.environ.get(PORT_ENV, str(DEFAULT_PORT)))
++    try:
++        mode = auth_mode_from_env()
++    except AuthConfigError as exc:
++        raise SystemExit(str(exc)) from exc
++    if mode == AUTH_MODE_DEV and not _is_loopback(host):
++        raise SystemExit(
++            f"{AUTH_MODE_ENV}={AUTH_MODE_DEV} trusts the X-Tenant-Id header and may only listen "
++            f"on a loopback address, but {HOST_ENV}={host}"
++        )
+     if _FASTAPI_AVAILABLE:  # pragma: no cover - 依赖运行时环境
+         import uvicorn
+ 
+diff --git a/packages/control-plane/src/forgemesh/controlplane/auth.py b/packages/control-plane/src/forgemesh/controlplane/auth.py
+new file mode 100644
+index 0000000..9d2562c
+--- /dev/null
++++ b/packages/control-plane/src/forgemesh/controlplane/auth.py
+@@ -0,0 +1,311 @@
++"""控制平面认证：把请求凭证解析为已验证的调用主体（:class:`Principal`）。
++
++租户身份必须来自经过验证的凭证，而不是客户端可以随意填写的请求头；控制平面
++自己完成校验，不依赖“请求一定经过网关”这一假设（见 ADR-014）。
++
++认证模式由环境变量 ``FORGEMESH_AUTH_MODE`` 选择：
++
++* ``apikey``（默认）：``Authorization: Bearer <key>``。key 与租户、主体、scope 的
++  绑定关系来自 ``FORGEMESH_API_KEYS_FILE`` 指向的 JSON 文件，文件中只保存 key 的
++  SHA-256 摘要。``X-Tenant-Id`` 请求头可以省略；如果携带，必须与凭证绑定的租户
++  一致，否则拒绝（403），避免请求被静默地写进另一个租户。
++* ``dev``：直接信任 ``X-Tenant-Id`` 请求头，仅供本地开发；
++  :func:`forgemesh.controlplane.app.main` 只允许在回环地址上以该模式启动。
++
++key 文件格式（与网关的 ``GATEWAY_API_KEYS_FILE`` 共用）::
++
++    {"keys": [{"id": "acme-ci", "sha256": "<64 位十六进制>", "tenantId": "acme",
++               "subject": "ci-bot", "scopes": ["read", "write"]}]}
++
++生成新 key：``python -m forgemesh.controlplane.auth keygen --tenant acme --subject ci-bot``。
++"""
++
++from __future__ import annotations
++
++import argparse
++import hashlib
++import hmac
++import json
++import os
++import secrets
++import sys
++from collections.abc import Iterable, Mapping
++from pathlib import Path
++from typing import Protocol
++
++from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
++
++AUTH_MODE_ENV = "FORGEMESH_AUTH_MODE"
++API_KEYS_FILE_ENV = "FORGEMESH_API_KEYS_FILE"
++AUTH_MODE_APIKEY = "apikey"
++AUTH_MODE_DEV = "dev"
++DEFAULT_AUTH_MODE = AUTH_MODE_APIKEY
++
++#: 承载租户声明的请求头。
++TENANT_HEADER = "X-Tenant-Id"
++
++SCOPE_READ = "read"
++SCOPE_WRITE = "write"
++#: 通配 scope，持有者视为拥有全部 scope。
++SCOPE_ALL = "*"
++KNOWN_SCOPES = frozenset({SCOPE_READ, SCOPE_WRITE, SCOPE_ALL})
++
++#: 生成的 key 的前缀，便于在日志和密钥扫描中识别。
++API_KEY_PREFIX = "fmk_"
++
++
++class AuthenticationError(Exception):
++    """凭证缺失或无效（HTTP 401）。"""
++
++
++class PermissionDeniedError(Exception):
++    """凭证有效，但无权执行该请求（HTTP 403）。"""
++
++
++class AuthConfigError(ValueError):
++    """认证配置缺失或非法；服务应拒绝启动。"""
++
++
++class Principal(BaseModel):
++    """已验证的调用主体。
++
++    Attributes:
++        subject: 主体标识（服务账号、用户等）。
++        tenant_id: 凭证绑定的租户，多租户隔离的权威来源。
++        scopes: 授予的 scope；``*`` 表示全部。
++    """
++
++    model_config = ConfigDict(frozen=True)
++
++    subject: str
++    tenant_id: str
++    scopes: frozenset[str] = frozenset()
++
++    def has_scope(self, scope: str) -> bool:
++        """是否持有 ``scope``（持有 ``*`` 视为持有全部 scope）。"""
++        return SCOPE_ALL in self.scopes or scope in self.scopes
++
++
++class Authenticator(Protocol):
++    """认证器协议：校验请求头中的凭证，返回 :class:`Principal`。"""
++
++    def authenticate(self, headers: Mapping[str, str]) -> Principal:
++        """校验凭证。
++
++        Raises:
++            AuthenticationError: 凭证缺失或无效。
++            PermissionDeniedError: 凭证有效但请求越权（例如租户头与凭证不符）。
++        """
++        ...
++
++
++class ApiKeyEntry(BaseModel):
++    """key 文件中的一条记录：只保存 key 的 SHA-256 摘要，不保存明文。"""
++
++    model_config = ConfigDict(extra="forbid", frozen=True, populate_by_name=True)
++
++    id: str = Field(min_length=1)
++    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
++    tenant_id: str = Field(alias="tenantId", min_length=1)
++    subject: str = Field(min_length=1)
++    scopes: tuple[str, ...] = (SCOPE_READ, SCOPE_WRITE)
++
++    @field_validator("sha256", mode="before")
++    @classmethod
++    def _normalize_digest(cls, value: object) -> object:
++        return value.strip().lower() if isinstance(value, str) else value
++
++    @field_validator("scopes")
++    @classmethod
++    def _known_scopes(cls, value: tuple[str, ...]) -> tuple[str, ...]:
++        unknown = sorted(set(value) - KNOWN_SCOPES)
++        if unknown:
++            raise ValueError(
++                f"unknown scopes {unknown}; expected a subset of {sorted(KNOWN_SCOPES)}"
++            )
++        return value
++
++
++class ApiKeyFile(BaseModel):
++    """key 文件的顶层结构。"""
++
++    model_config = ConfigDict(extra="forbid")
++
++    keys: list[ApiKeyEntry]
++
++
++def hash_api_key(key: str) -> str:
++    """返回 key 的 SHA-256 十六进制摘要（key 文件中保存的值）。"""
++    return hashlib.sha256(key.encode("utf-8")).hexdigest()
++
++
++def generate_api_key() -> str:
++    """生成一个新的随机 key（256 bit 熵）。"""
++    return API_KEY_PREFIX + secrets.token_urlsafe(32)
++
++
++def load_api_keys(path: str | os.PathLike[str]) -> list[ApiKeyEntry]:
++    """读取并校验 key 文件。
++
++    Raises:
++        AuthConfigError: 文件不可读，或内容不符合 key 文件格式。
++    """
++    try:
++        raw = Path(path).read_text(encoding="utf-8")
++    except OSError as exc:
++        raise AuthConfigError(f"cannot read API key file {path}: {exc}") from exc
++    try:
++        return ApiKeyFile.model_validate_json(raw).keys
++    except ValidationError as exc:
++        raise AuthConfigError(f"invalid API key file {path}: {exc}") from exc
++
++
++def _header(headers: Mapping[str, str], name: str) -> str | None:
++    value = headers.get(name)
++    if value is None:
++        lowered = name.lower()
++        value = next((v for k, v in headers.items() if k.lower() == lowered), None)
++    return value
++
++
++def _bearer_token(value: str | None) -> str | None:
++    if not value:
++        return None
++    scheme, _, token = value.strip().partition(" ")
++    if scheme.lower() != "bearer":
++        return None
++    return token.strip() or None
++
++
++class HeaderAuthenticator:
++    """``dev`` 模式：信任租户请求头，不校验任何凭证，只能用于本地开发。"""
++
++    def __init__(self, tenant_header: str = TENANT_HEADER) -> None:
++        self._tenant_header = tenant_header
++
++    def authenticate(self, headers: Mapping[str, str]) -> Principal:
++        tenant = (_header(headers, self._tenant_header) or "").strip()
++        if not tenant:
++            raise AuthenticationError(f"{self._tenant_header} header is required")
++        return Principal(subject=f"dev:{tenant}", tenant_id=tenant, scopes=frozenset({SCOPE_ALL}))
++
++
++class ApiKeyAuthenticator:
++    """``apikey`` 模式：``Authorization: Bearer <key>``，key 绑定租户、主体与 scope。
++
++    Raises:
++        AuthConfigError: 构造时发现重复的 key 摘要或 id。
++    """
++
++    def __init__(self, entries: Iterable[ApiKeyEntry], tenant_header: str = TENANT_HEADER) -> None:
++        by_digest: dict[str, ApiKeyEntry] = {}
++        ids: set[str] = set()
++        for entry in entries:
++            if entry.sha256 in by_digest:
++                raise AuthConfigError(f"duplicate API key digest (id={entry.id!r})")
++            if entry.id in ids:
++                raise AuthConfigError(f"duplicate API key id {entry.id!r}")
++            by_digest[entry.sha256] = entry
++            ids.add(entry.id)
++        self._by_digest = by_digest
++        self._tenant_header = tenant_header
++
++    @classmethod
++    def from_file(
++        cls, path: str | os.PathLike[str], tenant_header: str = TENANT_HEADER
++    ) -> ApiKeyAuthenticator:
++        """从 key 文件构造认证器（见 :func:`load_api_keys`）。"""
++        return cls(load_api_keys(path), tenant_header)
++
++    def authenticate(self, headers: Mapping[str, str]) -> Principal:
++        key = _bearer_token(_header(headers, "Authorization"))
++        if key is None:
++            raise AuthenticationError("missing bearer credentials")
++        digest = hash_api_key(key)
++        entry = self._by_digest.get(digest)
++        if entry is None or not hmac.compare_digest(entry.sha256, digest):
++            raise AuthenticationError("invalid credentials")
++        claimed = (_header(headers, self._tenant_header) or "").strip()
++        if claimed and claimed != entry.tenant_id:
++            raise PermissionDeniedError(
++                f"{self._tenant_header} does not match the tenant bound to the credentials"
++            )
++        return Principal(
++            subject=entry.subject, tenant_id=entry.tenant_id, scopes=frozenset(entry.scopes)
++        )
++
++
++def auth_mode_from_env(environ: Mapping[str, str] | None = None) -> str:
++    """读取 ``FORGEMESH_AUTH_MODE``（缺省为 ``apikey``）。
++
++    Raises:
++        AuthConfigError: 取值不是 ``apikey`` 或 ``dev``。
++    """
++    env = os.environ if environ is None else environ
++    mode = (env.get(AUTH_MODE_ENV) or DEFAULT_AUTH_MODE).strip().lower()
++    if mode not in (AUTH_MODE_APIKEY, AUTH_MODE_DEV):
++        raise AuthConfigError(
++            f"unsupported {AUTH_MODE_ENV}={mode!r}; expected {AUTH_MODE_APIKEY!r} or {AUTH_MODE_DEV!r}"
++        )
++    return mode
++
++
++def authenticator_from_env(environ: Mapping[str, str] | None = None) -> Authenticator:
++    """按环境变量构造认证器。
++
++    Raises:
++        AuthConfigError: 模式非法；或 ``apikey`` 模式下没有配置（或无法读取）key 文件。
++    """
++    env = os.environ if environ is None else environ
++    if auth_mode_from_env(env) == AUTH_MODE_DEV:
++        return HeaderAuthenticator()
++    path = (env.get(API_KEYS_FILE_ENV) or "").strip()
++    if not path:
++        raise AuthConfigError(
++            f"{API_KEYS_FILE_ENV} must point to an API key file when {AUTH_MODE_ENV}="
++            f"{AUTH_MODE_APIKEY} (the default); use {AUTH_MODE_ENV}={AUTH_MODE_DEV} only for "
++            "local development"
++        )
++    return ApiKeyAuthenticator.from_file(path)
++
++
++def _keygen(args: argparse.Namespace) -> int:
++    key = generate_api_key()
++    entry = ApiKeyEntry(
++        id=args.id or f"{args.tenant}-{args.subject}",
++        sha256=hash_api_key(key),
++        tenant_id=args.tenant,
++        subject=args.subject,
++        scopes=tuple(args.scope) if args.scope else (SCOPE_READ, SCOPE_WRITE),
++    )
++    print("API key (store it in a secret manager; it is not shown again):")
++    print(key)
++    print('Key file entry (append it to the "keys" array):')
++    print(json.dumps(entry.model_dump(by_alias=True, mode="json"), ensure_ascii=False))
++    return 0
++
++
++def main(argv: list[str] | None = None) -> int:
++    """命令行入口：``keygen`` 生成新 key 及对应的 key 文件条目。"""
++    parser = argparse.ArgumentParser(prog="python -m forgemesh.controlplane.auth")
++    commands = parser.add_subparsers(dest="command", required=True)
++    keygen = commands.add_parser("keygen", help="generate an API key bound to a tenant")
++    keygen.add_argument("--tenant", required=True, help="tenant bound to the key")
++    keygen.add_argument("--subject", required=True, help="subject (service account or user)")
++    keygen.add_argument("--id", help="entry id (default: <tenant>-<subject>)")
++    keygen.add_argument(
++        "--scope",
++        action="append",
++        choices=sorted(KNOWN_SCOPES),
++        help="granted scope, repeatable (default: read and write)",
++    )
++    args = parser.parse_args(argv)
++    try:
++        return _keygen(args)
++    except ValidationError as exc:
++        print(f"invalid key parameters: {exc}", file=sys.stderr)
++        return 2
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tests/unit/controlplane/conftest.py b/tests/unit/controlplane/conftest.py
+new file mode 100644
+index 0000000..d26c40c
+--- /dev/null
++++ b/tests/unit/controlplane/conftest.py
+@@ -0,0 +1,15 @@
++"""控制平面单元测试的公共夹具。"""
++
++from __future__ import annotations
++
++import pytest
++from forgemesh.controlplane.api.dependencies import init_authenticator, reset_authenticator
++from forgemesh.controlplane.auth import HeaderAuthenticator
++
++
++@pytest.fixture(autouse=True)
++def _dev_authenticator():
++    """默认注入 ``dev`` 认证器（信任 X-Tenant-Id），认证相关测试自行替换。"""
++    init_authenticator(HeaderAuthenticator())
++    yield
++    reset_authenticator()
+diff --git a/tests/unit/controlplane/test_api.py b/tests/unit/controlplane/test_api.py
+index 20dea14..ecca7b7 100644
+--- a/tests/unit/controlplane/test_api.py
++++ b/tests/unit/controlplane/test_api.py
+@@ -7,7 +7,7 @@
+ * 查询不存在返回 404；
+ * 删除：无副作用资源 204 直接物理删除；有副作用态（Ready）202 Terminating；
+ * 列表返回多个资源；
+-* 缺失 ``X-Tenant-Id`` 头返回 400。
++* 缺失 ``X-Tenant-Id`` 头返回 401（dev 认证模式）。
+ 
+ 使用 FastAPI ``TestClient``（同步驱动），不依赖 pytest-asyncio。
+ """
+@@ -165,9 +165,11 @@ def test_list_inference_services(client: TestClient) -> None:
+ 
+ 
+ def test_missing_tenant_header(client: TestClient) -> None:
+-    """无 X-Tenant-Id 头返回 400。"""
++    """dev 认证模式下无 X-Tenant-Id 头返回 401，且不落库。"""
+     resp = client.post("/api/v1/inference-services", json=_payload())
+-    assert resp.status_code == 400, resp.text
++    assert resp.status_code == 401, resp.text
++    assert resp.headers["WWW-Authenticate"].startswith("Bearer")
++    assert asyncio.run(get_registry().list("InferenceService", "tenant-a")) == []
+ 
+ 
+ def test_create_preserves_spec_and_assigns_server_fields(client: TestClient) -> None:
+diff --git a/tests/unit/controlplane/test_app.py b/tests/unit/controlplane/test_app.py
+index 9636317..aa0d233 100644
+--- a/tests/unit/controlplane/test_app.py
++++ b/tests/unit/controlplane/test_app.py
+@@ -6,6 +6,7 @@ import pytest
+ from fastapi.testclient import TestClient
+ from forgemesh.controlplane.api.dependencies import get_registry, reset_runtime_components
+ from forgemesh.controlplane.app import DB_PATH_ENV, create_app
++from forgemesh.controlplane.auth import AUTH_MODE_DEV, AUTH_MODE_ENV
+ 
+ HEADERS = {"X-Tenant-Id": "acme"}
+ BODY = {
+@@ -20,7 +21,8 @@ BODY = {
+ 
+ 
+ @pytest.fixture(autouse=True)
+-def _reset_components():
++def _reset_components(monkeypatch):
++    monkeypatch.setenv(AUTH_MODE_ENV, AUTH_MODE_DEV)
+     reset_runtime_components()
+     yield
+     reset_runtime_components()
+diff --git a/tests/unit/controlplane/test_auth.py b/tests/unit/controlplane/test_auth.py
+new file mode 100644
+index 0000000..8f89d1b
+--- /dev/null
++++ b/tests/unit/controlplane/test_auth.py
+@@ -0,0 +1,320 @@
++"""控制平面认证测试：凭证校验、租户绑定、scope、配置与启动约束。"""
++
++from __future__ import annotations
++
++import json
++
++import pytest
++from fastapi import FastAPI
++from fastapi.testclient import TestClient
++from forgemesh.controlplane import app as app_module
++from forgemesh.controlplane.api import create_api_router
++from forgemesh.controlplane.api.dependencies import init_registry, reset_authenticator
++from forgemesh.controlplane.api.errors import install_exception_handlers
++from forgemesh.controlplane.app import create_app
++from forgemesh.controlplane.auth import (
++    API_KEYS_FILE_ENV,
++    AUTH_MODE_ENV,
++    ApiKeyAuthenticator,
++    ApiKeyEntry,
++    AuthConfigError,
++    AuthenticationError,
++    HeaderAuthenticator,
++    PermissionDeniedError,
++    authenticator_from_env,
++    hash_api_key,
++    load_api_keys,
++)
++from forgemesh.controlplane.auth import main as auth_main
++
++KEY_A = "fmk_key-for-tenant-a"
++KEY_B = "fmk_key-for-tenant-b"
++KEY_READ_ONLY = "fmk_read-only-key-for-tenant-a"
++
++ENTRIES = [
++    ApiKeyEntry(id="a", sha256=hash_api_key(KEY_A), tenant_id="tenant-a", subject="alice"),
++    ApiKeyEntry(id="b", sha256=hash_api_key(KEY_B), tenant_id="tenant-b", subject="bob"),
++    ApiKeyEntry(
++        id="ro",
++        sha256=hash_api_key(KEY_READ_ONLY),
++        tenant_id="tenant-a",
++        subject="viewer",
++        scopes=("read",),
++    ),
++]
++
++BODY = {
++    "kind": "InferenceService",
++    "metadata": {"name": "llama", "namespace": "default"},
++    "spec": {
++        "model": {"reference": "models/llama"},
++        "runtime": {"provider": "vllm"},
++        "resources": {"accelerator": {"type": "nvidia-gpu", "minMemoryGiB": 16}},
++    },
++}
++
++
++def _bearer(key: str, **extra: str) -> dict[str, str]:
++    return {"Authorization": f"Bearer {key}", **extra}
++
++
++@pytest.fixture()
++def api_client(tmp_path):
++    app = create_app(db_path=str(tmp_path / "cp.db"), authenticator=ApiKeyAuthenticator(ENTRIES))
++    with TestClient(app) as client:
++        yield client
++
++
++# ------------------------------------------------------------------ #
++# 认证器
++# ------------------------------------------------------------------ #
++
++
++@pytest.mark.unit
++def test_header_authenticator_requires_a_tenant() -> None:
++    with pytest.raises(AuthenticationError):
++        HeaderAuthenticator().authenticate({})
++    principal = HeaderAuthenticator().authenticate({"x-tenant-id": " acme "})
++    assert principal.tenant_id == "acme"
++    assert principal.has_scope("write")
++
++
++@pytest.mark.unit
++def test_api_key_binds_tenant_subject_and_scopes() -> None:
++    authenticator = ApiKeyAuthenticator(ENTRIES)
++
++    principal = authenticator.authenticate(_bearer(KEY_A))
++    read_only = authenticator.authenticate(_bearer(KEY_READ_ONLY))
++
++    assert (principal.tenant_id, principal.subject) == ("tenant-a", "alice")
++    assert principal.has_scope("read") and principal.has_scope("write")
++    assert read_only.has_scope("read") and not read_only.has_scope("write")
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize(
++    "headers",
++    [
++        {},
++        {"X-Tenant-Id": "tenant-a"},
++        {"Authorization": f"Basic {KEY_A}"},
++        {"Authorization": "Bearer "},
++        {"Authorization": "Bearer fmk_unknown"},
++    ],
++)
++def test_api_key_rejects_missing_malformed_and_unknown_credentials(headers) -> None:
++    with pytest.raises(AuthenticationError):
++        ApiKeyAuthenticator(ENTRIES).authenticate(headers)
++
++
++@pytest.mark.unit
++def test_bearer_scheme_is_case_insensitive() -> None:
++    principal = ApiKeyAuthenticator(ENTRIES).authenticate({"authorization": f"bearer {KEY_B}"})
++    assert principal.tenant_id == "tenant-b"
++
++
++@pytest.mark.unit
++def test_tenant_header_must_match_the_credentials() -> None:
++    authenticator = ApiKeyAuthenticator(ENTRIES)
++
++    assert authenticator.authenticate(_bearer(KEY_A, **{"X-Tenant-Id": " tenant-a "}))
++    with pytest.raises(PermissionDeniedError):
++        authenticator.authenticate(_bearer(KEY_A, **{"X-Tenant-Id": "tenant-b"}))
++
++
++@pytest.mark.unit
++def test_duplicate_digests_or_ids_are_rejected() -> None:
++    duplicate_digest = ENTRIES[0].model_copy(update={"id": "other"})
++    duplicate_id = ENTRIES[1].model_copy(update={"id": "a"})
++    with pytest.raises(AuthConfigError):
++        ApiKeyAuthenticator([ENTRIES[0], duplicate_digest])
++    with pytest.raises(AuthConfigError):
++        ApiKeyAuthenticator([ENTRIES[0], duplicate_id])
++
++
++# ------------------------------------------------------------------ #
++# key 文件与环境变量
++# ------------------------------------------------------------------ #
++
++
++def _write_keys(path, entries: list[dict]) -> str:
++    path.write_text(json.dumps({"keys": entries}), encoding="utf-8")
++    return str(path)
++
++
++@pytest.mark.unit
++def test_load_api_keys_normalizes_digests(tmp_path) -> None:
++    keys_file = _write_keys(
++        tmp_path / "keys.json",
++        [{"id": "a", "sha256": hash_api_key(KEY_A).upper(), "tenantId": "t", "subject": "s"}],
++    )
++    (entry,) = load_api_keys(keys_file)
++    assert entry.sha256 == hash_api_key(KEY_A)
++    assert entry.scopes == ("read", "write")
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize(
++    "content",
++    [
++        "not json",
++        json.dumps({"keys": [{"id": "a", "sha256": "abc", "tenantId": "t", "subject": "s"}]}),
++        json.dumps(
++            {
++                "keys": [
++                    {
++                        "id": "a",
++                        "sha256": "0" * 64,
++                        "tenantId": "t",
++                        "subject": "s",
++                        "scopes": ["admin"],
++                    }
++                ]
++            }
++        ),
++        json.dumps({"keys": [{"id": "a", "sha256": "0" * 64, "tenantId": "t"}]}),
++    ],
++)
++def test_load_api_keys_rejects_invalid_files(tmp_path, content) -> None:
++    keys_file = tmp_path / "keys.json"
++    keys_file.write_text(content, encoding="utf-8")
++    with pytest.raises(AuthConfigError):
++        load_api_keys(keys_file)
++
++
++@pytest.mark.unit
++def test_load_api_keys_reports_unreadable_files(tmp_path) -> None:
++    with pytest.raises(AuthConfigError):
++        load_api_keys(tmp_path / "missing.json")
++
++
++@pytest.mark.unit
++def test_authenticator_from_env(tmp_path) -> None:
++    keys_file = _write_keys(
++        tmp_path / "keys.json",
++        [{"id": "a", "sha256": hash_api_key(KEY_A), "tenantId": "tenant-a", "subject": "s"}],
++    )
++
++    with pytest.raises(AuthConfigError):
++        authenticator_from_env({})
++    with pytest.raises(AuthConfigError):
++        authenticator_from_env({AUTH_MODE_ENV: "header"})
++    assert isinstance(authenticator_from_env({AUTH_MODE_ENV: "dev"}), HeaderAuthenticator)
++    configured = authenticator_from_env({API_KEYS_FILE_ENV: keys_file})
++    assert configured.authenticate(_bearer(KEY_A)).tenant_id == "tenant-a"
++
++
++@pytest.mark.unit
++def test_keygen_prints_a_key_matching_its_entry(capsys) -> None:
++    assert auth_main(["keygen", "--tenant", "acme", "--subject", "ci", "--scope", "read"]) == 0
++
++    lines = capsys.readouterr().out.strip().splitlines()
++    key, entry = lines[1], ApiKeyEntry.model_validate_json(lines[-1])
++    assert key.startswith("fmk_")
++    assert entry.sha256 == hash_api_key(key)
++    assert (entry.id, entry.tenant_id, entry.subject, entry.scopes) == (
++        "acme-ci",
++        "acme",
++        "ci",
++        ("read",),
++    )
++
++
++# ------------------------------------------------------------------ #
++# API 行为
++# ------------------------------------------------------------------ #
++
++
++@pytest.mark.unit
++def test_requests_without_valid_credentials_are_rejected(api_client) -> None:
++    for headers in ({}, {"X-Tenant-Id": "tenant-a"}, _bearer("fmk_unknown")):
++        response = api_client.get("/api/v1/inference-services", headers=headers)
++        assert response.status_code == 401
++        assert response.headers["WWW-Authenticate"].startswith("Bearer")
++        assert response.json()["error"]["code"] == "UNAUTHENTICATED"
++
++
++@pytest.mark.unit
++def test_tenant_comes_from_the_credentials_not_the_header(api_client) -> None:
++    created = api_client.post("/api/v1/inference-services", json=BODY, headers=_bearer(KEY_A))
++    spoofed = api_client.post(
++        "/api/v1/inference-services",
++        json=BODY,
++        headers=_bearer(KEY_A, **{"X-Tenant-Id": "tenant-b"}),
++    )
++    path = "/api/v1/inference-services/llama"
++    params = {"namespace": "default"}
++    own = api_client.get(path, params=params, headers=_bearer(KEY_A))
++    other = api_client.get(path, params=params, headers=_bearer(KEY_B))
++    other_list = api_client.get("/api/v1/inference-services", headers=_bearer(KEY_B))
++
++    assert created.status_code == 201
++    assert created.json()["metadata"]["tenantId"] == "tenant-a"
++    assert spoofed.status_code == 403
++    assert spoofed.json()["error"]["code"] == "FORBIDDEN"
++    assert own.status_code == 200
++    assert other.status_code == 404
++    assert other_list.json()["count"] == 0
++
++
++@pytest.mark.unit
++def test_read_only_credentials_cannot_write(api_client) -> None:
++    api_client.post("/api/v1/inference-services", json=BODY, headers=_bearer(KEY_A))
++
++    listed = api_client.get("/api/v1/inference-services", headers=_bearer(KEY_READ_ONLY))
++    created = api_client.post(
++        "/api/v1/inference-services",
++        json={**BODY, "metadata": {"name": "other", "namespace": "default"}},
++        headers=_bearer(KEY_READ_ONLY),
++    )
++    deleted = api_client.delete(
++        "/api/v1/inference-services/llama",
++        params={"namespace": "default"},
++        headers=_bearer(KEY_READ_ONLY),
++    )
++
++    assert listed.status_code == 200
++    assert listed.json()["count"] == 1
++    assert created.status_code == 403
++    assert deleted.status_code == 403
++    assert api_client.get("/api/v1/inference-services", headers=_bearer(KEY_A)).json()["count"] == 1
++
++
++@pytest.mark.unit
++def test_missing_authenticator_fails_closed() -> None:
++    init_registry(":memory:")
++    reset_authenticator()
++    bare = FastAPI()
++    install_exception_handlers(bare)
++    bare.include_router(create_api_router())
++
++    response = TestClient(bare).get("/api/v1/inference-services", headers={"X-Tenant-Id": "t"})
++
++    assert response.status_code == 503
++    assert response.json()["error"]["code"] == "AUTHENTICATOR_UNAVAILABLE"
++
++
++@pytest.mark.unit
++def test_app_refuses_to_start_without_an_api_key_file(tmp_path, monkeypatch) -> None:
++    monkeypatch.delenv(AUTH_MODE_ENV, raising=False)
++    monkeypatch.delenv(API_KEYS_FILE_ENV, raising=False)
++
++    with pytest.raises(AuthConfigError), TestClient(create_app(db_path=str(tmp_path / "cp.db"))):
++        pass
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize(
++    ("mode", "host"),
++    [("dev", "0.0.0.0"), ("dev", "10.0.0.5"), ("header", "127.0.0.1")],
++)
++def test_main_refuses_unsafe_auth_configuration(monkeypatch, mode, host) -> None:
++    def fail_if_started(*args, **kwargs):
++        raise AssertionError("server must not start")
++
++    monkeypatch.setenv(AUTH_MODE_ENV, mode)
++    monkeypatch.setenv(app_module.HOST_ENV, host)
++    monkeypatch.setattr("uvicorn.run", fail_if_started)
++
++    with pytest.raises(SystemExit):
++        app_module.main()
+diff --git a/tests/unit/controlplane/test_routes.py b/tests/unit/controlplane/test_routes.py
+index 8cc5168..364dfd1 100644
+--- a/tests/unit/controlplane/test_routes.py
++++ b/tests/unit/controlplane/test_routes.py
+@@ -168,10 +168,10 @@ def test_start_workflow_validation_error(client: TestClient) -> None:
+ 
+ 
+ def test_start_workflow_missing_tenant_header(client: TestClient) -> None:
+-    """缺 X-Tenant-Id 头返回 400（对齐现有租户依赖行为）。"""
++    """缺 X-Tenant-Id 头返回 401（dev 认证模式），不触达 runtime。"""
+     init_workflow_runtime(StubWorkflowRuntime())
+     resp = client.post("/api/v1/workflows", json={"definition": "gpu-onboarding", "version": 1})
+-    assert resp.status_code == 400, resp.text
++    assert resp.status_code == 401, resp.text
+ 
+ 
+ def test_start_workflow_runtime_not_injected(client: TestClient) -> None:
+@@ -292,10 +292,10 @@ def test_decision_router_exception(client: TestClient) -> None:
+ 
+ 
+ def test_decision_missing_tenant_header(client: TestClient) -> None:
+-    """缺 X-Tenant-Id 头返回 400。"""
++    """缺 X-Tenant-Id 头返回 401（dev 认证模式）。"""
+     init_decision_router(StubDecisionRouter(result=_ok_result()))
+     resp = client.post("/api/v1/decisions", json={"question": "inference.schedule", "context": {}})
+-    assert resp.status_code == 400, resp.text
++    assert resp.status_code == 401, resp.text
+ 
+ 
+ def test_decision_validation_error(client: TestClient) -> None:
+-- 
+2.43.0
+

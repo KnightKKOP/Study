@@ -1,0 +1,115 @@
+From 2d43f3d55ab01704609a6ba75f47916c6215bb4b Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 12 Oct 2026 04:26:38 +0000
+Subject: [PATCH 9/9] docs: document the control plane entrypoint and the
+ registry/API fixes
+
+Record the fixes on this branch in the Unreleased changelog, explain how to
+start the control plane and which environment variables it reads, and bring
+the OpenAPI contract in line with the new behaviour: the list endpoint's
+limit parameter and its 400 response, and the 409 answered when a delete
+loses a race.
+---
+ CHANGELOG.md             | 14 ++++++++++++++
+ README.md                | 15 +++++++++++++++
+ api/openapi/openapi.yaml | 12 ++++++++++++
+ 3 files changed, 41 insertions(+)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 4f2bb45..2ef17a8 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -11,6 +11,8 @@
+ - 新增 [docs/architecture/v1.1-development-plan.md](docs/architecture/v1.1-development-plan.md)（阶段 A–E 可信基线计划）与 [docs/architecture/module-mapping.md](docs/architecture/module-mapping.md)（逻辑模块 ↔ 真实代码路径映射，含依赖边界 import 循证）。
+ - 新增 CI 校验脚本：`scripts/validate_manifests.py`（JSON Schema metaschema 自校验 + 10 插件 manifest 实例校验）、`scripts/openapi_semantic_check.py`（operationId 唯一 / $ref 可解析 / 响应完整性）、`scripts/check_metadata_consistency.py`（requires-python>=3.12、描述禁 skeleton/placeholder）、`scripts/plugin_entrypoint_smoke.py`（插件入口进程内冒烟）。
+ - 新增契约 / 混沌 / 兼容测试 122 项（1115 vs 993）：Registry CAS 并发 / 租户过滤 / 重启恢复（19）、Workflow 恢复版本固定 / 取消补偿 + Outbox 事务 / 幂等 / 死信（12）、10 插件发布链路 conformance——manifest/isolation 一致性 + 四类 Provider 契约 + 卸载安全（91）。
++- 控制平面可运行入口：`control-plane` 包新增控制台脚本 `forgemesh-control-plane`（`forgemesh.controlplane.app:main`）；权威存储路径取自 `FORGEMESH_DB_PATH`（默认 `forgemesh.db`），监听地址取自 `FORGEMESH_HOST` / `FORGEMESH_PORT`（默认 `127.0.0.1:8080`），启动方式见 README「运行控制平面」。
++- 新增 `tests/contract/test_registry_hardening.py`：并发创建全部持久化、空 namespace 身份唯一、删除 / 释放 CAS、标签过滤与分页等 Registry 回归测试。
+ 
+ ### Changed
+ 
+@@ -20,6 +22,18 @@
+ - [.github/workflows/ci.yml](.github/workflows/ci.yml)：ADR 检查由硬编码 001–012 改为索引驱动动态校验；architecture-docs job 新增 manifest / OpenAPI 语义 / 元数据一致 / 插件冒烟四道步骤。
+ - 修正 `plugins/runtime-tgi`（移除 schema 未定义的 spec.capabilities）与 `plugins/workflow-temporal`（category 改为 provider 并移除 capabilities）manifest 至 schema 合规。
+ 
++### Fixed
++
++- 控制平面唯一的可运行应用仍注册阶段 0 占位路由，全部业务端点返回 `501`，已实现的 API 路由只在测试中挂载：现挂载真实路由；SQLite 在应用启动（lifespan）时打开，导入模块不再产生文件副作用；`/readyz` 探测权威存储可用性。
++- `control-plane` 包补齐 `forgemesh-policy-engine` 与 `forgemesh-plugin-sdk` 依赖声明（此前独立安装后导入即失败）。
++- `POST /api/v1/inference-services` 丢弃请求体中的 `spec`、接受任意 `kind`、不分配 `uid` 且返回 `200`：现按 `InferenceService` 强类型校验（`uid`、租户与 `status` 由服务端维护），成功返回 `201`，请求体不合法返回 `400` 错误信封，同名冲突返回 `409`。
++- 列表接口的 `limit` 原样传给 SQLite，`limit=-1` 返回全部行：API 层限定为 `[1, 1000]`，越界返回 `400`；Registry 对 `limit < 1` 抛出 `ValueError`。
++- Registry 标签选择器在 `LIMIT` 之后才在 Python 中过滤，首页之外的匹配项永远不会返回，翻页会静默跳过数据：现以 `json_extract` 在 SQL 中先过滤、再排序分页。
++- Registry 全部方法在 `asyncio.to_thread` 工作线程上共用一个 sqlite3 连接且无锁，交错事务中失败写入者的回滚会丢弃其他写入者尚未提交的插入（创建报告成功但未持久化，R-1）：现以实例级 `RLock` 串行化全部数据库调用。
++- `namespace` 为空（NULL）的资源可以同名重复创建（SQLite 主键视 NULL 互不相等），一次 DELETE 会删除全部副本：新增唯一表达式索引 `(tenant_id, kind, COALESCE(namespace, ''), name)`；打开已含重复数据的旧库时抛出 `PreconditionFailedError`，不静默丢行。
++- `request_delete` 与 `release_allocation` 读后写不校验版本，期间提交的写入会丢失、期间追加的 finalizer 会被绕过：现以读取到的 `resource_version` / 状态为条件做 CAS，竞争失败抛出 `ConflictError`（DELETE 端点返回 `409`）。
++- 调和器在 deny / require_approval / 分配失败等无副作用路径上也记录去重键，重新入队后命中幂等短路，被阻塞的资源在 spec 变更或 24h 去重 TTL 过期前不会被重新评估：这些路径不再记录去重键。
++
+ ### Security
+ 
+ - Go 网关多租户安全验证：跨租户拒绝、伪造 `X-Tenant-Id` 不得提权、SSE 客户端取消 / 上游断开连接释放、中间件链序（Recovery→Correlation→Authz→RateLimit→Route）测试；网关 README 新增 header 转发 / 剥离策略表。
+diff --git a/README.md b/README.md
+index f4d5e5b..df8dedf 100644
+--- a/README.md
++++ b/README.md
+@@ -135,6 +135,21 @@ make clean           # 清理构建与缓存产物
+ 
+ > `make install` 会遍历 `packages/*/`，对含 `pyproject.toml` 的子包执行 `uv pip install -e`，因此新增子包无需修改顶层 Makefile。
+ 
++### 运行控制平面
++
++```bash
++FORGEMESH_DB_PATH=./forgemesh.db .venv/bin/forgemesh-control-plane
++curl -s http://127.0.0.1:8080/readyz   # {"status":"ok",...}
++```
++
++| 环境变量 | 默认值 | 说明 |
++| --- | --- | --- |
++| `FORGEMESH_DB_PATH` | `forgemesh.db` | SQLite 权威存储文件；同一文件只允许一个控制平面实例写入（ADR-013） |
++| `FORGEMESH_HOST` | `127.0.0.1` | 监听地址 |
++| `FORGEMESH_PORT` | `8080` | 监听端口 |
++
++> 控制平面按 `X-Tenant-Id` 请求头识别租户、不校验凭证，请保持回环监听，不要直接暴露给不可信网络。
++
+ ### Go 网关
+ 
+ ```bash
+diff --git a/api/openapi/openapi.yaml b/api/openapi/openapi.yaml
+index 812883f..96bb737 100644
+--- a/api/openapi/openapi.yaml
++++ b/api/openapi/openapi.yaml
+@@ -71,6 +71,14 @@ paths:
+           in: query
+           schema:
+             type: string
++        - name: limit
++          in: query
++          description: 单页最多返回的条数；超出 1–1000 返回 400。
++          schema:
++            type: integer
++            minimum: 1
++            maximum: 1000
++            default: 100
+       responses:
+         "200":
+           description: 列表
+@@ -78,6 +86,8 @@ paths:
+             application/json:
+               schema:
+                 $ref: "#/components/schemas/InferenceServiceList"
++        "400":
++          $ref: "#/components/responses/BadRequest"
+         "401":
+           $ref: "#/components/responses/Unauthorized"
+         "403":
+@@ -143,6 +153,8 @@ paths:
+           description: 已直接删除（无 finalizer，无外部副作用）
+         "404":
+           $ref: "#/components/responses/NotFound"
++        "409":
++          $ref: "#/components/responses/Conflict"
+ 
+ 
+   /api/v1/workflows:
+-- 
+2.43.0
+

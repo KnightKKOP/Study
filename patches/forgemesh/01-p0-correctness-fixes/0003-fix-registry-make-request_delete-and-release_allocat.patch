@@ -1,7 +1,7 @@
 From f30b5714d5297042aa63e97d38bb75b2dcaea2f3 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Mon, 12 Oct 2026 02:34:40 +0000
-Subject: [PATCH 3/8] fix(registry): make request_delete and release_allocation
+Subject: [PATCH 3/9] fix(registry): make request_delete and release_allocation
  compare-and-swap
 
 request_delete read the row and then wrote Terminating (or physically deleted)

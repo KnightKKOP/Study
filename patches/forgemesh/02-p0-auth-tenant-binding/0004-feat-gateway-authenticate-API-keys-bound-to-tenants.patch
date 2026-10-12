@@ -1,0 +1,1811 @@
+From 8cde8997813389915133ab5932c04085a9fcc7d5 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 12 Oct 2026 04:16:18 +0000
+Subject: [PATCH 4/8] feat(gateway): authenticate API keys bound to tenants
+
+The gateway "authenticated" a request when it carried any X-Tenant-ID
+value, so a caller could act as any tenant by choosing the header. The
+unused AuthzWithToken checked a static token list that was not bound to
+a tenant at all.
+
+Add an Authenticator interface with two implementations:
+
+* APIKeyAuthenticator (GATEWAY_AUTH_MODE=apikey, the default): resolves
+  "Authorization: Bearer <key>" through GATEWAY_API_KEYS_FILE, the same
+  SHA-256-only key file format the control plane reads. A tenant header
+  that disagrees with the key's tenant is rejected with 403.
+* HeaderAuthenticator (GATEWAY_AUTH_MODE=dev): the previous header trust,
+  only accepted when the gateway listens on a loopback address.
+
+The Authenticate middleware stores the principal in the request context
+and overwrites the tenant header with the verified tenant. Failures use
+the control plane's error envelope; 401s carry WWW-Authenticate. The
+bearer scheme is matched case-insensitively (RFC 7235).
+
+Inference calls require the read scope. The resolver forwards the
+caller's Authorization header so the control plane can verify the caller
+itself, and a 403 from the control plane surfaces as 403 instead of 502.
+Startup fails when the mode is unknown or the key file is missing or
+invalid. "make run-dev" starts a local dev-mode gateway.
+---
+ gateway/Makefile                              |   9 +-
+ gateway/cmd/gateway/main.go                   |   6 +-
+ gateway/internal/config/config.go             |  47 +++
+ gateway/internal/config/config_test.go        |  56 ++++
+ gateway/internal/middleware/apikey.go         | 163 +++++++++++
+ gateway/internal/middleware/apikey_test.go    |  88 ++++++
+ gateway/internal/middleware/authz.go          | 206 ++++++++-----
+ gateway/internal/middleware/authz_test.go     | 236 ++++++++++-----
+ gateway/internal/middleware/chain_test.go     |  10 +-
+ gateway/internal/middleware/correlation.go    |   3 +-
+ gateway/internal/middleware/errors.go         |  27 ++
+ gateway/internal/middleware/middleware.go     |   5 +-
+ gateway/internal/router/auth_test.go          | 277 ++++++++++++++++++
+ gateway/internal/router/resolver_test.go      |   2 +
+ gateway/internal/router/router.go             |  41 ++-
+ gateway/internal/router/router_test.go        |   3 +-
+ .../internal/router/tenant_security_test.go   |  10 +-
+ gateway/internal/stream/proxy.go              |   9 +-
+ gateway/internal/upstream/resolver.go         |  26 +-
+ gateway/internal/upstream/resolver_test.go    |  40 +++
+ 20 files changed, 1086 insertions(+), 178 deletions(-)
+ create mode 100644 gateway/internal/middleware/apikey.go
+ create mode 100644 gateway/internal/middleware/apikey_test.go
+ create mode 100644 gateway/internal/middleware/errors.go
+ create mode 100644 gateway/internal/router/auth_test.go
+
+diff --git a/gateway/Makefile b/gateway/Makefile
+index 0a5f301..3377311 100644
+--- a/gateway/Makefile
++++ b/gateway/Makefile
+@@ -3,7 +3,8 @@
+ # 用法：
+ #   make build   编译网关二进制到 bin/gateway
+ #   make test    运行全部 Go 单元测试（含 -race）
+-#   make run     本地启动网关
++#   make run     本地启动网关（默认 apikey 认证，需要 GATEWAY_API_KEYS_FILE）
++#   make run-dev 以 dev 认证模式在 127.0.0.1:8081 启动网关（信任租户头，仅限本地开发）
+ #   make fmt     格式化代码
+ #   make vet     静态检查
+ #   make clean   清理构建产物
+@@ -13,7 +14,7 @@ BINARY  := bin/gateway
+ PKGS    := ./...
+ RACE_FLAGS := -race -count=1
+ 
+-.PHONY: all build test run fmt vet tidy clean
++.PHONY: all build test run run-dev fmt vet tidy clean
+ 
+ all: fmt vet build test
+ 
+@@ -29,6 +30,10 @@ test:
+ run:
+ 	$(GO) run ./cmd/gateway
+ 
++## run-dev: 以 dev 认证模式在回环地址运行网关（信任租户头，仅限本地开发）
++run-dev:
++	GATEWAY_AUTH_MODE=dev GATEWAY_LISTEN_ADDR=127.0.0.1:8081 $(GO) run ./cmd/gateway
++
+ ## fmt: 格式化所有 Go 源文件
+ fmt:
+ 	$(GO) fmt $(PKGS)
+diff --git a/gateway/cmd/gateway/main.go b/gateway/cmd/gateway/main.go
+index 22de100..fd13e07 100644
+--- a/gateway/cmd/gateway/main.go
++++ b/gateway/cmd/gateway/main.go
+@@ -37,6 +37,10 @@ func main() {
+ 	if err != nil {
+ 		logger.Fatalf("init router: %v", err)
+ 	}
++	if cfg.AuthMode == config.AuthModeDev {
++		logger.Printf("WARNING: GATEWAY_AUTH_MODE=dev trusts the %s header without verifying credentials; "+
++			"use it for local development only", cfg.TenantHeader)
++	}
+ 
+ 	srv := &http.Server{
+ 		Addr:              cfg.ListenAddr,
+@@ -52,7 +56,7 @@ func main() {
+ 
+ 	errCh := make(chan error, 1)
+ 	go func() {
+-		logger.Printf("listening on %s upstream=%s", cfg.ListenAddr, cfg.UpstreamURL)
++		logger.Printf("listening on %s upstream=%s auth=%s", cfg.ListenAddr, cfg.UpstreamURL, cfg.AuthMode)
+ 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+ 			errCh <- err
+ 		}
+diff --git a/gateway/internal/config/config.go b/gateway/internal/config/config.go
+index 4afee38..30583b6 100644
+--- a/gateway/internal/config/config.go
++++ b/gateway/internal/config/config.go
+@@ -8,6 +8,7 @@ package config
+ 
+ import (
+ 	"fmt"
++	"net"
+ 	"os"
+ 	"strconv"
+ 	"strings"
+@@ -23,6 +24,16 @@ const (
+ 	envCorrelationHeader        = "GATEWAY_CORRELATION_HEADER"
+ 	envResolverTTLSeconds       = "GATEWAY_RESOLVER_TTL_SECONDS"
+ 	envUnhealthyCooldownSeconds = "GATEWAY_UNHEALTHY_COOLDOWN_SECONDS"
++	envAuthMode                 = "GATEWAY_AUTH_MODE"
++	envAPIKeysFile              = "GATEWAY_API_KEYS_FILE"
++)
++
++// 认证模式（GATEWAY_AUTH_MODE）。
++const (
++	// AuthModeAPIKey 校验 `Authorization: Bearer <key>`，key 绑定租户（默认）。
++	AuthModeAPIKey = "apikey"
++	// AuthModeDev 直接信任租户请求头，只允许监听回环地址，仅供本地开发。
++	AuthModeDev = "dev"
+ )
+ 
+ // 默认值。
+@@ -35,6 +46,7 @@ const (
+ 	defaultCorrelationHeader        = "X-Correlation-ID"
+ 	defaultResolverTTLSeconds       = 5
+ 	defaultUnhealthyCooldownSeconds = 10
++	defaultAuthMode                 = AuthModeAPIKey
+ )
+ 
+ // Config 描述网关运行所需的全部配置项。
+@@ -55,6 +67,10 @@ type Config struct {
+ 	ResolverTTLSeconds int
+ 	// UnhealthyCooldownSeconds 实例被摘流后的冷却时长（秒），正整数。
+ 	UnhealthyCooldownSeconds int
++	// AuthMode 入口认证模式：AuthModeAPIKey 或 AuthModeDev。
++	AuthMode string
++	// APIKeysFile AuthModeAPIKey 下的 key 文件路径（与控制平面 FORGEMESH_API_KEYS_FILE 格式相同）。
++	APIKeysFile string
+ }
+ 
+ // Load 从环境变量读取配置；未设置项使用默认值。
+@@ -112,9 +128,40 @@ func Load() (Config, error) {
+ 		return Config{}, fmt.Errorf("config: %s 不能为空", envListenAddr)
+ 	}
+ 
++	cfg.AuthMode = strings.ToLower(strings.TrimSpace(getEnv(envAuthMode, defaultAuthMode)))
++	cfg.APIKeysFile = strings.TrimSpace(os.Getenv(envAPIKeysFile))
++	switch cfg.AuthMode {
++	case AuthModeAPIKey:
++		if cfg.APIKeysFile == "" {
++			return Config{}, fmt.Errorf("config: %s=%s（默认）时必须通过 %s 指定 API key 文件；"+
++				"%s=%s 仅供本地开发", envAuthMode, AuthModeAPIKey, envAPIKeysFile, envAuthMode, AuthModeDev)
++		}
++	case AuthModeDev:
++		if !isLoopbackAddr(cfg.ListenAddr) {
++			return Config{}, fmt.Errorf("config: %s=%s 信任租户请求头，只允许监听回环地址（如 127.0.0.1:8081），"+
++				"当前 %s=%q", envAuthMode, AuthModeDev, envListenAddr, cfg.ListenAddr)
++		}
++	default:
++		return Config{}, fmt.Errorf("config: %s 取值非法 %q（可选 %s、%s）",
++			envAuthMode, cfg.AuthMode, AuthModeAPIKey, AuthModeDev)
++	}
++
+ 	return cfg, nil
+ }
+ 
++// isLoopbackAddr 报告监听地址是否只绑定回环接口；未指定主机（如 ":8081"）表示绑定全部接口。
++func isLoopbackAddr(addr string) bool {
++	host, _, err := net.SplitHostPort(addr)
++	if err != nil {
++		return false
++	}
++	if host == "localhost" {
++		return true
++	}
++	ip := net.ParseIP(host)
++	return ip != nil && ip.IsLoopback()
++}
++
+ func getEnv(key, fallback string) string {
+ 	if v, ok := os.LookupEnv(key); ok && strings.TrimSpace(v) != "" {
+ 		return v
+diff --git a/gateway/internal/config/config_test.go b/gateway/internal/config/config_test.go
+index eb87589..c55898a 100644
+--- a/gateway/internal/config/config_test.go
++++ b/gateway/internal/config/config_test.go
+@@ -5,6 +5,15 @@ import (
+ 	"testing"
+ )
+ 
++const testKeysFile = "/etc/forgemesh/api-keys.json"
++
++// setAPIKeyAuthEnv 设置默认（apikey）认证模式所需的环境变量。
++func setAPIKeyAuthEnv(t *testing.T) {
++	t.Helper()
++	t.Setenv(envAuthMode, "")
++	t.Setenv(envAPIKeysFile, testKeysFile)
++}
++
+ // TestLoad_Defaults 验证未设置环境变量时使用安全默认值。
+ func TestLoad_Defaults(t *testing.T) {
+ 	t.Setenv(envListenAddr, "")
+@@ -13,6 +22,7 @@ func TestLoad_Defaults(t *testing.T) {
+ 	t.Setenv(envRateLimitBurst, "")
+ 	t.Setenv(envResolverTTLSeconds, "")
+ 	t.Setenv(envUnhealthyCooldownSeconds, "")
++	setAPIKeyAuthEnv(t)
+ 
+ 	cfg, err := Load()
+ 	if err != nil {
+@@ -25,10 +35,55 @@ func TestLoad_Defaults(t *testing.T) {
+ 		t.Fatalf("UnhealthyCooldownSeconds 默认应为 %d，实际 %d",
+ 			defaultUnhealthyCooldownSeconds, cfg.UnhealthyCooldownSeconds)
+ 	}
++	if cfg.AuthMode != AuthModeAPIKey || cfg.APIKeysFile != testKeysFile {
++		t.Fatalf("认证默认应为 apikey 且使用配置的 key 文件，实际 mode=%q file=%q", cfg.AuthMode, cfg.APIKeysFile)
++	}
++}
++
++// TestLoad_AuthModes 验证认证配置：apikey 必须提供 key 文件；dev 只允许回环监听地址；
++// 未知模式被拒绝。
++func TestLoad_AuthModes(t *testing.T) {
++	cases := []struct {
++		name, mode, keysFile, listen string
++		wantErr                      string
++	}{
++		{name: "apikey 缺少 key 文件", mode: "apikey", listen: ":8081", wantErr: envAPIKeysFile},
++		{name: "默认模式缺少 key 文件", listen: ":8081", wantErr: envAPIKeysFile},
++		{name: "未知模式", mode: "header", listen: "127.0.0.1:8081", wantErr: envAuthMode},
++		{name: "dev 监听全部接口", mode: "dev", listen: ":8081", wantErr: envListenAddr},
++		{name: "dev 监听 0.0.0.0", mode: "dev", listen: "0.0.0.0:8081", wantErr: envListenAddr},
++		{name: "dev 监听内网地址", mode: "dev", listen: "10.0.0.5:8081", wantErr: envListenAddr},
++		{name: "dev 监听 127.0.0.1", mode: "dev", listen: "127.0.0.1:8081"},
++		{name: "dev 监听 localhost", mode: "DEV", listen: "localhost:8081"},
++		{name: "dev 监听 ::1", mode: "dev", listen: "[::1]:8081"},
++		{name: "apikey 监听全部接口", mode: "apikey", keysFile: testKeysFile, listen: ":8081"},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			t.Setenv(envAuthMode, tc.mode)
++			t.Setenv(envAPIKeysFile, tc.keysFile)
++			t.Setenv(envListenAddr, tc.listen)
++
++			cfg, err := Load()
++			if tc.wantErr != "" {
++				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
++					t.Fatalf("应返回提及 %s 的错误，实际 %v", tc.wantErr, err)
++				}
++				return
++			}
++			if err != nil {
++				t.Fatalf("Load 应成功: %v", err)
++			}
++			if cfg.AuthMode != strings.ToLower(tc.mode) {
++				t.Fatalf("AuthMode 应为 %q，实际 %q", strings.ToLower(tc.mode), cfg.AuthMode)
++			}
++		})
++	}
+ }
+ 
+ // TestLoad_ResolverOverrides 验证环境变量可覆盖解析器参数。
+ func TestLoad_ResolverOverrides(t *testing.T) {
++	setAPIKeyAuthEnv(t)
+ 	t.Setenv(envResolverTTLSeconds, "30")
+ 	t.Setenv(envUnhealthyCooldownSeconds, "60")
+ 
+@@ -61,6 +116,7 @@ func TestLoad_InvalidResolverValues(t *testing.T) {
+ 	}
+ 	for _, tc := range cases {
+ 		t.Run(tc.name, func(t *testing.T) {
++			setAPIKeyAuthEnv(t)
+ 			t.Setenv(tc.env, tc.val)
+ 			_, err := Load()
+ 			if err == nil {
+diff --git a/gateway/internal/middleware/apikey.go b/gateway/internal/middleware/apikey.go
+new file mode 100644
+index 0000000..0353cbd
+--- /dev/null
++++ b/gateway/internal/middleware/apikey.go
+@@ -0,0 +1,163 @@
++package middleware
++
++import (
++	"bytes"
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"net/http"
++	"os"
++	"regexp"
++	"strings"
++)
++
++// APIKey 是 key 文件中的一条记录，只保存 key 的 SHA-256 摘要，不保存明文。
++//
++// key 文件与控制平面（FORGEMESH_API_KEYS_FILE）共用同一格式与校验规则：
++//
++//	{"keys": [{"id": "acme-ci", "sha256": "<64 位十六进制>", "tenantId": "acme",
++//	           "subject": "ci-bot", "scopes": ["read", "write"]}]}
++//
++// 新 key 由 `python -m forgemesh.controlplane.auth keygen` 生成。
++type APIKey struct {
++	ID       string
++	SHA256   string
++	TenantID string
++	Subject  string
++	Scopes   []string
++}
++
++// apiKeyRecord 是 APIKey 的 JSON 形态；scopes 保留原文，以区分缺省（取默认值）与 null（非法）。
++type apiKeyRecord struct {
++	ID       string          `json:"id"`
++	SHA256   string          `json:"sha256"`
++	TenantID string          `json:"tenantId"`
++	Subject  string          `json:"subject"`
++	Scopes   json.RawMessage `json:"scopes"`
++}
++
++var digestPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
++
++// LoadAPIKeys 读取并校验 key 文件：未知字段、非法摘要、未知作用域与多余内容均视为错误。
++func LoadAPIKeys(path string) ([]APIKey, error) {
++	raw, err := os.ReadFile(path)
++	if err != nil {
++		return nil, fmt.Errorf("auth: 无法读取 API key 文件: %w", err)
++	}
++	keys, err := parseAPIKeys(raw)
++	if err != nil {
++		return nil, fmt.Errorf("auth: API key 文件 %s 非法: %w", path, err)
++	}
++	return keys, nil
++}
++
++func parseAPIKeys(raw []byte) ([]APIKey, error) {
++	dec := json.NewDecoder(bytes.NewReader(raw))
++	dec.DisallowUnknownFields()
++	var file struct {
++		Keys []apiKeyRecord `json:"keys"`
++	}
++	if err := dec.Decode(&file); err != nil {
++		return nil, err
++	}
++	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
++		return nil, errors.New("JSON 文档之后存在多余内容")
++	}
++	if file.Keys == nil {
++		return nil, errors.New(`缺少 "keys" 数组`)
++	}
++	keys := make([]APIKey, 0, len(file.Keys))
++	for i, rec := range file.Keys {
++		key, err := rec.toAPIKey()
++		if err != nil {
++			return nil, fmt.Errorf("keys[%d]: %w", i, err)
++		}
++		keys = append(keys, key)
++	}
++	return keys, nil
++}
++
++func (rec apiKeyRecord) toAPIKey() (APIKey, error) {
++	digest := strings.ToLower(strings.TrimSpace(rec.SHA256))
++	switch {
++	case rec.ID == "":
++		return APIKey{}, errors.New(`"id" 不能为空`)
++	case !digestPattern.MatchString(digest):
++		return APIKey{}, errors.New(`"sha256" 必须是 64 位十六进制摘要`)
++	case rec.TenantID == "":
++		return APIKey{}, errors.New(`"tenantId" 不能为空`)
++	case rec.Subject == "":
++		return APIKey{}, errors.New(`"subject" 不能为空`)
++	}
++
++	scopes := []string{ScopeRead, ScopeWrite}
++	if rec.Scopes != nil {
++		var declared []string
++		if err := json.Unmarshal(rec.Scopes, &declared); err != nil || declared == nil {
++			return APIKey{}, errors.New(`"scopes" 必须是字符串数组`)
++		}
++		scopes = declared
++	}
++	for _, s := range scopes {
++		if s != ScopeRead && s != ScopeWrite && s != ScopeAll {
++			return APIKey{}, fmt.Errorf("未知作用域 %q（可选 %s、%s、%s）", s, ScopeRead, ScopeWrite, ScopeAll)
++		}
++	}
++	return APIKey{ID: rec.ID, SHA256: digest, TenantID: rec.TenantID, Subject: rec.Subject, Scopes: scopes}, nil
++}
++
++// APIKeyAuthenticator 校验 `Authorization: Bearer <key>`：key 绑定租户、主体与作用域。
++//
++// 租户请求头可以省略；若携带，每个值都必须与 key 绑定的租户一致，否则返回 403，
++// 请求不会被静默改写到另一个租户。
++type APIKeyAuthenticator struct {
++	byDigest     map[string]APIKey
++	tenantHeader string
++}
++
++// NewAPIKeyAuthenticator 构造认证器；重复的 id 或摘要视为配置错误。
++func NewAPIKeyAuthenticator(keys []APIKey, tenantHeader string) (*APIKeyAuthenticator, error) {
++	if tenantHeader == "" {
++		tenantHeader = DefaultTenantHeader
++	}
++	byDigest := make(map[string]APIKey, len(keys))
++	ids := make(map[string]struct{}, len(keys))
++	for _, k := range keys {
++		if _, dup := byDigest[k.SHA256]; dup {
++			return nil, fmt.Errorf("auth: API key 摘要重复（id=%q）", k.ID)
++		}
++		if _, dup := ids[k.ID]; dup {
++			return nil, fmt.Errorf("auth: API key id 重复: %q", k.ID)
++		}
++		byDigest[k.SHA256] = k
++		ids[k.ID] = struct{}{}
++	}
++	return &APIKeyAuthenticator{byDigest: byDigest, tenantHeader: tenantHeader}, nil
++}
++
++// Authenticate 实现 Authenticator。
++func (a *APIKeyAuthenticator) Authenticate(r *http.Request) (Principal, error) {
++	token := extractBearerToken(r)
++	if token == "" {
++		return Principal{}, unauthenticated("missing bearer credentials")
++	}
++	// 查表的键是 key 的 SHA-256 摘要而非 key 本身，查表耗时不会泄露 key 的内容。
++	sum := sha256.Sum256([]byte(token))
++	key, ok := a.byDigest[hex.EncodeToString(sum[:])]
++	if !ok {
++		return Principal{}, unauthenticated("invalid credentials")
++	}
++	for _, claimed := range r.Header.Values(a.tenantHeader) {
++		if c := strings.TrimSpace(claimed); c != "" && c != key.TenantID {
++			return Principal{}, forbidden(a.tenantHeader + " does not match the tenant bound to the credentials")
++		}
++	}
++	return Principal{
++		Subject:  key.Subject,
++		TenantID: key.TenantID,
++		Scopes:   append([]string(nil), key.Scopes...),
++	}, nil
++}
+diff --git a/gateway/internal/middleware/apikey_test.go b/gateway/internal/middleware/apikey_test.go
+new file mode 100644
+index 0000000..967f945
+--- /dev/null
++++ b/gateway/internal/middleware/apikey_test.go
+@@ -0,0 +1,88 @@
++package middleware
++
++import (
++	"os"
++	"path/filepath"
++	"reflect"
++	"strings"
++	"testing"
++)
++
++func writeKeyFile(t *testing.T, content string) string {
++	t.Helper()
++	path := filepath.Join(t.TempDir(), "api-keys.json")
++	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
++		t.Fatalf("写入 key 文件失败: %v", err)
++	}
++	return path
++}
++
++// TestLoadAPIKeys_NormalizesDigestAndDefaultsScopes 验证摘要规范化为小写、
++// 缺省 scopes 时授予 read/write、显式空数组表示不授予任何作用域。
++func TestLoadAPIKeys_NormalizesDigestAndDefaultsScopes(t *testing.T) {
++	digest := digestOf(keyTenantA)
++	path := writeKeyFile(t, `{"keys": [
++		{"id": "a", "sha256": " `+strings.ToUpper(digest)+` ", "tenantId": "tenant-a", "subject": "alice"},
++		{"id": "none", "sha256": "`+strings.Repeat("0", 64)+`", "tenantId": "tenant-a", "subject": "s", "scopes": []}
++	]}`)
++
++	keys, err := LoadAPIKeys(path)
++	if err != nil {
++		t.Fatalf("LoadAPIKeys 失败: %v", err)
++	}
++	want := []APIKey{
++		{ID: "a", SHA256: digest, TenantID: "tenant-a", Subject: "alice", Scopes: []string{ScopeRead, ScopeWrite}},
++		{ID: "none", SHA256: strings.Repeat("0", 64), TenantID: "tenant-a", Subject: "s", Scopes: []string{}},
++	}
++	if !reflect.DeepEqual(keys, want) {
++		t.Fatalf("解析结果不符:\nwant %+v\ngot  %+v", want, keys)
++	}
++}
++
++// TestLoadAPIKeys_RejectsInvalidFiles 验证与控制平面一致的严格校验。
++func TestLoadAPIKeys_RejectsInvalidFiles(t *testing.T) {
++	zero := strings.Repeat("0", 64)
++	cases := map[string]string{
++		"非 JSON":          `not json`,
++		"缺少 keys":         `{}`,
++		"keys 为 null":     `{"keys": null}`,
++		"顶层未知字段":          `{"keys": [], "extra": 1}`,
++		"多余内容":            `{"keys": []} {}`,
++		"摘要长度非法":          `{"keys": [{"id": "a", "sha256": "abc", "tenantId": "t", "subject": "s"}]}`,
++		"缺少 subject":      `{"keys": [{"id": "a", "sha256": "` + zero + `", "tenantId": "t"}]}`,
++		"缺少 id":           `{"keys": [{"sha256": "` + zero + `", "tenantId": "t", "subject": "s"}]}`,
++		"snake_case 租户字段": `{"keys": [{"id": "a", "sha256": "` + zero + `", "tenant_id": "t", "subject": "s"}]}`,
++		"未知作用域":           `{"keys": [{"id": "a", "sha256": "` + zero + `", "tenantId": "t", "subject": "s", "scopes": ["admin"]}]}`,
++		"scopes 为 null":   `{"keys": [{"id": "a", "sha256": "` + zero + `", "tenantId": "t", "subject": "s", "scopes": null}]}`,
++		"scopes 不是数组":     `{"keys": [{"id": "a", "sha256": "` + zero + `", "tenantId": "t", "subject": "s", "scopes": "read"}]}`,
++	}
++	for name, content := range cases {
++		t.Run(name, func(t *testing.T) {
++			if _, err := LoadAPIKeys(writeKeyFile(t, content)); err == nil {
++				t.Fatalf("内容 %s 应被拒绝", content)
++			}
++		})
++	}
++}
++
++// TestLoadAPIKeys_MissingFile 验证文件不可读时报错。
++func TestLoadAPIKeys_MissingFile(t *testing.T) {
++	if _, err := LoadAPIKeys(filepath.Join(t.TempDir(), "missing.json")); err == nil {
++		t.Fatal("文件不存在应返回错误")
++	}
++}
++
++// TestNewAPIKeyAuthenticator_RejectsDuplicates 验证重复的摘要或 id 视为配置错误。
++func TestNewAPIKeyAuthenticator_RejectsDuplicates(t *testing.T) {
++	a := APIKey{ID: "a", SHA256: digestOf(keyTenantA), TenantID: "t", Subject: "s"}
++	for name, keys := range map[string][]APIKey{
++		"重复摘要":  {a, {ID: "b", SHA256: a.SHA256, TenantID: "t", Subject: "s"}},
++		"重复 id": {a, {ID: "a", SHA256: digestOf(keyReadOnly), TenantID: "t", Subject: "s"}},
++	} {
++		t.Run(name, func(t *testing.T) {
++			if _, err := NewAPIKeyAuthenticator(keys, ""); err == nil {
++				t.Fatal("应返回错误")
++			}
++		})
++	}
++}
+diff --git a/gateway/internal/middleware/authz.go b/gateway/internal/middleware/authz.go
+index 748365c..2d30811 100644
+--- a/gateway/internal/middleware/authz.go
++++ b/gateway/internal/middleware/authz.go
+@@ -1,105 +1,171 @@
+ package middleware
+ 
+ import (
++	"context"
++	"errors"
+ 	"net/http"
+ 	"strings"
+ )
+ 
+-// Authz 返回入口鉴权卸载中间件。
++// 作用域，与控制平面（forgemesh.controlplane.auth）一致。
++const (
++	ScopeRead  = "read"
++	ScopeWrite = "write"
++	// ScopeAll 是通配作用域，持有者视为拥有全部作用域。
++	ScopeAll = "*"
++)
++
++// bearerChallenge 是 401 响应携带的 WWW-Authenticate 质询（RFC 6750）。
++const bearerChallenge = `Bearer realm="forgemesh"`
++
++// Principal 是通过认证的调用主体。
++type Principal struct {
++	// Subject 主体标识（服务账号、用户等）。
++	Subject string
++	// TenantID 凭证绑定的租户，是多租户隔离的权威来源。
++	TenantID string
++	// Scopes 授予的作用域；含 ScopeAll 表示全部。
++	Scopes []string
++}
++
++// HasScope 报告主体是否持有 scope（持有 ScopeAll 视为持有全部作用域）。
++func (p Principal) HasScope(scope string) bool {
++	for _, s := range p.Scopes {
++		if s == ScopeAll || s == scope {
++			return true
++		}
++	}
++	return false
++}
++
++// Authenticator 校验请求凭证，返回调用主体。
+ //
+-// 职责（首期骨架）：从租户身份请求头解析租户，注入 context 并向下游传播；
+-// 缺失租户身份时直接返回 401，阻止匿名请求进入业务链路。
++// 失败时返回 *AuthError：Status 为 401（凭证缺失或无效）或 403（凭证有效但越权，
++// 如租户头与凭证绑定的租户不一致）。
++type Authenticator interface {
++	Authenticate(r *http.Request) (Principal, error)
++}
++
++// AuthError 是认证失败；Message 不含凭证内容，可直接返回给客户端。
++type AuthError struct {
++	Status  int
++	Message string
++}
++
++func (e *AuthError) Error() string { return e.Message }
++
++func unauthenticated(message string) error {
++	return &AuthError{Status: http.StatusUnauthorized, Message: message}
++}
++
++func forbidden(message string) error {
++	return &AuthError{Status: http.StatusForbidden, Message: message}
++}
++
++// Authenticate 返回入口认证中间件。
+ //
+-// ────────────────────────────────────────────────────────────────────────
+-// 【零信任原则 — 必读】
+-//  1. 网关位于信任边界之外，仅做“入口鉴权卸载”：完成身份解析与基础校验，
+-//     并将解析结果（租户/主体/scope）以受信请求头下发给下游。
+-//  2. 下游控制平面【必须】对租户身份进行二次校验，不得仅凭网关转发的请求头
+-//     就信任租户——否则攻击者可绕过网关直接访问控制平面，或通过伪造头部实现
+-//     横向越权（confused deputy / header injection）。
+-//  3. 生产环境应在此处完成 JWT/OIDC 签名与有效期校验，并结合 mTLS 建立
+-//     网关与控制平面之间的相互信任；本骨架以“头存在性”作为占位实现。
+-//  4. 该中间件只解决“谁在调用”，不解决“能否调用”；细粒度授权（Policy/决策）
+-//     属于 Python 控制平面职责（决策 ≠ 授权）。
++// 校验通过后把调用主体注入 context，并以凭证绑定的租户覆写租户请求头：下游转发链
++// （反代、流式代理）读到的租户与认证结果严格同源，客户端伪造的租户头变体（多值、
++// 空白填充等）无法造成“认证身份 ≠ 转发身份”的越权。
+ //
+-// ────────────────────────────────────────────────────────────────────────
+-func Authz(tenantHeader string) Middleware {
++// 控制平面不依赖网关的结论，会用同一份凭证独立校验（零信任，见 ADR-014）；网关只
++// 回答“谁在调用”，细粒度授权仍属控制平面职责（决策 ≠ 授权）。
++//
++// 失败响应为错误信封：401 附 WWW-Authenticate，403 表示凭证有效但越权。
++func Authenticate(authn Authenticator, tenantHeader string) Middleware {
++	if authn == nil {
++		panic("middleware: Authenticate 需要非空 Authenticator")
++	}
+ 	if tenantHeader == "" {
+ 		tenantHeader = DefaultTenantHeader
+ 	}
+ 	return func(next http.Handler) http.Handler {
+ 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+-			tenant := strings.TrimSpace(r.Header.Get(tenantHeader))
+-			if tenant == "" {
+-				http.Error(w, "401 Unauthorized: missing tenant identity", http.StatusUnauthorized)
++			p, err := authn.Authenticate(r)
++			if err != nil {
++				writeAuthError(w, r, err)
+ 				return
+ 			}
+-
+-			// TODO(生产): 校验 JWT/OIDC，解析 Subject/Scopes/TokenID，
+-			//             并按路由执行 Authorize 判定。
+-			//
+-			// 防御性覆写（WP-D1）：以受信解析值（TrimSpace 后的首个值）覆写入站
+-			// 租户头，消除多值头/空白填充歧义——下游转发链（反代、流式代理、
+-			// 限流 key）重新读取请求头时拿到的与鉴权上下文严格同源，客户端
+-			// 伪造的头部变体无法造成“鉴权身份 ≠ 转发身份”的横向越权。
+-			r.Header.Set(tenantHeader, tenant)
+-			ctx := WithTenant(r.Context(), tenant)
+-			next.ServeHTTP(w, r.WithContext(ctx))
++			r.Header.Set(tenantHeader, p.TenantID)
++			next.ServeHTTP(w, r.WithContext(WithPrincipal(r.Context(), p)))
+ 		})
+ 	}
+ }
+ 
+-// AuthzWithToken 返回带 Bearer Token 校验的鉴权中间件。
++// Authz 返回 dev 模式的认证中间件：直接信任租户请求头，不校验任何凭证。
+ //
+-// 行为：
+-//   - 若 validTokens 非空，则从 Authorization: Bearer <token> 头提取 token，
+-//     校验是否在 validTokens 集合中；缺失或无效时返回 401。
+-//   - 若 validTokens 为空，退化为仅检查租户头存在性（与 Authz 一致），
+-//     便于在未启用 Token 校验的环境无缝降级。
+-//   - 通过 Token 校验后，仍需校验租户头存在性，保证多租户语义不被绕过。
+-//
+-// 安全约束：Token 比较采用 map 查找（O(1)），不泄露有效 token 列表；
+-// 生产环境应结合 JWT 签名校验使用，本实现为静态 Token 白名单占位。
+-func AuthzWithToken(tenantHeader string, validTokens map[string]bool) Middleware {
+-	if tenantHeader == "" {
+-		tenantHeader = DefaultTenantHeader
+-	}
++// 仅用于本地开发与测试；生产环境使用 Authenticate 搭配 APIKeyAuthenticator。
++func Authz(tenantHeader string) Middleware {
++	return Authenticate(HeaderAuthenticator{TenantHeader: tenantHeader}, tenantHeader)
++}
++
++// RequireScope 返回要求调用主体持有 scope 的中间件，否则返回 403；须位于 Authenticate 之后。
++func RequireScope(scope string) Middleware {
+ 	return func(next http.Handler) http.Handler {
+ 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+-			// 如果配置了 token 校验，先校验 Bearer Token。
+-			if len(validTokens) > 0 {
+-				token := extractBearerToken(r)
+-				if token == "" || !validTokens[token] {
+-					http.Error(w, "401 Unauthorized: invalid or missing token", http.StatusUnauthorized)
+-					return
+-				}
+-			}
+-			// 租户头校验（现有逻辑）。
+-			tenant := strings.TrimSpace(r.Header.Get(tenantHeader))
+-			if tenant == "" {
+-				http.Error(w, "401 Unauthorized: missing tenant identity", http.StatusUnauthorized)
++			if p, ok := PrincipalFromContext(r.Context()); !ok || !p.HasScope(scope) {
++				WriteError(w, r, http.StatusForbidden, "FORBIDDEN", "credentials lack the '"+scope+"' scope")
+ 				return
+ 			}
+-			// 防御性覆写：与 Authz 一致，以受信解析值覆写入站租户头（见上方注释）。
+-			r.Header.Set(tenantHeader, tenant)
+-			ctx := WithTenant(r.Context(), tenant)
+-			next.ServeHTTP(w, r.WithContext(ctx))
++			next.ServeHTTP(w, r)
+ 		})
+ 	}
+ }
+ 
+-// extractBearerToken 从 Authorization 头提取 Bearer token。
++func writeAuthError(w http.ResponseWriter, r *http.Request, err error) {
++	var authErr *AuthError
++	if !errors.As(err, &authErr) {
++		authErr = &AuthError{Status: http.StatusUnauthorized, Message: "invalid credentials"}
++	}
++	if authErr.Status == http.StatusForbidden {
++		WriteError(w, r, http.StatusForbidden, "FORBIDDEN", authErr.Message)
++		return
++	}
++	w.Header().Set("WWW-Authenticate", bearerChallenge)
++	WriteError(w, r, http.StatusUnauthorized, "UNAUTHENTICATED", authErr.Message)
++}
++
++// HeaderAuthenticator 是 dev 模式认证器：信任租户请求头（TrimSpace 后的首个值），
++// 不校验任何凭证并授予全部作用域。只能用于本地开发与测试。
++type HeaderAuthenticator struct {
++	// TenantHeader 承载租户身份的请求头，为空时使用 DefaultTenantHeader。
++	TenantHeader string
++}
++
++// Authenticate 实现 Authenticator。
++func (a HeaderAuthenticator) Authenticate(r *http.Request) (Principal, error) {
++	header := a.TenantHeader
++	if header == "" {
++		header = DefaultTenantHeader
++	}
++	tenant := strings.TrimSpace(r.Header.Get(header))
++	if tenant == "" {
++		return Principal{}, unauthenticated("missing tenant identity")
++	}
++	return Principal{Subject: "dev:" + tenant, TenantID: tenant, Scopes: []string{ScopeAll}}, nil
++}
++
++// WithPrincipal 把调用主体及其租户（见 TenantFromContext）写入 context。
++func WithPrincipal(ctx context.Context, p Principal) context.Context {
++	return WithTenant(context.WithValue(ctx, principalKey, p), p.TenantID)
++}
++
++// PrincipalFromContext 返回 Authenticate 注入的调用主体。
++func PrincipalFromContext(ctx context.Context) (Principal, bool) {
++	if ctx == nil {
++		return Principal{}, false
++	}
++	p, ok := ctx.Value(principalKey).(Principal)
++	return p, ok
++}
++
++// extractBearerToken 从 Authorization 头提取 Bearer 凭证。
+ //
+-// 仅识别 "Bearer <token>" 前缀格式（RFC 6750 §2.1），其他方案（Basic/Digest 等）
+-// 返回空字符串。token 前后空白会被 TrimSpace 去除，避免填充绕过。
++// 方案名大小写不敏感（RFC 7235 §2.1）；其他方案（Basic/Digest 等）返回空字符串。
+ func extractBearerToken(r *http.Request) string {
+-	auth := r.Header.Get("Authorization")
+-	if auth == "" {
+-		return ""
+-	}
+-	const prefix = "Bearer "
+-	if !strings.HasPrefix(auth, prefix) {
++	scheme, token, ok := strings.Cut(strings.TrimSpace(r.Header.Get("Authorization")), " ")
++	if !ok || !strings.EqualFold(scheme, "Bearer") {
+ 		return ""
+ 	}
+-	return strings.TrimSpace(auth[len(prefix):])
++	return strings.TrimSpace(token)
+ }
+diff --git a/gateway/internal/middleware/authz_test.go b/gateway/internal/middleware/authz_test.go
+index 1812dcf..e7889b9 100644
+--- a/gateway/internal/middleware/authz_test.go
++++ b/gateway/internal/middleware/authz_test.go
+@@ -1,6 +1,9 @@
+ package middleware
+ 
+ import (
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
+ 	"net/http"
+ 	"net/http/httptest"
+ 	"testing"
+@@ -11,6 +14,45 @@ var okHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+ 	w.WriteHeader(http.StatusOK)
+ })
+ 
++const (
++	keyTenantA  = "fmk_key-for-tenant-a"
++	keyReadOnly = "fmk_read-only-key-for-tenant-a"
++)
++
++func digestOf(key string) string {
++	sum := sha256.Sum256([]byte(key))
++	return hex.EncodeToString(sum[:])
++}
++
++func newTestAPIKeyAuthenticator(t *testing.T) *APIKeyAuthenticator {
++	t.Helper()
++	authn, err := NewAPIKeyAuthenticator([]APIKey{
++		{ID: "a", SHA256: digestOf(keyTenantA), TenantID: "tenant-a", Subject: "alice", Scopes: []string{ScopeRead, ScopeWrite}},
++		{ID: "ro", SHA256: digestOf(keyReadOnly), TenantID: "tenant-a", Subject: "viewer", Scopes: []string{ScopeRead}},
++	}, DefaultTenantHeader)
++	if err != nil {
++		t.Fatalf("NewAPIKeyAuthenticator 失败: %v", err)
++	}
++	return authn
++}
++
++// decodeError 解析错误信封，返回 error.code。
++func decodeError(t *testing.T, rec *httptest.ResponseRecorder) string {
++	t.Helper()
++	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
++		t.Fatalf("错误响应 Content-Type 应为 application/json，实际 %q", ct)
++	}
++	var body struct {
++		Error struct {
++			Code string `json:"code"`
++		} `json:"error"`
++	}
++	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
++		t.Fatalf("错误响应不是错误信封: %v（body=%s）", err, rec.Body.String())
++	}
++	return body.Error.Code
++}
++
+ // TestAuthz_MissingTenantHeader 验证缺失租户头时返回 401。
+ func TestAuthz_MissingTenantHeader(t *testing.T) {
+ 	h := Authz(DefaultTenantHeader)(okHandler)
+@@ -74,121 +116,157 @@ func TestAuthz_BlankTenantHeader(t *testing.T) {
+ 	}
+ }
+ 
+-// TestAuthzWithToken_ValidToken 验证有效 Bearer Token + 租户头放行。
+-func TestAuthzWithToken_ValidToken(t *testing.T) {
+-	tokens := map[string]bool{"secret-token-123": true}
+-	h := AuthzWithToken(DefaultTenantHeader, tokens)(okHandler)
++// TestAuthenticate_APIKeyBindsTenant 验证有效 key 放行：主体注入 context，
++// 租户头被覆写为 key 绑定的租户（客户端可以不发租户头）。
++func TestAuthenticate_APIKeyBindsTenant(t *testing.T) {
++	var got Principal
++	var forwardedTenant string
++	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		got, _ = PrincipalFromContext(r.Context())
++		forwardedTenant = r.Header.Get(DefaultTenantHeader)
++		w.WriteHeader(http.StatusOK)
++	})
++	h := Authenticate(newTestAPIKeyAuthenticator(t), DefaultTenantHeader)(next)
+ 
+ 	rec := httptest.NewRecorder()
+ 	req := httptest.NewRequest(http.MethodGet, "/api/v1/resources", nil)
+-	req.Header.Set("Authorization", "Bearer secret-token-123")
+-	req.Header.Set(DefaultTenantHeader, "tenant-a")
++	req.Header.Set("Authorization", "Bearer "+keyTenantA)
+ 	h.ServeHTTP(rec, req)
+ 
+ 	if rec.Code != http.StatusOK {
+-		t.Fatalf("有效 token 应放行(200)，实际 %d", rec.Code)
++		t.Fatalf("有效 key 应放行(200)，实际 %d", rec.Code)
++	}
++	if got.TenantID != "tenant-a" || got.Subject != "alice" || !got.HasScope(ScopeWrite) {
++		t.Fatalf("context 主体不符: %+v", got)
++	}
++	if forwardedTenant != "tenant-a" {
++		t.Fatalf("租户头应被覆写为 key 绑定的 tenant-a，实际 %q", forwardedTenant)
+ 	}
+ }
+ 
+-// TestAuthzWithToken_InvalidToken 验证无效 token 返回 401。
+-func TestAuthzWithToken_InvalidToken(t *testing.T) {
+-	tokens := map[string]bool{"secret-token-123": true}
+-	h := AuthzWithToken(DefaultTenantHeader, tokens)(okHandler)
+-
+-	rec := httptest.NewRecorder()
+-	req := httptest.NewRequest(http.MethodGet, "/api/v1/resources", nil)
+-	req.Header.Set("Authorization", "Bearer wrong-token")
+-	req.Header.Set(DefaultTenantHeader, "tenant-a")
+-	h.ServeHTTP(rec, req)
++// TestAuthenticate_APIKeyRejectsInvalidCredentials 验证缺失、非 Bearer、空白与未知 key
++// 均返回 401 错误信封并附 WWW-Authenticate，且不触达下游。
++func TestAuthenticate_APIKeyRejectsInvalidCredentials(t *testing.T) {
++	cases := map[string]string{
++		"缺失 Authorization": "",
++		"非 Bearer 方案":      "Basic " + keyTenantA,
++		"空白凭证":             "Bearer   ",
++		"未知 key":           "Bearer fmk_unknown",
++	}
++	for name, auth := range cases {
++		t.Run(name, func(t *testing.T) {
++			reached := false
++			next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { reached = true })
++			h := Authenticate(newTestAPIKeyAuthenticator(t), DefaultTenantHeader)(next)
++
++			rec := httptest.NewRecorder()
++			req := httptest.NewRequest(http.MethodGet, "/api/v1/resources", nil)
++			req.Header.Set(DefaultTenantHeader, "tenant-a")
++			if auth != "" {
++				req.Header.Set("Authorization", auth)
++			}
++			h.ServeHTTP(rec, req)
+ 
+-	if rec.Code != http.StatusUnauthorized {
+-		t.Fatalf("无效 token 应返回 401，实际 %d", rec.Code)
++			if rec.Code != http.StatusUnauthorized {
++				t.Fatalf("应返回 401，实际 %d", rec.Code)
++			}
++			if rec.Header().Get("WWW-Authenticate") != bearerChallenge {
++				t.Fatalf("401 应携带 WWW-Authenticate=%q，实际 %q", bearerChallenge, rec.Header().Get("WWW-Authenticate"))
++			}
++			if code := decodeError(t, rec); code != "UNAUTHENTICATED" {
++				t.Fatalf("错误码应为 UNAUTHENTICATED，实际 %q", code)
++			}
++			if reached {
++				t.Fatal("认证失败的请求不应触达下游")
++			}
++		})
+ 	}
+ }
+ 
+-// TestAuthzWithToken_MissingToken 验证缺失 Authorization 头返回 401。
+-func TestAuthzWithToken_MissingToken(t *testing.T) {
+-	tokens := map[string]bool{"secret-token-123": true}
+-	h := AuthzWithToken(DefaultTenantHeader, tokens)(okHandler)
+-
+-	rec := httptest.NewRecorder()
+-	req := httptest.NewRequest(http.MethodGet, "/api/v1/resources", nil)
+-	req.Header.Set(DefaultTenantHeader, "tenant-a")
+-	h.ServeHTTP(rec, req)
++// TestAuthenticate_APIKeyRejectsForeignTenantHeader 验证租户头与 key 绑定的租户不符时
++// 返回 403（含多值头中夹带他租户的情形），而不是被静默改写。
++func TestAuthenticate_APIKeyRejectsForeignTenantHeader(t *testing.T) {
++	for name, values := range map[string][]string{
++		"他租户":     {"tenant-b"},
++		"多值夹带他租户": {"tenant-a", "tenant-b"},
++	} {
++		t.Run(name, func(t *testing.T) {
++			h := Authenticate(newTestAPIKeyAuthenticator(t), DefaultTenantHeader)(okHandler)
++
++			rec := httptest.NewRecorder()
++			req := httptest.NewRequest(http.MethodGet, "/api/v1/resources", nil)
++			req.Header.Set("Authorization", "Bearer "+keyTenantA)
++			for _, v := range values {
++				req.Header.Add(DefaultTenantHeader, v)
++			}
++			h.ServeHTTP(rec, req)
+ 
+-	if rec.Code != http.StatusUnauthorized {
+-		t.Fatalf("缺失 token 应返回 401，实际 %d", rec.Code)
++			if rec.Code != http.StatusForbidden {
++				t.Fatalf("租户头与凭证不符应 403，实际 %d", rec.Code)
++			}
++			if code := decodeError(t, rec); code != "FORBIDDEN" {
++				t.Fatalf("错误码应为 FORBIDDEN，实际 %q", code)
++			}
++		})
+ 	}
+ }
+ 
+-// TestAuthzWithToken_EmptyTokenMap_Degraded 验证 validTokens 为空时退化为仅检查租户头。
+-func TestAuthzWithToken_EmptyTokenMap_Degraded(t *testing.T) {
+-	h := AuthzWithToken(DefaultTenantHeader, nil)(okHandler)
++// TestAuthenticate_APIKeyAcceptsMatchingTenantHeader 验证与凭证一致（含空白填充）的租户头放行。
++func TestAuthenticate_APIKeyAcceptsMatchingTenantHeader(t *testing.T) {
++	h := Authenticate(newTestAPIKeyAuthenticator(t), DefaultTenantHeader)(okHandler)
+ 
+-	// 无 Authorization 头但有租户头 → 应放行（降级模式）。
+ 	rec := httptest.NewRecorder()
+ 	req := httptest.NewRequest(http.MethodGet, "/api/v1/resources", nil)
+-	req.Header.Set(DefaultTenantHeader, "tenant-a")
++	req.Header.Set("Authorization", "bearer "+keyTenantA)
++	req.Header.Set(DefaultTenantHeader, " tenant-a ")
+ 	h.ServeHTTP(rec, req)
+ 
+ 	if rec.Code != http.StatusOK {
+-		t.Fatalf("空 token map 降级模式下应放行(200)，实际 %d", rec.Code)
+-	}
+-
+-	// 无租户头 → 仍应 401。
+-	rec2 := httptest.NewRecorder()
+-	req2 := httptest.NewRequest(http.MethodGet, "/api/v1/resources", nil)
+-	h.ServeHTTP(rec2, req2)
+-
+-	if rec2.Code != http.StatusUnauthorized {
+-		t.Fatalf("降级模式下缺失租户头应 401，实际 %d", rec2.Code)
++		t.Fatalf("与凭证一致的租户头应放行，实际 %d", rec.Code)
+ 	}
+ }
+ 
+-// TestAuthzWithToken_NonBearerScheme 验证非 Bearer 方案（如 Basic）被拒绝。
+-func TestAuthzWithToken_NonBearerScheme(t *testing.T) {
+-	tokens := map[string]bool{"secret-token-123": true}
+-	h := AuthzWithToken(DefaultTenantHeader, tokens)(okHandler)
++// TestAuthenticate_ErrorEnvelopeCarriesCorrelationID 验证认证失败的错误信封带关联 ID。
++func TestAuthenticate_ErrorEnvelopeCarriesCorrelationID(t *testing.T) {
++	h := Chain(okHandler,
++		Correlation(DefaultCorrelationHeader),
++		Authenticate(newTestAPIKeyAuthenticator(t), DefaultTenantHeader),
++	)
+ 
+ 	rec := httptest.NewRecorder()
+ 	req := httptest.NewRequest(http.MethodGet, "/api/v1/resources", nil)
+-	req.Header.Set("Authorization", "Basic dXNlcjpwYXNz")
+-	req.Header.Set(DefaultTenantHeader, "tenant-a")
++	req.Header.Set(DefaultCorrelationHeader, "corr-401")
+ 	h.ServeHTTP(rec, req)
+ 
+-	if rec.Code != http.StatusUnauthorized {
+-		t.Fatalf("非 Bearer 方案应返回 401，实际 %d", rec.Code)
++	var body struct {
++		Error struct {
++			CorrelationID string `json:"correlationId"`
++		} `json:"error"`
+ 	}
+-}
+-
+-// TestAuthzWithToken_BlankToken 验证 Bearer 后空白 token 被拒绝。
+-func TestAuthzWithToken_BlankToken(t *testing.T) {
+-	tokens := map[string]bool{"secret-token-123": true}
+-	h := AuthzWithToken(DefaultTenantHeader, tokens)(okHandler)
+-
+-	rec := httptest.NewRecorder()
+-	req := httptest.NewRequest(http.MethodGet, "/api/v1/resources", nil)
+-	req.Header.Set("Authorization", "Bearer   ")
+-	req.Header.Set(DefaultTenantHeader, "tenant-a")
+-	h.ServeHTTP(rec, req)
+-
+-	if rec.Code != http.StatusUnauthorized {
+-		t.Fatalf("空白 token 应返回 401，实际 %d", rec.Code)
++	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || body.Error.CorrelationID != "corr-401" {
++		t.Fatalf("错误信封应带 correlationId=corr-401，实际 body=%s", rec.Body.String())
+ 	}
+ }
+ 
+-// TestAuthzWithToken_ValidTokenMissingTenant 验证 token 有效但缺失租户头仍返回 401。
+-func TestAuthzWithToken_ValidTokenMissingTenant(t *testing.T) {
+-	tokens := map[string]bool{"secret-token-123": true}
+-	h := AuthzWithToken(DefaultTenantHeader, tokens)(okHandler)
++// TestRequireScope 验证作用域检查：持有所需作用域放行，否则 403；缺少主体同样拒绝。
++func TestRequireScope(t *testing.T) {
++	authn := newTestAPIKeyAuthenticator(t)
++	h := Authenticate(authn, DefaultTenantHeader)(RequireScope(ScopeWrite)(okHandler))
++
++	for key, want := range map[string]int{keyTenantA: http.StatusOK, keyReadOnly: http.StatusForbidden} {
++		rec := httptest.NewRecorder()
++		req := httptest.NewRequest(http.MethodPost, "/api/v1/resources", nil)
++		req.Header.Set("Authorization", "Bearer "+key)
++		h.ServeHTTP(rec, req)
++		if rec.Code != want {
++			t.Fatalf("key %s 期望 %d，实际 %d", key, want, rec.Code)
++		}
++	}
+ 
+ 	rec := httptest.NewRecorder()
+-	req := httptest.NewRequest(http.MethodGet, "/api/v1/resources", nil)
+-	req.Header.Set("Authorization", "Bearer secret-token-123")
+-	h.ServeHTTP(rec, req)
+-
+-	if rec.Code != http.StatusUnauthorized {
+-		t.Fatalf("有效 token 但缺失租户头应 401，实际 %d", rec.Code)
++	RequireScope(ScopeRead)(okHandler).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
++	if rec.Code != http.StatusForbidden {
++		t.Fatalf("context 中没有主体时应 403，实际 %d", rec.Code)
+ 	}
+ }
+ 
+@@ -203,7 +281,7 @@ func TestExtractBearerToken_Table(t *testing.T) {
+ 		{"带前后空白", "Bearer   abc123  ", "abc123"},
+ 		{"缺失 Authorization", "", ""},
+ 		{"非 Bearer 方案", "Basic abc123", ""},
+-		{"小写 bearer 不识别", "bearer abc123", ""},
++		{"方案名大小写不敏感", "bearer abc123", "abc123"},
+ 		{"仅前缀无 token", "Bearer ", ""},
+ 		{"Bearer 后多空格", "Bearer    xyz", "xyz"},
+ 	}
+diff --git a/gateway/internal/middleware/chain_test.go b/gateway/internal/middleware/chain_test.go
+index f8a2694..b87a979 100644
+--- a/gateway/internal/middleware/chain_test.go
++++ b/gateway/internal/middleware/chain_test.go
+@@ -10,8 +10,7 @@
+ //	  - 探针式直连路径（模仿 router.go 顶层 /healthz）不经过链、不泄漏受信头；
+ //	  - 各类拒绝响应为固定文案，不含内部细节。
+ //
+-// 注：middleware.go 包注释中的链序描述（RateLimit 在 Authz 之前）与
+-// router.go 实际组装不符，本测试以实际行为为准（详见任务 WP-D1 报告）。
++// 链中的 Authz 是 dev 模式的 Authenticate（信任租户头），链序语义与 apikey 模式相同。
+ package middleware
+ 
+ import (
+@@ -163,11 +162,12 @@ func TestChain_ProbeBypassesChainNoLeak(t *testing.T) {
+ func TestChain_RejectResponsesOpaque(t *testing.T) {
+ 	h := newAPIChain(NewRateLimiter(0.001, 1), nil)
+ 
+-	// 401：缺失租户身份。
++	// 401：缺失租户身份，返回固定文案的错误信封。
+ 	rec401 := httptest.NewRecorder()
+ 	h.ServeHTTP(rec401, httptest.NewRequest(http.MethodGet, "/api/v1/resources", nil))
+-	if want := "401 Unauthorized: missing tenant identity\n"; rec401.Body.String() != want {
+-		t.Fatalf("401 响应体应为 %q，实际 %q", want, rec401.Body.String())
++	if code := decodeError(t, rec401); code != "UNAUTHENTICATED" ||
++		!strings.Contains(rec401.Body.String(), `"message":"missing tenant identity"`) {
++		t.Fatalf("401 响应体应为 UNAUTHENTICATED 错误信封，实际 %q", rec401.Body.String())
+ 	}
+ 
+ 	// 429：同租户超限（首请求已消耗 burst=1 的唯一令牌）。
+diff --git a/gateway/internal/middleware/correlation.go b/gateway/internal/middleware/correlation.go
+index b6f2f8b..2de885f 100644
+--- a/gateway/internal/middleware/correlation.go
++++ b/gateway/internal/middleware/correlation.go
+@@ -19,6 +19,7 @@ type contextKey int
+ const (
+ 	correlationIDKey contextKey = iota
+ 	tenantIDKey
++	principalKey
+ )
+ 
+ // CorrelationIDFromContext 返回请求上下文中携带的关联 ID，缺失时返回空字符串。
+@@ -39,7 +40,7 @@ func TenantFromContext(ctx context.Context) string {
+ 	return v
+ }
+ 
+-// WithTenant 将租户 ID 写入上下文，供 Authz 中间件向下游处理链传播。
++// WithTenant 将租户 ID 写入上下文，供认证中间件向下游处理链传播。
+ func WithTenant(ctx context.Context, tenantID string) context.Context {
+ 	return context.WithValue(ctx, tenantIDKey, tenantID)
+ }
+diff --git a/gateway/internal/middleware/errors.go b/gateway/internal/middleware/errors.go
+new file mode 100644
+index 0000000..3d61545
+--- /dev/null
++++ b/gateway/internal/middleware/errors.go
+@@ -0,0 +1,27 @@
++package middleware
++
++import (
++	"encoding/json"
++	"net/http"
++)
++
++// WriteError 输出与控制平面一致的错误信封：
++//
++//	{"error":{"code":"...","message":"...","correlationId":"..."}}
++//
++// correlationId 取自 Correlation 中间件注入的 context，缺失时省略。
++func WriteError(w http.ResponseWriter, r *http.Request, status int, code, message string) {
++	type errorBody struct {
++		Code          string `json:"code"`
++		Message       string `json:"message"`
++		CorrelationID string `json:"correlationId,omitempty"`
++	}
++	body := struct {
++		Error errorBody `json:"error"`
++	}{errorBody{Code: code, Message: message, CorrelationID: CorrelationIDFromContext(r.Context())}}
++
++	w.Header().Set("Content-Type", "application/json")
++	w.WriteHeader(status)
++	// 序列化失败只可能源于内部构造，忽略并保留已写出的状态码。
++	_ = json.NewEncoder(w).Encode(body)
++}
+diff --git a/gateway/internal/middleware/middleware.go b/gateway/internal/middleware/middleware.go
+index e9b4fd3..ef383ce 100644
+--- a/gateway/internal/middleware/middleware.go
++++ b/gateway/internal/middleware/middleware.go
+@@ -2,10 +2,11 @@
+ //
+ // 链的执行顺序（外层 → 内层）：
+ //
+-//	Recovery → Correlation → RateLimit → Authz → Route
++//	Recovery → Correlation → Authenticate → RateLimit → Route
+ //
+ // Recovery 位于最外层，保证任何下游 panic 都能被兜底；
+-// Correlation 尽早生成关联 ID，便于后续日志与限流观测。
++// Correlation 尽早生成关联 ID，认证失败的响应也能携带；
++// Authenticate 先于 RateLimit，被拒请求不消耗令牌。
+ package middleware
+ 
+ import "net/http"
+diff --git a/gateway/internal/router/auth_test.go b/gateway/internal/router/auth_test.go
+new file mode 100644
+index 0000000..2d498e3
+--- /dev/null
++++ b/gateway/internal/router/auth_test.go
+@@ -0,0 +1,277 @@
++// auth_test.go 从网关入口验证 apikey 认证模式（ADR-014）：
++//
++//   - 无凭证或凭证无效 → 401，不触达上游；
++//   - 租户取自 key 绑定的租户，与凭证不符的租户头 → 403；
++//   - 控制平面收到调用方凭证，可独立校验（含 Resolver 查询）；
++//   - 推理调用要求 read 作用域。
++package router
++
++import (
++	"crypto/sha256"
++	"encoding/hex"
++	"fmt"
++	"io"
++	"log"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"testing"
++
++	"github.com/Mekoforge/ForgeMesh/gateway/internal/config"
++)
++
++const (
++	routerKeyTenantA  = "fmk_router-key-tenant-a"
++	routerKeyWriteOne = "fmk_router-key-write-only"
++)
++
++func sha256Hex(s string) string {
++	sum := sha256.Sum256([]byte(s))
++	return hex.EncodeToString(sum[:])
++}
++
++// apiKeyConfig 返回 apikey 模式配置，key 文件写入临时目录。
++func apiKeyConfig(t *testing.T, upstreamURL string) config.Config {
++	t.Helper()
++	keys := fmt.Sprintf(`{"keys": [
++		{"id": "a", "sha256": %q, "tenantId": "tenant-a", "subject": "alice"},
++		{"id": "w", "sha256": %q, "tenantId": "tenant-a", "subject": "writer", "scopes": ["write"]}
++	]}`, sha256Hex(routerKeyTenantA), sha256Hex(routerKeyWriteOne))
++	path := filepath.Join(t.TempDir(), "api-keys.json")
++	if err := os.WriteFile(path, []byte(keys), 0o600); err != nil {
++		t.Fatalf("写入 key 文件失败: %v", err)
++	}
++	return config.Config{
++		ListenAddr:        ":0",
++		UpstreamURL:       upstreamURL,
++		RateLimitRPS:      1000,
++		RateLimitBurst:    1000,
++		TenantHeader:      "X-Tenant-ID",
++		CorrelationHeader: "X-Correlation-ID",
++		AuthMode:          config.AuthModeAPIKey,
++		APIKeysFile:       path,
++	}
++}
++
++func newAPIKeyRouter(t *testing.T, upstreamURL string) *Router {
++	t.Helper()
++	r, err := New(apiKeyConfig(t, upstreamURL), log.New(io.Discard, "", 0))
++	if err != nil {
++		t.Fatalf("New 失败: %v", err)
++	}
++	return r
++}
++
++// headerRecorder 是记录请求头的假上游。
++type headerRecorder struct {
++	mu      sync.Mutex
++	calls   int
++	headers http.Header
++}
++
++func (h *headerRecorder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
++	h.mu.Lock()
++	h.calls++
++	h.headers = r.Header.Clone()
++	h.mu.Unlock()
++	w.WriteHeader(http.StatusOK)
++	_, _ = io.WriteString(w, `{"items":[],"count":0}`)
++}
++
++func (h *headerRecorder) snapshot() (int, http.Header) {
++	h.mu.Lock()
++	defer h.mu.Unlock()
++	return h.calls, h.headers
++}
++
++func newRecordingUpstream(t *testing.T) (*headerRecorder, string) {
++	t.Helper()
++	rec := &headerRecorder{}
++	srv := httptest.NewServer(rec)
++	t.Cleanup(srv.Close)
++	return rec, srv.URL
++}
++
++// TestAPIKeyMode_RejectsMissingAndUnknownCredentials 验证无凭证、仅租户头或未知 key 均 401，
++// 且不触达控制平面。
++func TestAPIKeyMode_RejectsMissingAndUnknownCredentials(t *testing.T) {
++	upstreamRec, url := newRecordingUpstream(t)
++	r := newAPIKeyRouter(t, url)
++
++	for name, auth := range map[string]string{"无凭证": "", "未知 key": "Bearer fmk_unknown"} {
++		rec := httptest.NewRecorder()
++		req := httptest.NewRequest(http.MethodGet, "/api/v1/inference-services", nil)
++		req.Header.Set("X-Tenant-ID", "tenant-a")
++		if auth != "" {
++			req.Header.Set("Authorization", auth)
++		}
++		r.ServeHTTP(rec, req)
++
++		if rec.Code != http.StatusUnauthorized {
++			t.Fatalf("%s：应 401，实际 %d", name, rec.Code)
++		}
++		if rec.Header().Get("WWW-Authenticate") == "" {
++			t.Fatalf("%s：401 应携带 WWW-Authenticate", name)
++		}
++	}
++	if calls, _ := upstreamRec.snapshot(); calls != 0 {
++		t.Fatalf("被拒请求不应触达控制平面，实际 %d 次", calls)
++	}
++}
++
++// TestAPIKeyMode_ForwardsVerifiedTenantAndCredentials 验证租户取自凭证（客户端未发租户头），
++// 且凭证原样转发给控制平面供其独立校验。
++func TestAPIKeyMode_ForwardsVerifiedTenantAndCredentials(t *testing.T) {
++	upstreamRec, url := newRecordingUpstream(t)
++	r := newAPIKeyRouter(t, url)
++
++	rec := httptest.NewRecorder()
++	req := httptest.NewRequest(http.MethodGet, "/api/v1/inference-services", nil)
++	req.Header.Set("Authorization", "Bearer "+routerKeyTenantA)
++	r.ServeHTTP(rec, req)
++
++	if rec.Code != http.StatusOK {
++		t.Fatalf("有效 key 应 200，实际 %d（body=%s）", rec.Code, rec.Body.String())
++	}
++	_, headers := upstreamRec.snapshot()
++	if got := headers.Values("X-Tenant-ID"); len(got) != 1 || got[0] != "tenant-a" {
++		t.Fatalf("控制平面收到的租户头应为 [tenant-a]，实际 %v", got)
++	}
++	if got := headers.Get("Authorization"); got != "Bearer "+routerKeyTenantA {
++		t.Fatalf("控制平面应收到调用方凭证，实际 %q", got)
++	}
++}
++
++// TestAPIKeyMode_RejectsForeignTenantHeader 验证凭证有效但租户头指向他租户时 403，不触达上游。
++func TestAPIKeyMode_RejectsForeignTenantHeader(t *testing.T) {
++	upstreamRec, url := newRecordingUpstream(t)
++	r := newAPIKeyRouter(t, url)
++
++	rec := httptest.NewRecorder()
++	req := httptest.NewRequest(http.MethodGet, "/api/v1/inference-services", nil)
++	req.Header.Set("Authorization", "Bearer "+routerKeyTenantA)
++	req.Header.Set("X-Tenant-ID", "tenant-b")
++	r.ServeHTTP(rec, req)
++
++	if rec.Code != http.StatusForbidden {
++		t.Fatalf("伪造租户头应 403，实际 %d", rec.Code)
++	}
++	if !strings.Contains(rec.Body.String(), `"code":"FORBIDDEN"`) {
++		t.Fatalf("403 应为 FORBIDDEN 错误信封，实际 %s", rec.Body.String())
++	}
++	if calls, _ := upstreamRec.snapshot(); calls != 0 {
++		t.Fatalf("被拒请求不应触达控制平面，实际 %d 次", calls)
++	}
++}
++
++// inferenceEnv 是假控制平面 + 假推理实例；控制平面记录 Resolver 查询带来的凭证。
++type inferenceEnv struct {
++	router     *Router
++	cpStatus   int
++	cpHits     atomic.Int64
++	cpAuth     atomic.Value
++	instanceOK atomic.Int64
++}
++
++func newInferenceEnv(t *testing.T, cpStatus int) *inferenceEnv {
++	t.Helper()
++	env := &inferenceEnv{cpStatus: cpStatus}
++	instance := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		env.instanceOK.Add(1)
++		w.Header().Set("Content-Type", "text/event-stream")
++		_, _ = io.WriteString(w, "data: ok\n\n")
++	}))
++	t.Cleanup(instance.Close)
++	cp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		env.cpHits.Add(1)
++		env.cpAuth.Store(r.Header.Get("Authorization"))
++		if env.cpStatus != http.StatusOK {
++			w.WriteHeader(env.cpStatus)
++			return
++		}
++		w.Header().Set("Content-Type", "application/json")
++		_, _ = io.WriteString(w, readyEndpointsJSON("Ready", []string{instance.URL}))
++	}))
++	t.Cleanup(cp.Close)
++	env.router = newAPIKeyRouter(t, cp.URL)
++	return env
++}
++
++func (e *inferenceEnv) chat(key string) *httptest.ResponseRecorder {
++	rec := httptest.NewRecorder()
++	req := httptest.NewRequest(http.MethodPost, "/api/v1/inference/svc-a/chat", nil)
++	req.Header.Set("Authorization", "Bearer "+key)
++	e.router.ServeHTTP(rec, req)
++	return rec
++}
++
++// TestAPIKeyMode_InferenceResolvesWithCallerCredentials 验证 Resolver 以调用方凭证查询控制平面。
++func TestAPIKeyMode_InferenceResolvesWithCallerCredentials(t *testing.T) {
++	env := newInferenceEnv(t, http.StatusOK)
++
++	if rec := env.chat(routerKeyTenantA); rec.Code != http.StatusOK {
++		t.Fatalf("推理请求应 200，实际 %d（body=%s）", rec.Code, rec.Body.String())
++	}
++	if got, _ := env.cpAuth.Load().(string); got != "Bearer "+routerKeyTenantA {
++		t.Fatalf("Resolver 应携带调用方凭证查询控制平面，实际 %q", got)
++	}
++	if env.instanceOK.Load() != 1 {
++		t.Fatalf("请求应转发到推理实例 1 次，实际 %d", env.instanceOK.Load())
++	}
++}
++
++// TestAPIKeyMode_InferenceRequiresReadScope 验证缺少 read 作用域的 key 调用推理返回 403，
++// 且不查询控制平面。
++func TestAPIKeyMode_InferenceRequiresReadScope(t *testing.T) {
++	env := newInferenceEnv(t, http.StatusOK)
++
++	rec := env.chat(routerKeyWriteOne)
++	if rec.Code != http.StatusForbidden {
++		t.Fatalf("缺少 read 作用域应 403，实际 %d", rec.Code)
++	}
++	if env.cpHits.Load() != 0 {
++		t.Fatalf("被拒请求不应查询控制平面，实际 %d 次", env.cpHits.Load())
++	}
++}
++
++// TestAPIKeyMode_ControlPlaneForbiddenMapsTo403 验证控制平面拒绝解析（403）时网关返回 403。
++func TestAPIKeyMode_ControlPlaneForbiddenMapsTo403(t *testing.T) {
++	env := newInferenceEnv(t, http.StatusForbidden)
++
++	rec := env.chat(routerKeyTenantA)
++	if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), `"code":"FORBIDDEN"`) {
++		t.Fatalf("控制平面 403 应映射为 403 FORBIDDEN，实际 %d（body=%s）", rec.Code, rec.Body.String())
++	}
++	if env.instanceOK.Load() != 0 {
++		t.Fatal("解析被拒时不应转发到推理实例")
++	}
++}
++
++// TestNew_RejectsInvalidAuthConfig 验证认证配置缺失或非法时 New 失败（不回退为信任请求头）。
++func TestNew_RejectsInvalidAuthConfig(t *testing.T) {
++	valid := apiKeyConfig(t, "http://127.0.0.1:1")
++	badFile := filepath.Join(t.TempDir(), "bad.json")
++	if err := os.WriteFile(badFile, []byte(`{"keys": [{"id": "a"}]}`), 0o600); err != nil {
++		t.Fatal(err)
++	}
++
++	cases := map[string]func(c *config.Config){
++		"未设置模式":     func(c *config.Config) { c.AuthMode = "" },
++		"未知模式":      func(c *config.Config) { c.AuthMode = "header" },
++		"key 文件不存在": func(c *config.Config) { c.APIKeysFile = filepath.Join(t.TempDir(), "missing.json") },
++		"key 文件非法":  func(c *config.Config) { c.APIKeysFile = badFile },
++	}
++	for name, mutate := range cases {
++		t.Run(name, func(t *testing.T) {
++			cfg := valid
++			mutate(&cfg)
++			if _, err := New(cfg, log.New(io.Discard, "", 0)); err == nil {
++				t.Fatal("New 应返回错误")
++			}
++		})
++	}
++}
+diff --git a/gateway/internal/router/resolver_test.go b/gateway/internal/router/resolver_test.go
+index bd83f39..bc26317 100644
+--- a/gateway/internal/router/resolver_test.go
++++ b/gateway/internal/router/resolver_test.go
+@@ -85,6 +85,7 @@ func newResolverEnv(t *testing.T, ttlSec, cooldownSec int, eps ...string) *resol
+ 		CorrelationHeader:        "X-Correlation-ID",
+ 		ResolverTTLSeconds:       ttlSec,
+ 		UnhealthyCooldownSeconds: cooldownSec,
++		AuthMode:                 config.AuthModeDev,
+ 	}
+ 	r, err := New(cfg, log.New(io.Discard, "", 0))
+ 	if err != nil {
+@@ -313,6 +314,7 @@ func TestResolver_ErrorResponseMapping(t *testing.T) {
+ 				CorrelationHeader:        "X-Correlation-ID",
+ 				ResolverTTLSeconds:       60,
+ 				UnhealthyCooldownSeconds: 600,
++				AuthMode:                 config.AuthModeDev,
+ 			}
+ 			r, err := New(cfg, log.New(io.Discard, "", 0))
+ 			if err != nil {
+diff --git a/gateway/internal/router/router.go b/gateway/internal/router/router.go
+index a92ca97..bfb17e7 100644
+--- a/gateway/internal/router/router.go
++++ b/gateway/internal/router/router.go
+@@ -9,10 +9,12 @@
+ //	ANY  /api/v1/workflows[/...]               反代到 Python 控制平面
+ //	ANY  /api/v1/decisions[/...]               反代到 Python 控制平面
+ //	ANY  /api/v1/inference/{svc}/chat          SSE 流式代理（{svc} 经 Resolver
+-//	                                          解析为实例 endpoint，轮询分发）
++//	                                          解析为实例 endpoint，轮询分发；
++//	                                          要求 read 作用域）
+ //
+-// 中间件链（执行顺序）：Recovery → Correlation → Authz → RateLimit → Route。
+-// Recovery 作为最外层兜底全量请求；探针刻意不经过鉴权/限流，保证健康检查可用。
++// 中间件链（执行顺序）：Recovery → Correlation → Authenticate → RateLimit → Route。
++// Recovery 作为最外层兜底全量请求；探针刻意不经过认证/限流，保证健康检查可用。
++// 认证模式见 config.AuthModeAPIKey / config.AuthModeDev 与 ADR-014。
+ package router
+ 
+ import (
+@@ -61,6 +63,10 @@ func New(cfg config.Config, logger *log.Logger) (*Router, error) {
+ 	if target.Scheme == "" || target.Host == "" {
+ 		return nil, fmt.Errorf("router: 上游地址必须包含 scheme 与 host: %q", cfg.UpstreamURL)
+ 	}
++	authn, err := newAuthenticator(cfg)
++	if err != nil {
++		return nil, err
++	}
+ 
+ 	hc := health.New(cfg.UpstreamURL)
+ 	proxy := upstream.New(target, cfg.CorrelationHeader, cfg.TenantHeader, logger)
+@@ -84,13 +90,15 @@ func New(cfg config.Config, logger *log.Logger) (*Router, error) {
+ 		apiMux.Handle(p, proxy)     // 精确匹配集合端点
+ 		apiMux.Handle(p+"/", proxy) // 匹配子资源
+ 	}
+-	apiMux.Handle(streamRoutePattern, streamProxy)
++	// 推理调用读取服务的 status.endpoints 并调用实例，不修改资源，故要求 read 作用域；
++	// 在网关侧检查，使命中 Resolver 缓存的请求同样受作用域约束。
++	apiMux.Handle(streamRoutePattern, middleware.RequireScope(middleware.ScopeRead)(streamProxy))
+ 
+-	// API 中间件链：Correlation → Authz → RateLimit。
++	// API 中间件链：Correlation → Authenticate → RateLimit。
+ 	limiter := middleware.NewRateLimiter(cfg.RateLimitRPS, cfg.RateLimitBurst)
+ 	apiHandler := middleware.Chain(apiMux,
+ 		middleware.Correlation(cfg.CorrelationHeader),
+-		middleware.Authz(cfg.TenantHeader),
++		middleware.Authenticate(authn, cfg.TenantHeader),
+ 		middleware.RateLimit(limiter, cfg.TenantHeader),
+ 	)
+ 
+@@ -104,6 +112,27 @@ func New(cfg config.Config, logger *log.Logger) (*Router, error) {
+ 	return &Router{handler: middleware.Recovery(logger)(root)}, nil
+ }
+ 
++// newAuthenticator 按配置构造入口认证器；未知模式视为配置错误，绝不退化为信任请求头。
++func newAuthenticator(cfg config.Config) (middleware.Authenticator, error) {
++	switch cfg.AuthMode {
++	case config.AuthModeAPIKey:
++		keys, err := middleware.LoadAPIKeys(cfg.APIKeysFile)
++		if err != nil {
++			return nil, fmt.Errorf("router: %w", err)
++		}
++		authn, err := middleware.NewAPIKeyAuthenticator(keys, cfg.TenantHeader)
++		if err != nil {
++			return nil, fmt.Errorf("router: %w", err)
++		}
++		return authn, nil
++	case config.AuthModeDev:
++		return middleware.HeaderAuthenticator{TenantHeader: cfg.TenantHeader}, nil
++	default:
++		return nil, fmt.Errorf("router: 未知认证模式 %q（可选 %q、%q）",
++			cfg.AuthMode, config.AuthModeAPIKey, config.AuthModeDev)
++	}
++}
++
+ // ServeHTTP 实现 http.Handler。
+ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+ 	r.handler.ServeHTTP(w, req)
+diff --git a/gateway/internal/router/router_test.go b/gateway/internal/router/router_test.go
+index 9962945..cacbc70 100644
+--- a/gateway/internal/router/router_test.go
++++ b/gateway/internal/router/router_test.go
+@@ -12,7 +12,7 @@ import (
+ 	"github.com/Mekoforge/ForgeMesh/gateway/internal/config"
+ )
+ 
+-// newTestRouter 构造测试用网关处理器；upstreamURL 指向被测的模拟上游。
++// newTestRouter 构造 dev 认证模式的测试用网关处理器；upstreamURL 指向被测的模拟上游。
+ func newTestRouter(t *testing.T, upstreamURL string) *Router {
+ 	t.Helper()
+ 	cfg := config.Config{
+@@ -22,6 +22,7 @@ func newTestRouter(t *testing.T, upstreamURL string) *Router {
+ 		RateLimitBurst:    1000,
+ 		TenantHeader:      "X-Tenant-ID",
+ 		CorrelationHeader: "X-Correlation-ID",
++		AuthMode:          config.AuthModeDev,
+ 	}
+ 	r, err := New(cfg, log.New(io.Discard, "", 0))
+ 	if err != nil {
+diff --git a/gateway/internal/router/tenant_security_test.go b/gateway/internal/router/tenant_security_test.go
+index 1778165..1e08dd7 100644
+--- a/gateway/internal/router/tenant_security_test.go
++++ b/gateway/internal/router/tenant_security_test.go
+@@ -6,9 +6,8 @@
+ //     被规范化为受信单值，无法造成“鉴权身份 ≠ 转发身份”的横向越权；
+ //   - 无认证请求访问推理路径被 authz 拒绝，且不触达上游。
+ //
+-// 已知骨架限制（非本测试可消除）：Authz 尚未接入 JWT/OIDC 签名校验，
+-// 租户身份本质仍是“客户端声明 + 控制平面二次校验”（零信任，见 authz.go）；
+-// 本文件针对的是其中可立即利用的“头部变体歧义”攻击面。
++// 本文件的用例运行在 dev 认证模式（信任租户头），针对“头部变体歧义”攻击面；
++// apikey 模式下租户取自凭证、与凭证不符的租户头被拒绝，见 auth_test.go。
+ package router
+ 
+ import (
+@@ -191,8 +190,8 @@ func TestTenantSecurity_UnauthorizedResponseOpaque(t *testing.T) {
+ 	r.ServeHTTP(rec, req)
+ 
+ 	body := rec.Body.String()
+-	if want := "401 Unauthorized: missing tenant identity\n"; body != want {
+-		t.Fatalf("401 响应体应为固定文案 %q，实际 %q", want, body)
++	if !strings.HasPrefix(body, `{"error":{"code":"UNAUTHENTICATED","message":"missing tenant identity"`) {
++		t.Fatalf("401 响应体应为固定文案的错误信封，实际 %q", body)
+ 	}
+ 	for _, leak := range []string{"goroutine", "panic", ".go:", "runtime", "stack"} {
+ 		if strings.Contains(strings.ToLower(body), strings.ToLower(leak)) {
+@@ -218,6 +217,7 @@ func TestTenantSecurity_ConfigTenantHeaderEndToEnd(t *testing.T) {
+ 		RateLimitBurst:    1000,
+ 		TenantHeader:      "X-Org-Scope",
+ 		CorrelationHeader: "X-Correlation-ID",
++		AuthMode:          config.AuthModeDev,
+ 	}
+ 	r, err := New(cfg, nil)
+ 	if err != nil {
+diff --git a/gateway/internal/stream/proxy.go b/gateway/internal/stream/proxy.go
+index dd0ffa0..8525f92 100644
+--- a/gateway/internal/stream/proxy.go
++++ b/gateway/internal/stream/proxy.go
+@@ -54,7 +54,7 @@ type Proxy struct {
+ // New 构造流式代理。
+ //
+ // resolver 提供按服务名的实例解析；tenantHeader 为提取租户身份的请求头名
+-// （与 Authz 中间件一致）；logger 为 nil 时使用 log.Default()。
++// （与认证中间件一致）；logger 为 nil 时使用 log.Default()。
+ //
+ // 客户端不设置整体超时（流式连接可能长时间保持），仅对响应头到达设置超时，
+ // 防止上游僵死连接长期占用资源。
+@@ -95,7 +95,8 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 	}
+ 	tenantID := r.Header.Get(p.tenantHeader)
+ 
+-	endpoints, err := p.resolver.Resolve(r.Context(), svc, tenantID)
++	resolveCtx := upstream.WithAuthorization(r.Context(), r.Header.Get("Authorization"))
++	endpoints, err := p.resolver.Resolve(resolveCtx, svc, tenantID)
+ 	if err != nil {
+ 		p.logger.Printf("stream resolve error: corr=%s svc=%s tenant=%s err=%v",
+ 			r.Header.Get("X-Correlation-ID"), svc, tenantID, err)
+@@ -220,9 +221,11 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, target *url.URL,
+ }
+ 
+ // classifyResolveError 将解析错误映射为 (HTTP 状态码, 错误码)。
+-// 服务缺失/未就绪/无实例 → 503；控制平面自身故障 → 502。
++// 凭证无权读取服务 → 403；服务缺失/未就绪/无实例 → 503；控制平面自身故障 → 502。
+ func classifyResolveError(err error) (int, string) {
+ 	switch {
++	case errors.Is(err, upstream.ErrForbidden):
++		return http.StatusForbidden, "FORBIDDEN"
+ 	case errors.Is(err, upstream.ErrServiceNotFound),
+ 		errors.Is(err, upstream.ErrNotReady),
+ 		errors.Is(err, upstream.ErrNoEndpoints),
+diff --git a/gateway/internal/upstream/resolver.go b/gateway/internal/upstream/resolver.go
+index bc904cd..5862d1d 100644
+--- a/gateway/internal/upstream/resolver.go
++++ b/gateway/internal/upstream/resolver.go
+@@ -1,6 +1,7 @@
+ // resolver.go 实现推理服务名 → 实例 endpoint 列表的解析。
+ //
+-// 数据源：控制平面 GET /api/v1/inference-services/{svc}（携带 X-Tenant-Id），
++// 数据源：控制平面 GET /api/v1/inference-services/{svc}（携带 X-Tenant-Id 与调用方的
++// Authorization，控制平面据此独立校验调用方，见 WithAuthorization），
+ // 从响应 status.endpoints[] 取实例地址（如 "http://10.0.0.1:8000"）。
+ //
+ // 设计要点：
+@@ -10,7 +11,8 @@
+ //     unhealthy 进入冷却期；冷却结束后按 half-open 语义重新放行（计数清零，
+ //     给实例一次探测机会，避免"一次失败即永久摘除"或"反复抖动"）。
+ //   - 解析失败（控制平面 404 / 网络错误 / status.endpoints 为空 /
+-//     phase 非 Ready）返回哨兵错误，调用方据此生成 502/503。
++//     phase 非 Ready）返回哨兵错误，调用方据此生成 502/503；控制平面 403
++//     返回 ErrForbidden，调用方据此生成 403。
+ //
+ // 依赖约束：仅使用标准库（encoding/json 等），与 config 包约束一致。
+ package upstream
+@@ -33,6 +35,8 @@ import (
+ var (
+ 	// ErrServiceNotFound 控制平面返回 404：推理服务不存在。
+ 	ErrServiceNotFound = errors.New("inference service not found")
++	// ErrForbidden 控制平面返回 403：调用方凭证无权读取该推理服务。
++	ErrForbidden = errors.New("credentials may not read the inference service")
+ 	// ErrNotReady 资源 status.phase 不为 Ready：服务尚未就绪。
+ 	ErrNotReady = errors.New("inference service not Ready")
+ 	// ErrNoEndpoints status.endpoints 为空（或全部无法解析）：没有可用实例地址。
+@@ -65,6 +69,17 @@ type inferenceServicePayload struct {
+ 	} `json:"status"`
+ }
+ 
++type authorizationKey struct{}
++
++// WithAuthorization 返回携带调用方 Authorization 请求头的 context。Resolver 查询控制平面
++// 时原样附带，控制平面用同一份凭证独立校验调用方与租户；value 为空时原样返回 ctx。
++func WithAuthorization(ctx context.Context, value string) context.Context {
++	if value == "" {
++		return ctx
++	}
++	return context.WithValue(ctx, authorizationKey{}, value)
++}
++
+ // cacheEntry 是服务级缓存条目。
+ type cacheEntry struct {
+ 	endpoints []string
+@@ -165,9 +180,12 @@ func (r *Resolver) fetch(ctx context.Context, svc, tenantID string) ([]string, e
+ 	if err != nil {
+ 		return nil, fmt.Errorf("resolver: 构造请求失败: %w", err)
+ 	}
+-	// 控制平面 get_tenant_id 依赖 X-Tenant-Id（HTTP 头大小写不敏感）。
++	// 租户已由网关认证中间件取自凭证；控制平面会核对它与凭证绑定的租户一致。
+ 	req.Header.Set("X-Tenant-Id", tenantID)
+ 	req.Header.Set("Accept", "application/json")
++	if auth, _ := ctx.Value(authorizationKey{}).(string); auth != "" {
++		req.Header.Set("Authorization", auth)
++	}
+ 
+ 	resp, err := r.client.Do(req)
+ 	if err != nil {
+@@ -178,6 +196,8 @@ func (r *Resolver) fetch(ctx context.Context, svc, tenantID string) ([]string, e
+ 	switch {
+ 	case resp.StatusCode == http.StatusNotFound:
+ 		return nil, fmt.Errorf("%w: svc=%s tenant=%s", ErrServiceNotFound, svc, tenantID)
++	case resp.StatusCode == http.StatusForbidden:
++		return nil, fmt.Errorf("%w: svc=%s tenant=%s", ErrForbidden, svc, tenantID)
+ 	case resp.StatusCode < 200 || resp.StatusCode >= 300:
+ 		return nil, fmt.Errorf("resolver: 控制平面返回异常状态 %d (svc=%s)", resp.StatusCode, svc)
+ 	}
+diff --git a/gateway/internal/upstream/resolver_test.go b/gateway/internal/upstream/resolver_test.go
+index 06315fc..6340bbf 100644
+--- a/gateway/internal/upstream/resolver_test.go
++++ b/gateway/internal/upstream/resolver_test.go
+@@ -86,6 +86,46 @@ func TestResolve_Success(t *testing.T) {
+ 	}
+ }
+ 
++// TestResolve_ForwardsCallerAuthorization 验证 WithAuthorization 注入的凭证随查询发给控制平面，
++// 未注入时不发送 Authorization。
++func TestResolve_ForwardsCallerAuthorization(t *testing.T) {
++	var mu sync.Mutex
++	var got []string
++	srv, _ := newControlPlane(t, func(w http.ResponseWriter, r *http.Request) {
++		mu.Lock()
++		got = append(got, r.Header.Get("Authorization"))
++		mu.Unlock()
++		_, _ = io.WriteString(w, readyBody("Ready", "http://10.0.0.1:8000"))
++	})
++	r := newTestResolver(srv.URL, time.Nanosecond, time.Second)
++
++	if _, err := r.Resolve(WithAuthorization(context.Background(), "Bearer fmk_k"), "svc-a", "tenant-a"); err != nil {
++		t.Fatalf("Resolve 应成功: %v", err)
++	}
++	time.Sleep(time.Millisecond)
++	if _, err := r.Resolve(WithAuthorization(context.Background(), ""), "svc-a", "tenant-a"); err != nil {
++		t.Fatalf("Resolve 应成功: %v", err)
++	}
++
++	mu.Lock()
++	defer mu.Unlock()
++	if len(got) != 2 || got[0] != "Bearer fmk_k" || got[1] != "" {
++		t.Fatalf("控制平面收到的 Authorization 应为 [Bearer fmk_k, 空]，实际 %q", got)
++	}
++}
++
++// TestResolve_Forbidden 验证控制平面 403 映射为 ErrForbidden。
++func TestResolve_Forbidden(t *testing.T) {
++	srv, _ := newControlPlane(t, func(w http.ResponseWriter, r *http.Request) {
++		w.WriteHeader(http.StatusForbidden)
++	})
++	r := newTestResolver(srv.URL, time.Second, time.Second)
++
++	if _, err := r.Resolve(context.Background(), "svc-a", "tenant-a"); !errors.Is(err, ErrForbidden) {
++		t.Fatalf("403 应映射为 ErrForbidden，实际 %v", err)
++	}
++}
++
+ // TestResolve_CacheHit 验证 TTL 内第二次 Resolve 命中缓存，不再发请求。
+ func TestResolve_CacheHit(t *testing.T) {
+ 	srv, calls := newControlPlane(t, nil)
+-- 
+2.43.0
+

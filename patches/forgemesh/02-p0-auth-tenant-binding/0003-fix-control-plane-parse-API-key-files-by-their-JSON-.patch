@@ -1,0 +1,76 @@
+From 63ba927b8f851ec2ca548a359feedc2cc85660b7 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 12 Oct 2026 04:06:31 +0000
+Subject: [PATCH 3/8] fix(control-plane): parse API key files by their JSON
+ field names only
+
+populate_by_name let the control plane accept "tenant_id" as well as
+"tenantId", while the gateway reads the same file format strictly. A file
+written with the snake_case name would then authenticate requests at the
+control plane but fail to load at the gateway. Accept the documented
+camelCase names only, so one key file validates the same way everywhere.
+---
+ .../control-plane/src/forgemesh/controlplane/auth.py   | 10 +++++++---
+ tests/unit/controlplane/test_auth.py                   |  7 ++++---
+ 2 files changed, 11 insertions(+), 6 deletions(-)
+
+diff --git a/packages/control-plane/src/forgemesh/controlplane/auth.py b/packages/control-plane/src/forgemesh/controlplane/auth.py
+index 9d2562c..f12ff38 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/auth.py
++++ b/packages/control-plane/src/forgemesh/controlplane/auth.py
+@@ -100,9 +100,13 @@ class Authenticator(Protocol):
+ 
+ 
+ class ApiKeyEntry(BaseModel):
+-    """key 文件中的一条记录：只保存 key 的 SHA-256 摘要，不保存明文。"""
++    """key 文件中的一条记录：只保存 key 的 SHA-256 摘要，不保存明文。
+ 
+-    model_config = ConfigDict(extra="forbid", frozen=True, populate_by_name=True)
++    字段只按 JSON 名（``tenantId``）解析，与网关的解析规则保持一致，同一份文件在
++    两个服务中的校验结果相同。
++    """
++
++    model_config = ConfigDict(extra="forbid", frozen=True)
+ 
+     id: str = Field(min_length=1)
+     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+@@ -274,7 +278,7 @@ def _keygen(args: argparse.Namespace) -> int:
+     entry = ApiKeyEntry(
+         id=args.id or f"{args.tenant}-{args.subject}",
+         sha256=hash_api_key(key),
+-        tenant_id=args.tenant,
++        tenantId=args.tenant,
+         subject=args.subject,
+         scopes=tuple(args.scope) if args.scope else (SCOPE_READ, SCOPE_WRITE),
+     )
+diff --git a/tests/unit/controlplane/test_auth.py b/tests/unit/controlplane/test_auth.py
+index 8f89d1b..4ae889e 100644
+--- a/tests/unit/controlplane/test_auth.py
++++ b/tests/unit/controlplane/test_auth.py
+@@ -32,12 +32,12 @@ KEY_B = "fmk_key-for-tenant-b"
+ KEY_READ_ONLY = "fmk_read-only-key-for-tenant-a"
+ 
+ ENTRIES = [
+-    ApiKeyEntry(id="a", sha256=hash_api_key(KEY_A), tenant_id="tenant-a", subject="alice"),
+-    ApiKeyEntry(id="b", sha256=hash_api_key(KEY_B), tenant_id="tenant-b", subject="bob"),
++    ApiKeyEntry(id="a", sha256=hash_api_key(KEY_A), tenantId="tenant-a", subject="alice"),
++    ApiKeyEntry(id="b", sha256=hash_api_key(KEY_B), tenantId="tenant-b", subject="bob"),
+     ApiKeyEntry(
+         id="ro",
+         sha256=hash_api_key(KEY_READ_ONLY),
+-        tenant_id="tenant-a",
++        tenantId="tenant-a",
+         subject="viewer",
+         scopes=("read",),
+     ),
+@@ -173,6 +173,7 @@ def test_load_api_keys_normalizes_digests(tmp_path) -> None:
+             }
+         ),
+         json.dumps({"keys": [{"id": "a", "sha256": "0" * 64, "tenantId": "t"}]}),
++        json.dumps({"keys": [{"id": "a", "sha256": "0" * 64, "tenant_id": "t", "subject": "s"}]}),
+     ],
+ )
+ def test_load_api_keys_rejects_invalid_files(tmp_path, content) -> None:
+-- 
+2.43.0
+

@@ -1,0 +1,602 @@
+From 0c1441e1bf1d39e444133c44b1a45174414aa07b Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 12 Oct 2026 04:34:11 +0000
+Subject: [PATCH 8/8] docs: record API key authentication (ADR-014) and
+ document its configuration
+
+Propose ADR-014 for tenant-bound API keys verified independently by the
+gateway and the control plane, and describe the resulting contract:
+
+- OpenAPI: a global bearer security scheme (probes exempt), 401/403 on
+  every /api/v1 operation, and the never-honoured tenantId query
+  parameter marked deprecated.
+- CHANGELOG: the new configuration, the breaking changes (apikey by
+  default, 401 instead of 400 without credentials, JSON error bodies
+  from the gateway, credentials no longer reaching inference instances)
+  and the security fixes.
+- README and gateway README: environment variables, key generation,
+  dev mode, the middleware chain and the header forwarding rules.
+- SECURITY.md, the v1.0 release notes (which claimed built-in API key
+  and OIDC authentication) and the module mapping.
+---
+ CHANGELOG.md                        | 18 ++++++-
+ README.md                           | 19 ++++++--
+ SECURITY.md                         |  1 +
+ api/openapi/openapi.yaml            | 50 ++++++++++++++++++-
+ docs/architecture/module-mapping.md |  6 +--
+ docs/design-decisions/README.md     |  3 +-
+ docs/design-decisions/adr-014.md    | 75 +++++++++++++++++++++++++++++
+ docs/releases/v1.0.md               |  3 +-
+ gateway/README.md                   | 74 ++++++++++++++++------------
+ 9 files changed, 208 insertions(+), 41 deletions(-)
+ create mode 100644 docs/design-decisions/adr-014.md
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 2ef17a8..6badc22 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -13,6 +13,10 @@
+ - 新增契约 / 混沌 / 兼容测试 122 项（1115 vs 993）：Registry CAS 并发 / 租户过滤 / 重启恢复（19）、Workflow 恢复版本固定 / 取消补偿 + Outbox 事务 / 幂等 / 死信（12）、10 插件发布链路 conformance——manifest/isolation 一致性 + 四类 Provider 契约 + 卸载安全（91）。
+ - 控制平面可运行入口：`control-plane` 包新增控制台脚本 `forgemesh-control-plane`（`forgemesh.controlplane.app:main`）；权威存储路径取自 `FORGEMESH_DB_PATH`（默认 `forgemesh.db`），监听地址取自 `FORGEMESH_HOST` / `FORGEMESH_PORT`（默认 `127.0.0.1:8080`），启动方式见 README「运行控制平面」。
+ - 新增 `tests/contract/test_registry_hardening.py`：并发创建全部持久化、空 namespace 身份唯一、删除 / 释放 CAS、标签过滤与分页等 Registry 回归测试。
++- 新增 [ADR-014](docs/design-decisions/adr-014.md)（Proposed）：对外 API 采用绑定租户的 API Key 认证。
++- API Key 认证（ADR-014）：网关（`GATEWAY_AUTH_MODE` / `GATEWAY_API_KEYS_FILE`）与控制平面（`FORGEMESH_AUTH_MODE` / `FORGEMESH_API_KEYS_FILE`）各自校验 `Authorization: Bearer <key>`；key 文件只保存 SHA-256 摘要，每个 key 绑定租户、主体与 scope（`read` / `write` / `*`）；`python -m forgemesh.controlplane.keygen --tenant <租户> --subject <主体>` 生成 key 与对应的 key 文件条目。
++- 网关 `make run-dev`：以 `dev` 认证模式在 `127.0.0.1:8081` 启动，仅供本地开发。
++- OpenAPI：新增 `apiKey`（HTTP bearer）安全方案并设为全局 `security`（探针豁免），全部 `/api/v1` 端点声明 `401` / `403`。
+ 
+ ### Changed
+ 
+@@ -21,6 +25,15 @@
+ - 包元数据事实统一：全部 10 个子包 `requires-python` 从 `>=3.9` 校准为 `>=3.12`（对齐 README/CI/Ruff 的 Python 3.12 基线）；`control-plane` 与 `workflow-runtime` 包描述去除过时的 skeleton/placeholder 表述，`cli` 与 `node-agent` 包描述同步移除 skeleton 字样。
+ - [.github/workflows/ci.yml](.github/workflows/ci.yml)：ADR 检查由硬编码 001–012 改为索引驱动动态校验；architecture-docs job 新增 manifest / OpenAPI 语义 / 元数据一致 / 插件冒烟四道步骤。
+ - 修正 `plugins/runtime-tgi`（移除 schema 未定义的 spec.capabilities）与 `plugins/workflow-temporal`（category 改为 provider 并移除 capabilities）manifest 至 schema 合规。
++- **破坏性**：网关与控制平面默认使用 `apikey` 认证模式，未配置 key 文件时拒绝启动；`dev` 模式（直接信任租户请求头）只允许监听回环地址。
++- **破坏性**：缺少凭证的请求由 `400`（缺少 `X-Tenant-Id`）改为 `401 UNAUTHENTICATED`，并携带 `WWW-Authenticate: Bearer realm="forgemesh"`；`X-Tenant-Id` 与凭证绑定的租户不一致返回 `403 FORBIDDEN`；读接口要求 `read` scope，写接口（含启动工作流与请求决策）要求 `write` scope。
++- **破坏性**：网关的 `401` 响应体由纯文本改为统一错误信封 `{"error": {"code", "message", "correlationId"}}`（新增的 `403` 同样使用信封）；推理实例不再收到调用方的 `Authorization` / `Cookie`。
++- 控制平面全部错误响应统一为错误信封：框架层 404 / 405 不再返回 `{"detail": ...}`，请求校验失败由 `422` 改为 `400`，未捕获异常返回不含内部细节的 `500 INTERNAL_ERROR`（细节写入日志）。
++- 网关接受任意大小写的 `Bearer` scheme（如 `bearer`）。
++
++### Deprecated
++
++- `GET /api/v1/inference-services` 的 `tenantId` 查询参数：从未生效，租户取自凭证（ADR-014）；计划在 1.3.0 移除。
+ 
+ ### Fixed
+ 
+@@ -36,7 +49,10 @@
+ 
+ ### Security
+ 
+-- Go 网关多租户安全验证：跨租户拒绝、伪造 `X-Tenant-Id` 不得提权、SSE 客户端取消 / 上游断开连接释放、中间件链序（Recovery→Correlation→Authz→RateLimit→Route）测试；网关 README 新增 header 转发 / 剥离策略表。
++- Go 网关多租户安全验证：跨租户拒绝、伪造 `X-Tenant-Id` 不得提权、SSE 客户端取消 / 上游断开连接释放、中间件链序（Recovery→Correlation→Authenticate→RateLimit→Route）测试；网关 README 新增 header 转发 / 剥离策略表。
++- 租户身份改由凭证绑定（ADR-014）：此前网关只检查 `X-Tenant-ID` 是否存在，控制平面直接信任该请求头且可被直连，任何调用方都能读写任意租户的资源。控制平面现自行校验凭证，不依赖请求必经网关；网关对推理路由检查 `read` scope，命中 Resolver 缓存的请求同样受约束。
++- 网关不再把调用方的 `Authorization` / `Cookie` 转发给推理实例（此前原样透传，凭证会泄露给实例）；资源反代与 Resolver 查询仍向控制平面转发 `Authorization`，由控制平面复核。
++- 网关限流改按已验证的租户计数，不再读取客户端可控的租户头或 `X-Forwarded-For`（此前更换头值即可获得新的令牌桶）。
+ 
+ ## [1.0.1] - 2026-10-11
+ 
+diff --git a/README.md b/README.md
+index df8dedf..b4a496f 100644
+--- a/README.md
++++ b/README.md
+@@ -137,18 +137,29 @@ make clean           # 清理构建与缓存产物
+ 
+ ### 运行控制平面
+ 
++控制平面与网关默认要求 API key（[ADR-014](docs/design-decisions/adr-014.md)）：每个 key 绑定一个租户和一组 scope（`read` / `write` / `*`），租户只取自 key，不取自请求头。
++
+ ```bash
+-FORGEMESH_DB_PATH=./forgemesh.db .venv/bin/forgemesh-control-plane
+-curl -s http://127.0.0.1:8080/readyz   # {"status":"ok",...}
++# 1. 生成 key：第 2 行是 key（只显示这一次），最后一行是 key 文件条目
++.venv/bin/python -m forgemesh.controlplane.keygen --tenant acme --subject ci-bot
++
++# 2. 把条目放进 key 文件的 "keys" 数组（文件只含 SHA-256 摘要，网关与控制平面共用）
++#    {"keys": [{"id": "acme-ci-bot", "sha256": "…", "tenantId": "acme", "subject": "ci-bot", "scopes": ["read", "write"]}]}
++
++# 3. 启动并调用
++FORGEMESH_API_KEYS_FILE=./api-keys.json FORGEMESH_DB_PATH=./forgemesh.db .venv/bin/forgemesh-control-plane
++curl -s -H "Authorization: Bearer fmk_…" http://127.0.0.1:8080/api/v1/inference-services
+ ```
+ 
+ | 环境变量 | 默认值 | 说明 |
+ | --- | --- | --- |
++| `FORGEMESH_AUTH_MODE` | `apikey` | `apikey`：校验 `Authorization: Bearer <key>`；`dev`：直接信任 `X-Tenant-Id` 请求头，只允许监听回环地址，仅供本地开发 |
++| `FORGEMESH_API_KEYS_FILE` | — | `apikey` 模式必填，缺失或格式非法时拒绝启动 |
+ | `FORGEMESH_DB_PATH` | `forgemesh.db` | SQLite 权威存储文件；同一文件只允许一个控制平面实例写入（ADR-013） |
+ | `FORGEMESH_HOST` | `127.0.0.1` | 监听地址 |
+ | `FORGEMESH_PORT` | `8080` | 监听端口 |
+ 
+-> 控制平面按 `X-Tenant-Id` 请求头识别租户、不校验凭证，请保持回环监听，不要直接暴露给不可信网络。
++> 请求可以不带 `X-Tenant-Id`；带了就必须与 key 绑定的租户一致，否则返回 `403`。缺少或无效的 key 返回 `401`。
+ 
+ ### Go 网关
+ 
+@@ -156,6 +167,8 @@ curl -s http://127.0.0.1:8080/readyz   # {"status":"ok",...}
+ cd gateway
+ go test ./...       # 运行网关测试
+ go build ./cmd/gateway  # 构建网关二进制
++GATEWAY_API_KEYS_FILE=../api-keys.json make run   # 默认 apikey 模式，监听 :8081
++make run-dev        # dev 模式：信任租户请求头，只监听 127.0.0.1:8081
+ ```
+ 
+ ---
+diff --git a/SECURITY.md b/SECURITY.md
+index 1385e61..3e53c79 100644
+--- a/SECURITY.md
++++ b/SECURITY.md
+@@ -119,6 +119,7 @@ ForgeMesh 通过插件与多组件扩展，供应链完整性是重点防护面
+ 
+ - **决策 ≠ 授权**（不变量三 / ADR-005）：任何 LLM/JEV 建议都不得绕过 Policy 与 Scheduler 检查。
+ - **多租户边界**（ADR-007）：身份、资源、工作流、数据与计量均具租户边界；不同租户不得读取彼此私有资源与审计数据。
++- **对外 API 认证**（ADR-014）：租户只来自已验证的凭证（绑定租户的 API key），`X-Tenant-Id` 只能与凭证一致，不能作为身份来源；新增端点必须声明所需 scope；`dev` 认证模式只用于回环地址上的本地开发。
+ - **密钥不落盘**：敏感信息以 `SecretRef` 引用 Secret Manager，禁止明文写入资源对象、日志或仓库（ADR-007）。
+ - **受认证任务协议**（ADR-009）：Node Agent 仅接受有类型任务，**禁止默认执行任意远程 Shell**。
+ - **最小权限**：插件与组件仅申请必要权限。
+diff --git a/api/openapi/openapi.yaml b/api/openapi/openapi.yaml
+index 96bb737..b588063 100644
+--- a/api/openapi/openapi.yaml
++++ b/api/openapi/openapi.yaml
+@@ -7,6 +7,9 @@ info:
+     （/api/v1/ 版本前缀）；本文件描述控制平面资源/运行 API 与探针。
+     统一响应信封与错误码见 components。资源权威 Schema 见 api/schemas/。
+     v1.0 为首个稳定版本，major 版本内保证 API 兼容性（见 docs/releases/v1.0.md）。
++    认证（ADR-014）：除探针外的全部端点要求 Authorization: Bearer <API key>，
++    租户取自 key 绑定的租户；X-Tenant-Id 请求头可以省略，携带时必须与之一致，
++    否则返回 403。读接口要求 read scope，写接口要求 write scope。
+   x-stability: stable
+   x-deprecation-policy: >-
+     端点或字段弃用时使用 x-deprecated: true 扩展字段标记，并附带 x-deprecated-since
+@@ -15,6 +18,8 @@ info:
+ servers:
+   - url: http://localhost:8080
+     description: 本地控制平面（Go 网关前置）
++security:
++  - apiKey: []
+ tags:
+   - name: inference-services
+     description: 推理服务声明式生命周期管理（创建/查询/删除）
+@@ -31,6 +36,7 @@ paths:
+       tags: [probes]
+       summary: 存活探针
+       operationId: healthz
++      security: []
+       responses:
+         "200":
+           description: 进程存活
+@@ -43,6 +49,7 @@ paths:
+       tags: [probes]
+       summary: 就绪探针
+       operationId: readyz
++      security: []
+       responses:
+         "200":
+           description: 就绪
+@@ -65,6 +72,11 @@ paths:
+       parameters:
+         - name: tenantId
+           in: query
++          deprecated: true
++          x-deprecated: true
++          x-deprecated-since: 1.1.0
++          x-deprecated-removal: 1.3.0
++          description: 从未生效，服务端忽略；租户取自凭证（ADR-014）。
+           schema:
+             type: string
+         - name: namespace
+@@ -111,6 +123,10 @@ paths:
+                 $ref: "#/components/schemas/InferenceService"
+         "400":
+           $ref: "#/components/responses/BadRequest"
++        "401":
++          $ref: "#/components/responses/Unauthorized"
++        "403":
++          $ref: "#/components/responses/Forbidden"
+         "409":
+           $ref: "#/components/responses/Conflict"
+ 
+@@ -133,6 +149,10 @@ paths:
+             application/json:
+               schema:
+                 $ref: "#/components/schemas/InferenceService"
++        "401":
++          $ref: "#/components/responses/Unauthorized"
++        "403":
++          $ref: "#/components/responses/Forbidden"
+         "404":
+           $ref: "#/components/responses/NotFound"
+     delete:
+@@ -151,6 +171,10 @@ paths:
+                 $ref: "#/components/schemas/TerminatingResponse"
+         "204":
+           description: 已直接删除（无 finalizer，无外部副作用）
++        "401":
++          $ref: "#/components/responses/Unauthorized"
++        "403":
++          $ref: "#/components/responses/Forbidden"
+         "404":
+           $ref: "#/components/responses/NotFound"
+         "409":
+@@ -177,6 +201,10 @@ paths:
+                 $ref: "#/components/schemas/WorkflowRun"
+         "400":
+           $ref: "#/components/responses/BadRequest"
++        "401":
++          $ref: "#/components/responses/Unauthorized"
++        "403":
++          $ref: "#/components/responses/Forbidden"
+ 
+ 
+   /api/v1/decisions:
+@@ -199,9 +227,20 @@ paths:
+                 $ref: "#/components/schemas/DecisionResponse"
+         "400":
+           $ref: "#/components/responses/BadRequest"
++        "401":
++          $ref: "#/components/responses/Unauthorized"
++        "403":
++          $ref: "#/components/responses/Forbidden"
+ 
+ 
+ components:
++  securitySchemes:
++    apiKey:
++      type: http
++      scheme: bearer
++      description: >-
++        绑定租户与 scope（read / write / *）的 API key（ADR-014），由
++        python -m forgemesh.controlplane.keygen 生成；服务端只保存其 SHA-256 摘要。
+   schemas:
+     HealthResponse:
+       type: object
+@@ -337,13 +376,20 @@ components:
+           schema:
+             $ref: "#/components/schemas/Error"
+     Unauthorized:
+-      description: 未认证
++      description: 缺少凭证或凭证无效（错误码 UNAUTHENTICATED）
++      headers:
++        WWW-Authenticate:
++          description: 固定为 Bearer realm="forgemesh"。
++          schema:
++            type: string
+       content:
+         application/json:
+           schema:
+             $ref: "#/components/schemas/Error"
+     Forbidden:
+-      description: 无权限
++      description: >-
++        凭证有效但无权执行（错误码 FORBIDDEN）：缺少所需 scope，或
++        X-Tenant-Id 与凭证绑定的租户不一致。
+       content:
+         application/json:
+           schema:
+diff --git a/docs/architecture/module-mapping.md b/docs/architecture/module-mapping.md
+index 2078662..decf67c 100644
+--- a/docs/architecture/module-mapping.md
++++ b/docs/architecture/module-mapping.md
+@@ -76,7 +76,7 @@
+ |---|---|
+ | 架构模块 | Data Plane Gateway（L1 推理流量入口，architecture.md 3.1 L1 / Dev-5） |
+ | 当前代码路径 | `gateway/cmd/gateway/main.go`；`gateway/internal/{config,health,middleware,router,stream,upstream}/`（共 20 个 `.go` 文件，glob 核对）；`gateway/go.mod`（`github.com/Mekoforge/ForgeMesh/gateway`，go 1.22）；`gateway/Makefile`、`gateway/README.md` |
+-| 核心契约 | `/api/v1/` REST + SSE 流式转发（见 openapi.yaml）；中间件链 `Recovery → Correlation → Authz → RateLimit → Route`；上游解析 `upstream/resolver.go`（endpoint 解析与健康摘流） |
++| 核心契约 | `/api/v1/` REST + SSE 流式转发（见 openapi.yaml）；中间件链 `Recovery → Correlation → Authenticate → RateLimit → Route`；API key 认证（ADR-014，`middleware/{authz,apikey}.go`）；上游解析 `upstream/resolver.go`（endpoint 解析与健康摘流） |
+ | 运行形态 | 独立进程（Go 二进制），经 `FORGEMESH_UPSTREAM` 转发至控制平面 |
+ | 数据所有权 | 无权威数据（运行态转发；端点解析缓存为派生数据） |
+ | 允许依赖 | 控制平面 HTTP API（上游）、Go 标准库 |
+@@ -120,13 +120,13 @@
+ | 字段 | 内容 |
+ |---|---|
+ | 架构模块 | L2 Core Control Plane（权威状态、协调、插件管理、审计） |
+-| 当前代码路径 | `packages/control-plane/src/forgemesh/controlplane/`：`registry/{models,store}.py`、`reconciler/{core,dedup}.py`、`api/{routes,dependencies}.py`、`plugin_manager.py`、`outbox.py`、`audit.py`、`tasks.py`、`heartbeat.py`、`observability.py`、`diagnostics.py`、`app.py`（共 18 个 `.py`，与任务书的 9 个子模块一一对应） |
++| 当前代码路径 | `packages/control-plane/src/forgemesh/controlplane/`：`registry/{models,store}.py`、`reconciler/{core,dedup}.py`、`api/{routes,dependencies,errors}.py`、`plugin_manager.py`、`outbox.py`、`audit.py`、`tasks.py`、`heartbeat.py`、`observability.py`、`diagnostics.py`、`app.py`、`auth.py`、`keygen.py`（共 21 个 `.py`；其中 `auth.py` / `keygen.py` / `api/errors.py` 为 API 认证与错误信封，见 ADR-014，其余与任务书的 9 个子模块一一对应） |
+ | 核心契约 | 实现 `core-contracts` 的 `ResourceRegistry` / `Reconciler` / `Scheduler`；`app.py` 提供 HTTP 服务（FastAPI，未安装时回退纯标准库占位——生产必须 FastAPI/ASGI）；Outbox 事务性事件（architecture.md 3.3 规则 7）；`ProcessedKeyStore` 去重（reconciler/dedup.py） |
+ | 运行形态 | 单实例控制平面进程（模块化单体，architecture.md 3.3 规则 8）；ADR-013 约束：仅允许单写方写同一 SQLite 权威库 |
+ | 数据所有权 | **全部业务资源权威状态**（registry/store.py）、审计事件（audit.py → `data/audit.db`）、Outbox 事件、任务与心跳状态 |
+ | 允许依赖 | `forgemesh.core` / `forgemesh.resource` / `forgemesh.policy` / `forgemesh.decision` / `forgemesh.workflow*` / `forgemesh.plugin`（plugin-sdk）、标准库 `sqlite3`、FastAPI |
+ | 禁止依赖 | 任何插件私有模块（`decision_rules` / `gpu_nvidia` 等，扫描二验证 ✅，见 3.2） |
+-| 测试路径 | `tests/unit/controlplane/`：`test_api.py`、`test_routes.py`、`test_registry.py`、`test_reconciler.py`、`test_dedup_store.py`、`test_plugin_manager.py`、`test_outbox.py`、`test_audit.py`、`test_tasks.py`、`test_heartbeat.py`、`test_observability.py`、`test_diagnostics.py`（12 个文件，glob 核对） |
++| 测试路径 | `tests/unit/controlplane/`：`test_api.py`、`test_routes.py`、`test_registry.py`、`test_reconciler.py`、`test_dedup_store.py`、`test_plugin_manager.py`、`test_outbox.py`、`test_audit.py`、`test_tasks.py`、`test_heartbeat.py`、`test_observability.py`、`test_diagnostics.py`、`test_app.py`、`test_auth.py`（14 个文件，glob 核对） |
+ | 状态 | 已实现且有测试覆盖 |
+ | 演进动作 | 保留；WP-C1 补故障路径（CAS 并发、重启恢复、finalizer 闭环、Allocation 唯一性） |
+ 
+diff --git a/docs/design-decisions/README.md b/docs/design-decisions/README.md
+index 6bb017b..1bab9b4 100644
+--- a/docs/design-decisions/README.md
++++ b/docs/design-decisions/README.md
+@@ -1,6 +1,6 @@
+ # 架构决策记录（Architecture Decision Records, ADR）
+ 
+-本目录保存 ForgeMesh 的架构决策记录。**ADR-001 ~ ADR-013 已被采纳（Accepted）**，构成架构约束；其中 ADR-001 ~ ADR-012 源自上游架构基线 [`../architecture/architecture.md`](../architecture/architecture.md) 第 2 章与开发计划 [`../architecture/development-plan.md`](../architecture/development-plan.md) 第 1.2 节，ADR-013 为实施期新增决策。
++本目录保存 ForgeMesh 的架构决策记录。**ADR-001 ~ ADR-013 已被采纳（Accepted）**，构成架构约束；其中 ADR-001 ~ ADR-012 源自上游架构基线 [`../architecture/architecture.md`](../architecture/architecture.md) 第 2 章与开发计划 [`../architecture/development-plan.md`](../architecture/development-plan.md) 第 1.2 节，ADR-013 为实施期新增决策。ADR-014 为待评审（Proposed）的实施期决策。
+ 
+ > 参与流程见 [`../../CONTRIBUTING.md`](../../CONTRIBUTING.md) 第 7 节；决策机制见 [`../../GOVERNANCE.md`](../../GOVERNANCE.md) 第 3.2 节。ADR 与上游架构基线冲突时，**以 architecture.md 为准**。
+ 
+@@ -23,6 +23,7 @@
+ | [ADR-011](adr-011.md) | 插件与工作流版本固定 | Accepted | 升级不能破坏正在运行的任务 | WP-2.1、WP-4.6 |
+ | [ADR-012](adr-012.md) | 所有公共契约版本化 | Accepted | 通过 Schema、兼容性测试与弃用周期管理 | WP-0.5、第 8 章 |
+ | [ADR-013](adr-013.md) | 权威存储 SQLite 先行、PostgreSQL 为目标态 | Accepted | SQL 方言限定两者兼容子集；PG 独有特性不得进入核心路径 | WP-1.2、ADR-007 |
++| [ADR-014](adr-014.md) | 对外 API 采用绑定租户的 API Key 认证 | Proposed | 租户只来自已验证凭证；网关与控制平面各自校验；默认拒绝 | 11.1、14.1、D1.1 |
+ 
+ ---
+ 
+diff --git a/docs/design-decisions/adr-014.md b/docs/design-decisions/adr-014.md
+new file mode 100644
+index 0000000..8e38130
+--- /dev/null
++++ b/docs/design-decisions/adr-014.md
+@@ -0,0 +1,75 @@
++# ADR-014: 对外 API 采用绑定租户的 API Key 认证
++
++- 状态: Proposed
++- 日期: 2026-10-12
++- 决策者: ForgeMesh 维护者（待评审）
++- 相关: ADR-005、ADR-012；architecture.md 3.1（L1 Access Layer）、11.1（多租户边界）、14.1（基础原则）；v1.1-development-plan.md D1.1；SECURITY.md 第 4 节
++
++## 背景
++
++v1.0.x 中租户身份完全来自客户端可以随意填写的请求头，没有任何凭证校验：
++
++- 网关 `Authz` 只检查 `X-Tenant-ID` 是否存在并原样采信；`AuthzWithToken` 只检查 `Authorization` 非空，不验证内容。
++- 控制平面直接读取 `X-Tenant-Id` 作为租户，并且可以绕过网关被直接访问。
++- 网关限流键取自同一个租户头（以及可伪造的 `X-Forwarded-For`），换一个头值就换一个令牌桶。
++- 流式代理把调用方的 `Authorization`、`Cookie` 原样转发给推理实例。
++
++结果是任何能访问网关或控制平面的人都可以读写任意租户的资源。这与 architecture.md 11.1（租户上下文必须在 API 边界验证）、14.1（最小权限、默认拒绝、租户间严格隔离）不符，也与 v1.0 发布记录"内置 API Key 与 OIDC 认证"的表述不符。
++
++备选方案：
++
++1. **OIDC / JWT**：需要外部 IdP 或签名密钥的分发与轮换；网关硬约束只用 Go 标准库，自行实现 JWS 校验成本高、风险大。适合作为后续扩展，而不是第一道防线。
++2. **mTLS 客户端证书**：适合服务间调用，不适合终端调用方，证书签发与吊销的运维成本高。
++3. **网关认证，控制平面信任网关注入的头**：控制平面仍可被直连绕过，违背网关 README 职责边界中"控制平面复核租户、不信任单点"的约定。
++4. **只保存摘要的静态 API Key，绑定租户与 scope，网关与控制平面各自校验**（本决策）：两端都只需标准库，没有外部依赖，且可以独立验证。
++
++## 决策
++
++**对外 API 默认采用绑定租户的 API Key 认证，网关与控制平面各自独立校验同一份 key 文件。**
++
++1. **凭证**：`Authorization: Bearer <key>`，scheme 大小写不敏感。key 由 `python -m forgemesh.controlplane.keygen --tenant <租户> --subject <主体>` 生成（`fmk_` 前缀 + 256 bit 随机数），只在生成时显示一次。
++2. **key 文件**：JSON，网关（`GATEWAY_API_KEYS_FILE`）与控制平面（`FORGEMESH_API_KEYS_FILE`）使用同一格式，只保存 key 的 SHA-256 摘要：
++
++   ```json
++   {"keys": [{"id": "acme-ci-bot", "sha256": "<64 位十六进制>", "tenantId": "acme",
++              "subject": "ci-bot", "scopes": ["read", "write"]}]}
++   ```
++
++   - 字段只认上述 JSON 名称；未知字段、重复 `id`、重复摘要、未知 scope 都是配置错误，服务拒绝启动。
++   - `scopes` 省略时为 `["read", "write"]`；`[]` 表示没有任何权限；`null` 非法。
++3. **租户来源**：租户只来自 key 绑定的 `tenantId`。请求可以不带 `X-Tenant-Id`；如果带了，任何一个取值与 key 绑定的租户不一致都返回 `403 FORBIDDEN`，而不是静默改写到另一个租户。网关在转发前把租户头覆写为已验证的值。
++4. **授权（scope）**：`read` 允许读接口（GET）与推理调用（`/api/v1/inference/{svc}/chat`）；`write` 允许写接口（POST / DELETE，包括启动工作流与请求决策）；`*` 表示全部。控制平面对每个端点检查 scope；网关对推理路由检查 `read`，使命中 Resolver 缓存、不经过控制平面的请求同样受约束。
++5. **纵深防御**：控制平面不假设请求一定经过网关，自行校验凭证。网关把调用方的 `Authorization` 转发给控制平面（资源反代与 Resolver 查询），但**不**把 `Authorization` / `Cookie` 转发给推理实例。
++6. **默认拒绝**：两端默认 `apikey` 模式，缺少 key 文件即拒绝启动；未知模式拒绝启动，绝不退化为信任请求头。控制平面应用未注入认证器时，受保护端点返回 `503 AUTHENTICATOR_UNAVAILABLE`。
++7. **开发模式**：`dev`（`GATEWAY_AUTH_MODE=dev` / `FORGEMESH_AUTH_MODE=dev`）直接信任租户请求头，视为拥有全部 scope；只允许监听回环地址，启动时打印警告。
++8. **错误语义**：缺少凭证或凭证无效返回 `401 UNAUTHENTICATED`，并携带 `WWW-Authenticate: Bearer realm="forgemesh"`；租户不一致或 scope 不足返回 `403 FORBIDDEN`。响应体为统一错误信封 `{"error": {"code", "message", "correlationId"}}`；所有不匹配的 key 都返回同一条 `invalid credentials`，不泄露 key 是否存在。
++9. **限流键**：网关按已验证的租户限流，不再读取租户头或 `X-Forwarded-For`。
++
++接口契约：
++
++- 网关：`middleware.Authenticator`（`Authenticate(*http.Request) (Principal, error)`），实现为 `APIKeyAuthenticator` 与仅供开发的 `HeaderAuthenticator`；`middleware.RequireScope(scope)`。
++- 控制平面：`forgemesh.controlplane.auth.Authenticator` 协议（`authenticate(headers) -> Principal`），实现为 `ApiKeyAuthenticator` 与 `HeaderAuthenticator`；FastAPI 依赖 `get_principal` / `require_read` / `require_write`。
++- OpenAPI：`components.securitySchemes.apiKey`（HTTP bearer）作为全局 `security`，探针 `security: []`。
++
++## 后果
++
++**正面**
++
++- 租户身份从"客户端声明"变为"凭证绑定"：伪造 `X-Tenant-Id`、直连控制平面、更换租户头绕过限流都被关闭。
++- 两端只依赖标准库，没有外部 IdP；key 文件只含摘要，文件泄露不会泄露 key。
++- `Principal`（subject / tenantId / scopes）与 `Authenticator` 抽象为审计归属以及后续的 OIDC / mTLS 提供统一接入点。
++
++**代价与约束（破坏性变更）**
++
++- 与 v1.0 "major 版本内保证 API 兼容"的承诺（ADR-012）冲突：对此前不带凭证的调用方，默认要求凭证是破坏性变更。本 ADR 认为租户隔离缺陷属于安全修复，优先于兼容承诺；`dev` 模式只用于本地过渡，不能作为生产环境的兼容开关。
++- 默认模式下没有 key 文件的部署无法启动；本地开发需要显式选择 `dev` 模式（网关 `make run-dev`）。
++- 不带凭证的请求由 `400`（缺少租户头）变为 `401`；网关的 `401` 响应体由纯文本变为 JSON 错误信封；推理实例不再收到调用方的 `Authorization`。实例如需凭证，应由网关以服务端配置注入，另行设计。
++- key 没有过期时间；轮换或吊销需要同时更新两端的 key 文件并重启（暂不支持热加载）。
++- 认证失败的请求不进入限流。256 bit 随机 key 无法暴力猜测，但入口洪泛防护仍需由前置负载均衡或 WAF 承担。
++
++**后续事项**
++
++- OIDC / JWT 与 mTLS 作为新的 `Authenticator` 实现，另行 ADR。
++- key 文件热加载、过期时间与最近使用时间。
++- 审计事件记录 `Principal.subject`。
++- docker-compose / Kubernetes 示例以 Secret 挂载 key 文件。
+diff --git a/docs/releases/v1.0.md b/docs/releases/v1.0.md
+index 8613fce..ee652c4 100644
+--- a/docs/releases/v1.0.md
++++ b/docs/releases/v1.0.md
+@@ -8,12 +8,13 @@
+ 
+ ## 勘误与现状（2026-10-11）
+ 
+-> 本节为 v1.1 发布前置的事实统一勘误（WP-A1）。下文原文保留作历史记录，但其中 PostgreSQL 相关表述与 ADR-013 不一致，请以本节为准。
++> 本节为 v1.1 发布前置的事实统一勘误（WP-A1）。下文原文保留作历史记录，但其中 PostgreSQL 相关表述与 ADR-013 不一致、认证表述与实现不符，请以本节为准。
+ 
+ 1. **不一致范围**：本文 P1 功能表中的「PostgreSQL 权威业务存储（ADR-007）」（原 L49）、已知限制第 4 条「权威存储仅支持 PostgreSQL；SQLite 仅用于测试」（原 L111）、升级指南前置条件「PostgreSQL ≥ 14（生产部署）」（原 L124）与升级步骤「备份 PostgreSQL 数据库」「数据库迁移：`forgemesh migrate upgrade`」（原 L129 起）等表述，均为 v1.0.0 发布时记录的目标态描述，与 [ADR-013](../design-decisions/adr-013.md) 的实际交付决策不一致。
+ 2. **当前事实**：依据 ADR-013，v1.0.x 的权威存储为 **SQLite**（`SQLiteRegistry` 实现 `ResourceRegistry` 抽象，应用层 CAS 乐观并发 `resource_version`）；PostgreSQL 为权威存储**目标态**，迁移判据（多实例部署 / 规模超限 / 租户级 RLS 需求）见 ADR-013。
+ 3. **重要警告**：本文档中的 PostgreSQL 备份与迁移命令（如 `forgemesh migrate upgrade`）在当前版本**不存在、不可用**，请勿执行。
+ 4. **权威操作指引**：备份与恢复流程请以 [docs/operations/backup-restore.md](../operations/backup-restore.md)（SQLite 备份/恢复与单实例写入约束）为准。
++5. **认证表述**（2026-10-12 补充）：已知限制第 5 条「内置 API Key 与 OIDC 认证」与 v1.0.x 实现不符——网关只检查 `X-Tenant-ID` 请求头是否存在，控制平面直接信任该请求头，两者都不校验凭证。绑定租户的 API Key 认证自 v1.1.0 起提供（[ADR-014](../design-decisions/adr-014.md)）；OIDC 与 mTLS 尚未实现。
+ 
+ ---
+ 
+diff --git a/gateway/README.md b/gateway/README.md
+index 3e64da7..eb9b1df 100644
+--- a/gateway/README.md
++++ b/gateway/README.md
+@@ -1,7 +1,7 @@
+ # ForgeMesh Go API 网关
+ 
+ ForgeMesh 的**统一外部入口**与**高性能流式代理**。与 Python 控制平面分离部署，负责
+-入口关注点（鉴权卸载、限流边车、SSE / 流式 Token 转发、协议与版本转换）。
++入口关注点（API key 认证、限流边车、SSE / 流式 Token 转发、协议与版本转换）。
+ 
+ > 权威依据：`docs/architecture/development-plan.md` §2.5（WS-4）与 §5.8（Go 网关接口）。
+ > 硬约束：**仅使用 Go 标准库**，`go.mod` 不引入任何第三方模块，保证 `go build ./...` 一次通过。
+@@ -15,16 +15,16 @@ ForgeMesh 的**统一外部入口**与**高性能流式代理**。与 Python 控
+ | 关注点 | Go 网关 | Python 控制平面 |
+ | --- | --- | --- |
+ | 外部入口 / 路由 / 版本前缀 | ✅ 负责 | ❌ 不直接暴露 |
+-| 鉴权（Token 校验）卸载 | ✅ 负责（认证结果下发） | 复核租户/权限（**不信任单点**） |
+-| 限流（租户/路由） | ✅ 令牌桶 | 业务级配额（Policy / Quota） |
++| 认证（API key 校验） | ✅ 校验凭证、覆写租户头、推理路由检查 `read` scope | ✅ 用同一份 key 文件独立复核凭证、租户与 scope（**不信任单点**） |
++| 限流（租户/路由） | ✅ 按已验证租户的令牌桶 | 业务级配额（Policy / Quota） |
+ | SSE / 流式 Token 转发 | ✅ 负责 | 提供上游流 |
+ | 协议 / 版本转换 | ✅ 负责 | 提供 `v1alpha1` 内部契约 |
+ | 资源权威状态 / 协调 / 工作流 | ❌ 不涉及 | ✅ 负责 |
+ | 探针 | ✅ `/healthz`、`/readyz` | ✅ `/healthz`、`/readyz` |
+ 
+-> **零信任提示**：网关仅完成入口鉴权卸载，把租户身份以受信头下发给下游；
+-> 下游控制平面**必须**对租户进行二次校验，禁止仅凭网关转发的头就信任租户。
+-> 详见 `internal/middleware/authz.go`。
++> **零信任提示**：网关校验 API key 后，以 key 绑定的租户覆写租户头再转发；控制平面
++> 不信任这个头，而是用调用方的 `Authorization` 自行校验（[ADR-014](../docs/design-decisions/adr-014.md)）。
++> 详见 `internal/middleware/authz.go` 与 `internal/middleware/apikey.go`。
+ 
+ ---
+ 
+@@ -38,7 +38,7 @@ ForgeMesh 的**统一外部入口**与**高性能流式代理**。与 Python 控
+ | ANY | `/api/v1/inference-services[/...]` | 反代 → Python 控制平面 | 全链 |
+ | ANY | `/api/v1/workflows[/...]` | 反代 → Python 控制平面 | 全链 |
+ | ANY | `/api/v1/decisions[/...]` | 反代 → Python 控制平面 | 全链 |
+-| ANY | `/api/v1/inference/{svc}/chat` | **SSE 流式代理** | 全链 |
++| ANY | `/api/v1/inference/{svc}/chat` | **SSE 流式代理** | 全链 + `read` scope |
+ 
+ `{svc}` 为 Go 1.22 `net/http.ServeMux` 的路径变量语法，表示单个路径段（推理服务标识）。
+ 
+@@ -48,17 +48,15 @@ ForgeMesh 的**统一外部入口**与**高性能流式代理**。与 Python 控
+ `internal/middleware/chain_test.go` 验证）：
+ 
+ ```
+-Recovery → Correlation → Authz → RateLimit → Route
++Recovery → Correlation → Authenticate → RateLimit → Route
+ ```
+ 
+ - **Recovery**：兜底 panic → 500，记录堆栈，进程不退出（最外层，覆盖全量请求）。
+ - **Correlation**：缺失则用 `crypto/rand` 生成 128-bit hex 关联 ID，注入 context 与响应头；已携带则透传。
+-- **Authz**：解析租户身份注入 context，并以受信解析值**覆写**入站租户头；缺失返回 `401`（探针路径豁免）。
+-- **RateLimit**：按租户令牌桶限流，超限 `429 + Retry-After`；位于 Authz 之后，被拒请求不消耗令牌。
++- **Authenticate**：按 `GATEWAY_AUTH_MODE` 校验凭证——`apikey`（默认）以 `Authorization: Bearer <key>` 的 SHA-256 摘要查 key 文件，`dev` 直接信任租户头。已验证的主体（subject / 租户 / scope）注入 context，并以已验证的租户**覆写**入站租户头。缺少或无效凭证返回 `401`（带 `WWW-Authenticate: Bearer realm="forgemesh"`），租户头与 key 绑定的租户不一致返回 `403`，响应体均为 JSON 错误信封。
++- **RateLimit**：按已验证租户的令牌桶限流，超限 `429 + Retry-After`；位于 Authenticate 之后，被拒请求不消耗令牌；不读取租户头或 `X-Forwarded-For`。
+ 
+-> 说明：探针刻意不经过鉴权/限流，保证负载均衡健康检查始终可用。
+-> 注意：`internal/middleware/middleware.go` 包注释中的链序描述
+-> （RateLimit 在 Authz 之前）为历史笔误，以本节与实际代码为准。
++> 说明：探针刻意不经过认证/限流，保证负载均衡健康检查始终可用。
+ 
+ ### Header 转发与剥离策略
+ 
+@@ -68,7 +66,8 @@ Recovery → Correlation → Authz → RateLimit → Route
+ 
+ | Header | 策略 | 受信来源与说明 |
+ | --- | --- | --- |
+-| `X-Tenant-ID`（可经 `GATEWAY_TENANT_HEADER` 配置） | **覆写后转发** | Authz 以受信解析值（TrimSpace 后首个值）**覆写**入站头再放行，下游读到的与鉴权上下文严格同源；多值/空白填充变体在入口即被规范化 |
++| `X-Tenant-ID`（可经 `GATEWAY_TENANT_HEADER` 配置） | **覆写后转发** | Authenticate 以已验证的租户**覆写**入站头再放行（`apikey` 模式取自 key；`dev` 模式取 TrimSpace 后首个值），下游读到的与认证上下文严格同源；`apikey` 模式下任一取值与 key 不一致即返回 `403` |
++| `Authorization` | 透传 | 控制平面用同一份 key 文件独立复核调用方（ADR-014） |
+ | `X-Correlation-ID`（可配置） | 生成/透传 | Correlation 中间件受信：缺失则生成 128-bit hex，已携带则原样透传（跨服务链路连续） |
+ | `X-Forwarded-*`（For/Proto/Host） | 网关注入 | ReverseProxy `SetXForwarded` 标准注入，标记经代理的事实 |
+ | `Host`、`Content-Length` | 剥离后重写 | 由出站 Transport 按上游语义重写，避免长度/主机不一致 |
+@@ -78,9 +77,9 @@ Recovery → Correlation → Authz → RateLimit → Route
+ 
+ | Header | 策略 | 受信来源与说明 |
+ | --- | --- | --- |
+-| `X-Tenant-ID` | 覆写后转发 | 同方向一：经 Authz 规范化的受信值（已注入 context，转发头与之一致），同时作为 Resolver 查询与多租户缓存隔离的 key |
++| `X-Tenant-ID` | 覆写后转发 | 同方向一：Authenticate 写入的已验证租户，同时作为 Resolver 查询与多租户缓存隔离的 key |
+ | `X-Correlation-ID` | 透传 | 由 Correlation 中间件保证存在（缺失时已生成） |
+-| `Authorization`（Bearer） | 透传 | 客户端凭证原样递交实例，网关不解析不存储 |
++| `Authorization`、`Cookie` | **剥离** | 调用方的平台凭证只交给网关与控制平面，不交给推理实例；Resolver 查询控制平面时携带调用方的 `Authorization`，控制平面拒绝（`403`）时网关同样返回 `403` |
+ | `Accept` | **强制覆写** | 网关强制 `text/event-stream`，保证流式语义 |
+ | `Host`、`Content-Length` | 剥离后重写 | 同方向一 |
+ | hop-by-hop 头（双向） | 剥离 | 请求与响应两个方向均过滤 |
+@@ -91,12 +90,15 @@ Recovery → Correlation → Authz → RateLimit → Route
+ **安全缺陷记录（WP-D1，已修复）**：修复前 Authz 仅校验租户头存在性、不回写
+ 请求头，下游（反代/流式代理/限流 key）重新读取客户端**原始头**——多值头
+ （两条 `X-Tenant-ID`）或空白填充值可造成"鉴权身份 ≠ 转发身份"的横向越权
+-（confused deputy）。最小防御修复：`Authz`/`AuthzWithToken` 校验通过后以
+-受信解析值覆写入站租户头（`internal/middleware/authz.go`），回归测试见
+-`internal/router/tenant_security_test.go`。
+-已知骨架限制：Authz 尚未接入 JWT/OIDC 签名校验，租户身份本质仍是
+-"客户端声明 + 控制平面二次校验"（零信任边界，见 `authz.go` 注释与
+-`internal/upstream/resolver.go` 按租户隔离的缓存设计）。
++（confused deputy）。最小防御修复：校验通过后以受信解析值覆写入站租户头
++（`internal/middleware/authz.go`），回归测试见 `internal/router/tenant_security_test.go`。
++
++**认证缺失（ADR-014，已修复）**：WP-D1 之后租户身份仍是"客户端声明"——网关只检查
++租户头是否存在，控制平面直接信任该头且可被直连，限流键同样取自客户端可控的头，流式
++代理把调用方的 `Authorization` / `Cookie` 原样交给实例。现网关与控制平面各自校验绑定
++租户的 API key，限流按已验证租户计数，实例不再收到调用方凭证；回归测试见
++`internal/router/auth_test.go`、`internal/middleware/authz_test.go` 与
++`tests/unit/controlplane/test_auth.py`。
+ 
+ ---
+ 
+@@ -106,9 +108,11 @@ Recovery → Correlation → Authz → RateLimit → Route
+ | --- | --- | --- |
+ | `GATEWAY_LISTEN_ADDR` | `:8081` | 监听地址 |
+ | `GATEWAY_UPSTREAM_URL` | `http://127.0.0.1:8080` | Python 控制平面地址 |
++| `GATEWAY_AUTH_MODE` | `apikey` | `apikey`：校验 `Authorization: Bearer <key>`；`dev`：直接信任租户请求头，只允许回环监听地址（如 `127.0.0.1:8081`），仅供本地开发；其他取值拒绝启动 |
++| `GATEWAY_API_KEYS_FILE` | — | `apikey` 模式必填；与控制平面 `FORGEMESH_API_KEYS_FILE` 格式相同（只含 SHA-256 摘要），缺失或格式非法时拒绝启动 |
+ | `GATEWAY_RATE_LIMIT_RPS` | `50` | 每租户每秒令牌补充速率 |
+ | `GATEWAY_RATE_LIMIT_BURST` | `100` | 每租户令牌桶容量（突发上限） |
+-| `GATEWAY_TENANT_HEADER` | `X-Tenant-ID` | 租户身份请求头 |
++| `GATEWAY_TENANT_HEADER` | `X-Tenant-ID` | 租户请求头：`apikey` 模式下可省略，携带时必须与 key 一致；`dev` 模式下即租户身份 |
+ | `GATEWAY_CORRELATION_HEADER` | `X-Correlation-ID` | 链路关联 ID 请求头 |
+ | `GATEWAY_RESOLVER_TTL_SECONDS` | `5` | 推理服务→实例列表缓存 TTL（秒） |
+ | `GATEWAY_UNHEALTHY_COOLDOWN_SECONDS` | `10` | 实例连续 3 次失败被摘流后的冷却时长（秒） |
+@@ -128,9 +132,12 @@ gateway/
+     │   ├── middleware.go           # Middleware 类型 + Chain 组合子
+     │   ├── recovery.go             # panic 兜底 → 500
+     │   ├── correlation.go          # 关联 ID 生成/透传 + context 注入
+-    │   ├── ratelimit.go            # 按租户令牌桶（自实现）
+-    │   └── authz.go                # 入口鉴权卸载（含零信任注释）
++    │   ├── ratelimit.go            # 按已验证租户的令牌桶（自实现）
++    │   ├── authz.go                # Authenticate / RequireScope、Principal、dev 模式认证器
++    │   ├── apikey.go               # key 文件解析与 API key 认证器
++    │   └── errors.go               # JSON 错误信封
+     ├── upstream/client.go          # httputil.ReverseProxy 反代
++    ├── upstream/resolver.go        # 推理服务 → 实例 endpoint 解析（TTL 缓存、健康摘流）
+     ├── stream/proxy.go             # SSE 流式代理（逐块 Flush，断连取消上游）
+     ├── health/health.go            # /healthz、/readyz
+     └── router/router.go            # 路由表 + 中间件链
+@@ -146,7 +153,14 @@ gateway/
+ cd gateway
+ make fmt vet build   # 格式化 + 静态检查 + 编译
+ make test            # go test -race ./...
+-make run             # 本地启动（默认 :8081）
++GATEWAY_API_KEYS_FILE=/path/to/api-keys.json make run   # apikey 模式，默认 :8081
++make run-dev         # dev 模式：信任租户头，只监听 127.0.0.1:8081
++```
++
++key 与 key 文件条目由控制平面工具生成（见根 README「运行控制平面」）：
++
++```bash
++python -m forgemesh.controlplane.keygen --tenant acme --subject ci-bot
+ ```
+ 
+ CI 门禁：
+@@ -177,9 +191,9 @@ go test ./...
+ flowchart LR
+     C[Client] --> R[Recovery]
+     R --> CO[Correlation]
+-    CO --> AZ[Authz\n解析并覆写租户头]
+-    AZ -->|401| C
+-    AZ --> RL[RateLimit\n租户令牌桶]
++    CO --> AZ[Authenticate\n校验 API key 并覆写租户头]
++    AZ -->|401 / 403| C
++    AZ --> RL[RateLimit\n已验证租户令牌桶]
+     RL -->|429| C
+     RL --> RT{Route}
+     RT -->|/healthz /readyz| H[Probe]
+@@ -193,7 +207,7 @@ flowchart LR
+ 
+ ## 8. 后续演进（首期骨架之外）
+ 
+-- Authz 接入真实 JWT/OIDC 校验（签名、有效期、scope）与 mTLS 信任边界。
++- 在 API key 之外接入 OIDC/JWT 与 mTLS（新的 `Authenticator` 实现）；key 文件热加载与过期时间（见 ADR-014 后续事项）。
+ - RateLimit 改为分布式限流（如 Redis），支持多网关实例共享配额。
+ - 协议/版本转换（`v1alpha1` ↔ 对外版本）与 gRPC-stream 转发。
+ - OpenTelemetry 链路追踪导出（复用 Correlation ID 作为 trace 关联）。
+\ No newline at end of file
+-- 
+2.43.0
+

@@ -1,7 +1,7 @@
 From b907a9e044160343de2e7481a8b4276bbabf9cac Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Mon, 12 Oct 2026 02:37:12 +0000
-Subject: [PATCH 5/8] fix(reconciler): do not record dedup keys on
+Subject: [PATCH 5/9] fix(reconciler): do not record dedup keys on
  side-effect-free failure paths
 
 The deny, require_approval and allocation-failure paths marked the dedup key as

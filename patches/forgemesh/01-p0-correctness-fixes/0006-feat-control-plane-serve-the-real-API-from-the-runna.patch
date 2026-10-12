@@ -1,7 +1,7 @@
 From 52f5381bce6997e264c9d7fb3f393aa9c4b1a90f Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Mon, 12 Oct 2026 02:40:03 +0000
-Subject: [PATCH 6/8] feat(control-plane): serve the real API from the runnable
+Subject: [PATCH 6/9] feat(control-plane): serve the real API from the runnable
  entrypoint
 
 The only runnable app still registered the phase-0 placeholder table, so every

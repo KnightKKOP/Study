@@ -1,7 +1,7 @@
 From 40620aa4b71e867440283e8aa885694810b4e705 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Mon, 12 Oct 2026 02:40:13 +0000
-Subject: [PATCH 7/8] build(control-plane): declare missing dependencies and a
+Subject: [PATCH 7/9] build(control-plane): declare missing dependencies and a
  console script
 
 reconciler/core.py imports forgemesh.policy and plugin_manager.py imports

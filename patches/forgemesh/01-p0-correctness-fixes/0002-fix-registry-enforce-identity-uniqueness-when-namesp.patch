@@ -1,7 +1,7 @@
 From a54cdcfed8645955f929e2c10c3489942bb74491 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Mon, 12 Oct 2026 02:32:18 +0000
-Subject: [PATCH 2/8] fix(registry): enforce identity uniqueness when namespace
+Subject: [PATCH 2/9] fix(registry): enforce identity uniqueness when namespace
  is NULL
 
 SQLite primary keys allow NULL and treat NULLs as distinct, so resources

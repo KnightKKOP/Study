@@ -1,0 +1,294 @@
+From 0abd9453538a85c6ddd8b73ca3861d466c41a57d Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 12 Oct 2026 03:57:04 +0000
+Subject: [PATCH 1/8] feat(api): render every error response with the error
+ envelope
+
+Only the create, workflow and decision handlers produced the documented
+{"error": {...}} envelope. Framework-level errors leaked FastAPI defaults:
+GET/DELETE 404s and 405s returned {"detail": ...}, request validation
+failures returned 422 instead of the contract's 400, and unhandled
+exceptions produced plain-text 500s.
+
+Register global handlers for HTTPException, RequestValidationError and
+uncaught exceptions. Every error now carries a machine-readable code and
+the request's correlation id; 500 responses no longer expose internal
+details, which are logged instead. ApiError lets dependencies raise a
+specific code (used by the upcoming authentication dependency).
+---
+ .../src/forgemesh/controlplane/api/errors.py  | 133 ++++++++++++++++++
+ .../src/forgemesh/controlplane/api/routes.py  |  15 +-
+ .../src/forgemesh/controlplane/app.py         |   2 +
+ tests/unit/controlplane/test_app.py           |  42 ++++++
+ 4 files changed, 181 insertions(+), 11 deletions(-)
+ create mode 100644 packages/control-plane/src/forgemesh/controlplane/api/errors.py
+
+diff --git a/packages/control-plane/src/forgemesh/controlplane/api/errors.py b/packages/control-plane/src/forgemesh/controlplane/api/errors.py
+new file mode 100644
+index 0000000..fcc9eed
+--- /dev/null
++++ b/packages/control-plane/src/forgemesh/controlplane/api/errors.py
+@@ -0,0 +1,133 @@
++"""API 错误：统一错误信封与全局异常处理。
++
++所有错误响应都使用 ``{"error": {"code", "message", "correlationId", "details"}}``
++信封（对齐 OpenAPI ``Error`` schema），包括框架层面的 404/405、请求校验失败
++（FastAPI 默认的 422 统一改为 400）以及未捕获的异常（500，不向客户端暴露内部细节）。
++"""
++
++from __future__ import annotations
++
++import logging
++from http import HTTPStatus
++from typing import Any
++from uuid import uuid4
++
++from fastapi import FastAPI, Request
++from fastapi.exceptions import RequestValidationError
++from fastapi.responses import JSONResponse
++from pydantic import ValidationError
++from starlette.exceptions import HTTPException as StarletteHTTPException
++
++from ..app import error_envelope
++
++logger = logging.getLogger(__name__)
++
++#: 承载全链路关联 ID 的请求头（HTTP 头大小写不敏感，与网关的 X-Correlation-ID 等价）。
++CORRELATION_HEADER = "X-Correlation-Id"
++
++#: 未显式指定错误码时，按 HTTP 状态码推导的默认错误码。
++_DEFAULT_CODES: dict[int, str] = {
++    400: "BAD_REQUEST",
++    401: "UNAUTHENTICATED",
++    403: "FORBIDDEN",
++    404: "NOT_FOUND",
++    405: "METHOD_NOT_ALLOWED",
++    409: "CONFLICT",
++    413: "PAYLOAD_TOO_LARGE",
++    415: "UNSUPPORTED_MEDIA_TYPE",
++    429: "RATE_LIMITED",
++    503: "SERVICE_UNAVAILABLE",
++}
++
++
++class ApiError(StarletteHTTPException):
++    """携带机器可读错误码的 HTTP 错误，由 :func:`install_exception_handlers` 渲染为错误信封。
++
++    未安装处理器时（例如只挂载了路由的测试应用），FastAPI 仍按 ``status_code``
++    响应，响应体退化为 ``{"detail": message}``。
++
++    Args:
++        status_code: HTTP 状态码。
++        code: 机器可读错误码（如 ``UNAUTHENTICATED``）。
++        message: 人类可读说明。
++        details: 附加结构化信息，可为空。
++        headers: 附加响应头（如 401 的 ``WWW-Authenticate``），可为空。
++    """
++
++    def __init__(
++        self,
++        status_code: int,
++        code: str,
++        message: str,
++        *,
++        details: dict[str, Any] | None = None,
++        headers: dict[str, str] | None = None,
++    ) -> None:
++        super().__init__(status_code=status_code, detail=message, headers=headers)
++        self.code = code
++        self.details = details
++
++
++def correlation_id_of(request: Request) -> str:
++    """取请求携带的关联 ID；缺失时生成一个新的。"""
++    return request.headers.get(CORRELATION_HEADER) or uuid4().hex
++
++
++def validation_details(exc: ValidationError | RequestValidationError) -> list[dict[str, Any]]:
++    """提取校验错误摘要（loc/msg/type），剥离不可 JSON 序列化的 ``ctx``。"""
++    return [
++        {
++            "loc": [str(part) for part in err.get("loc", ())],
++            "msg": err.get("msg", ""),
++            "type": err.get("type", ""),
++        }
++        for err in exc.errors()
++    ]
++
++
++async def _http_exception_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:
++    code = getattr(exc, "code", None) or _DEFAULT_CODES.get(exc.status_code, "HTTP_ERROR")
++    message = exc.detail if isinstance(exc.detail, str) else HTTPStatus(exc.status_code).phrase
++    return JSONResponse(
++        status_code=exc.status_code,
++        content=error_envelope(
++            code, message, correlation_id_of(request), getattr(exc, "details", None)
++        ),
++        headers=exc.headers,
++    )
++
++
++async def _validation_exception_handler(
++    request: Request, exc: RequestValidationError
++) -> JSONResponse:
++    return JSONResponse(
++        status_code=400,
++        content=error_envelope(
++            "BAD_REQUEST",
++            "request validation failed",
++            correlation_id_of(request),
++            {"errors": validation_details(exc)},
++        ),
++    )
++
++
++async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
++    correlation_id = correlation_id_of(request)
++    logger.error(
++        "unhandled error: correlation_id=%s method=%s path=%s",
++        correlation_id,
++        request.method,
++        request.url.path,
++        exc_info=exc,
++    )
++    return JSONResponse(
++        status_code=500,
++        content=error_envelope("INTERNAL_ERROR", "internal server error", correlation_id),
++    )
++
++
++def install_exception_handlers(app: FastAPI) -> None:
++    """为应用注册全局异常处理器，使所有错误响应都符合错误信封。"""
++    app.add_exception_handler(StarletteHTTPException, _http_exception_handler)
++    app.add_exception_handler(RequestValidationError, _validation_exception_handler)
++    app.add_exception_handler(Exception, _unhandled_exception_handler)
+diff --git a/packages/control-plane/src/forgemesh/controlplane/api/routes.py b/packages/control-plane/src/forgemesh/controlplane/api/routes.py
+index f2d165d..6d38220 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/api/routes.py
++++ b/packages/control-plane/src/forgemesh/controlplane/api/routes.py
+@@ -44,6 +44,7 @@ from .dependencies import (
+     get_tenant_id,
+     get_workflow_runtime,
+ )
++from .errors import validation_details
+ 
+ router = APIRouter(prefix="/api/v1")
+ 
+@@ -127,7 +128,7 @@ async def create_inference_service(
+             "BAD_REQUEST",
+             "推理服务创建请求校验失败",
+             correlation_id,
+-            {"errors": _validation_details(exc)},
++            {"errors": validation_details(exc)},
+         )
+     except ValueError as exc:
+         return _error_response(400, "BAD_REQUEST", str(exc), correlation_id)
+@@ -256,14 +257,6 @@ class WorkflowRunResponse(BaseModel):
+     definition_version: int = Field(alias="definitionVersion")
+ 
+ 
+-def _validation_details(exc: ValidationError) -> list[dict[str, Any]]:
+-    """提取校验错误摘要（loc/msg/type），剥离不可 JSON 序列化的 ``ctx``。"""
+-    return [
+-        {"loc": [str(x) for x in err["loc"]], "msg": err["msg"], "type": err["type"]}
+-        for err in exc.errors()
+-    ]
+-
+-
+ def _error_response(
+     status_code: int,
+     code: str,
+@@ -307,7 +300,7 @@ async def start_workflow(
+             "BAD_REQUEST",
+             "工作流启动请求校验失败",
+             correlation_id,
+-            {"errors": _validation_details(exc)},
++            {"errors": validation_details(exc)},
+         )
+ 
+     try:
+@@ -390,7 +383,7 @@ async def request_decision(
+             "BAD_REQUEST",
+             "决策请求校验失败",
+             correlation_id,
+-            {"errors": _validation_details(exc)},
++            {"errors": validation_details(exc)},
+         )
+ 
+     try:
+diff --git a/packages/control-plane/src/forgemesh/controlplane/app.py b/packages/control-plane/src/forgemesh/controlplane/app.py
+index fd8f460..0b2805e 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/app.py
++++ b/packages/control-plane/src/forgemesh/controlplane/app.py
+@@ -110,6 +110,7 @@ if _FASTAPI_AVAILABLE:
+         # 延迟导入：api.routes 反向依赖本模块的 error_envelope。
+         from .api import create_api_router
+         from .api.dependencies import get_registry, init_registry
++        from .api.errors import install_exception_handlers
+ 
+         @asynccontextmanager
+         async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+@@ -144,6 +145,7 @@ if _FASTAPI_AVAILABLE:
+                 )
+             return HealthResponse(status="ok")
+ 
++        install_exception_handlers(application)
+         application.include_router(create_api_router())
+         return application
+ 
+diff --git a/tests/unit/controlplane/test_app.py b/tests/unit/controlplane/test_app.py
+index 47d5b71..9636317 100644
+--- a/tests/unit/controlplane/test_app.py
++++ b/tests/unit/controlplane/test_app.py
+@@ -73,6 +73,48 @@ def test_readyz_reports_unavailable_registry(tmp_path) -> None:
+         assert not_ready.json()["error"]["code"] == "NOT_READY"
+ 
+ 
++@pytest.mark.unit
++def test_framework_errors_use_the_error_envelope(tmp_path) -> None:
++    with TestClient(create_app(db_path=str(tmp_path / "cp.db"))) as client:
++        missing = client.get(
++            "/api/v1/inference-services/nope",
++            headers={**HEADERS, "X-Correlation-Id": "corr-1"},
++        )
++        not_object = client.post("/api/v1/inference-services", json=[1, 2], headers=HEADERS)
++        bad_limit = client.get(
++            "/api/v1/inference-services", params={"limit": "many"}, headers=HEADERS
++        )
++        wrong_method = client.put("/healthz")
++
++    assert missing.status_code == 404
++    assert missing.json()["error"]["code"] == "NOT_FOUND"
++    assert missing.json()["error"]["correlationId"] == "corr-1"
++    assert not_object.status_code == 400
++    assert not_object.json()["error"]["code"] == "BAD_REQUEST"
++    assert not_object.json()["error"]["details"]["errors"]
++    assert bad_limit.status_code == 400
++    assert bad_limit.json()["error"]["code"] == "BAD_REQUEST"
++    assert wrong_method.status_code == 405
++    assert wrong_method.json()["error"]["code"] == "METHOD_NOT_ALLOWED"
++
++
++@pytest.mark.unit
++def test_unhandled_errors_return_an_opaque_500_envelope(tmp_path, monkeypatch) -> None:
++    async def failing_list(*args, **kwargs):
++        raise RuntimeError("secret internal detail")
++
++    app = create_app(db_path=str(tmp_path / "cp.db"))
++    with TestClient(app, raise_server_exceptions=False) as client:
++        monkeypatch.setattr(get_registry(), "list", failing_list)
++        response = client.get("/api/v1/inference-services", headers=HEADERS)
++
++    assert response.status_code == 500
++    error = response.json()["error"]
++    assert error["code"] == "INTERNAL_ERROR"
++    assert "secret" not in error["message"]
++    assert error["correlationId"]
++
++
+ @pytest.mark.unit
+ def test_runtime_endpoints_report_missing_components_instead_of_501(tmp_path) -> None:
+     with TestClient(create_app(db_path=str(tmp_path / "cp.db"))) as client:
+-- 
+2.43.0
+

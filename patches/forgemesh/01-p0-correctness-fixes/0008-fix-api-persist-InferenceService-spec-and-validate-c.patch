@@ -1,7 +1,7 @@
 From 5a1785aa751adc8a69e389027c1425ccbccadbc9 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Mon, 12 Oct 2026 02:42:53 +0000
-Subject: [PATCH 8/8] fix(api): persist InferenceService spec and validate
+Subject: [PATCH 8/9] fix(api): persist InferenceService spec and validate
  create/list input
 
 POST /inference-services built a base Resource from the body, silently dropping
