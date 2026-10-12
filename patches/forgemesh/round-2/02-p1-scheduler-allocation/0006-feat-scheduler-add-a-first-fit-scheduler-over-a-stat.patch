@@ -1,7 +1,7 @@
-From 8916089f1b80eef2cce32f5dc2d01cce62f5475a Mon Sep 17 00:00:00 2001
+From cfe0aeff792aacdfbbb53df8fb596717287daf05 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Mon, 12 Oct 2026 13:13:05 +0000
-Subject: [PATCH 6/8] feat(scheduler): add a first-fit scheduler over a static
+Subject: [PATCH 6/9] feat(scheduler): add a first-fit scheduler over a static
  inventory
 
 Nothing implemented the Scheduler contract, so the reconciler could

@@ -1,0 +1,654 @@
+From 191b080fba37275296dd34de3fa8994b4b3e0c02 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 12 Oct 2026 17:14:06 +0000
+Subject: [PATCH 07/10] feat(control-plane): deploy inference services when a
+ launcher is set
+
+Until now the app injected neither a workflow runtime nor a launcher, so
+every service stopped at WorkflowRuntimeUnavailable. With
+FORGEMESH_RUNTIME_LAUNCHER set (together with FORGEMESH_INVENTORY_FILE)
+the lifespan now assembles the deployment loop:
+
+- the launcher is built from the environment next to the inventory,
+  before any database is opened, so bad settings refuse the start;
+- the workflow runs live in their own SQLite file next to the registry
+  (workflow_db_path, e.g. forgemesh.workflows.db);
+- recover() resumes unfinished deployments, then mark_lost_instances()
+  degrades Ready services whose instance is gone, and only then does
+  the controller start, with the runtime, a DeploymentReleaser and the
+  launcher injected into the reconciler;
+- shutdown unwinds controller -> runtime -> launcher -> workflow store,
+  so compensations that run while the runtime closes can still stop
+  instances.
+
+POST /workflows keeps answering 503: it would start step-less runs in
+the deployment store, under keys a tenant could choose.
+
+forgemesh-workflow-runtime becomes a dependency of the control plane
+and is installed by its Dockerfile. The poll intervals become module
+constants so the end-to-end test can shorten them.
+
+tests/e2e/test_closed_loop.py drives the real app with a one-device
+inventory and the fake launcher: create -> Ready -> streaming chat to
+the advertised endpoint -> delete (instance stopped, allocation
+released, resource gone) -> re-create on the same device, and a restart
+that turns the Ready service Degraded with Ready=False InstanceLost.
+---
+ deploy/docker/Dockerfile.control-plane        |   1 +
+ packages/control-plane/pyproject.toml         |   1 +
+ .../src/forgemesh/controlplane/app.py         |  85 ++++++-
+ tests/e2e/test_closed_loop.py                 | 232 ++++++++++++++++++
+ tests/unit/controlplane/test_app.py           | 133 +++++++++-
+ 5 files changed, 441 insertions(+), 11 deletions(-)
+ create mode 100644 tests/e2e/test_closed_loop.py
+
+diff --git a/deploy/docker/Dockerfile.control-plane b/deploy/docker/Dockerfile.control-plane
+index df57205..8299c34 100644
+--- a/deploy/docker/Dockerfile.control-plane
++++ b/deploy/docker/Dockerfile.control-plane
+@@ -14,6 +14,7 @@ RUN /opt/forgemesh/bin/pip install \
+       /src/packages/core-contracts \
+       /src/packages/resource-model \
+       /src/packages/workflow-api \
++      /src/packages/workflow-runtime \
+       /src/packages/decision-api \
+       /src/packages/policy-engine \
+       /src/packages/plugin-sdk \
+diff --git a/packages/control-plane/pyproject.toml b/packages/control-plane/pyproject.toml
+index bf6ffc0..0e5b440 100644
+--- a/packages/control-plane/pyproject.toml
++++ b/packages/control-plane/pyproject.toml
+@@ -12,6 +12,7 @@ dependencies = [
+     "forgemesh-core",
+     "forgemesh-resource-model",
+     "forgemesh-workflow-api",
++    "forgemesh-workflow-runtime",
+     "forgemesh-decision-api",
+     "forgemesh-policy-engine",
+     "forgemesh-plugin-sdk",
+diff --git a/packages/control-plane/src/forgemesh/controlplane/app.py b/packages/control-plane/src/forgemesh/controlplane/app.py
+index f193a66..e735f6a 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/app.py
++++ b/packages/control-plane/src/forgemesh/controlplane/app.py
+@@ -20,8 +20,16 @@
+   :mod:`forgemesh.controlplane.scheduler.inventory`）时，控制器的协调器使用
+   :class:`~forgemesh.controlplane.scheduler.FirstFitScheduler`，清单不可读或非法时
+   拒绝启动；未设置时需要分配加速器的资源报告 ``Ready=False``
+-  （``SchedulerUnavailable``）。应用尚未注入工作流运行时，协调器在分配之前即报告
+-  ``WorkflowRuntimeUnavailable``。
++  （``SchedulerUnavailable``）。
++* **部署**：``FORGEMESH_RUNTIME_LAUNCHER``（``fake`` / ``vllm-process``，只能与清单一起
++  使用，见 :mod:`forgemesh.controlplane.deployment.config`）选择推理实例的启动器，配置
++  非法时拒绝启动。此时协调器分配加速器、经部署工作流启动并验证实例，就绪后写入
++  ``status.endpoints``；删除时停止实例、释放分配。工作流运行存放在单独的数据库文件
++  （:func:`~forgemesh.controlplane.sqlite.workflow_db_path`，如 ``forgemesh.workflows.db``）
++  中。启动时先恢复未完成的部署，再把实例已不在运行的 ``Ready`` 服务转为 ``Degraded``
++  （不会自动重新部署），然后才启动控制器；关闭时依次停止控制器、工作流运行时、启动器
++  （其实例随之停止）。``POST /workflows`` 不使用这个运行时（仍返回 503）。未设置时不部署，
++  协调器在分配之前即报告 ``WorkflowRuntimeUnavailable``。
+ * **无导入副作用**：数据库在应用启动（lifespan）时才打开，导入本模块不会
+   创建文件。
+ * **探针**：``/healthz``（存活）恒为 ok；``/readyz``（就绪）探测权威存储可用。
+@@ -43,6 +51,11 @@ from typing import TYPE_CHECKING, Any
+ 
+ from forgemesh.policy.engine import DefaultPolicyEngine
+ from forgemesh.policy.rules import AuthzRule
++from forgemesh.workflowruntime.approval import ApprovalGate
++from forgemesh.workflowruntime.compensate import CompensationExecutor
++from forgemesh.workflowruntime.exec import WorkflowExecutor
++from forgemesh.workflowruntime.runtime import LocalWorkflowRuntime
++from forgemesh.workflowruntime.store import WorkflowStore
+ from pydantic import BaseModel
+ 
+ from .auth import (
+@@ -54,11 +67,20 @@ from .auth import (
+     authenticator_from_env,
+ )
+ from .controller import ControllerManager
++from .deployment import (
++    RUNTIME_LAUNCHER_ENV,
++    DeploymentReleaser,
++    DeploymentSteps,
++    launcher_from_env,
++    mark_lost_instances,
++)
+ from .reconciler import ProcessedKeyStore, ReconciliationController
+ from .scheduler import INVENTORY_FILE_ENV, FirstFitScheduler, inventory_from_env
++from .sqlite import workflow_db_path
+ 
+ if TYPE_CHECKING:  # pragma: no cover - 仅静态类型检查使用
+     from .auth import Authenticator
++    from .deployment import RuntimeLauncher
+     from .registry import SQLiteRegistry
+     from .scheduler import Inventory
+ 
+@@ -87,6 +109,10 @@ HOST_ENV = "FORGEMESH_HOST"
+ DEFAULT_HOST = "127.0.0.1"
+ PORT_ENV = "FORGEMESH_PORT"
+ DEFAULT_PORT = 8080
++#: 控制器轮询资源变更的间隔（秒）。
++CONTROLLER_POLL_INTERVAL_SECONDS = 0.5
++#: 部署进行中时协调器查询工作流运行的间隔（秒）。
++WORKFLOW_POLL_INTERVAL_SECONDS = 2.0
+ 
+ 
+ class HealthResponse(BaseModel):
+@@ -132,23 +158,48 @@ def resolve_db_path(db_path: str | None = None) -> str:
+     return db_path or os.environ.get(DB_PATH_ENV) or DEFAULT_DB_PATH
+ 
+ 
++def _deployment_runtime(launcher: RuntimeLauncher, store: WorkflowStore) -> LocalWorkflowRuntime:
++    steps = DeploymentSteps(launcher)
++    compensation = CompensationExecutor()
++    for step_id, handler in steps.compensations().items():
++        compensation.registry.register(step_id, handler)
++    return LocalWorkflowRuntime(
++        store=store,
++        executor=WorkflowExecutor(),
++        compensation=compensation,
++        approval=ApprovalGate(),
++        handler=steps.handle,
++    )
++
++
+ def _build_controller(
+     registry: SQLiteRegistry,
+     processed_store: ProcessedKeyStore,
+     inventory: Inventory | None,
++    runtime: LocalWorkflowRuntime | None = None,
++    launcher: RuntimeLauncher | None = None,
+ ) -> ControllerManager:
+     # 没有授权规则的 DefaultPolicyEngine 拒绝一切操作。资源的创建和删除已经由 API 的
+     # 认证与 scope 把关，协调只是推进这些已被接受的期望状态，因此放行 reconcile。
+     policy = DefaultPolicyEngine(authz_rules=[AuthzRule(action="reconcile", effect="allow")])
+     scheduler = FirstFitScheduler(registry, inventory) if inventory is not None else None
++    release = (
++        DeploymentReleaser(runtime, launcher)
++        if runtime is not None and launcher is not None
++        else None
++    )
+     reconciler = ReconciliationController(
+         registry,
+         policy,
+         scheduler=scheduler,
++        workflow_runtime=runtime,
++        release_provider=release,
+         processed_store=processed_store,
+         record_dedup_keys=False,
++        workflow_poll_interval=WORKFLOW_POLL_INTERVAL_SECONDS,
++        launcher=launcher,
+     )
+-    return ControllerManager(registry, reconciler)
++    return ControllerManager(registry, reconciler, poll_interval=CONTROLLER_POLL_INTERVAL_SECONDS)
+ 
+ 
+ if _FASTAPI_AVAILABLE:
+@@ -192,6 +243,7 @@ if _FASTAPI_AVAILABLE:
+                     len(inventory.nodes),
+                     sum(len(node.devices) for node in inventory.nodes),
+                 )
++            launcher = launcher_from_env(inventory)
+             path = resolve_db_path(db_path)
+             async with AsyncExitStack() as cleanup:
+                 registry = init_registry(path)
+@@ -201,7 +253,32 @@ if _FASTAPI_AVAILABLE:
+                 cleanup.callback(reset_authenticator)
+                 processed_store = ProcessedKeyStore(path)
+                 cleanup.push_async_callback(processed_store.close)
+-                controller = _build_controller(registry, processed_store, inventory)
++                runtime: LocalWorkflowRuntime | None = None
++                if launcher is not None:
++                    workflow_path = workflow_db_path(path)
++                    workflow_store = WorkflowStore(workflow_path)
++                    cleanup.push_async_callback(workflow_store.close)
++                    # 运行时关闭时的补偿还会调用启动器的 stop，因此启动器在运行时之后关闭。
++                    cleanup.push_async_callback(launcher.aclose)
++                    runtime = _deployment_runtime(launcher, workflow_store)
++                    cleanup.push_async_callback(runtime.aclose)
++                    logger.info(
++                        "deployments enabled from %s: %s, workflow store %s",
++                        RUNTIME_LAUNCHER_ENV,
++                        type(launcher).__name__,
++                        workflow_path,
++                    )
++                    resumed = await runtime.recover()
++                    lost = await mark_lost_instances(registry, launcher)
++                    logger.info(
++                        "deployments recovered: %d unfinished run(s) resumed, %d Ready "
++                        "service(s) degraded because their instance is gone",
++                        len(resumed),
++                        len(lost),
++                    )
++                controller = _build_controller(
++                    registry, processed_store, inventory, runtime, launcher
++                )
+                 cleanup.push_async_callback(controller.stop)
+                 await controller.start()
+                 yield
+diff --git a/tests/e2e/test_closed_loop.py b/tests/e2e/test_closed_loop.py
+new file mode 100644
+index 0000000..93edffd
+--- /dev/null
++++ b/tests/e2e/test_closed_loop.py
+@@ -0,0 +1,232 @@
++"""控制平面闭环 E2E 测试：应用 + 一块设备的加速器清单 + 假启动器，不需要 GPU。
++
++* 创建 → ``Ready``：``status.endpoints`` 指向假实例，向这个地址发出的流式对话以
++  ``data: [DONE]`` 结束；
++* 删除 → 实例停止（端口拒绝连接）、分配释放、资源消失；同名服务重新创建后用同一块设备
++  再次 ``Ready``（另一个实例）；
++* 重启控制平面：实例随旧进程结束，``Ready`` 服务转为 ``Degraded``（``Ready=False``、
++  ``InstanceLost``，端点不再就绪），删除后资源消失、分配释放。
++
++经网关转发（``/api/v1/namespaces/{ns}/inference/{svc}/chat``）的一段由 compose 冒烟
++``scripts/compose_smoke.sh`` 覆盖。
++"""
++
++from __future__ import annotations
++
++import asyncio
++import http.client
++import json
++import logging
++import socket
++import time
++from collections.abc import Callable, Iterator
++from pathlib import Path
++from typing import Any
++from urllib.parse import urlsplit
++
++import pytest
++from fastapi.testclient import TestClient
++from forgemesh.controlplane import app as app_module
++from forgemesh.controlplane.api.dependencies import reset_runtime_components
++from forgemesh.controlplane.app import create_app
++from forgemesh.controlplane.auth import AUTH_MODE_DEV, AUTH_MODE_ENV
++from forgemesh.controlplane.deployment.config import (
++    FAKE_ADVERTISE_HOST_ENV,
++    FAKE_BIND_HOST_ENV,
++    RUNTIME_LAUNCHER_ENV,
++)
++from forgemesh.controlplane.registry import SQLiteRegistry
++from forgemesh.controlplane.scheduler import INVENTORY_FILE_ENV
++
++TENANT = "acme"
++HEADERS = {"X-Tenant-Id": TENANT}
++SERVICES = "/api/v1/inference-services"
++SERVICE = f"{SERVICES}/llama"
++PARAMS = {"namespace": "default"}
++BODY = {
++    "kind": "InferenceService",
++    "metadata": {"name": "llama", "namespace": "default"},
++    "spec": {
++        "model": {"reference": "models/llama"},
++        "runtime": {"provider": "vllm"},
++        "resources": {"accelerator": {"type": "nvidia-gpu", "minMemoryGiB": 16}},
++    },
++}
++CHAT = {"model": "llama", "messages": [{"role": "user", "content": "Hello"}], "stream": True}
++DEVICE = {"node_id": "node-a", "device_id": "gpu-0"}
++TIMEOUT_SECONDS = 10.0
++
++
++@pytest.fixture
++def db_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
++    """配置一块设备的清单与假启动器（监听回环地址），返回控制平面的数据库路径。"""
++    inventory = tmp_path / "inventory.json"
++    gpu = {"id": "gpu-0", "type": "nvidia-gpu", "memoryGiB": 80}
++    inventory.write_text(json.dumps({"nodes": [{"id": "node-a", "devices": [gpu]}]}))
++    monkeypatch.setenv(AUTH_MODE_ENV, AUTH_MODE_DEV)
++    monkeypatch.setenv(INVENTORY_FILE_ENV, str(inventory))
++    monkeypatch.setenv(RUNTIME_LAUNCHER_ENV, "fake")
++    monkeypatch.delenv(FAKE_BIND_HOST_ENV, raising=False)
++    monkeypatch.delenv(FAKE_ADVERTISE_HOST_ENV, raising=False)
++    monkeypatch.setattr(app_module, "CONTROLLER_POLL_INTERVAL_SECONDS", 0.05)
++    monkeypatch.setattr(app_module, "WORKFLOW_POLL_INTERVAL_SECONDS", 0.05)
++    reset_runtime_components()
++    yield tmp_path / "cp.db"
++    reset_runtime_components()
++
++
++def _get(client: TestClient) -> dict[str, Any] | None:
++    response = client.get(SERVICE, params=PARAMS, headers=HEADERS)
++    if response.status_code == 404:
++        return None
++    assert response.status_code == 200, response.text
++    return response.json()
++
++
++def _wait(
++    client: TestClient, done: Callable[[dict[str, Any] | None], bool], what: str
++) -> dict[str, Any] | None:
++    deadline = time.monotonic() + TIMEOUT_SECONDS
++    while True:
++        service = _get(client)
++        if done(service):
++            return service
++        assert time.monotonic() < deadline, f"timed out waiting for {what}: {service}"
++        time.sleep(0.02)
++
++
++def _deploy(client: TestClient) -> dict[str, Any]:
++    """创建服务并等它离开部署中的 phase；断言它 ``Ready``。"""
++    created = client.post(SERVICES, json=BODY, headers=HEADERS)
++    assert created.status_code == 201, created.text
++    service = _wait(
++        client,
++        lambda s: s is not None and s["status"].get("phase") in ("Ready", "Failed"),
++        "the service to be deployed",
++    )
++    assert service is not None
++    assert service["status"]["phase"] == "Ready", service["status"]
++    return service
++
++
++def _delete(client: TestClient) -> int:
++    """删除服务并等它从注册表中消失，返回 DELETE 的状态码。"""
++    response = client.delete(SERVICE, params=PARAMS, headers=HEADERS)
++    _wait(client, lambda s: s is None, "the service to be deleted")
++    return response.status_code
++
++
++def _ready_condition(service: dict[str, Any]) -> dict[str, Any]:
++    return next(c for c in service["status"]["conditions"] if c["type"] == "Ready")
++
++
++def _chat(url: str) -> tuple[int, str, list[str]]:
++    """向实例地址发出流式对话，返回 ``(状态码, Content-Type, 每个事件的 data)``。"""
++    parts = urlsplit(url)
++    assert parts.hostname is not None
++    connection = http.client.HTTPConnection(parts.hostname, parts.port, timeout=5)
++    try:
++        connection.request(
++            "POST",
++            "/v1/chat/completions",
++            body=json.dumps(CHAT),
++            headers={"Content-Type": "application/json"},
++        )
++        response = connection.getresponse()
++        body = response.read().decode()
++    finally:
++        connection.close()
++    events = [event.removeprefix("data: ") for event in body.split("\n\n") if event]
++    return response.status, response.getheader("Content-Type", ""), events
++
++
++def _text(events: list[str]) -> str:
++    chunks = [json.loads(event) for event in events[:-1]]
++    return "".join(chunk["choices"][0]["delta"].get("content", "") for chunk in chunks)
++
++
++def _refused(url: str) -> bool:
++    parts = urlsplit(url)
++    assert parts.hostname is not None and parts.port is not None
++    try:
++        socket.create_connection((parts.hostname, parts.port), timeout=1).close()
++    except ConnectionRefusedError:
++        return True
++    return False
++
++
++async def _allocations(db: Path) -> list[dict[str, Any]]:
++    registry = SQLiteRegistry(str(db))
++    try:
++        return await registry.list_allocations(TENANT)
++    finally:
++        await registry.close()
++
++
++def _errors(caplog: pytest.LogCaptureFixture) -> list[str]:
++    return [record.getMessage() for record in caplog.records if record.levelno >= logging.ERROR]
++
++
++@pytest.mark.e2e
++def test_a_service_is_deployed_served_deleted_and_deployed_again(
++    db_path: Path, caplog: pytest.LogCaptureFixture
++) -> None:
++    with TestClient(create_app(db_path=str(db_path))) as client:
++        first = _deploy(client)
++        [endpoint] = first["status"]["endpoints"]
++        status, content_type, events = _chat(endpoint["url"])
++        deleted = _delete(client)
++        stopped = _refused(endpoint["url"])
++
++        again = _deploy(client)
++        [endpoint_again] = again["status"]["endpoints"]
++        status_again, _, events_again = _chat(endpoint_again["url"])
++
++    ready = _ready_condition(first)
++    assert (ready["status"], ready["reason"]) == ("True", "Reconciled")
++    assert endpoint["ready"] is True
++    assert endpoint["protocol"] == "openai-chat"
++    assert endpoint["instanceId"].startswith("fake-")
++    assert urlsplit(endpoint["url"]).hostname == "127.0.0.1"
++    assert (status, content_type) == (200, "text/event-stream")
++    assert events[-1] == "[DONE]"
++    assert _text(events) == f"Hello from the ForgeMesh fake instance {endpoint['instanceId']}."
++
++    assert deleted == 202
++    assert stopped
++
++    assert endpoint_again["instanceId"] != endpoint["instanceId"]
++    assert (status_again, events_again[-1]) == (200, "[DONE]")
++    assert _refused(endpoint_again["url"])
++    allocations = asyncio.run(_allocations(db_path))
++    assert sorted(a["status"] for a in allocations) == ["Active", "Released"]
++    assert [a["devices"] for a in allocations] == [[DEVICE], [DEVICE]]
++    assert _errors(caplog) == []
++
++
++@pytest.mark.e2e
++def test_a_ready_service_whose_instance_ended_with_the_control_plane_is_degraded(
++    db_path: Path, caplog: pytest.LogCaptureFixture
++) -> None:
++    with TestClient(create_app(db_path=str(db_path))) as client:
++        [endpoint] = _deploy(client)["status"]["endpoints"]
++    stopped_with_the_control_plane = _refused(endpoint["url"])
++
++    with TestClient(create_app(db_path=str(db_path))) as client:
++        degraded = _get(client)
++        deleted = _delete(client)
++
++    assert stopped_with_the_control_plane
++    assert degraded is not None
++    assert degraded["status"]["phase"] == "Degraded"
++    assert degraded["status"]["endpoints"] == [{**endpoint, "ready": False}]
++    ready = _ready_condition(degraded)
++    assert (ready["status"], ready["reason"]) == ("False", "InstanceLost")
++    assert ready["message"] == (
++        f"instance {endpoint['instanceId']} at {endpoint['url']} did not survive the control "
++        "plane restart; delete and re-create the service to deploy it again"
++    )
++    assert deleted == 202
++    assert [a["status"] for a in asyncio.run(_allocations(db_path))] == ["Released"]
++    assert db_path.with_name("cp.workflows.db").exists()
++    assert _errors(caplog) == []
+diff --git a/tests/unit/controlplane/test_app.py b/tests/unit/controlplane/test_app.py
+index 007032f..5e86fce 100644
+--- a/tests/unit/controlplane/test_app.py
++++ b/tests/unit/controlplane/test_app.py
+@@ -1,5 +1,5 @@
+ """控制平面应用入口测试：真实路由已挂载、存储可配置、探针反映存储状态、控制器随应用运行、
+-配置加速器清单时启用调度器。"""
++配置加速器清单时启用调度器、配置启动器时启用部署（完整闭环见 ``tests/e2e/test_closed_loop.py``）。"""
+ 
+ from __future__ import annotations
+ 
+@@ -12,6 +12,7 @@ from typing import Any
+ 
+ import pytest
+ from fastapi.testclient import TestClient
++from forgemesh.controlplane import app as app_module
+ from forgemesh.controlplane.api.dependencies import (
+     ComponentNotReadyError,
+     get_authenticator,
+@@ -21,9 +22,17 @@ from forgemesh.controlplane.api.dependencies import (
+ from forgemesh.controlplane.app import DB_PATH_ENV, create_app
+ from forgemesh.controlplane.auth import AUTH_MODE_DEV, AUTH_MODE_ENV
+ from forgemesh.controlplane.controller import ControllerManager
++from forgemesh.controlplane.deployment import FakeLauncher, LauncherConfigError
++from forgemesh.controlplane.deployment import config as launcher_config
+ from forgemesh.controlplane.registry import SQLiteRegistry
+ from forgemesh.controlplane.scheduler import INVENTORY_FILE_ENV, InventoryConfigError
+ from forgemesh.resource.inference import InferenceService
++from forgemesh.workflowruntime.runtime import LocalWorkflowRuntime
++from forgemesh.workflowruntime.store import WorkflowStore
++
++LAUNCHER_ENVS = [
++    getattr(launcher_config, name) for name in launcher_config.__all__ if name.endswith("_ENV")
++]
+ 
+ HEADERS = {"X-Tenant-Id": "acme"}
+ BODY = {
+@@ -41,11 +50,20 @@ BODY = {
+ def _reset_components(monkeypatch):
+     monkeypatch.setenv(AUTH_MODE_ENV, AUTH_MODE_DEV)
+     monkeypatch.delenv(INVENTORY_FILE_ENV, raising=False)
++    for name in LAUNCHER_ENVS:
++        monkeypatch.delenv(name, raising=False)
+     reset_runtime_components()
+     yield
+     reset_runtime_components()
+ 
+ 
++def _write_inventory(tmp_path: Path) -> Path:
++    inventory = tmp_path / "inventory.json"
++    gpu = {"id": "gpu-0", "type": "nvidia-gpu", "memoryGiB": 80}
++    inventory.write_text(json.dumps({"nodes": [{"id": "node-a", "devices": [gpu]}]}))
++    return inventory
++
++
+ def _wait_for_ready_condition(client: TestClient, timeout: float = 5.0) -> dict[str, Any]:
+     """轮询直到控制器为 ``llama`` 写入 ``Ready`` 条件。"""
+     deadline = time.monotonic() + timeout
+@@ -203,13 +221,10 @@ def test_controller_picks_up_services_stored_while_it_was_not_running(tmp_path)
+ 
+ @pytest.mark.unit
+ def test_controller_schedules_when_an_inventory_is_configured(tmp_path, monkeypatch) -> None:
+-    """配置清单后不再报告 SchedulerUnavailable；应用尚未注入工作流运行时，协调器在分配
+-    之前停在 WorkflowRuntimeUnavailable，不留下分配。"""
++    """配置清单后不再报告 SchedulerUnavailable；没有设置 FORGEMESH_RUNTIME_LAUNCHER 时不部署，
++    协调器在分配之前停在 WorkflowRuntimeUnavailable，不留下分配，也不创建工作流数据库。"""
+     db_file = tmp_path / "cp.db"
+-    inventory = tmp_path / "inventory.json"
+-    gpu = {"id": "gpu-0", "type": "nvidia-gpu", "memoryGiB": 80}
+-    inventory.write_text(json.dumps({"nodes": [{"id": "node-a", "devices": [gpu]}]}))
+-    monkeypatch.setenv(INVENTORY_FILE_ENV, str(inventory))
++    monkeypatch.setenv(INVENTORY_FILE_ENV, str(_write_inventory(tmp_path)))
+ 
+     with TestClient(create_app(db_path=str(db_file))) as client:
+         created = client.post("/api/v1/inference-services", json=BODY, headers=HEADERS)
+@@ -218,6 +233,110 @@ def test_controller_schedules_when_an_inventory_is_configured(tmp_path, monkeypa
+ 
+     assert (ready["status"], ready["reason"]) == ("False", "WorkflowRuntimeUnavailable")
+     assert asyncio.run(_allocations(db_file)) == []
++    assert not (tmp_path / "cp.workflows.db").exists()
++
++
++@pytest.mark.unit
++def test_a_launcher_enables_deployments_with_their_own_workflow_database(
++    tmp_path, monkeypatch
++) -> None:
++    """部署工作流存放在注册表旁的 ``cp.workflows.db``；``POST /workflows`` 不使用部署的运行时。"""
++    db_file = tmp_path / "cp.db"
++    monkeypatch.setenv(INVENTORY_FILE_ENV, str(_write_inventory(tmp_path)))
++    monkeypatch.setenv(launcher_config.RUNTIME_LAUNCHER_ENV, "fake")
++
++    with TestClient(create_app(db_path=str(db_file))) as client:
++        workflows = client.post(
++            "/api/v1/workflows",
++            json={"definition": "inference-service-deployment", "version": 1},
++            headers=HEADERS,
++        )
++
++    assert workflows.status_code == 503
++    assert workflows.json()["error"]["code"] == "WORKFLOW_RUNTIME_UNAVAILABLE"
++    assert (tmp_path / "cp.workflows.db").exists()
++
++
++@pytest.mark.unit
++def test_deployments_recover_before_the_controller_starts_and_stop_after_it(
++    tmp_path, monkeypatch
++) -> None:
++    """启动：恢复未完成的部署 → 标记实例已丢失的服务 → 控制器；关闭：控制器 → 工作流运行时
++    （其补偿还会调用启动器）→ 启动器 → 工作流存储。"""
++    calls: list[str] = []
++
++    def record(owner: Any, name: str, label: str) -> None:
++        original = getattr(owner, name)
++
++        async def wrapper(*args: Any, **kwargs: Any) -> Any:
++            calls.append(label)
++            return await original(*args, **kwargs)
++
++        monkeypatch.setattr(owner, name, wrapper)
++
++    record(LocalWorkflowRuntime, "recover", "runtime.recover")
++    record(app_module, "mark_lost_instances", "mark_lost_instances")
++    record(ControllerManager, "start", "controller.start")
++    record(ControllerManager, "stop", "controller.stop")
++    record(LocalWorkflowRuntime, "aclose", "runtime.aclose")
++    record(FakeLauncher, "aclose", "launcher.aclose")
++    record(WorkflowStore, "close", "workflow_store.close")
++    monkeypatch.setenv(INVENTORY_FILE_ENV, str(_write_inventory(tmp_path)))
++    monkeypatch.setenv(launcher_config.RUNTIME_LAUNCHER_ENV, "fake")
++
++    with TestClient(create_app(db_path=str(tmp_path / "cp.db"))):
++        started = list(calls)
++
++    assert started == ["runtime.recover", "mark_lost_instances", "controller.start"]
++    assert calls[len(started) :] == [
++        "controller.stop",
++        "runtime.aclose",
++        "launcher.aclose",
++        "workflow_store.close",
++    ]
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize(
++    ("settings", "with_inventory", "message"),
++    [
++        pytest.param(
++            {"FORGEMESH_RUNTIME_LAUNCHER": "fake"},
++            False,
++            "FORGEMESH_RUNTIME_LAUNCHER=fake requires FORGEMESH_INVENTORY_FILE",
++            id="no-inventory",
++        ),
++        pytest.param(
++            {"FORGEMESH_RUNTIME_LAUNCHER": "docker"},
++            True,
++            "unsupported FORGEMESH_RUNTIME_LAUNCHER='docker'",
++            id="unknown-launcher",
++        ),
++        pytest.param(
++            {"FORGEMESH_RUNTIME_LAUNCHER": "fake", "FORGEMESH_FAKE_LAUNCHER_BIND_HOST": "0.0.0.0"},
++            True,
++            "FORGEMESH_FAKE_LAUNCHER_ADVERTISE_HOST must be set",
++            id="no-advertise-host",
++        ),
++    ],
++)
++def test_app_refuses_to_start_with_an_unusable_launcher_setting(
++    tmp_path, monkeypatch, settings, with_inventory, message
++) -> None:
++    db_file = tmp_path / "cp.db"
++    if with_inventory:
++        monkeypatch.setenv(INVENTORY_FILE_ENV, str(_write_inventory(tmp_path)))
++    for name, value in settings.items():
++        monkeypatch.setenv(name, value)
++
++    with (
++        pytest.raises(LauncherConfigError, match=message),
++        TestClient(create_app(db_path=str(db_file))),
++    ):
++        pass
++
++    assert not db_file.exists()
++    assert not (tmp_path / "cp.workflows.db").exists()
+ 
+ 
+ @pytest.mark.unit
+-- 
+2.43.0
+

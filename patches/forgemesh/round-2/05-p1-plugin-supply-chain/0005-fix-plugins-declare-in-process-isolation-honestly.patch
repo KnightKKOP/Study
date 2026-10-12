@@ -1,7 +1,7 @@
-From a301a424e5f6e9aa4ca36f4104f4cde72cdea6d5 Mon Sep 17 00:00:00 2001
+From 2b05c1df88342473f21fa6747c1f9bfe0f9d9cd7 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Mon, 12 Oct 2026 12:50:40 +0000
-Subject: [PATCH 5/8] fix(plugins): declare in-process isolation honestly
+Subject: [PATCH 5/9] fix(plugins): declare in-process isolation honestly
 
 Every shipped manifest declared `isolation: restricted-rpc`, but the
 host has no process boundary: plugins are imported into the control
@@ -298,7 +298,7 @@ index b26b1d4..d8c4fdd 100644
    healthCheck:
      mode: rpc
 diff --git a/tests/compat/test_plugin_conformance_v11.py b/tests/compat/test_plugin_conformance_v11.py
-index 7c12cf9..20b6990 100644
+index 1ebc43c..40b46dd 100644
 --- a/tests/compat/test_plugin_conformance_v11.py
 +++ b/tests/compat/test_plugin_conformance_v11.py
 @@ -43,6 +43,7 @@ from forgemesh.core.errors import (

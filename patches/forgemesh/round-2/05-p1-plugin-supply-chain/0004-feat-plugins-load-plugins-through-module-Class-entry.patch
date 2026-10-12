@@ -1,7 +1,7 @@
-From 17d25d8862071d4272313c513ce9d071d8a733a0 Mon Sep 17 00:00:00 2001
+From 9d1fd09929fd829e8f996055c7eaf258b7952b81 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Mon, 12 Oct 2026 12:46:52 +0000
-Subject: [PATCH 4/8] feat(plugins): load plugins through module:Class
+Subject: [PATCH 4/9] feat(plugins): load plugins through module:Class
  entrypoints
 
 Every shipped manifest declared `python -m forgemesh_<name>` as its

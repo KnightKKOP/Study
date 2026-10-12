@@ -1,7 +1,7 @@
-From a9e4d3e5698be399edc0aee8fa8e7cfd896694a1 Mon Sep 17 00:00:00 2001
+From 62168f91e850d72d4d233f3712eb697858939d4f Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Mon, 12 Oct 2026 13:11:12 +0000
-Subject: [PATCH 6/8] feat(control-plane): verify plugin signatures and grants
+Subject: [PATCH 6/9] feat(control-plane): verify plugin signatures and grants
  at registration
 
 PluginManager.register stored any manifest object as it was: nothing
@@ -414,7 +414,7 @@ index 5587093..88ef3e5 100644
 +    "load_plugin_policy",
 +]
 diff --git a/tests/compat/test_plugin_conformance_v11.py b/tests/compat/test_plugin_conformance_v11.py
-index 20b6990..3fcf471 100644
+index 40b46dd..8b14c29 100644
 --- a/tests/compat/test_plugin_conformance_v11.py
 +++ b/tests/compat/test_plugin_conformance_v11.py
 @@ -38,6 +38,7 @@ from typing import Any
@@ -433,7 +433,7 @@ index 20b6990..3fcf471 100644
  from forgemesh.workflow.runtime import Step, WorkflowDefinition, WorkflowRuntime
  from forgemesh.workflow.states import WorkflowStatus
  from jsonschema import Draft202012Validator
-@@ -1001,6 +1003,23 @@ def _manifest_model(plugin_dir: str, *, version: str | None = None) -> PluginMan
+@@ -1040,6 +1042,23 @@ def _manifest_model(plugin_dir: str, *, version: str | None = None) -> PluginMan
      return PluginManifest.model_validate(data)
  
  
@@ -457,7 +457,7 @@ index 20b6990..3fcf471 100644
  class TestUpgradeAndUnloadSafety:
      """升级/卸载安全：运行中引用下的卸载语义与版本并存规则。
  
-@@ -1028,10 +1047,8 @@ class TestUpgradeAndUnloadSafety:
+@@ -1067,10 +1086,8 @@ class TestUpgradeAndUnloadSafety:
  
          期望行为（未实现）：应被拒绝或进入 Draining，见类 docstring。
          """
@@ -470,7 +470,7 @@ index 20b6990..3fcf471 100644
  
          # 走完合法安装链路：Discovered → Validating → Installed → Enabled。
          for target in (
-@@ -1055,8 +1072,6 @@ class TestUpgradeAndUnloadSafety:
+@@ -1094,8 +1111,6 @@ class TestUpgradeAndUnloadSafety:
      @_compat
      def test_uninstall_unknown_plugin_rejected(self) -> None:
          """卸载未注册插件须被拒绝（NotFoundError）。"""
@@ -479,7 +479,7 @@ index 20b6990..3fcf471 100644
          manager = PluginManager()
          with pytest.raises(NotFoundError):
              manager.transition(
-@@ -1066,10 +1081,8 @@ class TestUpgradeAndUnloadSafety:
+@@ -1105,10 +1120,8 @@ class TestUpgradeAndUnloadSafety:
      @_compat
      def test_disorderly_transition_rejected(self) -> None:
          """无序转移被拒：Discovered 不能直接 Enabled/Uninstalled 之外的越级跳转。"""
@@ -492,7 +492,7 @@ index 20b6990..3fcf471 100644
  
          # 越级：Discovered → Enabled（须先 Validating → Installed）。
          with pytest.raises(InvalidStateTransition):
-@@ -1081,10 +1094,8 @@ class TestUpgradeAndUnloadSafety:
+@@ -1120,10 +1133,8 @@ class TestUpgradeAndUnloadSafety:
      @_compat
      def test_uninstalled_is_terminal_no_revive(self) -> None:
          """Uninstalled 为终态：已卸载插件不可再转移（不可复活/重启用）。"""
@@ -505,7 +505,7 @@ index 20b6990..3fcf471 100644
          manager.transition(pid, PluginLifecycleState.VALIDATING)
          manager.transition(pid, PluginLifecycleState.UNINSTALLED)
  
-@@ -1094,14 +1105,12 @@ class TestUpgradeAndUnloadSafety:
+@@ -1133,14 +1144,12 @@ class TestUpgradeAndUnloadSafety:
      @_compat
      def test_same_id_different_versions_coexist(self) -> None:
          """版本并存（ADR-011）：同 id 不同版本以 id:version 复合键并存。"""
@@ -523,7 +523,7 @@ index 20b6990..3fcf471 100644
  
          assert pid1 != pid2, "不同版本应有不同 plugin_id（id:version）"
          same_id = [
-@@ -1118,9 +1127,7 @@ class TestUpgradeAndUnloadSafety:
+@@ -1157,9 +1166,7 @@ class TestUpgradeAndUnloadSafety:
      @_compat
      def test_duplicate_exact_version_registration_conflicts(self) -> None:
          """重复注册同一 id:version 须抛 ConflictError（并存≠重复注册）。"""

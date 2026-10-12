@@ -1,7 +1,7 @@
-From 899c4d5bfec66bd99b72f067a057694900fa7729 Mon Sep 17 00:00:00 2001
+From fcc1663aba33f71feac10a711a21866860f8d344 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Mon, 12 Oct 2026 14:37:38 +0000
-Subject: [PATCH 2/5] feat(workflow-runtime): execute runs in the background
+Subject: [PATCH 2/6] feat(workflow-runtime): execute runs in the background
  and recover them
 
 The reference runtime only recorded runs: start() moved a run to Running

@@ -1,7 +1,7 @@
-From 35913165b9202d0f1d3352906355d5077f9c4716 Mon Sep 17 00:00:00 2001
+From eae9165f35ee7a7ef344f3b592d893731693cb83 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Mon, 12 Oct 2026 14:54:47 +0000
-Subject: [PATCH 3/5] feat(control-plane): add the deployment workflow and the
+Subject: [PATCH 3/6] feat(control-plane): add the deployment workflow and the
  runtime launcher contract
 
 Nothing in the control plane could start an inference instance: the

@@ -1,0 +1,634 @@
+From 65fb0ebb4adf072eff0fdc8797335babd45154fc Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 12 Oct 2026 17:06:03 +0000
+Subject: [PATCH 06/10] feat(control-plane): select the runtime launcher from
+ the environment
+
+The app needs one place that turns configuration into a launcher and
+refuses to start on anything it cannot honour, like the inventory and
+auth settings do. launcher_from_env(inventory) reads:
+
+- FORGEMESH_RUNTIME_LAUNCHER: `fake` or `vllm-process` (case
+  insensitive); unset or blank selects none; any other value is
+  refused, and so is a launcher without FORGEMESH_INVENTORY_FILE,
+  because then no service could ever be scheduled.
+- fake: FORGEMESH_FAKE_LAUNCHER_BIND_HOST (default 127.0.0.1) and
+  FORGEMESH_FAKE_LAUNCHER_ADVERTISE_HOST (default: the bind host,
+  required when binding all addresses).
+- vllm-process: FORGEMESH_VLLM_COMMAND (shell-style split, no shell;
+  default `<python> -m vllm.entrypoints.openai.api_server`, which needs
+  the vllm package for this interpreter), FORGEMESH_VLLM_BIND_HOST,
+  FORGEMESH_VLLM_ADVERTISE_HOST, FORGEMESH_VLLM_READY_TIMEOUT_SECONDS
+  (default 1200) and FORGEMESH_VLLM_STOP_GRACE_SECONDS (default 10).
+
+Because vLLM instances run on the control plane host, vllm-process
+also requires an inventory with exactly one node whose device ids all
+map to distinct CUDA devices; `0` and `gpu-0` naming the same GPU would
+let two services share it.
+
+Settings of the launcher that is not selected are not read. Every error
+names the variable to fix.
+---
+ .../controlplane/deployment/__init__.py       |   6 +
+ .../controlplane/deployment/config.py         | 210 +++++++++++
+ .../unit/controlplane/test_launcher_config.py | 327 ++++++++++++++++++
+ 3 files changed, 543 insertions(+)
+ create mode 100644 packages/control-plane/src/forgemesh/controlplane/deployment/config.py
+ create mode 100644 tests/unit/controlplane/test_launcher_config.py
+
+diff --git a/packages/control-plane/src/forgemesh/controlplane/deployment/__init__.py b/packages/control-plane/src/forgemesh/controlplane/deployment/__init__.py
+index 4fca2cf..54bf889 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/deployment/__init__.py
++++ b/packages/control-plane/src/forgemesh/controlplane/deployment/__init__.py
+@@ -8,6 +8,8 @@
+ * :mod:`.fake` —— 在控制平面进程内为每个实例提供 OpenAI 兼容桩服务的
+   :class:`FakeLauncher`（CI 与本地开发）；
+ * :mod:`.vllm_process` —— 把每个实例作为本机 vLLM 子进程运行的 :class:`VLLMProcessLauncher`；
++* :mod:`.config` —— 按环境变量（``FORGEMESH_RUNTIME_LAUNCHER`` 等）选择启动器的
++  :func:`launcher_from_env`；
+ * :mod:`.network` —— 启动器共用的地址校验与健康检查；
+ * :mod:`.memory` —— 测试替身 :class:`InMemoryLauncher`。
+ 
+@@ -16,6 +18,7 @@
+ 
+ from __future__ import annotations
+ 
++from .config import RUNTIME_LAUNCHER_ENV, LauncherConfigError, launcher_from_env
+ from .fake import FakeLauncher
+ from .launcher import LaunchedInstance, LaunchRequest, RuntimeLauncher
+ from .memory import InMemoryLauncher
+@@ -40,6 +43,7 @@ __all__ = [
+     "INSTANCE_LOST_REASON",
+     "LAUNCH_INSTANCE",
+     "PREPARE_MODEL",
++    "RUNTIME_LAUNCHER_ENV",
+     "VERIFY_INSTANCE",
+     "DeploymentReleaser",
+     "DeploymentSteps",
+@@ -47,6 +51,7 @@ __all__ = [
+     "InMemoryLauncher",
+     "LaunchRequest",
+     "LaunchedInstance",
++    "LauncherConfigError",
+     "RuntimeLauncher",
+     "StepCallable",
+     "VLLMProcessLauncher",
+@@ -54,5 +59,6 @@ __all__ = [
+     "deployment_run_key",
+     "deployment_workflow",
+     "launched_instance",
++    "launcher_from_env",
+     "mark_lost_instances",
+ ]
+diff --git a/packages/control-plane/src/forgemesh/controlplane/deployment/config.py b/packages/control-plane/src/forgemesh/controlplane/deployment/config.py
+new file mode 100644
+index 0000000..1a27310
+--- /dev/null
++++ b/packages/control-plane/src/forgemesh/controlplane/deployment/config.py
+@@ -0,0 +1,210 @@
++"""按环境变量选择推理实例的启动器。
++
++* ``FORGEMESH_RUNTIME_LAUNCHER``：``fake``（:class:`~.fake.FakeLauncher`，控制平面进程内的
++  OpenAI 兼容桩服务，供 CI 与本地开发）或 ``vllm-process``
++  （:class:`~.vllm_process.VLLMProcessLauncher`，本机上的 vLLM 子进程）；不区分大小写。
++  未设置或为空时不选择启动器（应用不部署实例）；其他取值拒绝启动。选择了启动器就必须
++  同时设置 ``FORGEMESH_INVENTORY_FILE``，否则没有服务能被调度。
++* ``fake``：``FORGEMESH_FAKE_LAUNCHER_BIND_HOST`` 为实例监听的 IP 地址（默认
++  ``127.0.0.1``；``0.0.0.0`` / ``::`` 监听全部地址）；``FORGEMESH_FAKE_LAUNCHER_ADVERTISE_HOST``
++  为写进实例地址的主机名或 IP 地址（默认同监听地址，监听全部地址时必须设置）。
++* ``vllm-process``：``FORGEMESH_VLLM_COMMAND`` 为启动 vLLM 的命令（按 shell 规则拆分，
++  不经过 shell；默认 ``<控制平面的解释器> -m vllm.entrypoints.openai.api_server``，此时
++  该解释器必须装有 ``vllm``；否则第一个词须是可执行文件）；``FORGEMESH_VLLM_BIND_HOST`` /
++  ``FORGEMESH_VLLM_ADVERTISE_HOST`` 同上；``FORGEMESH_VLLM_READY_TIMEOUT_SECONDS``（默认
++  ``1200``）为进程启动后等它就绪的时限；``FORGEMESH_VLLM_STOP_GRACE_SECONDS``（默认
++  ``10``）为 ``SIGTERM`` 之后的宽限期。实例只运行在控制平面所在的主机上，因此清单必须
++  恰好有一个节点，其设备 id 都能写进 ``CUDA_VISIBLE_DEVICES``，且不会有两个 id 选中同一块
++  设备（见 :func:`~.vllm_process.cuda_device`）。
++
++未选中的启动器的变量不读取。空白值视同未设置。
++"""
++
++from __future__ import annotations
++
++import math
++import os
++import shlex
++import shutil
++from collections.abc import Mapping
++from importlib.util import find_spec
++from typing import TYPE_CHECKING
++
++from ..scheduler.inventory import INVENTORY_FILE_ENV
++from . import fake, vllm_process
++from .fake import FakeLauncher
++from .launcher import RuntimeLauncher
++from .network import check_advertise_host, check_bind_host, resolve_hosts
++from .vllm_process import (
++    DEFAULT_COMMAND,
++    DEFAULT_READY_TIMEOUT_SECONDS,
++    DEFAULT_STOP_GRACE_SECONDS,
++    VLLMProcessLauncher,
++    cuda_device,
++)
++
++if TYPE_CHECKING:  # pragma: no cover - 仅静态类型检查使用
++    from ..scheduler.inventory import Inventory
++
++RUNTIME_LAUNCHER_ENV = "FORGEMESH_RUNTIME_LAUNCHER"
++FAKE_LAUNCHER = "fake"
++VLLM_PROCESS_LAUNCHER = "vllm-process"
++FAKE_BIND_HOST_ENV = "FORGEMESH_FAKE_LAUNCHER_BIND_HOST"
++FAKE_ADVERTISE_HOST_ENV = "FORGEMESH_FAKE_LAUNCHER_ADVERTISE_HOST"
++VLLM_COMMAND_ENV = "FORGEMESH_VLLM_COMMAND"
++VLLM_BIND_HOST_ENV = "FORGEMESH_VLLM_BIND_HOST"
++VLLM_ADVERTISE_HOST_ENV = "FORGEMESH_VLLM_ADVERTISE_HOST"
++VLLM_READY_TIMEOUT_ENV = "FORGEMESH_VLLM_READY_TIMEOUT_SECONDS"
++VLLM_STOP_GRACE_ENV = "FORGEMESH_VLLM_STOP_GRACE_SECONDS"
++
++
++class LauncherConfigError(ValueError):
++    """启动器配置非法；服务应拒绝启动。"""
++
++
++def _get(env: Mapping[str, str], name: str) -> str | None:
++    return (env.get(name) or "").strip() or None
++
++
++def _hosts(
++    env: Mapping[str, str], bind_env: str, advertise_env: str, default_bind: str
++) -> tuple[str, str | None]:
++    bind = _get(env, bind_env) or default_bind
++    advertise = _get(env, advertise_env)
++    try:
++        check_bind_host(bind)
++    except ValueError as exc:
++        raise LauncherConfigError(f"invalid {bind_env}: {exc}") from None
++    if advertise is not None:
++        try:
++            check_advertise_host(advertise)
++        except ValueError as exc:
++            raise LauncherConfigError(f"invalid {advertise_env}: {exc}") from None
++    try:
++        resolve_hosts(bind, advertise)
++    except ValueError:
++        raise LauncherConfigError(
++            f"{advertise_env} must be set when {bind_env}={bind} listens on all addresses: "
++            "instance urls need a host that the gateway can connect to"
++        ) from None
++    return bind, advertise
++
++
++def _seconds(env: Mapping[str, str], name: str, default: float) -> float:
++    raw = _get(env, name)
++    if raw is None:
++        return default
++    try:
++        value = float(raw)
++    except ValueError:
++        raise LauncherConfigError(f"{name}={raw!r} is not a number of seconds") from None
++    if not math.isfinite(value) or value <= 0:
++        raise LauncherConfigError(f"{name}={raw!r} must be a positive number of seconds")
++    return value
++
++
++def _vllm_command(env: Mapping[str, str]) -> tuple[str, ...]:
++    raw = _get(env, VLLM_COMMAND_ENV)
++    if raw is None:
++        if find_spec("vllm") is None:
++            raise LauncherConfigError(
++                f"{RUNTIME_LAUNCHER_ENV}={VLLM_PROCESS_LAUNCHER} runs {' '.join(DEFAULT_COMMAND)} "
++                f"by default, but the vllm package is not installed for this interpreter; "
++                f"install vllm or point {VLLM_COMMAND_ENV} to a vLLM installation"
++            )
++        return DEFAULT_COMMAND
++    try:
++        command = tuple(shlex.split(raw))
++    except ValueError as exc:
++        raise LauncherConfigError(f"invalid {VLLM_COMMAND_ENV}: {exc}") from None
++    if shutil.which(command[0]) is None:
++        raise LauncherConfigError(
++            f"invalid {VLLM_COMMAND_ENV}: {command[0]!r} is not an executable file"
++        )
++    return command
++
++
++def _vllm_node(inventory: Inventory) -> str:
++    if len(inventory.nodes) != 1:
++        raise LauncherConfigError(
++            f"{RUNTIME_LAUNCHER_ENV}={VLLM_PROCESS_LAUNCHER} runs instances on the control plane "
++            f"host only, so {INVENTORY_FILE_ENV} must describe exactly one node (this host), "
++            f"not {len(inventory.nodes)}: {', '.join(node.id for node in inventory.nodes)}"
++        )
++    [node] = inventory.nodes
++    selected: dict[str, str] = {}
++    for device in node.devices:
++        try:
++            visible = cuda_device(device.id)
++        except ValueError as exc:
++            raise LauncherConfigError(f"invalid {INVENTORY_FILE_ENV} for vLLM: {exc}") from None
++        if visible in selected:
++            raise LauncherConfigError(
++                f"invalid {INVENTORY_FILE_ENV} for vLLM: device ids {selected[visible]!r} and "
++                f"{device.id!r} both select CUDA device {visible}"
++            )
++        selected[visible] = device.id
++    return node.id
++
++
++def launcher_from_env(
++    inventory: Inventory | None, environ: Mapping[str, str] | None = None
++) -> RuntimeLauncher | None:
++    """按环境变量构造启动器；未设置 ``FORGEMESH_RUNTIME_LAUNCHER`` 时返回 ``None``。
++
++    Args:
++        inventory: 已加载的加速器清单（:func:`~forgemesh.controlplane.scheduler.inventory_from_env`），
++            未配置时为 ``None``。
++        environ: 环境变量，默认 :data:`os.environ`。
++
++    Raises:
++        LauncherConfigError: 启动器未知、缺少清单，或所选启动器的配置非法（见模块说明）。
++    """
++    env = os.environ if environ is None else environ
++    name = (_get(env, RUNTIME_LAUNCHER_ENV) or "").lower()
++    if not name:
++        return None
++    if name not in (FAKE_LAUNCHER, VLLM_PROCESS_LAUNCHER):
++        raise LauncherConfigError(
++            f"unsupported {RUNTIME_LAUNCHER_ENV}={name!r}; expected {FAKE_LAUNCHER!r} or "
++            f"{VLLM_PROCESS_LAUNCHER!r}"
++        )
++    if inventory is None:
++        raise LauncherConfigError(
++            f"{RUNTIME_LAUNCHER_ENV}={name} requires {INVENTORY_FILE_ENV}: without an "
++            "accelerator inventory no inference service can be scheduled"
++        )
++    if name == FAKE_LAUNCHER:
++        bind, advertise = _hosts(
++            env, FAKE_BIND_HOST_ENV, FAKE_ADVERTISE_HOST_ENV, fake.DEFAULT_BIND_HOST
++        )
++        return FakeLauncher(bind_host=bind, advertise_host=advertise)
++    node_id = _vllm_node(inventory)
++    command = _vllm_command(env)
++    bind, advertise = _hosts(
++        env, VLLM_BIND_HOST_ENV, VLLM_ADVERTISE_HOST_ENV, vllm_process.DEFAULT_BIND_HOST
++    )
++    return VLLMProcessLauncher(
++        node_id,
++        command=command,
++        bind_host=bind,
++        advertise_host=advertise,
++        ready_timeout=_seconds(env, VLLM_READY_TIMEOUT_ENV, DEFAULT_READY_TIMEOUT_SECONDS),
++        stop_grace=_seconds(env, VLLM_STOP_GRACE_ENV, DEFAULT_STOP_GRACE_SECONDS),
++    )
++
++
++__all__ = [
++    "FAKE_ADVERTISE_HOST_ENV",
++    "FAKE_BIND_HOST_ENV",
++    "FAKE_LAUNCHER",
++    "RUNTIME_LAUNCHER_ENV",
++    "VLLM_ADVERTISE_HOST_ENV",
++    "VLLM_BIND_HOST_ENV",
++    "VLLM_COMMAND_ENV",
++    "VLLM_PROCESS_LAUNCHER",
++    "VLLM_READY_TIMEOUT_ENV",
++    "VLLM_STOP_GRACE_ENV",
++    "LauncherConfigError",
++    "launcher_from_env",
++]
+diff --git a/tests/unit/controlplane/test_launcher_config.py b/tests/unit/controlplane/test_launcher_config.py
+new file mode 100644
+index 0000000..d45cecd
+--- /dev/null
++++ b/tests/unit/controlplane/test_launcher_config.py
+@@ -0,0 +1,327 @@
++"""启动器配置测试：``FORGEMESH_RUNTIME_LAUNCHER`` 及各启动器的环境变量。
++
++* 未设置或为空时不选择启动器，也不读取各启动器的变量；取值不区分大小写；未知取值、缺少
++  加速器清单都拒绝启动；
++* ``fake``：监听地址与写进实例地址的主机；
++* ``vllm-process``：命令（默认要求本解释器装有 ``vllm``）、地址与时限；清单必须恰好有一个
++  节点，设备 id 都能写进 ``CUDA_VISIBLE_DEVICES`` 且不会选中同一块设备。
++"""
++
++from __future__ import annotations
++
++import json
++import shlex
++import sys
++
++import pytest
++from forgemesh.controlplane.deployment import (
++    FakeLauncher,
++    LauncherConfigError,
++    VLLMProcessLauncher,
++    launcher_from_env,
++)
++from forgemesh.controlplane.deployment import config as config_module
++from forgemesh.controlplane.deployment.vllm_process import DEFAULT_COMMAND
++from forgemesh.controlplane.scheduler import Inventory
++
++GPU_UUID = "GPU-8f0c5a62-3b1e-4a7d-9c2f-0d1e2f3a4b5c"
++PYTHON = shlex.quote(sys.executable)
++
++
++def _inventory(*nodes: tuple[str, tuple[str, ...]]) -> Inventory:
++    payload = {
++        "nodes": [
++            {
++                "id": node_id,
++                "devices": [
++                    {"id": device_id, "type": "nvidia-gpu", "memoryGiB": 80}
++                    for device_id in device_ids
++                ],
++            }
++            for node_id, device_ids in nodes
++        ]
++    }
++    return Inventory.model_validate_json(json.dumps(payload))
++
++
++ONE_NODE = _inventory(("node-a", ("gpu-0", "gpu-1")))
++VLLM = {"FORGEMESH_RUNTIME_LAUNCHER": "vllm-process", "FORGEMESH_VLLM_COMMAND": PYTHON}
++
++
++def _refusal(inventory: Inventory | None, env: dict[str, str]) -> str:
++    with pytest.raises(LauncherConfigError) as caught:
++        launcher_from_env(inventory, env)
++    return str(caught.value)
++
++
++# ---------------------------------------------------------------------- #
++# 选择启动器
++# ---------------------------------------------------------------------- #
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize("value", [None, "", "  "])
++@pytest.mark.parametrize("inventory", [None, ONE_NODE], ids=["no-inventory", "inventory"])
++def test_no_launcher_is_selected_when_the_variable_is_unset_or_blank(
++    value: str | None, inventory: Inventory | None
++) -> None:
++    env = {
++        "FORGEMESH_FAKE_LAUNCHER_BIND_HOST": "not-an-address",
++        "FORGEMESH_VLLM_COMMAND": "/no/such/vllm",
++    }
++    if value is not None:
++        env["FORGEMESH_RUNTIME_LAUNCHER"] = value
++
++    assert launcher_from_env(inventory, env) is None
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize("value", ["docker", "vllm", "fake,vllm-process"])
++def test_an_unknown_launcher_is_refused(value: str) -> None:
++    message = _refusal(ONE_NODE, {"FORGEMESH_RUNTIME_LAUNCHER": value})
++
++    assert message == (
++        f"unsupported FORGEMESH_RUNTIME_LAUNCHER={value!r}; expected 'fake' or 'vllm-process'"
++    )
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize("value", ["fake", "vllm-process"])
++def test_a_launcher_requires_the_accelerator_inventory(value: str) -> None:
++    message = _refusal(None, {"FORGEMESH_RUNTIME_LAUNCHER": value})
++
++    assert message == (
++        f"FORGEMESH_RUNTIME_LAUNCHER={value} requires FORGEMESH_INVENTORY_FILE: without an "
++        "accelerator inventory no inference service can be scheduled"
++    )
++
++
++# ---------------------------------------------------------------------- #
++# fake
++# ---------------------------------------------------------------------- #
++
++
++@pytest.mark.unit
++def test_the_fake_launcher_listens_on_loopback_by_default() -> None:
++    env = {"FORGEMESH_RUNTIME_LAUNCHER": " Fake ", "FORGEMESH_VLLM_COMMAND": "/no/such/vllm"}
++
++    launcher = launcher_from_env(ONE_NODE, env)
++
++    assert isinstance(launcher, FakeLauncher)
++    assert (launcher.bind_host, launcher.advertise_host) == ("127.0.0.1", "127.0.0.1")
++
++
++@pytest.mark.unit
++def test_the_fake_launcher_can_listen_on_all_addresses_under_an_advertised_host() -> None:
++    env = {
++        "FORGEMESH_RUNTIME_LAUNCHER": "fake",
++        "FORGEMESH_FAKE_LAUNCHER_BIND_HOST": "0.0.0.0",
++        "FORGEMESH_FAKE_LAUNCHER_ADVERTISE_HOST": "control-plane",
++    }
++
++    launcher = launcher_from_env(ONE_NODE, env)
++
++    assert isinstance(launcher, FakeLauncher)
++    assert (launcher.bind_host, launcher.advertise_host) == ("0.0.0.0", "control-plane")
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize(
++    ("settings", "message"),
++    [
++        pytest.param(
++            {"FORGEMESH_FAKE_LAUNCHER_BIND_HOST": "localhost"},
++            "invalid FORGEMESH_FAKE_LAUNCHER_BIND_HOST: 'localhost' is not an IP address",
++            id="bind-host-name",
++        ),
++        pytest.param(
++            {"FORGEMESH_FAKE_LAUNCHER_ADVERTISE_HOST": "http://control-plane"},
++            "invalid FORGEMESH_FAKE_LAUNCHER_ADVERTISE_HOST: 'http://control-plane' is neither "
++            "an IP address nor a host name",
++            id="advertise-url",
++        ),
++        pytest.param(
++            {"FORGEMESH_FAKE_LAUNCHER_BIND_HOST": "0.0.0.0"},
++            "FORGEMESH_FAKE_LAUNCHER_ADVERTISE_HOST must be set when "
++            "FORGEMESH_FAKE_LAUNCHER_BIND_HOST=0.0.0.0 listens on all addresses",
++            id="wildcard-without-advertise",
++        ),
++    ],
++)
++def test_invalid_fake_launcher_addresses_are_refused(
++    settings: dict[str, str], message: str
++) -> None:
++    assert message in _refusal(ONE_NODE, {"FORGEMESH_RUNTIME_LAUNCHER": "fake", **settings})
++
++
++# ---------------------------------------------------------------------- #
++# vllm-process
++# ---------------------------------------------------------------------- #
++
++
++@pytest.mark.unit
++def test_the_vllm_launcher_runs_the_installed_vllm_by_default(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    looked_up: list[str] = []
++
++    def find_spec(name: str) -> object:
++        looked_up.append(name)
++        return object()
++
++    monkeypatch.setattr(config_module, "find_spec", find_spec)
++    env = {"FORGEMESH_RUNTIME_LAUNCHER": "vllm-process", "FORGEMESH_FAKE_LAUNCHER_BIND_HOST": "x"}
++
++    launcher = launcher_from_env(ONE_NODE, env)
++
++    assert isinstance(launcher, VLLMProcessLauncher)
++    assert looked_up == ["vllm"]
++    assert launcher.command == DEFAULT_COMMAND
++    assert launcher.node_id == "node-a"
++    assert (launcher.bind_host, launcher.advertise_host) == ("127.0.0.1", "127.0.0.1")
++    assert (launcher.ready_timeout, launcher.stop_grace) == (1200.0, 10.0)
++
++
++@pytest.mark.unit
++def test_the_default_vllm_command_requires_vllm_to_be_installed(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    monkeypatch.setattr(config_module, "find_spec", lambda name: None)
++
++    message = _refusal(ONE_NODE, {"FORGEMESH_RUNTIME_LAUNCHER": "vllm-process"})
++
++    assert "the vllm package is not installed for this interpreter" in message
++    assert "FORGEMESH_VLLM_COMMAND" in message
++
++
++@pytest.mark.unit
++def test_the_vllm_launcher_uses_the_configured_command_addresses_and_timeouts() -> None:
++    env = {
++        "FORGEMESH_RUNTIME_LAUNCHER": "VLLM-Process",
++        "FORGEMESH_VLLM_COMMAND": f"{PYTHON} -m my.vllm --served-model-name 'my model'",
++        "FORGEMESH_VLLM_BIND_HOST": "::",
++        "FORGEMESH_VLLM_ADVERTISE_HOST": "gpu-host.internal",
++        "FORGEMESH_VLLM_READY_TIMEOUT_SECONDS": "90",
++        "FORGEMESH_VLLM_STOP_GRACE_SECONDS": " 2.5 ",
++    }
++    inventory = _inventory(("this-host", ("0", GPU_UUID, f"MIG-{GPU_UUID}/1/0")))
++
++    launcher = launcher_from_env(inventory, env)
++
++    assert isinstance(launcher, VLLMProcessLauncher)
++    assert launcher.command == (
++        sys.executable,
++        "-m",
++        "my.vllm",
++        "--served-model-name",
++        "my model",
++    )
++    assert launcher.node_id == "this-host"
++    assert (launcher.bind_host, launcher.advertise_host) == ("::", "gpu-host.internal")
++    assert (launcher.ready_timeout, launcher.stop_grace) == (90.0, 2.5)
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize(
++    ("settings", "message"),
++    [
++        pytest.param(
++            {"FORGEMESH_VLLM_COMMAND": "/no/such/vllm serve"},
++            "invalid FORGEMESH_VLLM_COMMAND: '/no/such/vllm' is not an executable file",
++            id="missing-executable",
++        ),
++        pytest.param(
++            {"FORGEMESH_VLLM_COMMAND": "''"},
++            "invalid FORGEMESH_VLLM_COMMAND: '' is not an executable file",
++            id="empty-executable",
++        ),
++        pytest.param(
++            {"FORGEMESH_VLLM_COMMAND": "vllm 'serve"},
++            "invalid FORGEMESH_VLLM_COMMAND: No closing quotation",
++            id="unbalanced-quote",
++        ),
++        pytest.param(
++            {"FORGEMESH_VLLM_READY_TIMEOUT_SECONDS": "soon"},
++            "FORGEMESH_VLLM_READY_TIMEOUT_SECONDS='soon' is not a number of seconds",
++            id="ready-timeout-text",
++        ),
++        pytest.param(
++            {"FORGEMESH_VLLM_READY_TIMEOUT_SECONDS": "0"},
++            "FORGEMESH_VLLM_READY_TIMEOUT_SECONDS='0' must be a positive number of seconds",
++            id="ready-timeout-zero",
++        ),
++        pytest.param(
++            {"FORGEMESH_VLLM_STOP_GRACE_SECONDS": "-1"},
++            "FORGEMESH_VLLM_STOP_GRACE_SECONDS='-1' must be a positive number of seconds",
++            id="stop-grace-negative",
++        ),
++        pytest.param(
++            {"FORGEMESH_VLLM_STOP_GRACE_SECONDS": "inf"},
++            "FORGEMESH_VLLM_STOP_GRACE_SECONDS='inf' must be a positive number of seconds",
++            id="stop-grace-infinite",
++        ),
++        pytest.param(
++            {"FORGEMESH_VLLM_BIND_HOST": "0.0.0.0"},
++            "FORGEMESH_VLLM_ADVERTISE_HOST must be set when FORGEMESH_VLLM_BIND_HOST=0.0.0.0 "
++            "listens on all addresses",
++            id="wildcard-without-advertise",
++        ),
++        pytest.param(
++            {"FORGEMESH_VLLM_ADVERTISE_HOST": "::"},
++            "invalid FORGEMESH_VLLM_ADVERTISE_HOST: '::' is a wildcard address",
++            id="wildcard-advertise",
++        ),
++    ],
++)
++def test_invalid_vllm_settings_are_refused(settings: dict[str, str], message: str) -> None:
++    assert message in _refusal(ONE_NODE, {**VLLM, **settings})
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize(
++    ("inventory", "message"),
++    [
++        pytest.param(
++            _inventory(("node-a", ("gpu-0",)), ("node-b", ("gpu-0",))),
++            "FORGEMESH_RUNTIME_LAUNCHER=vllm-process runs instances on the control plane host "
++            "only, so FORGEMESH_INVENTORY_FILE must describe exactly one node (this host), not "
++            "2: node-a, node-b",
++            id="two-nodes",
++        ),
++        pytest.param(
++            _inventory(("node-a", ("gpu-0", "accel-1"))),
++            "invalid FORGEMESH_INVENTORY_FILE for vLLM: device id 'accel-1' is neither a CUDA "
++            "device index",
++            id="device-id",
++        ),
++        pytest.param(
++            _inventory(("node-a", ("0", "gpu-0"))),
++            "invalid FORGEMESH_INVENTORY_FILE for vLLM: device ids '0' and 'gpu-0' both select "
++            "CUDA device 0",
++            id="same-device-twice",
++        ),
++        pytest.param(
++            _inventory(("node-a", ("gpu-1", "gpu-01"))),
++            "device ids 'gpu-1' and 'gpu-01' both select CUDA device 1",
++            id="leading-zero",
++        ),
++    ],
++)
++def test_the_vllm_launcher_needs_an_inventory_of_this_host(
++    inventory: Inventory, message: str
++) -> None:
++    assert message in _refusal(inventory, dict(VLLM))
++
++
++@pytest.mark.unit
++def test_settings_are_read_from_the_process_environment_by_default(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    monkeypatch.setenv("FORGEMESH_RUNTIME_LAUNCHER", "fake")
++    monkeypatch.setenv("FORGEMESH_FAKE_LAUNCHER_ADVERTISE_HOST", "127.0.0.2")
++    monkeypatch.delenv("FORGEMESH_FAKE_LAUNCHER_BIND_HOST", raising=False)
++
++    launcher = launcher_from_env(ONE_NODE)
++
++    assert isinstance(launcher, FakeLauncher)
++    assert launcher.advertise_host == "127.0.0.2"
+-- 
+2.43.0
+

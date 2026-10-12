@@ -1,7 +1,7 @@
-From 3318eaa041f9861a42a43a87f24273a10970cac6 Mon Sep 17 00:00:00 2001
+From 3eb686d8ffa805a782cb5c9f64461f8faa6b90da Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Mon, 12 Oct 2026 15:46:57 +0000
-Subject: [PATCH 5/5] docs: describe the deployment workflow and the
+Subject: [PATCH 5/6] docs: describe the deployment workflow and the
  phase-driven reconciler
 
 Record in the changelog what the workflow runtime, the deployment
@@ -25,7 +25,7 @@ one database file) are unchanged.
  5 files changed, 31 insertions(+), 19 deletions(-)
 
 diff --git a/CHANGELOG.md b/CHANGELOG.md
-index e8334f4..777d27e 100644
+index 5079683..5dbf0dd 100644
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
 @@ -30,6 +30,9 @@
@@ -38,7 +38,7 @@ index e8334f4..777d27e 100644
  
  ### Changed
  
-@@ -58,6 +61,11 @@
+@@ -59,6 +62,11 @@
  - **破坏性**：`ScheduleRequest` 必须提供 `resource_ref` 与 `idempotency_key`（见 Added）；`resource_kind` 改为只读属性（等同 `resource_ref.kind`），构造时传入会被拒绝。`AllocationRef.resource_id` 改为归属资源的 `uid`。
  - **破坏性**：`allocations.resource_id` 改为归属资源的 `uid`（此前协调器按 `{kind}/{name}` 查找），同一租户内同一 uid 至多一个 Active 分配：部分唯一索引 `idx_allocations_one_active_per_tenant_resource`（`ON allocations(tenant_id, resource_id) WHERE status = 'Active'`）取代 `idx_allocations_one_active_per_resource`，打开旧库时自动替换，已有行保留。旧库中以 `{kind}/{name}` 记录的分配不做迁移，也不再随资源删除释放（此前仓库没有调度器实现，正常部署不会产生这类分配）。
  - **破坏性**：持有 Active 分配的资源无论处于哪个 phase，`DELETE` 都返回 `202` 并先进入 `Terminating`（此前 `Pending` / `Scheduling` / `Preparing` / `Failed` / `Unknown` 直接物理删除并返回 `204`），由协调器释放分配后再物理删除；检查之后才提交的分配使这次删除失败（`409`），而不是遗留一个没有归属的分配。OpenAPI 已同步。
@@ -50,7 +50,7 @@ index e8334f4..777d27e 100644
  
  ### Deprecated
  
-@@ -90,6 +98,8 @@
+@@ -99,6 +107,8 @@
  - 协调器传给调度器的 `requirements` 恒为空，调度器无从得知资源申请了几张什么卡：现取自 `spec.resources.accelerator`。
  - 删除处于 `Pending` / `Scheduling` 等无副作用 phase、但已持有分配的资源时直接物理删除，分配及其设备永远不会被释放：现先进入 `Terminating`（见 Changed）。
  - `Terminating` 协调按 `{kind}/{name}` 释放分配，忽略命名空间，删除一个服务可能释放另一个命名空间中同名服务的分配：现按资源 uid（限本租户）释放。资源已被删除、或同名资源已以新 uid 重建时，只释放原资源的分配，不再移除新资源的 finalizer 并把它删除。
@@ -60,7 +60,7 @@ index e8334f4..777d27e 100644
  ### Security
  
 diff --git a/README.md b/README.md
-index 133b280..0a1bd8e 100644
+index 0b4a8c8..3fc19a2 100644
 --- a/README.md
 +++ b/README.md
 @@ -174,7 +174,7 @@ curl -s -H "Authorization: Bearer fmk_…" http://127.0.0.1:8080/api/v1/inferenc
@@ -73,7 +73,7 @@ index 133b280..0a1bd8e 100644
  ### Go 网关
  
 diff --git a/docs/architecture/module-mapping.md b/docs/architecture/module-mapping.md
-index 63549fc..50ad379 100644
+index 314f947..a33fc2a 100644
 --- a/docs/architecture/module-mapping.md
 +++ b/docs/architecture/module-mapping.md
 @@ -120,13 +120,13 @@

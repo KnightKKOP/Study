@@ -1,7 +1,7 @@
-From 0f0ac594035db3e462e77f052b8a669bb81ed773 Mon Sep 17 00:00:00 2001
+From c63ad2846df83423613c7ea2c330b758355a17f4 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Mon, 12 Oct 2026 13:13:36 +0000
-Subject: [PATCH 7/8] fix(plugin-sdk): deprecate the unverified manifest
+Subject: [PATCH 7/9] fix(plugin-sdk): deprecate the unverified manifest
  signature fields
 
 The manifest's artifactDigest and signature fields were described as

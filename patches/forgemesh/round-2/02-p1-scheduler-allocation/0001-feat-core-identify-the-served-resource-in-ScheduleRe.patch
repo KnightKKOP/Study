@@ -1,7 +1,7 @@
-From e17b44d7976afec8c193b770dcc1f108d0a7974d Mon Sep 17 00:00:00 2001
+From 2fb5412ba465adfeba1e672d34c93ef962b1ca7a Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Mon, 12 Oct 2026 12:25:38 +0000
-Subject: [PATCH 1/8] feat(core): identify the served resource in
+Subject: [PATCH 1/9] feat(core): identify the served resource in
  ScheduleRequest
 
 ScheduleRequest only carried the tenant and the resource kind, so a

@@ -1,0 +1,724 @@
+From f00832895bfca827a2bae8afdc532d12308bc40c Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 12 Oct 2026 17:59:02 +0000
+Subject: [PATCH 09/10] docs: describe the runtime launchers and the deployed
+ inference loop
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The control plane now deploys inference services when
+FORGEMESH_RUNTIME_LAUNCHER is set, so the documents that still
+described the unwired state are brought up to date:
+
+- README: the launcher variables in the configuration table, the
+  controller paragraph, a new "部署推理服务" section (the fake loop
+  on one machine, restarts, running vLLM) and the fake-runtime compose
+  override.
+- CHANGELOG: entries for the fake and vLLM process launchers, their
+  configuration, the app wiring, Degraded after a restart, the compose
+  override and the closed-loop E2E test; the scheduler, deployment and
+  compose smoke entries no longer say the app lacks a launcher.
+- backup-restore: with a launcher the control plane has a second
+  database, the workflow store. Backups take the registry first and the
+  workflow store second, and a restore must use files from the same
+  set; the scripts, the Python helper and the container commands handle
+  both files, and a new section explains what restored services do.
+- module-mapping, architecture (known limitations), the Kubernetes
+  manifest header and the DELETE 202 description in OpenAPI.
+---
+ CHANGELOG.md                                  |  21 +-
+ README.md                                     |  82 ++++++-
+ api/openapi/openapi.yaml                      |   2 +-
+ .../kubernetes/control-plane-deployment.yaml  |   3 +
+ docs/architecture/architecture.md             |   3 +-
+ docs/architecture/module-mapping.md           |  22 +-
+ docs/operations/backup-restore.md             | 227 ++++++++++++------
+ 7 files changed, 267 insertions(+), 93 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 5dbf0dd..bda2a1c 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -24,15 +24,23 @@
+ - 网关新增带命名空间的推理路由 `/api/v1/namespaces/{ns}/inference/{svc}/chat`：Resolver 以 `?namespace=` 查询控制平面，缓存按租户与命名空间隔离；`/api/v1/inference/{svc}/chat` 继续解析不带命名空间的服务。
+ - 网关请求体上限 `GATEWAY_MAX_REQUEST_BODY_BYTES`（默认 10 MiB）：声明的 `Content-Length` 超限时直接返回 `413 REQUEST_TOO_LARGE`，不访问上游；分块传输的请求体读到上限时同样返回 `413`，不计实例失败。
+ - 容器镜像：`deploy/docker/Dockerfile.control-plane`（控制平面，以 uid 10001 运行）与 `deploy/docker/Dockerfile.gateway`（静态编译的网关，distroless `nonroot` 用户）；根目录 `.dockerignore` 只把 `packages/` 与 `gateway/` 送入构建上下文。
+-- `scripts/compose_smoke.sh` 端到端冒烟：构建镜像并按 compose 启动，经网关验证无 key 返回 `401`、创建与读取推理服务、控制器写入 `status`，重启控制平面后资源仍在。CI 新增 `compose-smoke` job 执行该脚本。
++- `scripts/compose_smoke.sh` 端到端冒烟：构建镜像，以 `deploy/docker/docker-compose.yaml` 叠加 `deploy/docker/docker-compose.fake-runtime.yaml`（一块设备的加速器清单 + 假启动器，见下）启动，经网关验证无 key 返回 `401`，并走完推理服务的闭环：创建 → `Ready`（`status.endpoints` 指向假实例）→ 经网关流式对话（以 `data: [DONE]` 结束）→ 删除（资源消失、实例端口关闭）→ 同名重新创建（只有一块设备，可见分配已释放）并再次对话 → 重启控制平面：资源仍在，服务转为 `Degraded`（`InstanceLost`），网关返回 `503`（`NO_HEALTHY_UPSTREAM`）→ 删除。CI 新增 `compose-smoke` job 执行该脚本（依赖 runner 自带的 `curl` 与 `jq`）。
+ - CI `go` job 新增 `gofmt` 检查与 `go vet`，网关测试改以 `-race` 运行。
+ - [docs/operations/backup-restore.md](docs/operations/backup-restore.md) 新增容器部署中的备份与恢复（2.5 / 3.4 节）：镜像不含 `sqlite3` 命令行、根文件系统只读，改在容器内用备份 API 生成快照并写回；Kubernetes 上 PVC 应使用块存储。
+-- 调度器 `forgemesh.controlplane.scheduler.FirstFitScheduler`：按静态加速器清单首次适配分配。清单是 JSON 文件，路径取自 `FORGEMESH_INVENTORY_FILE`（未设置时不启用调度器），列出节点及其设备（`id` / `type` / `memoryGiB`），严格校验（未知字段、隐式类型转换、空列表、重复 id 都是错误），文件不可读或非法时控制平面拒绝启动，格式见 README「运行控制平面」。调度器按清单顺序取第一个能凑齐数量的节点（类型精确匹配、单卡显存不低于 `minMemoryGiB`，不跨节点）；同一幂等键返回同一分配（重启后亦然）；资源已持有仍满足需求的分配时直接复用，不满足时报冲突，须先释放；`feasible()` 只读，`release()` 幂等。分配不设租约，资源删除时由协调器释放。应用尚未接入工作流运行时，因此协调器在分配之前即报告 `Ready=False`（`WorkflowRuntimeUnavailable`）。
++- 调度器 `forgemesh.controlplane.scheduler.FirstFitScheduler`：按静态加速器清单首次适配分配。清单是 JSON 文件，路径取自 `FORGEMESH_INVENTORY_FILE`（未设置时不启用调度器），列出节点及其设备（`id` / `type` / `memoryGiB`），严格校验（未知字段、隐式类型转换、空列表、重复 id 都是错误），文件不可读或非法时控制平面拒绝启动，格式见 README「运行控制平面」。调度器按清单顺序取第一个能凑齐数量的节点（类型精确匹配、单卡显存不低于 `minMemoryGiB`，不跨节点）；同一幂等键返回同一分配（重启后亦然）；资源已持有仍满足需求的分配时直接复用，不满足时报冲突，须先释放；`feasible()` 只读，`release()` 幂等。分配不设租约，资源删除时由协调器释放。未设置 `FORGEMESH_RUNTIME_LAUNCHER` 时应用不注入工作流运行时，协调器在分配之前即报告 `Ready=False`（`WorkflowRuntimeUnavailable`）。
+ - 设备级独占：新表 `allocation_devices` 记录每个分配占用的 `(node_id, device_id)`，部分唯一索引 `idx_allocation_devices_one_active` 保证一个设备至多属于一个 Active 分配，触发器 `trg_allocation_devices_follow_status` 让设备随分配状态一起释放。`SQLiteRegistry.create_allocation` 在同一个 `BEGIN IMMEDIATE` 事务中检查归属资源（存在、uid 一致、不在 `Terminating`）、幂等键（重放返回原分配，用过的键不再复用）、资源与设备是否已被占用，再一起写入分配与设备行；另新增 `get_allocation`、`get_allocation_by_idempotency_key`、`allocated_devices`、`release_active_allocation`，分配记录包含 `devices`。
+ - 调度契约：`ScheduleRequest` 新增 `resource_ref`（`ResourceRef`：`kind` / `namespace` / `name` / `uid`）与 `idempotency_key`，`AllocationRef` 新增 `devices`（`AllocatedDevice`：`node_id` / `device_id`）。协调器以 `{uid}:{generation}`（`allocation_idempotency_key`）为幂等键，`requirements` 取自 `spec.resources.accelerator`（`{"accelerator": {"type", "count", "minMemoryGiB"}}`）；没有 `metadata.uid` 的资源报告 `Ready=False`（`MissingUid`），不分配。
+ - 工作流契约：运行快照 `RunInfo`（`status`、按定义顺序的步骤状态 `steps`、已成功步骤的输出 `outputs`（步骤之后被补偿也保留）、失败原因 `error`、属性 `terminal`）；`WorkflowRuntime` 新增两个非抽象方法：`get_run(run_id)`（默认只填 `status`）与 `find_run(idempotency_key)`（按幂等键查找运行、不创建，默认抛 `NotImplementedError`），既有实现（如 `workflow-temporal`）无需修改。
+ - 工作流运行时 `forgemesh.workflowruntime.runtime.LocalWorkflowRuntime`：`start()` 创建（或按幂等键复用）运行后立即返回，步骤由运行时持有的后台任务按定义顺序执行（重试、步骤超时与工作流超时沿用 `WorkflowExecutor`），每一步的状态与结果都落盘。全部成功 → `Succeeded`；某一步用尽重试或工作流超时 → `Compensating`，反向补偿已成功且注册了补偿的步骤，未执行的步骤置为 `Skipped`，然后 `Failed`（`error` 记录失败的步骤与错误）。`cancel()` 中断正在执行的步骤并等待运行进入 `Cancelled`（`cleanup=True` 时先补偿）；`recover()`（进程启动时调用一次）让未结束的运行从第一个未成功的步骤继续，或完成中断的补偿；`wait()` 等待后台执行结束；`aclose()` 取消或等待全部后台任务，之后才能关闭存储。审批结果只保存在内存中，重启后需要重新审批。`workflow-reference` 插件的 `ReferenceWorkflowRuntime` 即是它的子类。`WorkflowStore` 记录运行失败原因（打开旧库时自动补上 `error` 列）、补偿后保留步骤结果、记录步骤尝试次数，新增 `get_run_by_idempotency_key`；连接以锁串行化，文件库以 WAL 模式打开。
+-- 推理服务部署 `forgemesh.controlplane.deployment`：启动器契约 `RuntimeLauncher`（`prepare`（可选）/ `launch` / `verify` / `stop`，均须幂等，`stop` 须在有限时间内返回）及其请求 `LaunchRequest`（实例幂等键、租户、资源身份、`spec`、分配 id 与设备）与结果 `LaunchedInstance`（实例 id、地址、协议，按 `status.endpoints` 的规则校验）；部署工作流 `inference-service-deployment`：`prepare-model`（单次时限 3600 秒）→ `launch-instance`（600 秒，补偿为 `stop`）→ `verify-instance`（1800 秒），步骤 handler 为 `DeploymentSteps`；每个资源 uid 一次部署运行，幂等键 `deployment:{uid}`（`deployment_run_key`）同时是实例幂等键；`DeploymentReleaser`（协调器的 `ReleaseProvider`）在资源删除时取消进行中的部署运行（补偿停止已启动的实例）并停止可能仍在运行的实例。仓库只提供测试替身 `InMemoryLauncher`，还没有真实的启动器；控制平面应用也尚未注入工作流运行时与启动器。`forgemesh.controlplane.sqlite.workflow_db_path()` 给出工作流存储的文件：控制平面数据库旁的独立文件（`forgemesh.db` → `forgemesh.workflows.db`），步骤写入不必等待 Registry 的写锁。
++- 推理服务部署 `forgemesh.controlplane.deployment`：启动器契约 `RuntimeLauncher`（`prepare`（可选）/ `launch` / `verify` / `stop`，均须幂等，`stop` 须在有限时间内返回；`is_running` 只查看启动器自己的记录，报告实例是否仍在运行；`aclose`（可选）在应用关闭时调用，实例随控制平面进程结束的启动器在这里停止全部实例）及其请求 `LaunchRequest`（实例幂等键、租户、资源身份、`spec`、分配 id 与设备）与结果 `LaunchedInstance`（实例 id、地址、协议，按 `status.endpoints` 的规则校验）；部署工作流 `inference-service-deployment`：`prepare-model`（单次时限 3600 秒）→ `launch-instance`（600 秒，补偿为 `stop`）→ `verify-instance`（1800 秒），步骤 handler 为 `DeploymentSteps`；每个资源 uid 一次部署运行，幂等键 `deployment:{uid}`（`deployment_run_key`）同时是实例幂等键；`DeploymentReleaser`（协调器的 `ReleaseProvider`）在资源删除时取消进行中的部署运行（补偿停止已启动的实例）并停止可能仍在运行的实例。启动器有测试替身 `InMemoryLauncher`、假启动器 `FakeLauncher` 与 vLLM 进程启动器 `VLLMProcessLauncher`（见下），应用按 `FORGEMESH_RUNTIME_LAUNCHER` 选择。`forgemesh.controlplane.sqlite.workflow_db_path()` 给出工作流存储的文件：控制平面数据库旁的独立文件（`forgemesh.db` → `forgemesh.workflows.db`），步骤写入不必等待 Registry 的写锁。
++- 假启动器 `forgemesh.controlplane.deployment.FakeLauncher`（`FORGEMESH_RUNTIME_LAUNCHER=fake`）：每个实例是控制平面进程内的一个 OpenAI 兼容桩服务（只用标准库，运行在控制平面的事件循环中），监听在内核挑选的临时端口上，提供 `GET /health` 与 `POST /v1/chat/completions`（`"stream": true` 时以 SSE 返回若干 `chat.completion.chunk` 事件、以 `data: [DONE]` 结束，否则返回一个 `chat.completion` 对象；回复为含实例 id 的固定文本）。不需要 GPU、不加载模型，供 CI 与本地开发使用；实例随控制平面进程结束。
++- vLLM 进程启动器 `forgemesh.controlplane.deployment.VLLMProcessLauncher`（`FORGEMESH_RUNTIME_LAUNCHER=vllm-process`）：每个实例是控制平面所在主机上的一个 vLLM OpenAI 兼容服务子进程，命令为 `<FORGEMESH_VLLM_COMMAND> --model=<spec.model.reference> --host <监听地址> --port <空闲端口> --tensor-parallel-size <设备数>`；`CUDA_VISIBLE_DEVICES` 取自分配的设备（清单中的设备 id 须是 CUDA 设备序号 `0`、`gpu-0`，或以 `GPU-` / `MIG-` 开头的 UUID），未设置 `CUDA_DEVICE_ORDER` 时设为 `PCI_BUS_ID`；实例继承控制平面的环境变量（去掉 `FORGEMESH_*`），输出即控制平面的输出。只服务 `spec.runtime.provider` 为 `vllm` 的资源，`spec.runtime.version` 与 `spec.model.digest` 不检查；加速器清单必须恰好有一个节点（控制平面所在的主机）。`verify` 等到 `GET /health` 返回 `200`，进程退出或启动后超过就绪时限即失败；每个实例在自己的进程组中运行，`stop` 向整个进程组发送 `SIGTERM`，宽限期过后 `SIGKILL`；`aclose` 并行停止全部实例。
++- 启动器配置 `forgemesh.controlplane.deployment.launcher_from_env`：`FORGEMESH_RUNTIME_LAUNCHER`（`fake` / `vllm-process`，不区分大小写；未设置或为空时不部署）必须与 `FORGEMESH_INVENTORY_FILE` 一起设置。`fake` 读取 `FORGEMESH_FAKE_LAUNCHER_BIND_HOST`（实例监听的 IP 地址，默认 `127.0.0.1`）与 `FORGEMESH_FAKE_LAUNCHER_ADVERTISE_HOST`（写进实例地址的主机，默认同监听地址，监听全部地址时必须设置）；`vllm-process` 读取 `FORGEMESH_VLLM_COMMAND`（按 shell 规则拆分、不经过 shell，默认 `<控制平面的解释器> -m vllm.entrypoints.openai.api_server`，此时该解释器须装有 `vllm`）、`FORGEMESH_VLLM_BIND_HOST` / `FORGEMESH_VLLM_ADVERTISE_HOST`（同上）、`FORGEMESH_VLLM_READY_TIMEOUT_SECONDS`（默认 `1200`）与 `FORGEMESH_VLLM_STOP_GRACE_SECONDS`（默认 `10`）；未选中的启动器的变量不读取。取值未知、缺少清单或配置非法（如监听地址不是 IP 地址、命令找不到、清单不止一个节点）时抛出 `LauncherConfigError`，控制平面在打开数据库之前拒绝启动。变量见 README「运行控制平面」，用法见 README「部署推理服务」。
++- 控制平面部署推理服务：设置了 `FORGEMESH_RUNTIME_LAUNCHER` 时，应用以 `LocalWorkflowRuntime` 与所选启动器组装部署工作流，连同 `DeploymentReleaser` 注入协调器：服务从 `Pending` 推进到 `Ready` 并写入 `status.endpoints`，网关随即可以转发；删除时取消部署、停止实例、释放分配。工作流运行存放在数据库旁的独立文件中（`workflow_db_path`，如 `forgemesh.workflows.db`）。启动时先以 `recover()` 让未结束的部署运行继续，再核对已部署的实例（见下一条），然后才启动控制器；关闭时依次停止控制器、工作流运行时、启动器（其实例随之停止）。`POST /api/v1/workflows` 不使用这个运行时，仍返回 `503`。
++- 重启之后核对实例 `mark_lost_instances`（`forgemesh.controlplane.deployment.recovery`）：两个启动器在重启之后都不认识重启之前的实例（实例随控制平面进程结束；控制平面直接运行在主机上、被 `SIGKILL` 时，vLLM 进程除外，见 README「部署推理服务」），重启之前 `Ready` 的服务转为 `Degraded`，实例的 endpoint 标记为 `ready: false`，`Ready=False`（`InstanceLost`），网关不再向它转发（缓存解析结果的几秒内除外）。不会自动重新部署：`Degraded` 的服务保留分配，删除后重新创建即可再次部署。重启时仍在部署的服务继续部署：实例尚未启动的照常完成，已启动的实例随旧进程结束，部署以 `Failed` 结束（`WorkflowFailed` 或 `InstanceLost`）。
++- `deploy/docker/docker-compose.fake-runtime.yaml`：叠加在 `docker-compose.yaml` 之上，以一块虚构设备的加速器清单 `deploy/docker/fake-runtime-inventory.json` 与假启动器打开推理服务的完整闭环，不需要 GPU；实例在控制平面容器内监听全部地址，写进实例地址的主机为服务名 `control-plane`，实例端口不发布到宿主机。
++- 新增 `tests/e2e/test_closed_loop.py`：以控制平面应用、一块设备的加速器清单与假启动器覆盖创建 → `Ready` → 向实例发出流式对话 → 删除（实例停止、分配释放）→ 重新创建 → 重启后 `Degraded` → 删除的闭环。
++- [docs/operations/backup-restore.md](docs/operations/backup-restore.md) 覆盖工作流存储：部署推理服务时控制平面有两个数据库文件，备份与恢复脚本、Python 示例与容器内的命令都按同一组处理两个文件（先备份注册表、再备份工作流存储，同一组恢复，见 2.6 节）；新增 3.5 节说明恢复之后的推理服务（`Ready` 的转为 `Degraded`）。
+ 
+ ### Changed
+ 
+@@ -63,10 +71,11 @@
+ - **破坏性**：`allocations.resource_id` 改为归属资源的 `uid`（此前协调器按 `{kind}/{name}` 查找），同一租户内同一 uid 至多一个 Active 分配：部分唯一索引 `idx_allocations_one_active_per_tenant_resource`（`ON allocations(tenant_id, resource_id) WHERE status = 'Active'`）取代 `idx_allocations_one_active_per_resource`，打开旧库时自动替换，已有行保留。旧库中以 `{kind}/{name}` 记录的分配不做迁移，也不再随资源删除释放（此前仓库没有调度器实现，正常部署不会产生这类分配）。
+ - **破坏性**：持有 Active 分配的资源无论处于哪个 phase，`DELETE` 都返回 `202` 并先进入 `Terminating`（此前 `Pending` / `Scheduling` / `Preparing` / `Failed` / `Unknown` 直接物理删除并返回 `204`），由协调器释放分配后再物理删除；检查之后才提交的分配使这次删除失败（`409`），而不是遗留一个没有归属的分配。OpenAPI 已同步。
+ - **破坏性**：协调器按 phase 逐轮部署 `InferenceService`，每一轮只做一个合法的 phase 转移并写回 `status.phase`：`Pending` → `Scheduling`（策略放行；策略只在离开 `Pending` 时评估）→ `Preparing`（分配加速器）→ `Deploying`（以同一幂等键取回分配，启动部署工作流，输入携带分配的设备）→ `Verifying`（`launch-instance` 已成功）→ `Ready`（运行成功：写入 `status.endpoints` 与 `Ready=True`，原因 `Reconciled`）。部署过程中 `Ready=False`，原因即当前 phase；运行未结束时按幂等键 `find_run()`，每 `workflow_poll_interval` 秒查询一次。只有进入 `Ready` 或 `Failed` 的一轮登记去重键。
+-- **破坏性**：部署失败时资源进入终态 `Failed`（`Ready=False`）：运行失败、被取消或超时 → `WorkflowFailed`（消息为运行记录的失败原因，如 `step 'verify-instance' failed: …`），释放分配；补偿没能停止实例时保留分配（消息说明实例可能仍在运行），删除资源时经 `Terminating` 停止实例后再释放；找不到运行（`WorkflowRunNotFound`，如工作流数据库被重置）或运行成功却没有报告实例时同样进入 `Failed` 并保留分配。协调器不自动重试，删除后重新创建资源即可再次部署。
++- **破坏性**：部署失败时资源进入终态 `Failed`（`Ready=False`）：运行失败、被取消或超时 → `WorkflowFailed`（消息为运行记录的失败原因，如 `step 'verify-instance' failed: …`），释放分配；补偿没能停止实例时保留分配（消息说明实例可能仍在运行），删除资源时经 `Terminating` 停止实例后再释放；找不到运行（`WorkflowRunNotFound`，如工作流数据库被重置）或运行成功却没有报告实例时同样进入 `Failed` 并保留分配。注入了启动器时，运行成功、实例却已不在运行（如控制平面在运行成功之后、写入 `Ready` 之前重启）→ `InstanceLost`，释放分配。协调器不自动重试，删除后重新创建资源即可再次部署。
+ - **破坏性**：处于 `Ready` / `Degraded` / `Updating` / `Failed` / `Unknown` 的资源不再被协调（不评估策略、不写 `status`）：还没有更新已部署服务的流程，修改 `spec`（新 `generation`）不会重新部署。此前协调器对 `Updating` / `Failed` / `Unknown` 的资源（`Ready` / `Degraded` 在 generation 变化时）重新评估策略后写入 `Ready=True`。
+-- **破坏性**：`ReconciliationController` 注入 `workflow_runtime` 时必须同时注入 `release_provider`（否则抛 `ValueError`：删除资源会留下运行中的实例），运行时须实现 `find_run` 并在快照中返回步骤输出；新增参数 `workflow_poll_interval`（默认 `2.0` 秒，须为正数）。不是 `InferenceService` 的资源报告 `Ready=False`（`NotDeployable`），不分配、不启动工作流。
++- **破坏性**：`ReconciliationController` 注入 `workflow_runtime` 时必须同时注入 `release_provider`（否则抛 `ValueError`：删除资源会留下运行中的实例），运行时须实现 `find_run` 并在快照中返回步骤输出；新增参数 `workflow_poll_interval`（默认 `2.0` 秒，须为正数）与可选的 `launcher`（注入时写入 `Ready` 之前以 `is_running` 确认实例仍在运行）。不是 `InferenceService` 的资源报告 `Ready=False`（`NotDeployable`），不分配、不启动工作流。
+ - **破坏性**：`ReferenceWorkflowRuntime` 在后台执行运行（见 Added）：`start()` 返回时运行可能仍在执行，步骤失败时补偿并以 `Failed` 结束，`cancel()` 等待运行进入终态；使用方须在启动时调用 `recover()`、关闭时调用 `aclose()`。
++- `control-plane` 包新增依赖 `forgemesh-workflow-runtime`（应用以其中的 `LocalWorkflowRuntime` 组装部署工作流），`deploy/docker/Dockerfile.control-plane` 随之安装该包。
+ 
+ ### Deprecated
+ 
+@@ -99,7 +108,7 @@
+ - 网关 `/readyz` 只对上游做 TCP 拨号，控制平面的权威存储不可用（其 `/readyz` 返回 `503`）或端口被其他进程占用时仍报告就绪：现请求控制平面的 `/readyz`，返回 `200` 才就绪，否则返回 `503`（`upstream not ready` / `upstream unreachable`）。
+ - 推理实例返回错误（如 vLLM 对非法参数返回 `400` JSON）时，网关把响应的 `Content-Type` 改成 `text/event-stream`：现只对 2xx 响应这样设置，错误响应保留实例的 `Content-Type`。
+ - [docs/operations/backup-restore.md](docs/operations/backup-restore.md) 的热备份方法「`PRAGMA wal_checkpoint(TRUNCATE)` 后 `cp` 主库文件」在控制平面写入期间不安全：复制途中的自动 checkpoint 会改写主库文件，备份可能不一致甚至损坏；脚本只看 `PRAGMA integrity_check` 的退出码，而 `sqlite3` 检查出损坏时同样返回 `0`。现改为 `VACUUM INTO`（脚本）/ `Connection.backup`（Python）在线快照，校验输出必须为 `ok`，数据库路径不存在时报错，而不是备份一个新建的空库。
+-- 备份文档列出的 `data/registry.db` / `audit.db` / `decisions.db` 并不存在，控制平面的权威状态只在 `FORGEMESH_DB_PATH` 一个文件中。恢复时旧库的 `-wal` / `-shm` 随旧库一起改名保留（`-wal` 中可能有尚未合并回主库的已提交事务），全量恢复示例改为先停止、再启动控制平面。
++- 备份文档列出的 `data/registry.db` / `audit.db` / `decisions.db` 并不存在，控制平面的权威状态只在 `FORGEMESH_DB_PATH` 一个文件中（部署推理服务时另有同目录的工作流存储，两个文件一起备份，见 Added）。恢复时旧库的 `-wal` / `-shm` 随旧库一起改名保留（`-wal` 中可能有尚未合并回主库的已提交事务），全量恢复示例改为先停止、再启动控制平面。
+ - compose 拓扑无法运行（module-mapping 偏差 D2）：引用的 `Dockerfile.control-plane` 不存在，gateway 没有构建配置；compose 设置的 `FORGEMESH_UPSTREAM` 网关并不读取（网关读取 `GATEWAY_UPSTREAM_URL`），端口写成 `8000`（网关监听 `8081`）；控制平面默认只监听容器内的回环地址，网关访问不到；数据库写在容器文件系统中，重建容器即丢失；控制平面依赖它并不使用的 postgres，postgres 以默认口令发布在所有网卡上。现改为见 Changed。
+ - Kubernetes 控制平面清单把数据库写在容器文件系统中，Pod 重建即丢失全部资源；默认的 `RollingUpdate` 在更新期间同时运行新旧两个 Pod，违反 ADR-013 的单写者约束；控制平面默认只监听回环地址，kubelet 探针访问不到。现改为 PVC + `Recreate`，并设置 `FORGEMESH_HOST=0.0.0.0`（见 Changed）。
+ - `tests/unit/controlplane/test_registry.py` 有两处 `reg.close()` 未被 await，关闭逻辑从未执行。
+diff --git a/README.md b/README.md
+index bea2ee4..0e6cc8f 100644
+--- a/README.md
++++ b/README.md
+@@ -156,10 +156,18 @@ curl -s -H "Authorization: Bearer fmk_…" http://127.0.0.1:8080/api/v1/inferenc
+ | --- | --- | --- |
+ | `FORGEMESH_AUTH_MODE` | `apikey` | `apikey`：校验 `Authorization: Bearer <key>`；`dev`：直接信任 `X-Tenant-Id` 请求头，只允许监听回环地址，仅供本地开发 |
+ | `FORGEMESH_API_KEYS_FILE` | — | `apikey` 模式必填，缺失或格式非法时拒绝启动 |
+-| `FORGEMESH_DB_PATH` | `forgemesh.db` | SQLite 权威存储文件；同一文件只允许一个控制平面实例写入（ADR-013）。以 WAL 模式打开，运行时旁边有 `-wal` / `-shm` 文件，不能直接复制文件做备份，见 [备份与灾备演练](docs/operations/backup-restore.md) |
++| `FORGEMESH_DB_PATH` | `forgemesh.db` | SQLite 权威存储文件；同一文件只允许一个控制平面实例写入（ADR-013）。以 WAL 模式打开，运行时旁边有 `-wal` / `-shm` 文件，不能直接复制文件做备份，见 [备份与灾备演练](docs/operations/backup-restore.md)。设置了 `FORGEMESH_RUNTIME_LAUNCHER` 时，部署工作流的运行记录在同目录的第二个文件中（`forgemesh.db` → `forgemesh.workflows.db`），两个文件一起备份与恢复 |
+ | `FORGEMESH_HOST` | `127.0.0.1` | 监听地址 |
+ | `FORGEMESH_PORT` | `8080` | 监听端口 |
+ | `FORGEMESH_INVENTORY_FILE` | — | 静态加速器清单（JSON，格式见下），设置后启用首次适配调度器；文件不可读或格式非法时拒绝启动，修改后需重启。未设置时不启用调度器 |
++| `FORGEMESH_RUNTIME_LAUNCHER` | — | 推理实例启动器，设置后部署推理服务（见「部署推理服务」）：`fake`（控制平面进程内的 OpenAI 兼容桩服务，不需要 GPU，供 CI 与本地开发）或 `vllm-process`（本机上的 vLLM 子进程），不区分大小写。必须同时设置 `FORGEMESH_INVENTORY_FILE`；取值未知、缺少清单或所选启动器的配置非法时拒绝启动。未设置时不部署。下面各启动器的变量只在选中该启动器时读取，空白值视同未设置 |
++| `FORGEMESH_FAKE_LAUNCHER_BIND_HOST` | `127.0.0.1` | `fake`：实例监听的 IP 地址，`0.0.0.0` / `::` 监听全部地址 |
++| `FORGEMESH_FAKE_LAUNCHER_ADVERTISE_HOST` | 同监听地址 | `fake`：写进 `status.endpoints` 的主机名或 IP 地址，网关用它连接实例；监听全部地址时必须设置 |
++| `FORGEMESH_VLLM_COMMAND` | `<控制平面的解释器> -m vllm.entrypoints.openai.api_server` | `vllm-process`：启动 vLLM OpenAI 兼容服务的命令，按 shell 规则拆分（不经过 shell），第一个词须是可执行文件；使用默认命令时控制平面的解释器必须装有 `vllm` |
++| `FORGEMESH_VLLM_BIND_HOST` | `127.0.0.1` | `vllm-process`：实例监听的 IP 地址，`0.0.0.0` / `::` 监听全部地址 |
++| `FORGEMESH_VLLM_ADVERTISE_HOST` | 同监听地址 | `vllm-process`：写进 `status.endpoints` 的主机名或 IP 地址；监听全部地址时必须设置 |
++| `FORGEMESH_VLLM_READY_TIMEOUT_SECONDS` | `1200` | `vllm-process`：进程启动后等 `GET /health` 返回 `200` 的时限（秒），包括下载与加载模型 |
++| `FORGEMESH_VLLM_STOP_GRACE_SECONDS` | `10` | `vllm-process`：停止实例时 `SIGTERM` 之后等它退出的秒数，之后 `SIGKILL` |
+ 
+ > 请求可以不带 `X-Tenant-Id`；带了就必须与 key 绑定的租户一致，否则返回 `403`。缺少或无效的 key 返回 `401`。
+ 
+@@ -174,7 +182,7 @@ curl -s -H "Authorization: Bearer fmk_…" http://127.0.0.1:8080/api/v1/inferenc
+ 
+ 节点 `id` 在清单内唯一，设备 `id` 在所属节点内唯一，节点与设备都至少一个，不允许其他字段；`type` 与 `spec.resources.accelerator.type` 按字符串精确匹配，`memoryGiB` 是单卡显存（正整数，不接受 `"80"` 或 `80.0`）。调度器按清单顺序取第一个能凑齐 `count` 张卡的节点，在该节点内按顺序取类型匹配、显存不低于 `minMemoryGiB` 且未被占用的设备，不跨节点凑数。分配按资源 `uid` 记录在权威存储中（`allocations` / `allocation_devices`），同一设备同时至多属于一个生效的分配；分配不设租约，在资源删除时释放：持有分配的资源无论处于哪个 phase，`DELETE` 都返回 `202` 并先进入 `Terminating`。
+ 
+-控制平面启动后会自动协调 `InferenceService`：新建、修改或请求删除的资源在 0.5 秒内被处理，协调结果写入 `status.conditions`（例如 `Ready=False` 及其原因）。未设置 `FORGEMESH_INVENTORY_FILE` 时，新建的服务会停在 `Pending`，并带有 `Ready=False`（`SchedulerUnavailable`）条件；设置后，由于应用尚未接入工作流运行时，条件为 `Ready=False`（`WorkflowRuntimeUnavailable`），协调器在分配之前停下，暂不占用设备。协调器本身已能完成部署：注入工作流运行时与推理实例启动器（`forgemesh.controlplane.deployment.RuntimeLauncher`）后，资源每轮推进一个 phase（`Pending` → `Scheduling` → `Preparing` → `Deploying` → `Verifying` → `Ready`），部署工作流（准备模型 → 启动实例 → 验证实例）成功后写入 `status.endpoints` 与 `Ready=True`；部署失败时资源进入 `Failed`，不自动重试，删除后重新创建即可再次部署；删除时先取消部署、停止实例，再释放分配。仓库目前只有测试用的内存启动器。控制器与 API 运行在同一个进程中，是权威存储的唯一写者（ADR-013）：请以单进程运行，不要使用 `uvicorn --workers` 或多副本。
++控制平面启动后会自动协调 `InferenceService`：新建、修改或请求删除的资源在 0.5 秒内被处理，协调结果写入 `status.conditions`（例如 `Ready=False` 及其原因）。未设置 `FORGEMESH_INVENTORY_FILE` 时，新建的服务会停在 `Pending`，并带有 `Ready=False`（`SchedulerUnavailable`）条件；只设置清单、未设置 `FORGEMESH_RUNTIME_LAUNCHER` 时，条件为 `Ready=False`（`WorkflowRuntimeUnavailable`），协调器在分配之前停下，不占用设备。两者都设置后，资源每轮推进一个 phase（`Pending` → `Scheduling` → `Preparing` → `Deploying` → `Verifying` → `Ready`）：分配设备，运行部署工作流（准备模型 → 启动实例 → 验证实例），成功后写入 `status.endpoints` 与 `Ready=True`，网关随即可以转发对话；部署失败时资源进入 `Failed`，不自动重试，删除后重新创建即可再次部署；删除时先取消部署、停止实例，再释放分配。每个服务只部署一个实例（`spec.availability.replicas` 不生效），已部署服务的 `spec` 变化不会重新部署。控制器与 API 运行在同一个进程中，是权威存储的唯一写者（ADR-013）：请以单进程运行，不要使用 `uvicorn --workers` 或多副本。设置了启动器时 `POST /api/v1/workflows` 同样返回 `503`（`WORKFLOW_RUNTIME_UNAVAILABLE`）：部署工作流的运行时只供协调器使用，不对外开放。
+ 
+ ### Go 网关
+ 
+@@ -188,6 +196,68 @@ make run-dev        # dev 模式：信任租户请求头，只监听 127.0.0.1:8
+ 
+ > 网关默认不连接回环、链路本地与云元数据地址上的推理实例。实例运行在本机时设置 `GATEWAY_INSTANCE_ALLOWED_CIDRS=127.0.0.0/8,::1/128`（`make run-dev` 已设置），见 [gateway/README.md](gateway/README.md)「实例地址限制」。
+ 
++### 部署推理服务
++
++设置 `FORGEMESH_INVENTORY_FILE` 与 `FORGEMESH_RUNTIME_LAUNCHER` 后，控制平面为每个 `InferenceService` 启动一个推理实例，网关经 `/api/v1/namespaces/{ns}/inference/{svc}/chat` 把对话转发给它。启动器有两种：
++
++- `fake`：每个实例是控制平面进程内的 OpenAI 兼容桩服务，监听一个临时端口：`GET /health`；`POST /v1/chat/completions` 返回固定的回复，`"stream": true` 时以 SSE 返回，以 `data: [DONE]` 结束。不需要 GPU，也不加载模型，只用于 CI 与本地开发。
++- `vllm-process`：每个实例是控制平面所在主机上的一个 vLLM 进程，见下文「vLLM」。
++
++不需要 GPU 的完整闭环，控制平面与网关都以 `dev` 模式运行在本机：
++
++```bash
++# 终端 1：控制平面，使用一块虚构设备的清单与假启动器
++FORGEMESH_AUTH_MODE=dev FORGEMESH_DB_PATH=./forgemesh.db \
++  FORGEMESH_INVENTORY_FILE=deploy/docker/fake-runtime-inventory.json \
++  FORGEMESH_RUNTIME_LAUNCHER=fake .venv/bin/forgemesh-control-plane
++
++# 终端 2：网关（make run-dev 已允许连接本机上的实例）
++cd gateway && make run-dev
++
++# 终端 3：创建服务，等 status.phase 变为 Ready（几秒），经网关流式对话，最后删除
++curl -s -H "X-Tenant-Id: acme" -H "Content-Type: application/json" \
++  -d '{"kind": "InferenceService", "metadata": {"name": "llama", "namespace": "default"},
++       "spec": {"model": {"reference": "models/llama"}, "runtime": {"provider": "vllm"},
++                "resources": {"accelerator": {"type": "nvidia-gpu", "minMemoryGiB": 16}}}}' \
++  http://127.0.0.1:8081/api/v1/inference-services
++curl -s -H "X-Tenant-Id: acme" "http://127.0.0.1:8081/api/v1/inference-services/llama?namespace=default" | jq .status
++curl -sN -H "X-Tenant-Id: acme" -H "Content-Type: application/json" \
++  -d '{"model": "models/llama", "messages": [{"role": "user", "content": "Hello"}], "stream": true}' \
++  http://127.0.0.1:8081/api/v1/namespaces/default/inference/llama/chat
++curl -s -X DELETE -H "X-Tenant-Id: acme" "http://127.0.0.1:8081/api/v1/inference-services/llama?namespace=default"
++```
++
++`Ready` 的服务带有 `Ready=True`（`Reconciled`），`status.endpoints` 形如 `[{"url": "http://127.0.0.1:<端口>", "ready": true, "instanceId": "fake-…", "protocol": "openai-chat"}]`；回复拼起来是 `Hello from the ForgeMesh fake instance fake-….`。删除返回 `202`，实例停止、分配释放之后资源消失（`404`）。网关缓存服务的实例列表 5 秒（`GATEWAY_RESOLVER_TTL_SECONDS`），删除或重新创建之后的几秒内可能仍连接旧实例（`502`）。在容器中运行同样的闭环见「容器部署」。
++
++**控制平面重启**：两种启动器的实例都随控制平面进程结束（`fake` 的实例在进程内；`vllm-process` 的实例是子进程，控制平面退出时停止它们），重启之后：
++
++- 重启之前 `Ready` 的服务转为 `Degraded`：`Ready=False`（`InstanceLost`），`status.endpoints` 中的实例标记为 `ready: false`，网关不再转发（缓存的几秒内除外）。控制平面不会自动重新部署，删除后重新创建即可；`Degraded` 的服务在删除之前一直持有分配。
++- 仍在部署的服务从中断处继续（部署工作流的运行记录在 `forgemesh.workflows.db` 中，启动时继续未结束的运行）：还没有启动实例的照常完成；已经启动了实例的进入 `Failed`（实例已不在运行）。
++
++**vLLM**：`vllm-process` 以 `<FORGEMESH_VLLM_COMMAND> --model=<spec.model.reference> --host <监听地址> --port <空闲端口> --tensor-parallel-size <设备数>` 启动实例，`GET /health` 返回 `200` 后服务进入 `Ready`。它只部署 `spec.runtime.provider` 为 `vllm` 的服务，不检查 `spec.runtime.version` 与 `spec.model.digest`：运行的是命令对应的 vLLM 版本，模型由 vLLM 启动时按引用下载、加载（计入就绪时限）。
++
++- 实例只运行在控制平面所在的主机上：清单必须恰好有一个节点（就是这台主机），设备 id 是 CUDA 设备序号（`0`、`gpu-0`）或 `nvidia-smi -L` 列出的 UUID（`GPU-…`、`MIG-…`），且没有两个 id 指向同一块设备，否则拒绝启动。分配到的设备写进实例的 `CUDA_VISIBLE_DEVICES`；未设置 `CUDA_DEVICE_ORDER` 时设为 `PCI_BUS_ID`，序号与 `nvidia-smi` 一致。
++- 默认命令要求控制平面的解释器装有 vLLM（例如 `.venv/bin/pip install vllm`）；也可以用 `FORGEMESH_VLLM_COMMAND` 指向另一个环境中的 vLLM，如 `/opt/vllm/bin/python -m vllm.entrypoints.openai.api_server`。仓库的控制平面镜像不含 vLLM。
++- 实例继承控制平面的环境变量（去掉 `FORGEMESH_*`，例如 `HF_TOKEN` 会传给 vLLM），输出写到控制平面的标准输出与标准错误。
++- 实例默认监听 `127.0.0.1`：网关在同一台主机上时为它设置 `GATEWAY_INSTANCE_ALLOWED_CIDRS=127.0.0.0/8`；网关在其他主机上时设置 `FORGEMESH_VLLM_BIND_HOST=0.0.0.0` 与网关能够连接的 `FORGEMESH_VLLM_ADVERTISE_HOST`。
++- 每个实例在自己的进程组中运行，停止时整组收到 `SIGTERM`，`FORGEMESH_VLLM_STOP_GRACE_SECONDS` 秒后 `SIGKILL`。控制平面退出时并行停止全部实例，连同控制器与工作流的收尾，默认设置下最长约 40 秒，在容器或服务管理器中相应调大停止时限。控制平面被 `SIGKILL` 时实例进程不会随之结束、继续占用 GPU：请以容器或 systemd 服务（默认 `KillMode=control-group`）运行控制平面。
++
++```bash
++# 一台有两块 GPU 的主机：节点 id 任意，设备 id 为 CUDA 设备序号
++cat > inventory.json <<'EOF'
++{"nodes": [{"id": "gpu-host", "devices": [
++  {"id": "gpu-0", "type": "nvidia-gpu", "memoryGiB": 80},
++  {"id": "gpu-1", "type": "nvidia-gpu", "memoryGiB": 80}
++]}]}
++EOF
++FORGEMESH_API_KEYS_FILE=./api-keys.json FORGEMESH_DB_PATH=./forgemesh.db \
++  FORGEMESH_INVENTORY_FILE=./inventory.json FORGEMESH_RUNTIME_LAUNCHER=vllm-process \
++  .venv/bin/forgemesh-control-plane
++# 网关：cd gateway && GATEWAY_API_KEYS_FILE=../api-keys.json GATEWAY_INSTANCE_ALLOWED_CIDRS=127.0.0.0/8 make run
++# 服务：spec.runtime.provider 为 vllm，spec.model.reference 为 Hugging Face 模型 id 或本地路径，
++#       spec.resources.accelerator.count 即 --tensor-parallel-size
++```
++
+ ### 容器部署
+ 
+ ```bash
+@@ -197,10 +267,16 @@ make run-dev        # dev 模式：信任租户请求头，只监听 127.0.0.1:8
+ docker compose -f deploy/docker/docker-compose.yaml up --build
+ curl -s -H "Authorization: Bearer fmk_…" http://127.0.0.1:8081/api/v1/inference-services
+ 
++# 不需要 GPU 的完整闭环：叠加一块虚构设备的清单与假启动器
++docker compose -f deploy/docker/docker-compose.yaml \
++  -f deploy/docker/docker-compose.fake-runtime.yaml up --build
++
+ scripts/compose_smoke.sh   # 端到端冒烟（CI 同样执行）
+ ```
+ 
+-控制平面的 SQLite 数据库在 compose 卷 `control-plane-data` 中。Kubernetes 清单见 `deploy/kubernetes/`：数据库放在 PersistentVolumeClaim 上，key 文件来自 Secret `forgemesh-api-keys`，更新策略为 `Recreate`，保证任何时刻只有一个控制平面写数据库（ADR-013）。容器中的备份与恢复见 [备份与灾备演练](docs/operations/backup-restore.md) 2.5 / 3.4 节。
++只用 `docker-compose.yaml` 时控制平面没有清单与启动器，新建的服务停在 `Pending`（`SchedulerUnavailable`）。`docker-compose.fake-runtime.yaml` 为控制平面加上清单 `deploy/docker/fake-runtime-inventory.json`（一个节点、一块设备 `gpu-0`）与 `fake` 启动器：实例在控制平面容器内监听全部地址，写进 `status.endpoints` 的主机是服务名 `control-plane`，网关经 compose 网络连接它（私网地址默认允许），实例端口不发布到宿主机。`scripts/compose_smoke.sh` 用这两个文件经网关走完闭环：无 key 的请求返回 `401`；创建 → `Ready`（一个就绪的 `openai-chat` 端点）→ 流式对话到达实例、以 `[DONE]` 结束 → 删除后资源消失、实例停止监听 → 同名重新创建（只有一块设备，可见分配已释放）→ 再次对话到达新实例 → 重启控制平面：资源仍在，服务转为 `Degraded`（`InstanceLost`），网关返回 `503`（`NO_HEALTHY_UPSTREAM`）→ 删除。
++
++控制平面的 SQLite 数据库（部署推理服务时还有工作流存储 `forgemesh.workflows.db`）在 compose 卷 `control-plane-data` 中。Kubernetes 清单见 `deploy/kubernetes/`：数据库放在 PersistentVolumeClaim 上，key 文件来自 Secret `forgemesh-api-keys`，更新策略为 `Recreate`，保证任何时刻只有一个控制平面写数据库（ADR-013）；清单没有设置加速器清单与启动器，不部署推理实例。容器中的备份与恢复见 [备份与灾备演练](docs/operations/backup-restore.md) 2.5 / 3.4 节。
+ 
+ ---
+ 
+diff --git a/api/openapi/openapi.yaml b/api/openapi/openapi.yaml
+index fde7591..622e552 100644
+--- a/api/openapi/openapi.yaml
++++ b/api/openapi/openapi.yaml
+@@ -170,7 +170,7 @@ paths:
+         "202":
+           description: >
+             已受理删除（异步）——资源持有 finalizer（有外部副作用或持有加速器
+-            分配时自动追加），置为 Terminating，由协调器驱动「受控释放 GPU →
++            分配时自动追加），置为 Terminating，由协调器驱动「取消部署、停止推理实例 →
+             清空 finalizer → 释放分配 → 物理删除」闭环（development-plan 第 7 章）。
+           content:
+             application/json:
+diff --git a/deploy/kubernetes/control-plane-deployment.yaml b/deploy/kubernetes/control-plane-deployment.yaml
+index b85183f..1391990 100644
+--- a/deploy/kubernetes/control-plane-deployment.yaml
++++ b/deploy/kubernetes/control-plane-deployment.yaml
+@@ -8,6 +8,9 @@
+ # 才启动新 Pod），避免滚动更新期间两个 Pod 同时写同一个库；数据卷为 ReadWriteOnce。
+ # SQLite 以 WAL 模式运行，依赖共享内存文件：PVC 的 StorageClass 应是块存储，不能是 NFS 类文件系统。
+ # 备份与恢复见 docs/operations/backup-restore.md 2.5 / 3.4 节。
++# 没有设置 FORGEMESH_INVENTORY_FILE 与 FORGEMESH_RUNTIME_LAUNCHER：控制平面不部署推理实例，新建的
++# 服务停在 Pending（SchedulerUnavailable）。vllm-process 启动器在控制平面的容器内运行 vLLM，需要
++# 装有 vLLM 的镜像与分配了 GPU 的 Pod，仓库没有提供。
+ # 尚未提供：serviceAccount、NetworkPolicy。
+ apiVersion: v1
+ kind: PersistentVolumeClaim
+diff --git a/docs/architecture/architecture.md b/docs/architecture/architecture.md
+index 67cb768..250588f 100644
+--- a/docs/architecture/architecture.md
++++ b/docs/architecture/architecture.md
+@@ -1337,7 +1337,8 @@ Foundation
+ 
+ ## 20.6 已知限制
+ 
+-- `InferenceServiceStatus.endpoints`（实例地址、`ready`、`protocol`）已进入资源模型、JSON Schema 与 OpenAPI，可经 status 子资源写入，网关按 `protocol` 映射实例上的推理路径；但目前没有调度器与运行时启动器写入真实实例地址，服务停在 `Pending`，网关对推理请求明确返回 503，不静默降级。
++- `InferenceServiceStatus.endpoints`（实例地址、`ready`、`protocol`）已进入资源模型、JSON Schema 与 OpenAPI，可经 status 子资源写入，网关按 `protocol` 映射实例上的推理路径。控制平面只在设置了加速器清单（`FORGEMESH_INVENTORY_FILE`）与启动器（`FORGEMESH_RUNTIME_LAUNCHER`）时部署实例、写入实例地址；未设置时服务停在 `Pending`（`Ready=False`），网关对推理请求明确返回 503，不静默降级。
++- 启动器只有两种：控制平面进程内的假实例（`fake`，供 CI 与本地开发）与控制平面所在主机上的 vLLM 子进程（`vllm-process`，清单只能有这一个节点）；还没有容器、Kubernetes 或经 Node Agent 的远程启动。每个服务只部署一个实例（`spec.availability.replicas` 不生效）。实例活不过控制平面的重启：重启之前 `Ready` 的服务转为 `Degraded`（`InstanceLost`），不会自动重新部署，需删除后重新创建。
+ 
+ # 附录 A. 状态转移矩阵
+ 
+diff --git a/docs/architecture/module-mapping.md b/docs/architecture/module-mapping.md
+index a33fc2a..5f42f05 100644
+--- a/docs/architecture/module-mapping.md
++++ b/docs/architecture/module-mapping.md
+@@ -120,13 +120,13 @@
+ | 字段 | 内容 |
+ |---|---|
+ | 架构模块 | L2 Core Control Plane（权威状态、协调、插件管理、审计） |
+-| 当前代码路径 | `packages/control-plane/src/forgemesh/controlplane/`：`registry/{models,store}.py`、`reconciler/{core,dedup}.py`、`controller/{manager,queue}.py`、`scheduler/{inventory,first_fit}.py`、`deployment/{launcher,workflow,release,memory}.py`、`api/{routes,dependencies,errors}.py`、`plugin_manager.py`、`outbox.py`、`audit.py`、`tasks.py`、`heartbeat.py`、`observability.py`、`diagnostics.py`、`app.py`、`auth.py`、`keygen.py`、`sqlite.py`（共 33 个 `.py`；其中 `auth.py` / `keygen.py` / `api/errors.py` 为 API 认证与错误信封，见 ADR-014；`controller/` 驱动协调器并回写 status；`scheduler/` 按静态加速器清单首次适配分配；`deployment/` 为部署工作流（准备模型 → 启动实例 → 验证实例）、启动器契约 `RuntimeLauncher`、删除时的清理 `DeploymentReleaser` 与测试替身 `InMemoryLauncher`；`sqlite.py` 统一 SQLite 连接设置（WAL、外键），并由 `workflow_db_path` 给出工作流存储文件；其余与任务书的 9 个子模块一一对应） |
+-| 核心契约 | 实现 `core-contracts` 的 `ResourceRegistry` / `Reconciler` / `Scheduler`（`FirstFitScheduler`：清单来自 `FORGEMESH_INVENTORY_FILE`，设置时才注入控制器；分配与设备占用经 `SQLiteRegistry.create_allocation` 在同一事务中写入，设备独占由 `allocation_devices` 部分唯一索引保证）；协调器按 phase 逐轮推进 `InferenceService`（`Pending` → `Scheduling` → `Preparing` → `Deploying` → `Verifying` → `Ready`），以 `deployment:{uid}` 为幂等键启动并查询部署工作流，成功后写入 `status.endpoints`，删除时经 `DeploymentReleaser` 取消部署、停止实例（部署包只依赖工作流契约，运行时与启动器由组装方注入；应用尚未注入，协调器在分配之前报告 `WorkflowRuntimeUnavailable`）；`app.py` 提供 HTTP 服务（FastAPI，未安装时回退纯标准库占位——生产必须 FastAPI/ASGI），并在 lifespan 中运行控制器；控制器按序号增量读取 `resource_changes` 变更记录，经 `update_status`（status 子资源，CAS）回写协调结果；Outbox 事务性事件（architecture.md 3.3 规则 7）；`ProcessedKeyStore` 去重（reconciler/dedup.py） |
++| 当前代码路径 | `packages/control-plane/src/forgemesh/controlplane/`：`registry/{models,store}.py`、`reconciler/{core,dedup}.py`、`controller/{manager,queue}.py`、`scheduler/{inventory,first_fit}.py`、`deployment/{launcher,workflow,release,recovery,config,network,fake,vllm_process,memory}.py`、`api/{routes,dependencies,errors}.py`、`plugin_manager.py`、`outbox.py`、`audit.py`、`tasks.py`、`heartbeat.py`、`observability.py`、`diagnostics.py`、`app.py`、`auth.py`、`keygen.py`、`sqlite.py`（共 38 个 `.py`；其中 `auth.py` / `keygen.py` / `api/errors.py` 为 API 认证与错误信封，见 ADR-014；`controller/` 驱动协调器并回写 status；`scheduler/` 按静态加速器清单首次适配分配；`deployment/` 为部署工作流（准备模型 → 启动实例 → 验证实例）、启动器契约 `RuntimeLauncher` 与两个启动器（`fake.py`：控制平面进程内的 OpenAI 兼容桩服务 `FakeLauncher`；`vllm_process.py`：本机 vLLM 子进程 `VLLMProcessLauncher`；由 `config.py` 按 `FORGEMESH_RUNTIME_LAUNCHER` 选择，`network.py` 为两者共用的地址校验与健康检查）、删除时的清理 `DeploymentReleaser`、重启之后把实例已不在运行的 `Ready` 服务转为 `Degraded` 的 `mark_lost_instances`（`recovery.py`）与测试替身 `InMemoryLauncher`；`sqlite.py` 统一 SQLite 连接设置（WAL、外键），并由 `workflow_db_path` 给出工作流存储文件；其余与任务书的 9 个子模块一一对应） |
++| 核心契约 | 实现 `core-contracts` 的 `ResourceRegistry` / `Reconciler` / `Scheduler`（`FirstFitScheduler`：清单来自 `FORGEMESH_INVENTORY_FILE`，设置时才注入控制器；分配与设备占用经 `SQLiteRegistry.create_allocation` 在同一事务中写入，设备独占由 `allocation_devices` 部分唯一索引保证）；协调器按 phase 逐轮推进 `InferenceService`（`Pending` → `Scheduling` → `Preparing` → `Deploying` → `Verifying` → `Ready`），以 `deployment:{uid}` 为幂等键启动并查询部署工作流，成功后写入 `status.endpoints`，删除时经 `DeploymentReleaser` 取消部署、停止实例（部署包只依赖工作流契约，运行时与启动器由组装方注入：`app.py` 在设置了 `FORGEMESH_RUNTIME_LAUNCHER` 时以 `workflow-runtime` 的 `LocalWorkflowRuntime` 与所选启动器组装，未设置时不注入，协调器在分配之前报告 `WorkflowRuntimeUnavailable`）；`app.py` 提供 HTTP 服务（FastAPI，未安装时回退纯标准库占位——生产必须 FastAPI/ASGI），并在 lifespan 中运行控制器（设置了启动器时，先恢复未结束的部署运行、把实例已不在运行的 `Ready` 服务转为 `Degraded`，再启动控制器）；控制器按序号增量读取 `resource_changes` 变更记录，经 `update_status`（status 子资源，CAS）回写协调结果；Outbox 事务性事件（architecture.md 3.3 规则 7）；`ProcessedKeyStore` 去重（reconciler/dedup.py） |
+ | 运行形态 | 单实例控制平面进程（模块化单体，architecture.md 3.3 规则 8）；ADR-013 约束：仅允许单写方写同一 SQLite 权威库；控制器与 API 同进程运行，不得以多个 worker 进程启动 |
+ | 数据所有权 | **全部业务资源权威状态**（registry/store.py）、审计事件（audit.py，默认内存库，控制平面应用尚未接入）、Outbox 事件、任务与心跳状态 |
+ | 允许依赖 | `forgemesh.core` / `forgemesh.resource` / `forgemesh.policy` / `forgemesh.decision` / `forgemesh.workflow*` / `forgemesh.plugin`（plugin-sdk）、标准库 `sqlite3`、FastAPI |
+ | 禁止依赖 | 任何插件私有模块（`decision_rules` / `gpu_nvidia` 等，扫描二验证 ✅，见 3.2） |
+-| 测试路径 | `tests/unit/controlplane/`：`test_api.py`、`test_routes.py`、`test_registry.py`、`test_reconciler.py`、`test_dedup_store.py`、`test_plugin_manager.py`、`test_outbox.py`、`test_audit.py`、`test_tasks.py`、`test_heartbeat.py`、`test_observability.py`、`test_diagnostics.py`、`test_app.py`、`test_auth.py`、`test_controller_manager.py`、`test_controller_queue.py`、`test_registry_changes.py`、`test_registry_status.py`、`test_registry_allocations.py`、`test_sqlite.py`、`test_scheduler.py`、`test_scheduler_inventory.py`、`test_allocation_lifecycle.py`、`test_deployment.py`、`test_deployment_lifecycle.py`（25 个文件，glob 核对；`test_deployment_lifecycle.py` 以控制器、调度器、本地工作流运行时与内存启动器覆盖部署、重启、失败与删除闭环） |
++| 测试路径 | `tests/unit/controlplane/`：`test_api.py`、`test_routes.py`、`test_registry.py`、`test_reconciler.py`、`test_dedup_store.py`、`test_plugin_manager.py`、`test_outbox.py`、`test_audit.py`、`test_tasks.py`、`test_heartbeat.py`、`test_observability.py`、`test_diagnostics.py`、`test_app.py`、`test_auth.py`、`test_controller_manager.py`、`test_controller_queue.py`、`test_registry_changes.py`、`test_registry_status.py`、`test_registry_allocations.py`、`test_sqlite.py`、`test_scheduler.py`、`test_scheduler_inventory.py`、`test_allocation_lifecycle.py`、`test_deployment.py`、`test_deployment_lifecycle.py`、`test_fake_launcher.py`、`test_vllm_launcher.py`、`test_launcher_config.py`、`test_launcher_network.py`（29 个文件，glob 核对；`test_deployment_lifecycle.py` 以控制器、调度器、本地工作流运行时与内存启动器覆盖部署、重启、失败与删除闭环；`test_vllm_launcher.py` 以同目录的替身 `vllm_standin.py` 代替 vLLM 运行，不需要 GPU）；端到端 `tests/e2e/test_closed_loop.py`（应用 + 假启动器：创建 → `Ready` → 对话 → 删除 → 重新创建 → 重启后 `Degraded`） |
+ | 状态 | 已实现且有测试覆盖 |
+ | 演进动作 | 保留；WP-C1 补故障路径（CAS 并发、重启恢复、finalizer 闭环、Allocation 唯一性） |
+ 
+@@ -198,7 +198,7 @@
+ | 当前代码路径 | `packages/workflow-runtime/src/forgemesh/workflowruntime/{dsl,exec,store,approval,compensate,gpu_onboarding,runtime}.py` |
+ | 核心契约 | `LocalWorkflowRuntime`（runtime.py）实现 `WorkflowRuntime(ABC)`：在后台执行运行、失败时反向补偿、`recover()` 让重启前未结束的运行继续、`aclose()` 结束全部后台任务；DSL 解析（dsl.py）、步骤执行与重试（exec.py）、运行存储（store.py）、审批集成（approval.py）、补偿语义（compensate.py）；GPU onboarding 内置工作流（gpu_onboarding.py） |
+ | 运行形态 | 进程内模块（被控制平面编排调用） |
+-| 数据所有权 | 工作流运行实例状态（store.py，含步骤结果与失败原因；恢复/重启语义见 performance 测试与 `test_runtime.py`）；部署工作流的存储文件由控制平面的 `workflow_db_path` 给出（应用尚未打开） |
++| 数据所有权 | 工作流运行实例状态（store.py，含步骤结果与失败原因；恢复/重启语义见 performance 测试与 `test_runtime.py`）；部署工作流的运行存放在控制平面 `workflow_db_path` 给出的独立文件中（设置了 `FORGEMESH_RUNTIME_LAUNCHER` 时由控制平面应用打开） |
+ | 允许依赖 | `forgemesh.workflow`（API）、`forgemesh.core`、`forgemesh.resource`、标准库 |
+ | 禁止依赖 | Workflow Provider 插件私有模块（扫描六验证 ✅，见 3.5）、直连插件 |
+ | 测试路径 | `tests/unit/workflowruntime/test_{dsl,exec,store,approval,compensate,runtime}.py`；端到端 `tests/e2e/test_gpu_onboarding.py`；恢复语义 `tests/performance/test_restart_recovery.py` |
+@@ -257,7 +257,7 @@
+ | 架构模块 | L4 推理运行时插件：vLLM、TGI |
+ | 当前代码路径 | `plugins/runtime-vllm/{provider,deploy,model,release,verify}.py` + `manifest.yaml`；`plugins/runtime-tgi/{provider.py,manifest.yaml,__init__.py}` |
+ | 核心契约 | Runtime Provider 接口（部署 deploy、模型加载 model、发布 release、验证 verify——vllm 完整五段；tgi 精简 provider）；manifest 同 2.8 |
+-| 运行形态 | 插件（产出/操作推理服务实例；实际推理流量不经此，经 Go 网关直达） |
++| 运行形态 | 插件（产出/操作推理服务实例；实际推理流量不经此，经 Go 网关直达）；控制平面部署推理服务不经这两个插件：启动器（含 `vllm-process`）是控制平面 `deployment/` 中的代码（见 2.5；控制平面不导入插件，见扫描二） |
+ | 数据所有权 | 无（InferenceService 权威状态归 Registry） |
+ | 允许依赖 | plugin-sdk、`forgemesh.resource` |
+ | 禁止依赖 | 控制平面内部实现（扫描五验证 ✅）、其他插件私有数据 |
+@@ -287,11 +287,11 @@
+ | 架构模块 | L6 权威存储（过渡态：SQLite；目标态：PostgreSQL） |
+ | 当前代码路径 | `packages/control-plane/src/forgemesh/controlplane/registry/store.py`（`SQLiteRegistry`，权威资源状态，CAS 乐观并发 `resource_version`；分配 `allocations` 与设备占用 `allocation_devices`，部分唯一索引保证每个资源 uid 在其租户内至多一个 Active 分配、每个设备（跨租户）至多属于一个 Active 分配）；`packages/decision-api/src/forgemesh/decision/records.py`（`DecisionRecordStore`）；`packages/workflow-runtime/src/forgemesh/workflowruntime/store.py`（工作流运行存储）；审计 `audit.py` |
+ | 核心契约 | ADR-013：**SQLite 为权威存储、单控制平面实例写、禁止扩展 replicas；PostgreSQL 为目标态**（迁移由真实 SLO/基准触发）；Registry 对齐 `core-contracts.ResourceRegistry` 契约 |
+-| 运行形态 | 进程内嵌入式：控制平面应用只打开 `FORGEMESH_DB_PATH` 一个 SQLite 文件（Registry 与去重键，WAL 模式），审计、决策记录、工作流存储默认使用内存库；部署工作流的存储应使用 `workflow_db_path(FORGEMESH_DB_PATH)` 给出的同目录独立文件（`*.workflows.db`，步骤写入不必等待 Registry 的写锁），应用尚未接入；备份见 docs/operations/backup-restore.md |
++| 运行形态 | 进程内嵌入式：控制平面应用打开 `FORGEMESH_DB_PATH`（Registry 与去重键，WAL 模式）；设置了 `FORGEMESH_RUNTIME_LAUNCHER` 时另以 `workflow_db_path(FORGEMESH_DB_PATH)` 给出的同目录独立文件（`*.workflows.db`，WAL 模式，步骤写入不必等待 Registry 的写锁）作为部署工作流的存储；审计、决策记录、工作流存储未指定文件时使用内存库。两个文件之间没有跨文件事务：备份时先注册表、后工作流存储，同一组恢复，见 docs/operations/backup-restore.md |
+ | 数据所有权 | 权威写方：控制平面**唯一实例**（registry/audit/outbox）；决策记录写方为 Decision 链路（D1 关联） |
+ | 允许依赖 | 标准库 `sqlite3`（仅控制平面实现层；API 层现状见 D1） |
+ | 禁止依赖 | 第三方 DB 驱动（v1.x）、多实例并发写同一库文件 |
+-| 测试路径 | `tests/unit/controlplane/test_registry.py`、`tests/unit/controlplane/test_registry_allocations.py`、`tests/unit/decision/test_records.py`、`tests/unit/workflowruntime/test_store.py`；恢复/并发：`tests/performance/test_restart_recovery.py`、`test_conflict_correctness.py`、`tests/chaos/test_cp_restart.py`、`tests/unit/workflowruntime/test_runtime.py`、`tests/unit/controlplane/test_deployment_lifecycle.py`；备份恢复演练见 `docs/operations/backup-restore.md` |
++| 测试路径 | `tests/unit/controlplane/test_registry.py`、`tests/unit/controlplane/test_registry_allocations.py`、`tests/unit/decision/test_records.py`、`tests/unit/workflowruntime/test_store.py`；恢复/并发：`tests/performance/test_restart_recovery.py`、`test_conflict_correctness.py`、`tests/chaos/test_cp_restart.py`、`tests/unit/workflowruntime/test_runtime.py`、`tests/unit/controlplane/test_deployment_lifecycle.py`；应用打开两个文件（`tests/unit/controlplane/test_app.py`）、重启后服务转为 `Degraded`（`tests/e2e/test_closed_loop.py`）；备份恢复演练见 `docs/operations/backup-restore.md` |
+ | 状态 | 已实现且有测试覆盖 |
+ | 演进动作 | 保留；WP-C1 补 CAS 并发冲突/重启恢复/备份恢复的故障路径测试；PostgreSQL 迁移属阶段 F（有证据后） |
+ 
+@@ -300,7 +300,7 @@
+ | 字段 | 内容 |
+ |---|---|
+ | 架构模块 | 开发工具链与持续集成 |
+-| 当前代码路径 | `Makefile`（target：`install` / `deps` / `test` / `test-unit` / `test-contract` / `lint` / `fmt` / `clean`，实测核对）；根 `pyproject.toml`（**仅 ruff/pytest/coverage 工具配置，不含打包配置**——monorepo + PEP 420 命名空间包，各子包自带 pyproject）；`.github/workflows/ci.yml`（四 job：`python` 矩阵 lint+pytest（未 await 的协程视为失败）、`go` gofmt+vet+build+`go test -race`、`compose-smoke` 构建镜像并端到端冒烟、`architecture-docs` 校验 OpenAPI/Schema/ADR）；`requirements-dev.txt`；根 `conftest.py`；`gateway/Makefile` |
++| 当前代码路径 | `Makefile`（target：`install` / `deps` / `test` / `test-unit` / `test-contract` / `lint` / `fmt` / `clean`，实测核对）；根 `pyproject.toml`（**仅 ruff/pytest/coverage 工具配置，不含打包配置**——monorepo + PEP 420 命名空间包，各子包自带 pyproject）；`.github/workflows/ci.yml`（四 job：`python` 矩阵 lint+pytest（未 await 的协程视为失败）、`go` gofmt+vet+build+`go test -race`、`compose-smoke` 构建镜像并以假启动器端到端冒烟推理服务闭环、`architecture-docs` 校验 OpenAPI/Schema/ADR）；`requirements-dev.txt`；根 `conftest.py`；`gateway/Makefile` |
+ | 核心契约 | 子包统一模板（README「统一子包模板」+ CONTRIBUTING）；`requires-python >= 3.12` 基线（WP-A1.3 统一） |
+ | 运行形态 | 开发期工具 + CI 流水线（push 触发，`ci-${{ github.ref }}` 分组去重） |
+ | 数据所有权 | 无 |
+@@ -315,13 +315,13 @@
+ | 字段 | 内容 |
+ |---|---|
+ | 架构模块 | 部署拓扑与运维文档（L6 平台基础设施落地） |
+-| 当前代码路径 | `deploy/docker/{Dockerfile.control-plane,Dockerfile.gateway}`（均以非 root 用户运行：控制平面 uid 10001，网关 distroless `nonroot`）与根目录 `.dockerignore`；`deploy/docker/docker-compose.yaml`（control-plane + gateway，只发布在 127.0.0.1；postgres 在 `postgres` profile 中、默认不启动；含 ADR-013 单实例注记）；`deploy/kubernetes/{namespace,control-plane-deployment}.yaml`（replicas: 1、`strategy: Recreate`、数据库在 PVC 上、key 文件来自 Secret `forgemesh-api-keys`）；`scripts/compose_smoke.sh`；`docs/operations/backup-restore.md`（RPO≤5min / RTO≤15min、在线备份与恢复演练）；示例 `examples/single-node/{inference-service,plugin-vllm}.yaml`、`examples/multi-tenant/tenant-quota.yaml` |
++| 当前代码路径 | `deploy/docker/{Dockerfile.control-plane,Dockerfile.gateway}`（均以非 root 用户运行：控制平面 uid 10001，网关 distroless `nonroot`）与根目录 `.dockerignore`；`deploy/docker/docker-compose.yaml`（control-plane + gateway，只发布在 127.0.0.1；postgres 在 `postgres` profile 中、默认不启动；含 ADR-013 单实例注记；不设置加速器清单与启动器，不部署推理实例）与叠加文件 `deploy/docker/docker-compose.fake-runtime.yaml`（一块虚构设备的清单 `deploy/docker/fake-runtime-inventory.json` + 假启动器，不需要 GPU 的推理服务闭环）；`deploy/kubernetes/{namespace,control-plane-deployment}.yaml`（replicas: 1、`strategy: Recreate`、数据库在 PVC 上、key 文件来自 Secret `forgemesh-api-keys`；不设置加速器清单与启动器，不部署推理实例）；`scripts/compose_smoke.sh`；`docs/operations/backup-restore.md`（RPO≤5min / RTO≤15min、在线备份与恢复演练）；示例 `examples/single-node/{inference-service,plugin-vllm}.yaml`、`examples/multi-tenant/tenant-quota.yaml` |
+ | 核心契约 | ADR-013 单控制平面实例约束：compose 不扩展 control-plane；k8s 清单 `replicas: 1` 且更新策略为 `Recreate`（旧 Pod 退出后才启动新 Pod，更新期间不会有两个写者）；控制平面只使用 SQLite，postgres 为目标态预置 |
+ | 运行形态 | 容器镜像（Dockerfile）+ 部署工件（YAML）+ 运维文档（Markdown） |
+-| 数据所有权 | 无；控制平面的 SQLite 库位于 compose 卷 `control-plane-data` / k8s PVC `forgemesh-control-plane-data`（pgdata 卷属目标态预置，仅 `postgres` profile 使用） |
++| 数据所有权 | 无；控制平面的 SQLite 库（叠加 `docker-compose.fake-runtime.yaml` 时还有工作流存储 `forgemesh.workflows.db`）位于 compose 卷 `control-plane-data` / k8s PVC `forgemesh-control-plane-data`（pgdata 卷属目标态预置，仅 `postgres` profile 使用） |
+ | 允许依赖 | — |
+ | 禁止依赖 | —（约束：部署不得暗示多副本写同一 SQLite） |
+-| 测试路径 | `scripts/compose_smoke.sh`（CI `compose-smoke` job：构建镜像，经网关验证无 key 返回 401、创建与读取 `InferenceService`、控制器写入 `SchedulerUnavailable`（compose 未配置 `FORGEMESH_INVENTORY_FILE`），重启控制平面后数据仍在）；k8s 清单无自动化测试；备份恢复有人工演练清单 |
++| 测试路径 | `scripts/compose_smoke.sh`（CI `compose-smoke` job：构建镜像，以两个 compose 文件启动，经网关验证无 key 返回 401，创建 `InferenceService` → `Ready` → 经网关流式对话 → 删除（实例端口关闭）→ 同名重新创建并再次对话 → 重启控制平面：资源仍在，服务转为 `Degraded`（`InstanceLost`），网关返回 503 → 删除）；k8s 清单无自动化测试；备份恢复有人工演练清单 |
+ | 状态 | compose 已实现且有测试覆盖；k8s 清单实现待核验（无自动化测试，尚未提供网关清单、ServiceAccount、NetworkPolicy）；运维文档已交付 |
+ | 演进动作 | k8s 补网关清单、ServiceAccount 与 NetworkPolicy；A1.5 已核对部署文档含单实例约束；目标态 PostgreSQL 部署属阶段 F |
+ 
+diff --git a/docs/operations/backup-restore.md b/docs/operations/backup-restore.md
+index 09d2646..e975d46 100644
+--- a/docs/operations/backup-restore.md
++++ b/docs/operations/backup-restore.md
+@@ -1,17 +1,20 @@
+ # 备份与灾备演练
+ 
+-> 适用范围：ForgeMesh 控制平面 SQLite 权威状态存储（`FORGEMESH_DB_PATH`）。
++> 适用范围：ForgeMesh 控制平面 SQLite 权威状态存储（`FORGEMESH_DB_PATH`），以及部署推理服务时同目录下的工作流存储（`forgemesh.workflows.db`）。
+ >
+ > 对齐 ADR-007（注册表为权威状态）、development-plan WP-4.7 安全测试与灾备。
+ 
+ ## 1. 概述
+ 
+-ForgeMesh 控制平面（`forgemesh-control-plane`）把权威状态存放在**一个** SQLite 文件中，路径取自 `FORGEMESH_DB_PATH`（默认为工作目录下的 `forgemesh.db`）：
++ForgeMesh 控制平面（`forgemesh-control-plane`）把权威状态存放在 SQLite 文件中，路径取自 `FORGEMESH_DB_PATH`（默认为工作目录下的 `forgemesh.db`）。设置了 `FORGEMESH_RUNTIME_LAUNCHER`（部署推理服务）时，部署工作流的运行记录存放在同一目录下的第二个文件中：文件名把数据库文件名的扩展名换成 `.workflows.db`（`forgemesh.db` → `forgemesh.workflows.db`，没有扩展名时追加，见 `forgemesh.controlplane.sqlite.workflow_db_path`），不能单独配置。
+ 
+-| 表 | 模块 | 内容 |
+-|----|------|------|
+-| `resources` / `allocations` / `allocation_devices` / `resource_changes` | `forgemesh.controlplane.registry.SQLiteRegistry` | 资源对象（spec/status/conditions）、资源分配记录及其占用的设备、控制器读取的变更记录 |
+-| `processed_dedup_keys` | `forgemesh.controlplane.reconciler.dedup.ProcessedKeyStore` | 控制器已处理的去重键 |
++| 文件 | 表 | 模块 | 内容 |
++|------|----|------|------|
++| `forgemesh.db` | `resources` / `allocations` / `allocation_devices` / `resource_changes` | `forgemesh.controlplane.registry.SQLiteRegistry` | 资源对象（spec/status/conditions）、资源分配记录及其占用的设备、控制器读取的变更记录 |
++| `forgemesh.db` | `processed_dedup_keys` | `forgemesh.controlplane.reconciler.dedup.ProcessedKeyStore` | 控制器已处理的去重键 |
++| `forgemesh.workflows.db` | `workflow_runs` / `workflow_steps` | `forgemesh.workflowruntime.store.WorkflowStore` | 每个推理服务（按 `uid`，幂等键 `deployment:{uid}`）的部署工作流运行及其各步骤的状态与结果（含启动的实例 id 与地址） |
++
++两个文件之间没有共同的事务，备份与恢复时把它们当作一组，见 2.6 节。推理实例本身不在任何文件中：它们随控制平面进程结束，恢复之后的情况见 3.5 节。
+ 
+ 审计日志（`forgemesh.controlplane.audit.AuditLog`）、决策记录（`forgemesh.decision.records.DecisionRecordStore`）等其他 SQLite 存储默认使用内存库，控制平面进程不会打开它们；嵌入方把它们指向文件时，按本文同样的方法逐个备份。
+ 
+@@ -38,7 +41,7 @@ ForgeMesh 控制平面（`forgemesh-control-plane`）把权威状态存放在**
+ 
+ ### 2.1 WAL 模式
+ 
+-控制平面以 WAL（Write-Ahead Logging）模式打开数据库（`forgemesh.controlplane.sqlite.connect`）：写入先追加到 `-wal` 文件，SQLite 再自动 checkpoint 合并回主库文件（`-wal` 每增长约 1000 页一次，最后一个连接关闭时再合并一次）。因此：
++控制平面以 WAL（Write-Ahead Logging）模式打开数据库（`forgemesh.controlplane.sqlite.connect`；工作流存储 `WorkflowStore` 同样如此）：写入先追加到 `-wal` 文件，SQLite 再自动 checkpoint 合并回主库文件（`-wal` 每增长约 1000 页一次，最后一个连接关闭时再合并一次）。因此：
+ 
+ - 运行期间已提交的事务可能只在 `-wal` 里。**不要用 `cp` / `rsync` 复制运行中的数据库文件**：复制出的主库缺少这部分事务，复制途中发生的自动 checkpoint 还会改写主库文件，备份可能前后不一致甚至损坏。先执行 `PRAGMA wal_checkpoint` 再复制同样不安全：checkpoint 与复制之间、复制过程中控制平面仍在提交。
+ - 主库文件与 `-wal` / `-shm` 是一个整体，移动、删除、恢复时一起处理（见第 3 节）。
+@@ -48,6 +51,9 @@ ForgeMesh 控制平面（`forgemesh-control-plane`）把权威状态存放在**
+ 
+ ```bash
+ sqlite3 /var/lib/forgemesh/data/forgemesh.db "PRAGMA journal_mode;"  # 应返回 wal
++# 工作流存储同样返回 wal；sqlite3 会为不存在的路径新建空文件，先确认它存在
++test -f /var/lib/forgemesh/data/forgemesh.workflows.db \
++  && sqlite3 /var/lib/forgemesh/data/forgemesh.workflows.db "PRAGMA journal_mode;"
+ ```
+ 
+ ### 2.2 备份方法：在线快照
+@@ -60,12 +66,14 @@ sqlite3 /var/lib/forgemesh/data/forgemesh.db "PRAGMA journal_mode;"  # 应返回
+ #!/usr/bin/env bash
+ # forgemesh-backup.sh — SQLite 数据库在线备份脚本（控制平面无需停服）
+ # 用法: ./forgemesh-backup.sh <db_path> <backup_dir>
++# 数据库旁有工作流存储（<db_path> 去掉 .db 后加 .workflows.db，与 workflow_db_path 一致；
++# 数据库文件名须以 .db 结尾或没有扩展名）时紧接着备份它，两份备份共用一个时间戳，是一组（见 2.6 节）
+ set -euo pipefail
+ 
+ DB_PATH="${1:?usage: $0 <db_path> <backup_dir>}"
+ BACKUP_DIR="${2:?usage: $0 <db_path> <backup_dir>}"
++WORKFLOW_DB_PATH="${DB_PATH%.db}.workflows.db"
+ TIMESTAMP=$(date -u +"%Y%m%dT%H%M%SZ")
+-BACKUP_FILE="${BACKUP_DIR}/$(basename "${DB_PATH}" .db)-${TIMESTAMP}.db"
+ 
+ # 路径写错时 sqlite3 会新建一个空库，并"成功"备份这个空库
+ if [[ ! -f "${DB_PATH}" ]]; then
+@@ -75,28 +83,39 @@ fi
+ 
+ mkdir -p "${BACKUP_DIR}"
+ 
+-# Step 1: 在线快照
+-sqlite3 "${DB_PATH}" "VACUUM INTO '${BACKUP_FILE}';"
+-# VACUUM INTO 不对生成的文件执行 fsync
+-sync "${BACKUP_FILE}"
++backup() {
++  local source=$1 backup_file integrity
++  backup_file="${BACKUP_DIR}/$(basename "${source}" .db)-${TIMESTAMP}.db"
+ 
+-# Step 2: 校验备份完整性（检查出损坏时 sqlite3 的退出码仍为 0，必须比较输出）
+-INTEGRITY=$(sqlite3 "${BACKUP_FILE}" "PRAGMA integrity_check;")
+-if [[ "${INTEGRITY}" != "ok" ]]; then
+-  echo "ERROR: backup integrity check failed: ${INTEGRITY}" >&2
+-  exit 1
+-fi
++  # Step 1: 在线快照
++  sqlite3 "${source}" "VACUUM INTO '${backup_file}';"
++  # VACUUM INTO 不对生成的文件执行 fsync
++  sync "${backup_file}"
+ 
+-# Step 3: 计算摘要（供恢复时校验）
+-sha256sum "${BACKUP_FILE}" > "${BACKUP_FILE}.sha256"
++  # Step 2: 校验备份完整性（检查出损坏时 sqlite3 的退出码仍为 0，必须比较输出）
++  integrity=$(sqlite3 "${backup_file}" "PRAGMA integrity_check;")
++  if [[ "${integrity}" != "ok" ]]; then
++    echo "ERROR: backup integrity check failed: ${integrity}" >&2
++    exit 1
++  fi
+ 
+-echo "backup completed: ${BACKUP_FILE}"
++  # Step 3: 计算摘要（供恢复时校验）
++  sha256sum "${backup_file}" > "${backup_file}.sha256"
++
++  echo "backup completed: ${backup_file}"
++}
++
++# 先注册表、后工作流存储（见 2.6 节）
++backup "${DB_PATH}"
++if [[ -f "${WORKFLOW_DB_PATH}" ]]; then
++  backup "${WORKFLOW_DB_PATH}"
++fi
+ ```
+ 
+ ### 2.3 备份调度（cron）
+ 
+ ```cron
+-# 每 5 分钟备份一次控制平面数据库（路径与 FORGEMESH_DB_PATH 一致）
++# 每 5 分钟备份一次控制平面数据库（路径与 FORGEMESH_DB_PATH 一致；旁边的工作流存储随之备份）
+ */5 * * * * /opt/forgemesh/bin/forgemesh-backup.sh /var/lib/forgemesh/data/forgemesh.db /var/backups/forgemesh
+ 
+ # 每日清理 7 天前的备份
+@@ -118,12 +137,16 @@ from datetime import datetime, timezone
+ from pathlib import Path
+ 
+ 
+-async def backup_database(db_path: Path, backup_dir: Path) -> Path:
++async def backup_database(
++    db_path: Path, backup_dir: Path, timestamp: str | None = None
++) -> Path:
+     """在线备份单个 SQLite 数据库：备份 API 快照 + 完整性校验 + 摘要。
+ 
+     Args:
+         db_path: 源数据库文件路径。
+         backup_dir: 备份目录。
++        timestamp: 备份文件名中的时间戳，默认取当前时间。同一组备份（先注册表、后工作流
++            存储，见 2.6 节）传入同一个值，3.2 的恢复脚本按它配对。
+ 
+     Returns:
+         备份文件路径。
+@@ -132,8 +155,8 @@ async def backup_database(db_path: Path, backup_dir: Path) -> Path:
+         # sqlite3.connect 会为不存在的路径新建空库
+         if not db_path.is_file():
+             raise FileNotFoundError(f"database not found: {db_path}")
+-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+-        backup_path = backup_dir / f"{db_path.stem}-{timestamp}.db"
++        stamp = timestamp or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
++        backup_path = backup_dir / f"{db_path.stem}-{stamp}.db"
+         backup_dir.mkdir(parents=True, exist_ok=True)
+ 
+         # Step 1: 在线备份
+@@ -163,25 +186,39 @@ async def backup_database(db_path: Path, backup_dir: Path) -> Path:
+ 
+ ### 2.5 容器部署中的备份
+ 
+-控制平面镜像不含 `sqlite3` 命令行工具，根文件系统只读，2.2 的脚本无法在容器内运行。在容器内用备份 API 把快照写到数据卷上（数据卷需留出与数据库同样大小的空间），取出后在宿主机上校验：
++控制平面镜像不含 `sqlite3` 命令行工具，根文件系统只读，2.2 的脚本无法在容器内运行。在容器内用备份 API 把快照写到数据卷上的 `backup/` 目录（数据卷需留出与数据库同样大小的空间），先注册表、后工作流存储（见 2.6 节），取出后在宿主机上校验。`compose` 使用启动时的同一组 `-f` 文件（叠加了 `docker-compose.fake-runtime.yaml` 时也要带上）：
+ 
+ ```bash
+ compose=(docker compose -f deploy/docker/docker-compose.yaml)
+ "${compose[@]}" exec control-plane python -c "
+-import sqlite3
+-src = sqlite3.connect('/var/lib/forgemesh/forgemesh.db')
+-dst = sqlite3.connect('/var/lib/forgemesh/backup.db')
+-src.backup(dst)
+-dst.close()
+-src.close()
++import pathlib, sqlite3
++data = pathlib.Path('/var/lib/forgemesh')
++(data / 'backup').mkdir()
++for name in ('forgemesh.db', 'forgemesh.workflows.db'):
++    if (data / name).is_file():  # 没有部署推理服务时没有工作流存储
++        src = sqlite3.connect(data / name)
++        dst = sqlite3.connect(data / 'backup' / name)
++        src.backup(dst)
++        dst.close()
++        src.close()
+ "
+-"${compose[@]}" cp control-plane:/var/lib/forgemesh/backup.db ./forgemesh-backup.db
+-"${compose[@]}" exec control-plane rm /var/lib/forgemesh/backup.db
+-sqlite3 ./forgemesh-backup.db "PRAGMA integrity_check;"   # 输出必须为 ok
+-sha256sum ./forgemesh-backup.db > ./forgemesh-backup.db.sha256
++"${compose[@]}" cp control-plane:/var/lib/forgemesh/backup/. ./forgemesh-backup
++"${compose[@]}" exec control-plane rm -r /var/lib/forgemesh/backup
++for db in ./forgemesh-backup/*.db; do
++  echo "$db: $(sqlite3 "$db" "PRAGMA integrity_check;")"   # 每个文件都必须为 ok
++done
++(cd ./forgemesh-backup && sha256sum ./*.db > SHA256SUMS)
+ ```
+ 
+-Kubernetes 上用 `kubectl -n forgemesh exec deploy/forgemesh-control-plane -- python -c "…"` 执行同样的快照命令，再用 `kubectl -n forgemesh cp <pod>:/var/lib/forgemesh/backup.db ./forgemesh-backup.db` 取出（`kubectl cp` 需要 Pod 名称；它依赖的 `tar` 在镜像中）。
++`./forgemesh-backup` 目录就是一组备份，文件保留原名，恢复见 3.4 节。Kubernetes 上用 `kubectl -n forgemesh exec deploy/forgemesh-control-plane -- python -c "…"` 执行同样的快照命令，再用 `kubectl -n forgemesh cp <pod>:/var/lib/forgemesh/backup ./forgemesh-backup` 取出、`kubectl -n forgemesh exec deploy/forgemesh-control-plane -- rm -r /var/lib/forgemesh/backup` 清理，之后同样在宿主机上逐个校验并生成 `SHA256SUMS`（`kubectl cp` 需要 Pod 名称；它依赖的 `tar` 在镜像中）。
++
++### 2.6 注册表与工作流存储的一致性
++
++部署推理服务时，注册表（`forgemesh.db`）与工作流存储（`forgemesh.workflows.db`）各自的快照都是一致的，但两个文件之间没有共同的事务：只有控制平面停止时备份的两个文件是同一时刻的状态。在线备份时先快照注册表、紧接着快照工作流存储（2.2 的脚本与 2.5 的命令都按这个顺序）。控制平面总是先在工作流存储中记录部署运行的进展，再在注册表中写入依赖它的 phase，因此恢复后的注册表引用的部署运行都在恢复后的工作流存储中，且不会比注册表记录的更旧。
++
++例外是两次快照之间才开始部署的服务：注册表快照中它还没有分配（或者根本还不存在），工作流存储快照中却已有它未结束的部署运行，恢复之后控制平面启动时继续这个运行。快照时实例已经启动的，运行在验证实例时失败，服务（若存在）随之进入 `Failed`；还没有启动实例的，运行在两次快照之间分配到的设备上启动实例，而恢复后的注册表没有这份分配，可能把这些设备再分配给其他服务；服务本身不存在时，这个实例没有任何服务引用，一直运行到控制平面下一次停止（之后运行已结束，不会再继续）。需要排除这些情况时，停止控制平面之后再备份。
++
++恢复时两个文件必须取自同一组备份（3.2 的脚本按备份文件名配对，3.4 按目录）。只恢复注册表、保留更新的工作流存储，相当于把两次快照的间隔拉长到备份之后的全部时间，备份之后开始部署的服务都会出现上面的情况。一组备份中没有工作流存储时（备份时还没有部署推理服务），把现有的工作流存储移走（3.2 的脚本与 3.4 的命令都会这样做），控制平面启动时新建一个空的：注册表中仍在部署的服务找不到部署运行，进入 `Failed`（`WorkflowRunNotFound`），删除后重新创建即可。
+ 
+ ---
+ 
+@@ -202,47 +239,73 @@ Kubernetes 上用 `kubectl -n forgemesh exec deploy/forgemesh-control-plane -- p
+ | 9 | 验证服务健康 | `curl http://localhost:8080/healthz` 返回 200 | < 30s |
+ | 10 | 验证数据完整性 | 执行数据一致性检查脚本 | < 5min |
+ 
++部署推理服务时，第 3–7 步对同一组备份中的工作流存储（`forgemesh.workflows-<时间戳>.db` → `data/forgemesh.workflows.db`）再执行一次；这组备份中没有工作流存储时，第 5 步照常移走现有的工作流存储，跳过第 6 步（见 2.6 节）。3.2 的脚本自动完成这些步骤。恢复之后推理服务的状态见 3.5 节。
++
+ ### 3.2 恢复脚本
+ 
+ ```bash
+ #!/usr/bin/env bash
+ # forgemesh-restore.sh — SQLite 数据库恢复脚本
+ # 用法: ./forgemesh-restore.sh <backup_file> <target_db_path>
++# 同时恢复同一组备份中的工作流存储（2.2 的脚本写在旁边的 *.workflows-<时间戳>.db），
++# 这组备份中没有工作流存储时移走现有的工作流存储（见 2.6 节）。
+ # 先停止控制平面：进程仍打开着数据库时替换文件，会丢失数据甚至损坏数据库。
+ set -euo pipefail
+ 
+ BACKUP_FILE="${1:?usage: $0 <backup_file> <target_db_path>}"
+ TARGET_PATH="${2:?usage: $0 <backup_file> <target_db_path>}"
+-
+-# Step 1: 校验摘要
+-sha256sum -c "${BACKUP_FILE}.sha256"
+-
+-# Step 2: 校验完整性
+-INTEGRITY=$(sqlite3 "${BACKUP_FILE}" "PRAGMA integrity_check;")
+-if [[ "${INTEGRITY}" != "ok" ]]; then
+-  echo "ERROR: backup integrity check failed: ${INTEGRITY}" >&2
+-  exit 1
+-fi
++WORKFLOW_BACKUP_FILE="${BACKUP_FILE%-*}.workflows-${BACKUP_FILE##*-}"
++WORKFLOW_TARGET_PATH="${TARGET_PATH%.db}.workflows.db"
++BROKEN_SUFFIX=".broken.$(date -u +%s)"
++
++# Step 1: 校验摘要；Step 2: 校验完整性
++verify() {
++  local integrity
++  sha256sum -c "$1.sha256"
++  integrity=$(sqlite3 "$1" "PRAGMA integrity_check;")
++  if [[ "${integrity}" != "ok" ]]; then
++    echo "ERROR: backup integrity check failed: $1: ${integrity}" >&2
++    exit 1
++  fi
++}
+ 
+ # Step 3: 保留当前数据库（若存在），-wal / -shm 随之改名：
+ # -wal 里可能有尚未合并回主库的已提交事务，也不能留给恢复后的数据库
+-if [[ -f "${TARGET_PATH}" ]]; then
+-  BROKEN_PATH="${TARGET_PATH}.broken.$(date -u +%s)"
+-  mv "${TARGET_PATH}" "${BROKEN_PATH}"
+-  for suffix in -wal -shm; do
+-    if [[ -f "${TARGET_PATH}${suffix}" ]]; then
+-      mv "${TARGET_PATH}${suffix}" "${BROKEN_PATH}${suffix}"
+-    fi
+-  done
++keep() {
++  local suffix
++  if [[ -f "$1" ]]; then
++    mv "$1" "$1${BROKEN_SUFFIX}"
++    for suffix in -wal -shm; do
++      if [[ -f "$1${suffix}" ]]; then
++        mv "$1${suffix}" "$1${BROKEN_SUFFIX}${suffix}"
++      fi
++    done
++  fi
++}
++
++restore() {
++  keep "$2"
++  # Step 4: 恢复备份
++  cp "$1" "$2"
++  # Step 5: 清除残留 WAL/SHM
++  rm -f "$2-wal" "$2-shm"
++  echo "restore completed: $1 -> $2"
++}
++
++# 先校验这组备份中的全部文件，任何一个不通过都不改动现有文件
++verify "${BACKUP_FILE}"
++if [[ -f "${WORKFLOW_BACKUP_FILE}" ]]; then
++  verify "${WORKFLOW_BACKUP_FILE}"
+ fi
+ 
+-# Step 4: 恢复备份
+-cp "${BACKUP_FILE}" "${TARGET_PATH}"
+-
+-# Step 5: 清除残留 WAL/SHM
+-rm -f "${TARGET_PATH}-wal" "${TARGET_PATH}-shm"
+-
+-echo "restore completed: ${BACKUP_FILE} -> ${TARGET_PATH}"
++restore "${BACKUP_FILE}" "${TARGET_PATH}"
++if [[ -f "${WORKFLOW_BACKUP_FILE}" ]]; then
++  restore "${WORKFLOW_BACKUP_FILE}" "${WORKFLOW_TARGET_PATH}"
++else
++  keep "${WORKFLOW_TARGET_PATH}"
++  rm -f "${WORKFLOW_TARGET_PATH}-wal" "${WORKFLOW_TARGET_PATH}-shm"
++  echo "no workflow store in this backup set; the control plane starts with an empty one"
++fi
+ ```
+ 
+ ### 3.3 全量恢复示例
+@@ -251,6 +314,7 @@ echo "restore completed: ${BACKUP_FILE} -> ${TARGET_PATH}"
+ # 替换数据库文件前先停止控制平面
+ systemctl stop forgemesh-controlplane
+ 
++# 同一组备份中有 forgemesh.workflows-20260101T120000Z.db 时一并恢复到 data/forgemesh.workflows.db
+ ./forgemesh-restore.sh /var/backups/forgemesh/forgemesh-20260101T120000Z.db /var/lib/forgemesh/data/forgemesh.db
+ 
+ systemctl start forgemesh-controlplane
+@@ -262,7 +326,7 @@ curl -sf http://localhost:8080/readyz | jq .
+ 
+ ### 3.4 容器部署中的恢复
+ 
+-容器内同样用备份 API 写回：SQLite 打开目标库时会先处理遗留的 `-wal`，写回在一个事务内完成，不会出现 3.1 第 7 步所说的 WAL 错配。先按 3.1 第 3、4 步在宿主机上校验备份文件，把它放在 `./restore/` 下（对 uid 10001 可读，例如权限 0644）：
++容器内同样用备份 API 写回：SQLite 打开目标库时会先处理遗留的 `-wal`，写回在一个事务内完成，不会出现 3.1 第 7 步所说的 WAL 错配。先在宿主机上校验 2.5 取出的一组备份（`(cd ./forgemesh-backup && sha256sum -c SHA256SUMS)`，再按 3.1 第 4 步逐个检查完整性），把这组文件以原名放在 `./restore/` 下（对 uid 10001 可读，例如权限 0644）。`compose` 使用启动时的同一组 `-f` 文件：
+ 
+ ```bash
+ compose=(docker compose -f deploy/docker/docker-compose.yaml)
+@@ -272,18 +336,36 @@ compose=(docker compose -f deploy/docker/docker-compose.yaml)
+ # 一次性容器挂载同一个数据卷。备份 API 生成的文件仍标记为 WAL 模式，
+ # 不加 immutable=1 时 SQLite 要在只读的 /restore 中创建 -wal / -shm，打开即失败
+ "${compose[@]}" run --rm --no-deps -v "$PWD/restore:/restore:ro" control-plane python -c "
+-import sqlite3
+-src = sqlite3.connect('file:/restore/forgemesh-backup.db?immutable=1', uri=True)
+-dst = sqlite3.connect('/var/lib/forgemesh/forgemesh.db')
+-src.backup(dst)
+-dst.close()
+-src.close()
++import pathlib, sqlite3
++data = pathlib.Path('/var/lib/forgemesh')
++
++def restore(name):
++    src = sqlite3.connect(f'file:/restore/{name}?immutable=1', uri=True)
++    dst = sqlite3.connect(data / name)
++    src.backup(dst)
++    dst.close()
++    src.close()
++
++restore('forgemesh.db')
++if pathlib.Path('/restore/forgemesh.workflows.db').is_file():
++    restore('forgemesh.workflows.db')
++else:  # 这组备份中没有工作流存储：删除现有的（上面已保留副本），见 2.6 节
++    for suffix in ('', '-wal', '-shm'):
++        (data / f'forgemesh.workflows.db{suffix}').unlink(missing_ok=True)
+ "
+ "${compose[@]}" up --detach --wait control-plane   # 等 /readyz 健康检查通过
+ curl -sf http://127.0.0.1:8080/readyz
+ ```
+ 
+-Kubernetes 上先 `kubectl -n forgemesh scale deploy/forgemesh-control-plane --replicas=0` 并等 Pod 退出，再启动一个挂载 PVC `forgemesh-control-plane-data`、以 uid 10001 运行的临时 Pod（同一镜像，命令如 `sleep infinity`）：用 `kubectl cp` 取出 `/var/lib/forgemesh` 保留当前数据、把备份文件复制到它的 `/tmp`，`kubectl exec` 执行上面的恢复命令（源路径改为 `/tmp/forgemesh-backup.db`），删除临时 Pod 后把副本数改回 1。
++Kubernetes 上先 `kubectl -n forgemesh scale deploy/forgemesh-control-plane --replicas=0` 并等 Pod 退出，再启动一个挂载 PVC `forgemesh-control-plane-data`、以 uid 10001 运行的临时 Pod（同一镜像，命令如 `sleep infinity`）：用 `kubectl cp` 取出 `/var/lib/forgemesh` 保留当前数据、把这组备份文件复制到它的 `/tmp/restore/`，`kubectl exec` 执行上面的恢复命令（源路径中的 `/restore` 改为 `/tmp/restore`），删除临时 Pod 后把副本数改回 1。
++
++### 3.5 恢复之后的推理服务
++
++恢复总要重启控制平面，而推理实例随控制平面进程结束（`fake` 启动器的实例在控制平面进程内，`vllm-process` 的实例是它的子进程），恢复之后没有任何实例在运行：
++
++- 恢复前（备份时）`Ready` 的服务在控制平面启动时转为 `Degraded`：`Ready=False`（`InstanceLost`），`status.endpoints` 中的实例标记为 `ready: false`，网关不再转发。控制平面不会自动重新部署，删除后重新创建即可；`Degraded` 的服务在删除之前一直持有分配。
++- 仍在部署的服务从中断处继续：还没有启动实例的照常完成；已经启动了实例的进入 `Failed`（实例已不在运行：验证实例的步骤失败时原因为 `WorkflowFailed`，部署运行已经成功、只是还没写入 `Ready` 时为 `InstanceLost`），删除后重新创建即可。
++- 注册表与工作流存储不是同一组备份时的情况见 2.6 节。
+ 
+ ---
+ 
+@@ -303,16 +385,18 @@ Kubernetes 上先 `kubectl -n forgemesh scale deploy/forgemesh-control-plane --r
+ - [ ] 验证备份文件摘要：`sha256sum -c <backup>.db.sha256` 通过
+ - [ ] 验证备份完整性：`PRAGMA integrity_check` 返回 `ok`
+ - [ ] 验证备份可打开：`sqlite3 <backup>.db ".tables"` 列出 `allocation_devices`、`allocations`、`processed_dedup_keys`、`resource_changes`、`resources`
++- [ ] 部署推理服务时：同一组备份中有工作流存储（时间戳相同的 `forgemesh.workflows-<时间戳>.db`，容器部署为同一目录中的 `forgemesh.workflows.db`），`.tables` 列出 `workflow_runs`、`workflow_steps`
+ - [ ] 验证备份数据行数与源库一致（抽样表）
+ 
+ ### 4.3 恢复验证
+ 
+ - [ ] 停止控制平面进程
+-- [ ] 执行 `forgemesh-restore.sh` 恢复控制平面数据库（容器部署按 3.4 节）
++- [ ] 执行 `forgemesh-restore.sh` 恢复控制平面数据库（容器部署按 3.4 节），部署推理服务时工作流存储取自同一组备份
+ - [ ] 启动控制平面进程
+ - [ ] `/healthz` 探针返回 200
+ - [ ] `/readyz` 探针返回 200
+ - [ ] 资源注册表：`list` 返回预期资源数量
++- [ ] 推理服务（3.5 节）：备份时 `Ready` 的服务为 `Degraded`（`Ready=False`，`InstanceLost`）；删除并重新创建其中一个，它重新进入 `Ready`
+ - [ ] 审计日志 / 决策记录（仅当部署把它们持久化到文件时）：`query_by_tenant` / `list_by_tenant` 返回预期记录数量
+ 
+ ### 4.4 数据一致性验证
+@@ -347,6 +431,7 @@ Kubernetes 上先 `kubectl -n forgemesh scale deploy/forgemesh-control-plane --r
+ | 磁盘空间不足 | 监控告警 | 清理旧备份 + 扩容 |
+ | 备份文件损坏 | `sha256sum -c` 失败 | 回退到上一份有效备份 |
+ | 误删资源 | 用户报告 / 审计日志确认 | 从误删前备份恢复（需停服） |
++| 注册表与工作流存储来自不同的备份 | 恢复后仍在部署的服务进入 `Failed`（`WorkflowRunNotFound`），或设备被注册表之外的实例占用（2.6 节） | 停止控制平面，从同一组备份重新恢复两个文件 |
+ | 租户数据串扰 | 安全测试失败 | 立即从备份恢复 + 排查隔离边界缺陷 |
+ 
+ ---
+-- 
+2.43.0
+

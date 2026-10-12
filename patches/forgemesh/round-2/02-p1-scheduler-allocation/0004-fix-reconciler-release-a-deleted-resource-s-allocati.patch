@@ -1,7 +1,7 @@
-From a19381384e091fb22cc71d117b672f44e87ab457 Mon Sep 17 00:00:00 2001
+From 7fe5a930e4e0d77e5453f138f6c27059202e4e88 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Mon, 12 Oct 2026 12:43:55 +0000
-Subject: [PATCH 4/8] fix(reconciler): release a deleted resource's allocation
+Subject: [PATCH 4/9] fix(reconciler): release a deleted resource's allocation
  by uid
 
 The Terminating path looked the allocation up by "{kind}/{name}". That

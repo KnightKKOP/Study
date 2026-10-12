@@ -1,0 +1,1049 @@
+From d21a81de80830113a38edd03fd6bc23b3a08488e Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 12 Oct 2026 17:01:05 +0000
+Subject: [PATCH 05/10] feat(control-plane): add a vLLM process launcher
+
+The fake launcher proves the loop, but a real deployment needs an
+instance that serves a model. VLLMProcessLauncher runs every instance
+as a child process of the control plane:
+
+  <command> --model=<spec.model.reference> --host <bind> --port <free>
+            --tensor-parallel-size <device count>
+
+The command defaults to the control plane's interpreter with
+`-m vllm.entrypoints.openai.api_server` and can be replaced (another
+virtualenv, or a stand-in in tests). The model is passed as
+`--model=<ref>` so a reference starting with "-" cannot become an
+option. CUDA_VISIBLE_DEVICES comes from the allocated devices: an
+inventory device id must be a CUDA index (`0`, `gpu-0`) or a GPU-/MIG-
+UUID; CUDA_DEVICE_ORDER defaults to PCI_BUS_ID so indexes match
+nvidia-smi. FORGEMESH_* variables are not passed to instances.
+
+Instances can only run on the host of the control plane, so the
+launcher is bound to one inventory node and refuses devices of other
+nodes, runtimes other than `vllm` and blank model references before
+starting anything.
+
+Readiness: verify polls GET /health until it answers 200, and fails as
+soon as the process exits or the ready timeout (measured from the
+process start, so retried verify attempts fail at once) has passed.
+Stop: every instance runs in its own session; stop sends SIGTERM to the
+process group, then SIGKILL after the grace period, and SIGKILL to the
+group in any case because vLLM workers can outlive the leader. aclose
+stops all instances; after a restart the launcher knows no instance.
+
+The tests drive a stand-in executable that mimics the vLLM command
+line and /health, with modes for slow start, early exit, hanging,
+ignoring SIGTERM and a child process that ignores SIGTERM.
+---
+ .../controlplane/deployment/__init__.py       |   3 +
+ .../controlplane/deployment/vllm_process.py   | 387 ++++++++++++++
+ tests/unit/controlplane/test_vllm_launcher.py | 491 ++++++++++++++++++
+ tests/unit/controlplane/vllm_standin.py       |  75 +++
+ 4 files changed, 956 insertions(+)
+ create mode 100644 packages/control-plane/src/forgemesh/controlplane/deployment/vllm_process.py
+ create mode 100644 tests/unit/controlplane/test_vllm_launcher.py
+ create mode 100644 tests/unit/controlplane/vllm_standin.py
+
+diff --git a/packages/control-plane/src/forgemesh/controlplane/deployment/__init__.py b/packages/control-plane/src/forgemesh/controlplane/deployment/__init__.py
+index 67daeae..4fca2cf 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/deployment/__init__.py
++++ b/packages/control-plane/src/forgemesh/controlplane/deployment/__init__.py
+@@ -7,6 +7,7 @@
+   :func:`mark_lost_instances`；
+ * :mod:`.fake` —— 在控制平面进程内为每个实例提供 OpenAI 兼容桩服务的
+   :class:`FakeLauncher`（CI 与本地开发）；
++* :mod:`.vllm_process` —— 把每个实例作为本机 vLLM 子进程运行的 :class:`VLLMProcessLauncher`；
+ * :mod:`.network` —— 启动器共用的地址校验与健康检查；
+ * :mod:`.memory` —— 测试替身 :class:`InMemoryLauncher`。
+ 
+@@ -20,6 +21,7 @@ from .launcher import LaunchedInstance, LaunchRequest, RuntimeLauncher
+ from .memory import InMemoryLauncher
+ from .recovery import INSTANCE_LOST_REASON, mark_lost_instances
+ from .release import DeploymentReleaser
++from .vllm_process import VLLMProcessLauncher
+ from .workflow import (
+     DEPLOYMENT_WORKFLOW,
+     LAUNCH_INSTANCE,
+@@ -47,6 +49,7 @@ __all__ = [
+     "LaunchedInstance",
+     "RuntimeLauncher",
+     "StepCallable",
++    "VLLMProcessLauncher",
+     "deployment_inputs",
+     "deployment_run_key",
+     "deployment_workflow",
+diff --git a/packages/control-plane/src/forgemesh/controlplane/deployment/vllm_process.py b/packages/control-plane/src/forgemesh/controlplane/deployment/vllm_process.py
+new file mode 100644
+index 0000000..dcbcebc
+--- /dev/null
++++ b/packages/control-plane/src/forgemesh/controlplane/deployment/vllm_process.py
+@@ -0,0 +1,387 @@
++"""vLLM 进程启动器：每个实例是控制平面所在主机上的一个 vLLM OpenAI 兼容服务进程。
++
++:class:`VLLMProcessLauncher` 以 ``<command> --model=<spec.model.reference> --host <bind_host>
++--port <port> --tensor-parallel-size <设备数>`` 启动实例。``command`` 默认是
++``<控制平面的解释器> -m vllm.entrypoints.openai.api_server``，可换成其他环境中的 vLLM（或
++测试用的替身）；端口由操作系统挑选。实例继承控制平面的环境变量（去掉 ``FORGEMESH_*``），
++``CUDA_VISIBLE_DEVICES`` 取自分配的设备，未设置 ``CUDA_DEVICE_ORDER`` 时设为
++``PCI_BUS_ID``，设备序号因此与 ``nvidia-smi`` 一致。实例的标准输出与标准错误即控制平面
++的输出。只服务 ``spec.runtime.provider`` 为 ``vllm`` 的资源；``spec.runtime.version`` 与
++``spec.model.digest`` 都不检查：运行的是 ``command`` 对应的 vLLM，模型由 vLLM 按引用加载。
++
++实例在哪里运行
++--------------
++实例是控制平面的子进程，只能运行在控制平面所在的主机上：加速器清单必须恰好有一个节点
++（就是这台主机），分配的设备都属于该节点（``node_id``）。清单中的设备 id 必须能写进
++``CUDA_VISIBLE_DEVICES``：CUDA 设备序号（``0``）、带 ``gpu-`` 前缀的序号（``gpu-0``），
++或以 ``GPU-`` / ``MIG-`` 开头的 UUID（原样使用），见 :func:`cuda_device`。
++
++就绪与停止
++----------
++``verify`` 每隔 ``poll_interval`` 秒请求一次 ``GET /health``，返回 ``200`` 即就绪；进程
++退出、或进程启动 ``ready_timeout`` 秒后仍未就绪时抛出。每个实例在自己的会话（进程组）中
++运行：``stop`` 向整个进程组发送 ``SIGTERM``，``stop_grace`` 秒内没有退出就发送
++``SIGKILL``，vLLM 派生的工作进程一并结束。
++
++控制平面重启
++------------
++实例随控制平面结束：``aclose`` 停止全部实例，容器中整个进程树随容器结束。重启之后启动器
++不认识重启之前的实例。直接在主机上运行、控制平面被 ``SIGKILL`` 时，实例进程（不在控制
++平面的进程组中）不会随之结束、继续占用 GPU：请以容器或 systemd 服务（默认
++``KillMode=control-group``）运行控制平面。
++"""
++
++from __future__ import annotations
++
++import asyncio
++import contextlib
++import logging
++import math
++import os
++import re
++import signal
++import socket
++import sys
++import uuid
++from collections.abc import Sequence
++from dataclasses import dataclass
++
++from forgemesh.resource.inference import EndpointProtocol
++
++from .launcher import LaunchedInstance, LaunchRequest, RuntimeLauncher
++from .network import instance_url, local_address, probe_health, resolve_hosts, socket_family
++
++logger = logging.getLogger(__name__)
++
++#: vLLM 的 OpenAI 兼容服务入口模块。
++VLLM_MODULE = "vllm.entrypoints.openai.api_server"
++#: 默认命令：以控制平面的解释器运行 vLLM。
++DEFAULT_COMMAND: tuple[str, ...] = (sys.executable, "-m", VLLM_MODULE)
++#: 默认监听地址（同时也是默认写进实例地址的主机）。
++DEFAULT_BIND_HOST = "127.0.0.1"
++#: 进程启动后等它就绪的默认时限（秒），包括下载与加载模型。
++DEFAULT_READY_TIMEOUT_SECONDS = 1200.0
++#: ``SIGTERM`` 之后等进程退出的默认宽限期（秒）。
++DEFAULT_STOP_GRACE_SECONDS = 10.0
++#: ``SIGKILL`` 之后等进程退出的时限（秒）；超过即 :meth:`~VLLMProcessLauncher.stop` 失败。
++KILL_WAIT_SECONDS = 10.0
++#: 服务的运行时（``spec.runtime.provider``）。
++PROVIDER = "vllm"
++
++_INDEX_DEVICE = re.compile(r"(?:gpu-)?([0-9]+)")
++_UUID_DEVICE = re.compile(r"(?:GPU|MIG)-[0-9A-Za-z][0-9A-Za-z/-]*")
++_PORT_ATTEMPTS = 20
++
++
++def cuda_device(device_id: str) -> str:
++    """清单中的设备 id 在 ``CUDA_VISIBLE_DEVICES`` 中的写法。
++
++    ``0`` / ``gpu-0`` → ``0``（CUDA 设备序号）；``GPU-…`` / ``MIG-…``（UUID）原样返回。
++
++    Raises:
++        ValueError: 不是上述格式。
++    """
++    if match := _INDEX_DEVICE.fullmatch(device_id):
++        return str(int(match.group(1)))
++    if _UUID_DEVICE.fullmatch(device_id):
++        return device_id
++    raise ValueError(
++        f"device id {device_id!r} is neither a CUDA device index (0, gpu-0) nor a GPU-/MIG- UUID"
++    )
++
++
++def _positive(name: str, value: float) -> float:
++    if not math.isfinite(value) or value <= 0:
++        raise ValueError(f"{name} must be a positive number of seconds, got {value!r}")
++    return value
++
++
++def _signal_group(pgid: int, sig: signal.Signals) -> None:
++    with contextlib.suppress(ProcessLookupError):
++        os.killpg(pgid, sig)
++
++
++@dataclass(eq=False)
++class _Process:
++    key: str
++    instance: LaunchedInstance
++    process: asyncio.subprocess.Process
++    port: int
++    ready_deadline: float
++
++
++class VLLMProcessLauncher(RuntimeLauncher):
++    """把每个实例作为本机上的 vLLM 子进程运行的启动器（见模块说明）。
++
++    Args:
++        node_id: 控制平面所在主机在加速器清单中的节点 id；分配到其他节点的设备无法使用。
++        command: 启动 vLLM OpenAI 兼容服务的命令（参数列表），默认 :data:`DEFAULT_COMMAND`。
++        bind_host: 实例监听的 IP 地址，默认 ``127.0.0.1``；``0.0.0.0`` / ``::`` 监听全部地址。
++        advertise_host: 写进实例地址的主机名或 IP 地址，默认同 ``bind_host``；监听全部
++            地址时必须给出。
++        ready_timeout: 进程启动后等它就绪的时限（秒）。
++        stop_grace: ``SIGTERM`` 之后等进程退出的宽限期（秒），之后 ``SIGKILL``。
++        poll_interval: 等待就绪时两次 ``GET /health`` 之间的秒数。
++
++    Raises:
++        ValueError: 命令为空、地址非法或时间不是正数。
++    """
++
++    def __init__(
++        self,
++        node_id: str,
++        *,
++        command: Sequence[str] = DEFAULT_COMMAND,
++        bind_host: str = DEFAULT_BIND_HOST,
++        advertise_host: str | None = None,
++        ready_timeout: float = DEFAULT_READY_TIMEOUT_SECONDS,
++        stop_grace: float = DEFAULT_STOP_GRACE_SECONDS,
++        poll_interval: float = 1.0,
++    ) -> None:
++        if not node_id:
++            raise ValueError("node_id must not be empty")
++        if isinstance(command, str):
++            raise ValueError("the vLLM command must be a sequence of arguments, not a string")
++        if not command or not command[0]:
++            raise ValueError("the vLLM command must not be empty")
++        self._node_id = node_id
++        self._command = tuple(command)
++        self._bind_host, self._advertise_host = resolve_hosts(bind_host, advertise_host)
++        self._probe_host = local_address(self._bind_host)
++        self._ready_timeout = _positive("ready_timeout", ready_timeout)
++        self._stop_grace = _positive("stop_grace", stop_grace)
++        self._poll_interval = _positive("poll_interval", poll_interval)
++        self._by_key: dict[str, _Process] = {}
++        self._by_id: dict[str, _Process] = {}
++        self._closed = False
++
++    @property
++    def node_id(self) -> str:
++        """实例运行所在的清单节点。"""
++        return self._node_id
++
++    @property
++    def command(self) -> tuple[str, ...]:
++        """启动 vLLM 的命令。"""
++        return self._command
++
++    @property
++    def bind_host(self) -> str:
++        """实例监听的地址。"""
++        return self._bind_host
++
++    @property
++    def advertise_host(self) -> str:
++        """写进实例地址的主机。"""
++        return self._advertise_host
++
++    @property
++    def ready_timeout(self) -> float:
++        """进程启动后等它就绪的时限（秒）。"""
++        return self._ready_timeout
++
++    @property
++    def stop_grace(self) -> float:
++        """``SIGTERM`` 之后的宽限期（秒）。"""
++        return self._stop_grace
++
++    async def launch(self, request: LaunchRequest) -> LaunchedInstance:
++        """启动 vLLM 进程并立即返回；``instance_key`` 的进程仍在运行时返回它。
++
++        Raises:
++            ValueError: 资源不是 vLLM 运行时、模型引用为空、设备不在本节点或设备 id 无法
++                写进 ``CUDA_VISIBLE_DEVICES``。
++            RuntimeError: 启动器已关闭，或找不到空闲端口。
++            OSError: 无法启动命令。
++        """
++        if self._closed:
++            raise RuntimeError("the vLLM process launcher is closed")
++        existing = self._by_key.get(request.instance_key)
++        if existing is not None:
++            if existing.process.returncode is None:
++                return existing.instance
++            await self._terminate(existing)
++            self._forget(existing)
++        devices = self._cuda_devices(request)
++        port = self._free_port()
++        instance = LaunchedInstance(
++            instance_id=f"vllm-{uuid.uuid4().hex[:12]}",
++            url=instance_url(self._advertise_host, port),
++            protocol=EndpointProtocol.OPENAI_CHAT,
++        )
++        env = {
++            name: value for name, value in os.environ.items() if not name.startswith("FORGEMESH_")
++        }
++        env["CUDA_VISIBLE_DEVICES"] = ",".join(devices)
++        env.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
++        process = await asyncio.create_subprocess_exec(
++            *self._command,
++            f"--model={request.spec.model.reference}",
++            "--host",
++            self._bind_host,
++            "--port",
++            str(port),
++            "--tensor-parallel-size",
++            str(max(len(devices), 1)),
++            stdin=asyncio.subprocess.DEVNULL,
++            env=env,
++            start_new_session=True,
++        )
++        state = _Process(
++            key=request.instance_key,
++            instance=instance,
++            process=process,
++            port=port,
++            ready_deadline=asyncio.get_running_loop().time() + self._ready_timeout,
++        )
++        self._by_key[state.key] = state
++        self._by_id[instance.instance_id] = state
++        logger.info(
++            "vLLM instance started: instance_id=%s pid=%d url=%s model=%s "
++            "CUDA_VISIBLE_DEVICES=%s instance_key=%s",
++            instance.instance_id,
++            process.pid,
++            instance.url,
++            request.spec.model.reference,
++            env["CUDA_VISIBLE_DEVICES"],
++            state.key,
++        )
++        return instance
++
++    async def verify(self, instance: LaunchedInstance) -> None:
++        """等实例的 ``GET /health`` 返回 ``200``。
++
++        Raises:
++            RuntimeError: 启动器不认识这个实例（如重启之前的实例）、进程已退出，或进程启动
++                ``ready_timeout`` 秒后仍未就绪。
++        """
++        state = self._by_id.get(instance.instance_id)
++        if state is None:
++            raise RuntimeError(f"instance {instance.instance_id} is not running")
++        loop = asyncio.get_running_loop()
++        while True:
++            returncode = state.process.returncode
++            if returncode is not None:
++                raise RuntimeError(
++                    f"instance {instance.instance_id} exited with code {returncode} before it "
++                    "became healthy"
++                )
++            if await probe_health(self._probe_host, state.port):
++                return
++            remaining = state.ready_deadline - loop.time()
++            if remaining <= 0:
++                raise RuntimeError(
++                    f"instance {instance.instance_id} did not become healthy within "
++                    f"{self._ready_timeout:g}s of its start"
++                )
++            await asyncio.sleep(min(self._poll_interval, remaining))
++
++    async def stop(self, instance_id: str) -> None:
++        """结束实例的整个进程组：先 ``SIGTERM``，宽限期过后 ``SIGKILL``。
++
++        Raises:
++            RuntimeError: ``SIGKILL`` 之后进程仍未退出；实例仍记录在案，可以再次停止。
++        """
++        state = self._by_id.get(instance_id)
++        if state is None:
++            return
++        await self._terminate(state)
++        self._forget(state)
++
++    async def is_running(self, instance_id: str) -> bool:
++        state = self._by_id.get(instance_id)
++        return state is not None and state.process.returncode is None
++
++    async def aclose(self) -> None:
++        """停止全部实例；之后 :meth:`launch` 抛出 :class:`RuntimeError`。"""
++        self._closed = True
++        states = list(self._by_id.values())
++        results = await asyncio.gather(
++            *(self._terminate(state) for state in states), return_exceptions=True
++        )
++        for state, result in zip(states, results, strict=True):
++            self._forget(state)
++            if isinstance(result, BaseException):
++                logger.error(
++                    "vLLM instance %s (pid %d) could not be stopped: %r",
++                    state.instance.instance_id,
++                    state.process.pid,
++                    result,
++                )
++
++    def _cuda_devices(self, request: LaunchRequest) -> list[str]:
++        provider = request.spec.runtime.provider
++        if provider != PROVIDER:
++            raise ValueError(
++                f"runtime provider {provider!r} is not served by the vllm-process launcher "
++                f"(it serves {PROVIDER!r})"
++            )
++        if not request.spec.model.reference.strip():
++            raise ValueError("spec.model.reference must name the model to serve")
++        foreign = sorted({device.node_id for device in request.devices} - {self._node_id})
++        if foreign:
++            raise ValueError(
++                f"devices on node(s) {', '.join(foreign)} cannot be used: the vllm-process "
++                f"launcher runs instances on node {self._node_id!r} only"
++            )
++        return [cuda_device(device.device_id) for device in request.devices]
++
++    def _free_port(self) -> int:
++        """操作系统挑选的空闲端口，避开本启动器的实例已经占用（或即将监听）的端口。"""
++        taken = {state.port for state in self._by_id.values()}
++        for _ in range(_PORT_ATTEMPTS):
++            with socket.socket(socket_family(self._bind_host), socket.SOCK_STREAM) as sock:
++                sock.bind((self._bind_host, 0))
++                port = sock.getsockname()[1]
++            if port not in taken:
++                return port
++        raise RuntimeError(f"no free port on {self._bind_host}")
++
++    def _forget(self, state: _Process) -> None:
++        self._by_id.pop(state.instance.instance_id, None)
++        if self._by_key.get(state.key) is state:
++            del self._by_key[state.key]
++
++    async def _terminate(self, state: _Process) -> None:
++        process = state.process
++        if process.returncode is None:
++            _signal_group(process.pid, signal.SIGTERM)
++            try:
++                async with asyncio.timeout(self._stop_grace):
++                    await process.wait()
++            except TimeoutError:
++                logger.warning(
++                    "vLLM instance %s (pid %d) did not exit within %gs of SIGTERM; killing it",
++                    state.instance.instance_id,
++                    process.pid,
++                    self._stop_grace,
++                )
++        # 进程组中可能还有 vLLM 派生的工作进程（领头进程已退出也一样）。
++        _signal_group(process.pid, signal.SIGKILL)
++        try:
++            async with asyncio.timeout(KILL_WAIT_SECONDS):
++                await process.wait()
++        except TimeoutError:
++            raise RuntimeError(
++                f"instance {state.instance.instance_id} (pid {process.pid}) did not exit "
++                "after SIGKILL"
++            ) from None
++        logger.info(
++            "vLLM instance stopped: instance_id=%s pid=%d returncode=%s",
++            state.instance.instance_id,
++            process.pid,
++            process.returncode,
++        )
++
++
++__all__ = [
++    "DEFAULT_BIND_HOST",
++    "DEFAULT_COMMAND",
++    "DEFAULT_READY_TIMEOUT_SECONDS",
++    "DEFAULT_STOP_GRACE_SECONDS",
++    "KILL_WAIT_SECONDS",
++    "PROVIDER",
++    "VLLM_MODULE",
++    "VLLMProcessLauncher",
++    "cuda_device",
++]
+diff --git a/tests/unit/controlplane/test_vllm_launcher.py b/tests/unit/controlplane/test_vllm_launcher.py
+new file mode 100644
+index 0000000..9a6d808
+--- /dev/null
++++ b/tests/unit/controlplane/test_vllm_launcher.py
+@@ -0,0 +1,491 @@
++"""vLLM 进程启动器测试：用替身（``vllm_standin.py``）代替 vLLM 运行，不需要 GPU。
++
++* 启动命令带上模型、监听地址、空闲端口与张量并行数；``CUDA_VISIBLE_DEVICES`` 取自分配的
++  设备；实例在自己的会话中运行，看不到 ``FORGEMESH_*`` 环境变量；
++* 同一实例幂等键在进程运行期间返回同一实例，进程退出之后启动新进程；
++* ``verify`` 等到 ``GET /health`` 返回 200，进程退出或超过就绪时限时失败，不认识的实例
++  立即失败；
++* ``stop`` 先 ``SIGTERM``、宽限期过后 ``SIGKILL``，结束整个进程组；``aclose`` 停止全部实例；
++* 无法服务的请求（其他运行时、其他节点的设备、无法写进 ``CUDA_VISIBLE_DEVICES`` 的设备 id）
++  不启动进程；非法配置在构造时被拒绝。
++"""
++
++from __future__ import annotations
++
++import asyncio
++import contextlib
++import json
++import logging
++import math
++import os
++import signal
++import sys
++import time
++from pathlib import Path
++from typing import Any
++from urllib.parse import urlsplit
++
++import pytest
++from forgemesh.controlplane.deployment import (
++    LaunchedInstance,
++    LaunchRequest,
++    VLLMProcessLauncher,
++    deployment_run_key,
++)
++from forgemesh.controlplane.deployment.vllm_process import cuda_device
++from forgemesh.core.scheduler import AllocatedDevice, ResourceRef
++from forgemesh.resource.inference import (
++    AcceleratorSpec,
++    EndpointProtocol,
++    InferenceServiceSpec,
++    ModelRef,
++    ResourcesSpec,
++    RuntimeRef,
++)
++
++STANDIN = Path(__file__).with_name("vllm_standin.py")
++LOGGER = "forgemesh.controlplane.deployment.vllm_process"
++GPU_UUID = "GPU-8f0c5a62-3b1e-4a7d-9c2f-0d1e2f3a4b5c"
++
++
++def _request(
++    uid: str = "uid-1",
++    *,
++    provider: str = "vllm",
++    reference: str = "models/llama",
++    devices: tuple[tuple[str, str], ...] = (("node-a", "gpu-0"),),
++) -> LaunchRequest:
++    return LaunchRequest(
++        instance_key=deployment_run_key(uid),
++        tenant_id="tenant-1",
++        resource=ResourceRef(kind="InferenceService", namespace="team-a", name="svc", uid=uid),
++        spec=InferenceServiceSpec(
++            model=ModelRef(reference=reference),
++            runtime=RuntimeRef(provider=provider),
++            resources=ResourcesSpec(
++                accelerator=AcceleratorSpec(
++                    type="nvidia-gpu", count=len(devices) or 1, minMemoryGiB=16
++                )
++            ),
++        ),
++        allocation_id="alloc-1",
++        devices=tuple(AllocatedDevice(node_id=node, device_id=device) for node, device in devices),
++    )
++
++
++def _launcher(
++    tmp_path: Path, *standin_args: str, **options: Any
++) -> tuple[VLLMProcessLauncher, Path]:
++    """以替身为命令的启动器，以及替身记录每次启动的报告文件。"""
++    report = tmp_path / "starts.jsonl"
++    options.setdefault("ready_timeout", 10.0)
++    options.setdefault("stop_grace", 2.0)
++    options.setdefault("poll_interval", 0.02)
++    command = (sys.executable, str(STANDIN), "--report", str(report), *standin_args)
++    return VLLMProcessLauncher("node-a", command=command, **options), report
++
++
++def _starts(report: Path) -> list[dict[str, Any]]:
++    if not report.exists():
++        return []
++    return [json.loads(line) for line in report.read_text(encoding="utf-8").splitlines()]
++
++
++def _port(instance: LaunchedInstance) -> int:
++    port = urlsplit(instance.url).port
++    assert port is not None
++    return port
++
++
++def _gone(pid: int) -> bool:
++    """进程已不存在，或已结束、只等父进程回收（僵尸）。"""
++    try:
++        stat = Path(f"/proc/{pid}/stat").read_text()
++    except FileNotFoundError:
++        return True
++    return stat.rpartition(")")[2].split()[0] in {"Z", "X"}
++
++
++async def _wait_gone(pid: int, timeout: float = 5.0) -> bool:
++    deadline = time.monotonic() + timeout
++    while not _gone(pid):
++        if time.monotonic() > deadline:
++            return False
++        await asyncio.sleep(0.02)
++    return True
++
++
++async def _refused(port: int) -> bool:
++    try:
++        _, writer = await asyncio.open_connection("127.0.0.1", port)
++    except ConnectionRefusedError:
++        return True
++    writer.close()
++    await writer.wait_closed()
++    return False
++
++
++# ---------------------------------------------------------------------- #
++# 启动
++# ---------------------------------------------------------------------- #
++
++
++@pytest.mark.unit
++def test_launch_runs_the_command_with_the_model_address_and_devices(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    monkeypatch.setenv("FORGEMESH_STANDIN_SECRET", "not-for-instances")
++    monkeypatch.delenv("CUDA_DEVICE_ORDER", raising=False)
++    launcher, report = _launcher(tmp_path)
++    request = _request(devices=(("node-a", "gpu-1"), ("node-a", GPU_UUID)))
++
++    async def scenario() -> tuple[LaunchedInstance, bool, bool]:
++        instance = await launcher.launch(request)
++        await launcher.verify(instance)
++        running = await launcher.is_running(instance.instance_id)
++        await launcher.aclose()
++        return instance, running, await launcher.is_running(instance.instance_id)
++
++    instance, running, after_close = asyncio.run(scenario())
++    [start] = _starts(report)
++    port = _port(instance)
++    assert instance.instance_id.startswith("vllm-")
++    assert instance.url == f"http://127.0.0.1:{port}"
++    assert instance.protocol is EndpointProtocol.OPENAI_CHAT
++    assert start["argv"][-7:] == [
++        "--model=models/llama",
++        "--host",
++        "127.0.0.1",
++        "--port",
++        str(port),
++        "--tensor-parallel-size",
++        "2",
++    ]
++    assert start["env"] == {
++        "CUDA_VISIBLE_DEVICES": f"1,{GPU_UUID}",
++        "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
++        "FORGEMESH_STANDIN_SECRET": None,
++    }
++    assert start["sid"] == start["pid"]
++    assert (running, after_close) == (True, False)
++    assert _gone(start["pid"])
++
++
++@pytest.mark.unit
++def test_an_instance_listening_on_all_addresses_is_advertised_under_the_configured_host(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    monkeypatch.setenv("CUDA_DEVICE_ORDER", "FASTEST_FIRST")
++    launcher, report = _launcher(tmp_path, bind_host="0.0.0.0", advertise_host="vllm.internal")
++
++    async def scenario() -> LaunchedInstance:
++        instance = await launcher.launch(_request())
++        await launcher.verify(instance)
++        await launcher.aclose()
++        return instance
++
++    instance = asyncio.run(scenario())
++    [start] = _starts(report)
++    assert instance.url == f"http://vllm.internal:{start['port']}"
++    assert start["host"] == "0.0.0.0"
++    assert start["env"]["CUDA_DEVICE_ORDER"] == "FASTEST_FIRST"
++
++
++@pytest.mark.unit
++def test_launch_returns_the_running_instance_for_the_same_key(tmp_path: Path) -> None:
++    launcher, report = _launcher(tmp_path)
++
++    async def scenario() -> tuple[LaunchedInstance, LaunchedInstance, LaunchedInstance]:
++        first = await launcher.launch(_request("uid-1"))
++        again = await launcher.launch(_request("uid-1"))
++        other = await launcher.launch(_request("uid-2"))
++        await launcher.verify(first)
++        await launcher.verify(other)
++        await launcher.aclose()
++        return first, again, other
++
++    first, again, other = asyncio.run(scenario())
++    assert again == first
++    assert other.instance_id != first.instance_id
++    assert _port(other) != _port(first)
++    assert len(_starts(report)) == 2
++
++
++@pytest.mark.unit
++def test_launch_starts_a_new_process_once_the_previous_one_exited(tmp_path: Path) -> None:
++    launcher, report = _launcher(tmp_path, "--mode", "exit")
++
++    async def scenario() -> tuple[LaunchedInstance, LaunchedInstance, bool]:
++        first = await launcher.launch(_request())
++        with pytest.raises(
++            RuntimeError,
++            match=f"instance {first.instance_id} exited with code 3 before it became healthy",
++        ):
++            await launcher.verify(first)
++        second = await launcher.launch(_request())
++        running = await launcher.is_running(first.instance_id)
++        with pytest.raises(RuntimeError, match=f"instance {second.instance_id} exited with code 3"):
++            await launcher.verify(second)
++        await launcher.aclose()
++        return first, second, running
++
++    first, second, running = asyncio.run(scenario())
++    assert second.instance_id != first.instance_id
++    assert running is False
++    assert len(_starts(report)) == 2
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize(
++    ("request_options", "message"),
++    [
++        pytest.param(
++            {"provider": "tgi"},
++            "runtime provider 'tgi' is not served by the vllm-process launcher (it serves 'vllm')",
++            id="other-runtime",
++        ),
++        pytest.param({"provider": "vLLM"}, "runtime provider 'vLLM'", id="provider-spelling"),
++        pytest.param(
++            {"reference": "  "},
++            "spec.model.reference must name the model to serve",
++            id="blank-model",
++        ),
++        pytest.param(
++            {"devices": (("node-a", "gpu-0"), ("node-b", "gpu-0"))},
++            "devices on node(s) node-b cannot be used: the vllm-process launcher runs "
++            "instances on node 'node-a' only",
++            id="other-node",
++        ),
++        pytest.param(
++            {"devices": (("node-a", "accel-0"),)},
++            "device id 'accel-0' is neither a CUDA device index",
++            id="device-id",
++        ),
++    ],
++)
++def test_launch_refuses_requests_it_cannot_serve_without_starting_a_process(
++    tmp_path: Path, request_options: dict[str, Any], message: str
++) -> None:
++    launcher, report = _launcher(tmp_path)
++
++    async def scenario() -> str:
++        with pytest.raises(ValueError) as caught:
++            await launcher.launch(_request(**request_options))
++        await launcher.aclose()
++        return str(caught.value)
++
++    assert message in asyncio.run(scenario())
++    assert _starts(report) == []
++
++
++@pytest.mark.unit
++def test_a_command_that_cannot_be_started_leaves_no_instance_behind(tmp_path: Path) -> None:
++    launcher = VLLMProcessLauncher("node-a", command=[str(tmp_path / "no-such-vllm")])
++
++    async def scenario() -> None:
++        for _ in range(2):
++            with pytest.raises(FileNotFoundError):
++                await launcher.launch(_request())
++        await launcher.aclose()
++
++    asyncio.run(scenario())
++
++
++# ---------------------------------------------------------------------- #
++# 就绪
++# ---------------------------------------------------------------------- #
++
++
++@pytest.mark.unit
++def test_verify_waits_until_the_instance_answers_health(tmp_path: Path) -> None:
++    launcher, _ = _launcher(tmp_path, "--delay", "0.3")
++
++    async def scenario() -> float:
++        instance = await launcher.launch(_request())
++        started = time.monotonic()
++        await launcher.verify(instance)
++        waited = time.monotonic() - started
++        await launcher.aclose()
++        return waited
++
++    assert asyncio.run(scenario()) >= 0.3
++
++
++@pytest.mark.unit
++def test_verify_fails_when_the_instance_does_not_become_healthy_in_time(tmp_path: Path) -> None:
++    launcher, _ = _launcher(tmp_path, "--mode", "hang", ready_timeout=0.3)
++
++    async def scenario() -> tuple[float, bool, bool]:
++        instance = await launcher.launch(_request())
++        with pytest.raises(
++            RuntimeError,
++            match=rf"instance {instance.instance_id} did not become healthy within 0\.3s of its "
++            "start",
++        ):
++            await launcher.verify(instance)
++        started = time.monotonic()
++        with pytest.raises(RuntimeError, match="did not become healthy"):
++            await launcher.verify(instance)
++        retried = time.monotonic() - started
++        running = await launcher.is_running(instance.instance_id)
++        await launcher.stop(instance.instance_id)
++        return retried, running, await launcher.is_running(instance.instance_id)
++
++    retried, running, after_stop = asyncio.run(scenario())
++    assert retried < 0.3
++    assert (running, after_stop) == (True, False)
++
++
++@pytest.mark.unit
++def test_an_unknown_instance_is_not_running_and_fails_verification_at_once(
++    tmp_path: Path,
++) -> None:
++    launcher, _ = _launcher(tmp_path)
++    instance = LaunchedInstance(
++        instance_id="vllm-gone", url="http://127.0.0.1:9", protocol=EndpointProtocol.OPENAI_CHAT
++    )
++
++    async def scenario() -> bool:
++        running = await launcher.is_running("vllm-gone")
++        with pytest.raises(RuntimeError, match="instance vllm-gone is not running"):
++            await launcher.verify(instance)
++        await launcher.stop("vllm-gone")
++        return running
++
++    assert asyncio.run(scenario()) is False
++
++
++# ---------------------------------------------------------------------- #
++# 停止
++# ---------------------------------------------------------------------- #
++
++
++@pytest.mark.unit
++def test_stop_kills_an_instance_that_ignores_sigterm_after_the_grace_period(
++    tmp_path: Path, caplog: pytest.LogCaptureFixture
++) -> None:
++    launcher, report = _launcher(tmp_path, "--ignore-sigterm", stop_grace=0.2)
++
++    async def scenario() -> tuple[LaunchedInstance, bool, bool]:
++        instance = await launcher.launch(_request())
++        await launcher.verify(instance)
++        await launcher.stop(instance.instance_id)
++        running = await launcher.is_running(instance.instance_id)
++        return instance, running, await _refused(_port(instance))
++
++    with caplog.at_level(logging.WARNING, logger=LOGGER):
++        instance, running, refused = asyncio.run(scenario())
++    [start] = _starts(report)
++    assert (running, refused) == (False, True)
++    assert _gone(start["pid"])
++    assert (
++        f"vLLM instance {instance.instance_id} (pid {start['pid']}) did not exit within 0.2s of "
++        "SIGTERM; killing it"
++    ) in caplog.text
++
++
++@pytest.mark.unit
++def test_stop_ends_every_process_of_the_instance(tmp_path: Path) -> None:
++    launcher, report = _launcher(tmp_path, "--spawn-child")
++
++    async def scenario() -> bool:
++        instance = await launcher.launch(_request())
++        await launcher.verify(instance)
++        await launcher.stop(instance.instance_id)
++        return await _wait_gone(_starts(report)[0]["child_pid"])
++
++    try:
++        assert asyncio.run(scenario())
++    finally:
++        for start in _starts(report):
++            with contextlib.suppress(ProcessLookupError):
++                os.kill(start["child_pid"], signal.SIGKILL)
++
++
++@pytest.mark.unit
++def test_aclose_stops_every_instance_and_refuses_new_launches(tmp_path: Path) -> None:
++    launcher, report = _launcher(tmp_path)
++
++    async def scenario() -> tuple[list[bool], list[bool]]:
++        instances = [await launcher.launch(_request(uid)) for uid in ("uid-1", "uid-2")]
++        for instance in instances:
++            await launcher.verify(instance)
++        await launcher.aclose()
++        running = [await launcher.is_running(instance.instance_id) for instance in instances]
++        refused = [await _refused(_port(instance)) for instance in instances]
++        with pytest.raises(RuntimeError, match="the vLLM process launcher is closed"):
++            await launcher.launch(_request("uid-3"))
++        return running, refused
++
++    running, refused = asyncio.run(scenario())
++    starts = _starts(report)
++    assert (running, refused) == ([False, False], [True, True])
++    assert len(starts) == 2
++    assert all(_gone(start["pid"]) for start in starts)
++
++
++# ---------------------------------------------------------------------- #
++# 设备 id 与配置
++# ---------------------------------------------------------------------- #
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize(
++    ("device_id", "expected"),
++    [
++        ("0", "0"),
++        ("gpu-3", "3"),
++        ("gpu-010", "10"),
++        (GPU_UUID, GPU_UUID),
++        ("MIG-5c6a3b4d-1e2f-4a5b-8c9d-0e1f2a3b4c5d", "MIG-5c6a3b4d-1e2f-4a5b-8c9d-0e1f2a3b4c5d"),
++        (f"MIG-{GPU_UUID}/1/0", f"MIG-{GPU_UUID}/1/0"),
++    ],
++)
++def test_cuda_device_maps_inventory_device_ids(device_id: str, expected: str) -> None:
++    assert cuda_device(device_id) == expected
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize(
++    "device_id", ["", "gpu-", "gpu0", "GPU-", "mig-0", "nvidia0", "0,1", " 0", "gpu-1 ", "\u0663"]
++)
++def test_cuda_device_refuses_ids_cuda_cannot_select(device_id: str) -> None:
++    with pytest.raises(ValueError, match="is neither a CUDA device index"):
++        cuda_device(device_id)
++
++
++@pytest.mark.unit
++def test_the_default_command_runs_vllm_with_the_control_plane_interpreter() -> None:
++    launcher = VLLMProcessLauncher("node-a")
++
++    assert launcher.command == (sys.executable, "-m", "vllm.entrypoints.openai.api_server")
++    assert launcher.node_id == "node-a"
++    assert (launcher.bind_host, launcher.advertise_host) == ("127.0.0.1", "127.0.0.1")
++    assert (launcher.ready_timeout, launcher.stop_grace) == (1200.0, 10.0)
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize(
++    ("options", "message"),
++    [
++        ({"node_id": ""}, "node_id must not be empty"),
++        ({"command": ()}, "the vLLM command must not be empty"),
++        ({"command": ("",)}, "the vLLM command must not be empty"),
++        ({"command": "vllm serve"}, "must be a sequence of arguments, not a string"),
++        ({"bind_host": "localhost"}, "'localhost' is not an IP address"),
++        ({"bind_host": "::"}, "an advertise host is required when listening on ::"),
++        ({"advertise_host": "0.0.0.0"}, "'0.0.0.0' is a wildcard address"),
++        ({"advertise_host": "vllm_host"}, "is neither an IP address nor a host name"),
++        ({"ready_timeout": 0}, "ready_timeout must be a positive number of seconds"),
++        ({"stop_grace": -1.0}, "stop_grace must be a positive number of seconds"),
++        ({"poll_interval": math.inf}, "poll_interval must be a positive number of seconds"),
++        ({"ready_timeout": math.nan}, "ready_timeout must be a positive number of seconds"),
++    ],
++)
++def test_invalid_settings_are_refused(options: dict[str, Any], message: str) -> None:
++    settings: dict[str, Any] = {"node_id": "node-a", **options}
++
++    with pytest.raises(ValueError) as caught:
++        VLLMProcessLauncher(**settings)
++
++    assert message in str(caught.value)
+diff --git a/tests/unit/controlplane/vllm_standin.py b/tests/unit/controlplane/vllm_standin.py
+new file mode 100644
+index 0000000..2831028
+--- /dev/null
++++ b/tests/unit/controlplane/vllm_standin.py
+@@ -0,0 +1,75 @@
++"""vLLM OpenAI 兼容服务的替身，供 vLLM 进程启动器的测试代替 ``python -m vllm...`` 运行。
++
++接受启动器追加的 ``--model=… --host … --port … --tensor-parallel-size …``，每次启动向
++``--report`` 文件追加一行 JSON（参数、进程与会话 id、相关环境变量、派生的子进程），然后按
++``--mode`` 行事：``serve``（``--delay`` 秒后监听，``GET /health`` 返回 200）、``exit``（以
++退出码 3 结束）、``hang``（从不监听）。``--ignore-sigterm`` 忽略 ``SIGTERM``；
++``--spawn-child`` 派生一个忽略 ``SIGTERM`` 的子进程（同一进程组）。
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import os
++import signal
++import subprocess
++import sys
++import time
++from http.server import BaseHTTPRequestHandler, HTTPServer
++
++_CHILD = "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(600)"
++
++
++class _Health(BaseHTTPRequestHandler):
++    def do_GET(self) -> None:  # noqa: N802 - http.server 约定命名
++        self.send_response(200 if self.path == "/health" else 404)
++        self.send_header("Content-Length", "0")
++        self.end_headers()
++
++    def log_message(self, format: str, *args: object) -> None:  # noqa: A002
++        return
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--report", required=True)
++    parser.add_argument("--mode", choices=["serve", "exit", "hang"], default="serve")
++    parser.add_argument("--delay", type=float, default=0.0)
++    parser.add_argument("--ignore-sigterm", action="store_true")
++    parser.add_argument("--spawn-child", action="store_true")
++    parser.add_argument("--model", required=True)
++    parser.add_argument("--host", required=True)
++    parser.add_argument("--port", type=int, required=True)
++    parser.add_argument("--tensor-parallel-size", type=int, required=True)
++    args = parser.parse_args()
++    if args.ignore_sigterm:
++        signal.signal(signal.SIGTERM, signal.SIG_IGN)
++    child = subprocess.Popen([sys.executable, "-c", _CHILD]) if args.spawn_child else None
++    report = {
++        "argv": sys.argv[1:],
++        "model": args.model,
++        "host": args.host,
++        "port": args.port,
++        "tensor_parallel_size": args.tensor_parallel_size,
++        "pid": os.getpid(),
++        "sid": os.getsid(0),
++        "child_pid": child.pid if child else None,
++        "env": {
++            name: os.environ.get(name)
++            for name in ("CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER", "FORGEMESH_STANDIN_SECRET")
++        },
++    }
++    with open(args.report, "a", encoding="utf-8") as file:
++        file.write(json.dumps(report) + "\n")
++    if args.mode == "exit":
++        sys.exit(3)
++    if args.mode == "hang":
++        while True:
++            time.sleep(60)
++    time.sleep(args.delay)
++    HTTPServer((args.host, args.port), _Health).serve_forever()
++
++
++if __name__ == "__main__":
++    main()
+-- 
+2.43.0
+

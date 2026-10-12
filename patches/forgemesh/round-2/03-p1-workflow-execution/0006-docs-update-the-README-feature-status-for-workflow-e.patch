@@ -1,0 +1,38 @@
+From b5329dbecec6077aad81b5c4bd7493ec919c992b Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 12 Oct 2026 16:14:56 +0000
+Subject: [PATCH 6/6] docs: update the README feature status for workflow
+ execution
+
+The reference workflow runtime now executes the steps of a run in the
+background, so drop the note that start() only records the run.
+Refresh the test count.
+---
+ README.md | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/README.md b/README.md
+index 3fc19a2..bea2ee4 100644
+--- a/README.md
++++ b/README.md
+@@ -221,7 +221,7 @@ ForgeMesh 目前处于预览阶段，API 稳定性标注为 `beta`：minor 版
+ 
+ ### 工作流与决策（M3）
+ - **工作流引擎**：持久化执行，幂等去重，三级超时，重试策略
+-- **参考执行器**：DSL 解析，补偿步骤（反向执行），审批等待与重校验（现状：参考工作流运行时的 `start()` 只登记运行、不执行步骤）
++- **参考执行器**：DSL 解析，补偿步骤（反向执行），审批等待与重校验
+ - **熔断器与降级**：closed/open/half-open 状态机，按风险决定是否尝试备用
+ - **决策插件**：decision-rules（确定性规则）、decision-jev（JEV 类型化决策）
+ 
+@@ -254,7 +254,7 @@ ForgeMesh 目前处于预览阶段，API 稳定性标注为 `beta`：minor 版
+ 
+ | 类型 | 数量 |
+ |------|------|
+-| Python 测试 | **1350** |
++| Python 测试 | **1479** |
+ | Go 测试 | 134 个测试函数，全部通过 |
+ | ruff 检查 | All checks passed |
+ 
+-- 
+2.43.0
+

@@ -1,7 +1,7 @@
-From 7eb7ba91f4f59fd5b4fb727cb5db0d4bbc74d040 Mon Sep 17 00:00:00 2001
+From 3dea186cdd3fa859919ffd5ae4d3996492b2a826 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Mon, 12 Oct 2026 13:25:22 +0000
-Subject: [PATCH 8/8] docs: document the scheduler, the inventory file and uid
+Subject: [PATCH 8/9] docs: document the scheduler, the inventory file and uid
  allocations
 
 README lists FORGEMESH_INVENTORY_FILE with the inventory format and
@@ -30,7 +30,7 @@ guide lists allocation_devices among the tables a backup contains.
  4 files changed, 36 insertions(+), 14 deletions(-)
 
 diff --git a/CHANGELOG.md b/CHANGELOG.md
-index 2045c3c..e8334f4 100644
+index aa8b52e..5079683 100644
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
 @@ -27,6 +27,9 @@
@@ -43,7 +43,7 @@ index 2045c3c..e8334f4 100644
  
  ### Changed
  
-@@ -52,6 +55,9 @@
+@@ -53,6 +56,9 @@
  - README 与 CONTRIBUTING 的安装命令改为 `make install`：在仓库根目录执行 `uv sync` 只会创建一个空的虚拟环境，随后 `make test` 找不到 pytest。README 目录树列出全部 10 个插件，并补充容器部署说明。
  - [docs/architecture/module-mapping.md](docs/architecture/module-mapping.md)：更正网关文件与测试数量（33 / 17）和上游变量名（`GATEWAY_UPSTREAM_URL`），部署小节与 CI 小节按当前工件更新，偏差 D2 处置后移除。
  - 删除源码与测试 docstring 中「兼容 Python 3.9+」/「兼容 3.9–3.12」的说法（各子包 `requires-python` 已是 `>=3.12`，代码使用 `X | None` 与 `enum.StrEnum`，在 3.9 上无法导入）；CONTRIBUTING 的类型注解约定改为与 ruff `UP` 规则一致的 `list[X]` / `X | None`。
@@ -53,7 +53,7 @@ index 2045c3c..e8334f4 100644
  
  ### Deprecated
  
-@@ -69,7 +75,7 @@
+@@ -78,7 +84,7 @@
  - `request_delete` 与 `release_allocation` 读后写不校验版本，期间提交的写入会丢失、期间追加的 finalizer 会被绕过：现以读取到的 `resource_version` / 状态为条件做 CAS，竞争失败抛出 `ConflictError`（DELETE 端点返回 `409`）。
  - 调和器在 deny / require_approval / 分配失败等无副作用路径上也记录去重键，重新入队后命中幂等短路，被阻塞的资源在 spec 变更或 24h 去重 TTL 过期前不会被重新评估：这些路径不再记录去重键。
  - 生产代码中没有任何地方驱动调和器，创建的资源永远停在 `Pending`、`status` 从不更新：现由控制器驱动（见 Added）。
@@ -62,7 +62,7 @@ index 2045c3c..e8334f4 100644
  - 网关把入站路径原样拼接到实例地址，请求以 `/api/v1/inference/{svc}/chat` 到达推理运行时，而 vLLM 与 TGI 都不提供这个路径：现按实例的 `protocol` 转发到 `/v1/chat/completions`（`openai-chat`）或 `/generate_stream`（`tgi-generate`），查询串保留。
  - 网关解析推理服务时不带命名空间，控制平面因此只查找不带命名空间的服务，带命名空间的服务无法经网关调用：现由带命名空间的路由解析（见 Added）。
  - OpenAPI 没有描述 `GET` / `DELETE /api/v1/inference-services/{name}` 的 `namespace` 查询参数，而实现一直支持它，网关解析带命名空间的服务时也依赖它：现已补上，并写明省略时指不带命名空间的资源（列表接口省略时则不按命名空间过滤）。
-@@ -80,6 +86,10 @@
+@@ -89,6 +95,10 @@
  - compose 拓扑无法运行（module-mapping 偏差 D2）：引用的 `Dockerfile.control-plane` 不存在，gateway 没有构建配置；compose 设置的 `FORGEMESH_UPSTREAM` 网关并不读取（网关读取 `GATEWAY_UPSTREAM_URL`），端口写成 `8000`（网关监听 `8081`）；控制平面默认只监听容器内的回环地址，网关访问不到；数据库写在容器文件系统中，重建容器即丢失；控制平面依赖它并不使用的 postgres，postgres 以默认口令发布在所有网卡上。现改为见 Changed。
  - Kubernetes 控制平面清单把数据库写在容器文件系统中，Pod 重建即丢失全部资源；默认的 `RollingUpdate` 在更新期间同时运行新旧两个 Pod，违反 ADR-013 的单写者约束；控制平面默认只监听回环地址，kubelet 探针访问不到。现改为 PVC + `Recreate`，并设置 `FORGEMESH_HOST=0.0.0.0`（见 Changed）。
  - `tests/unit/controlplane/test_registry.py` 有两处 `reg.close()` 未被 await，关闭逻辑从未执行。
@@ -74,7 +74,7 @@ index 2045c3c..e8334f4 100644
  ### Security
  
 diff --git a/README.md b/README.md
-index 371feb4..133b280 100644
+index 9d63b0f..fdb1599 100644
 --- a/README.md
 +++ b/README.md
 @@ -159,10 +159,22 @@ curl -s -H "Authorization: Bearer fmk_…" http://127.0.0.1:8080/api/v1/inferenc
@@ -102,7 +102,7 @@ index 371feb4..133b280 100644
  ### Go 网关
  
 diff --git a/docs/architecture/module-mapping.md b/docs/architecture/module-mapping.md
-index f786404..63549fc 100644
+index 8b3b9bd..314f947 100644
 --- a/docs/architecture/module-mapping.md
 +++ b/docs/architecture/module-mapping.md
 @@ -91,12 +91,12 @@

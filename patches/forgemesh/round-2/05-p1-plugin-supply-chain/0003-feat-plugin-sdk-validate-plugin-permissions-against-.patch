@@ -1,7 +1,7 @@
-From 78a62dce6dd62c389a2afab82cb26ee316c5e0d5 Mon Sep 17 00:00:00 2001
+From a98a9f50c4009c2dbee8c7f19c1420e5b8bbd93c Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Mon, 12 Oct 2026 12:35:58 +0000
-Subject: [PATCH 3/8] feat(plugin-sdk): validate plugin permissions against one
+Subject: [PATCH 3/9] feat(plugin-sdk): validate plugin permissions against one
  vocabulary
 
 Manifests request dotted permissions such as network.egress and
@@ -438,7 +438,7 @@ index 7c4ae34..162f751 100644
  
  # ===========================================================================
 diff --git a/tests/compat/test_plugin_conformance_v11.py b/tests/compat/test_plugin_conformance_v11.py
-index 3b8f1a4..7c12cf9 100644
+index 7815cf6..1ebc43c 100644
 --- a/tests/compat/test_plugin_conformance_v11.py
 +++ b/tests/compat/test_plugin_conformance_v11.py
 @@ -31,7 +31,6 @@ from __future__ import annotations

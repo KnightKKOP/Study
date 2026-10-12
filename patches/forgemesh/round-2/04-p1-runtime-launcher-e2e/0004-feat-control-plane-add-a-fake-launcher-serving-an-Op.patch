@@ -1,0 +1,1082 @@
+From 48d77bd9dd3c58aef82e100055238d823df928b8 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 12 Oct 2026 16:49:01 +0000
+Subject: [PATCH 04/10] feat(control-plane): add a fake launcher serving an
+ OpenAI-compatible stub
+
+CI and local development need deployments that reach Ready and answer
+requests through the gateway without GPUs or model weights.
+
+FakeLauncher starts one asyncio HTTP server per instance on an
+ephemeral port, inside the control plane's event loop and with the
+standard library only (no threads). Each instance answers GET /health
+and POST /v1/chat/completions: with "stream": true an SSE stream of
+chat.completion.chunk events ending with "data: [DONE]", otherwise one
+chat.completion object; the reply names the instance. Requests are
+bounded (Content-Length up to 1 MiB, 30 s to read) and get OpenAI-style
+errors. The listen address and the host written into instance urls are
+separate, so a container can listen on 0.0.0.0 and advertise its
+compose service name. stop() closes the server and cancels requests in
+flight, releasing the port; aclose() stops every instance; verify()
+fails at once for instances it does not know, e.g. after a restart.
+
+network.py holds what the process launcher will share: bind and
+advertise host validation, instance urls, and a GET /health probe over
+asyncio streams that never goes through an HTTP proxy.
+---
+ .../controlplane/deployment/__init__.py       |   5 +
+ .../forgemesh/controlplane/deployment/fake.py | 356 ++++++++++++++++
+ .../controlplane/deployment/network.py        | 114 ++++++
+ tests/unit/controlplane/test_fake_launcher.py | 384 ++++++++++++++++++
+ .../controlplane/test_launcher_network.py     | 134 ++++++
+ 5 files changed, 993 insertions(+)
+ create mode 100644 packages/control-plane/src/forgemesh/controlplane/deployment/fake.py
+ create mode 100644 packages/control-plane/src/forgemesh/controlplane/deployment/network.py
+ create mode 100644 tests/unit/controlplane/test_fake_launcher.py
+ create mode 100644 tests/unit/controlplane/test_launcher_network.py
+
+diff --git a/packages/control-plane/src/forgemesh/controlplane/deployment/__init__.py b/packages/control-plane/src/forgemesh/controlplane/deployment/__init__.py
+index 60bffa1..67daeae 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/deployment/__init__.py
++++ b/packages/control-plane/src/forgemesh/controlplane/deployment/__init__.py
+@@ -5,6 +5,9 @@
+ * :mod:`.release` —— 删除资源时取消部署、停止实例的 :class:`DeploymentReleaser`；
+ * :mod:`.recovery` —— 重启之后把实例已不在运行的 ``Ready`` 服务转为 ``Degraded`` 的
+   :func:`mark_lost_instances`；
++* :mod:`.fake` —— 在控制平面进程内为每个实例提供 OpenAI 兼容桩服务的
++  :class:`FakeLauncher`（CI 与本地开发）；
++* :mod:`.network` —— 启动器共用的地址校验与健康检查；
+ * :mod:`.memory` —— 测试替身 :class:`InMemoryLauncher`。
+ 
+ 本包只依赖工作流契约（``forgemesh-workflow-api``），不依赖具体的工作流运行时。
+@@ -12,6 +15,7 @@
+ 
+ from __future__ import annotations
+ 
++from .fake import FakeLauncher
+ from .launcher import LaunchedInstance, LaunchRequest, RuntimeLauncher
+ from .memory import InMemoryLauncher
+ from .recovery import INSTANCE_LOST_REASON, mark_lost_instances
+@@ -37,6 +41,7 @@ __all__ = [
+     "VERIFY_INSTANCE",
+     "DeploymentReleaser",
+     "DeploymentSteps",
++    "FakeLauncher",
+     "InMemoryLauncher",
+     "LaunchRequest",
+     "LaunchedInstance",
+diff --git a/packages/control-plane/src/forgemesh/controlplane/deployment/fake.py b/packages/control-plane/src/forgemesh/controlplane/deployment/fake.py
+new file mode 100644
+index 0000000..e364e42
+--- /dev/null
++++ b/packages/control-plane/src/forgemesh/controlplane/deployment/fake.py
+@@ -0,0 +1,356 @@
++"""假推理运行时：每个实例是控制平面进程内的一个 OpenAI 兼容 HTTP 桩服务。
++
++供 CI 与本地开发使用（不需要 GPU，不加载模型）。:class:`FakeLauncher` 为每个实例在一个
++临时端口上启动一个 asyncio HTTP 服务（只用标准库，运行在控制平面的事件循环中，不开
++线程）：
++
++* ``GET /health`` → ``200``；
++* ``POST /v1/chat/completions`` → 请求体须是带非空 ``messages`` 数组的 JSON 对象；
++  ``"stream": true`` 时以 SSE 返回若干 ``chat.completion.chunk`` 事件（每个一行
++  ``data: {...}``），以 ``data: [DONE]`` 结束，否则返回一个 ``chat.completion`` 对象。
++  回复内容固定，含实例 id。
++
++每个连接只处理一个请求（``Connection: close``）；请求体须以 ``Content-Length`` 给出长度，
++至多 1 MiB。
++
++实例只存在于控制平面进程中，重启之后不复存在（重启之前 ``Ready`` 的服务随之转为
++``Degraded``，见 :mod:`.recovery`）。
++"""
++
++from __future__ import annotations
++
++import asyncio
++import functools
++import json
++import logging
++import socket
++import time
++import uuid
++from dataclasses import dataclass, field
++from http import HTTPStatus
++from typing import Any
++
++from forgemesh.resource.inference import EndpointProtocol
++
++from .launcher import LaunchedInstance, LaunchRequest, RuntimeLauncher
++from .network import instance_url, local_address, probe_health, resolve_hosts, socket_family
++
++logger = logging.getLogger(__name__)
++
++#: 默认监听地址（同时也是默认写进实例地址的主机）。
++DEFAULT_BIND_HOST = "127.0.0.1"
++#: 读取一个请求（请求头与请求体）的时限（秒）。
++REQUEST_TIMEOUT_SECONDS = 30.0
++#: 请求体的上限（字节）。
++MAX_BODY_BYTES = 1024 * 1024
++
++_HEALTH_PATH = "/health"
++_CHAT_PATH = "/v1/chat/completions"
++
++
++class _HttpError(Exception):
++    def __init__(self, status: HTTPStatus, message: str, *, allow: str | None = None) -> None:
++        super().__init__(message)
++        self.status = status
++        self.allow = allow
++
++
++@dataclass(eq=False)
++class _Instance:
++    key: str
++    instance: LaunchedInstance
++    model: str
++    server: asyncio.Server
++    port: int
++    connections: set[asyncio.Task[None]] = field(default_factory=set)
++
++
++def _response(
++    status: HTTPStatus, body: bytes, content_type: str, headers: dict[str, str] | None = None
++) -> bytes:
++    lines = [
++        f"HTTP/1.1 {status.value} {status.phrase}",
++        f"Content-Type: {content_type}",
++        f"Content-Length: {len(body)}",
++        *(f"{name}: {value}" for name, value in (headers or {}).items()),
++        "Connection: close",
++        "",
++        "",
++    ]
++    return "\r\n".join(lines).encode("latin-1") + body
++
++
++def _error_response(error: _HttpError) -> bytes:
++    body = {"error": {"message": str(error), "type": "invalid_request_error", "code": None}}
++    headers = {"Allow": error.allow} if error.allow else None
++    return _response(error.status, json.dumps(body).encode(), "application/json", headers)
++
++
++def _event(payload: dict[str, Any]) -> bytes:
++    return b"data: " + json.dumps(payload, separators=(",", ":")).encode() + b"\n\n"
++
++
++def _parse_head(head: bytes) -> tuple[str, str, dict[str, str]]:
++    """解析请求行与请求头，返回 ``(method, path, headers)``（头名小写，路径不含查询串）。"""
++    request_line, *header_lines = head.decode("latin-1").split("\r\n")
++    parts = request_line.split(" ")
++    if len(parts) != 3 or not parts[2].startswith("HTTP/1."):
++        raise _HttpError(HTTPStatus.BAD_REQUEST, "malformed request line")
++    method, target, _ = parts
++    headers: dict[str, str] = {}
++    for line in header_lines:
++        if not line:
++            continue
++        name, separator, value = line.partition(":")
++        if not separator or not name.strip():
++            raise _HttpError(HTTPStatus.BAD_REQUEST, "malformed header line")
++        headers[name.strip().lower()] = value.strip()
++    return method, target.split("?", 1)[0], headers
++
++
++async def _read_body(
++    reader: asyncio.StreamReader, writer: asyncio.StreamWriter, headers: dict[str, str]
++) -> bytes:
++    if "transfer-encoding" in headers:
++        raise _HttpError(HTTPStatus.LENGTH_REQUIRED, "send the request body with Content-Length")
++    length = headers.get("content-length")
++    if length is None:
++        return b""
++    if not (length.isascii() and length.isdigit()):
++        raise _HttpError(HTTPStatus.BAD_REQUEST, "invalid Content-Length")
++    size = int(length)
++    if size > MAX_BODY_BYTES:
++        raise _HttpError(
++            HTTPStatus.REQUEST_ENTITY_TOO_LARGE, f"the request body exceeds {MAX_BODY_BYTES} bytes"
++        )
++    if size and headers.get("expect", "").lower() == "100-continue":
++        writer.write(b"HTTP/1.1 100 Continue\r\n\r\n")
++    return await reader.readexactly(size)
++
++
++class FakeLauncher(RuntimeLauncher):
++    """为每个实例启动一个 OpenAI 兼容桩服务的启动器（见模块说明）。
++
++    Args:
++        bind_host: 实例监听的 IP 地址，默认 ``127.0.0.1``；``0.0.0.0`` / ``::`` 监听全部
++            地址。
++        advertise_host: 写进实例地址的主机名或 IP 地址，默认同 ``bind_host``；监听全部
++            地址时必须给出（如 compose 中网关可以解析的服务名 ``control-plane``）。
++
++    Raises:
++        ValueError: 地址非法，或监听全部地址却没有给出 ``advertise_host``。
++    """
++
++    def __init__(
++        self, bind_host: str = DEFAULT_BIND_HOST, advertise_host: str | None = None
++    ) -> None:
++        self._bind_host, self._advertise_host = resolve_hosts(bind_host, advertise_host)
++        self._probe_host = local_address(self._bind_host)
++        self._by_key: dict[str, _Instance] = {}
++        self._by_id: dict[str, _Instance] = {}
++        self._closed = False
++
++    @property
++    def bind_host(self) -> str:
++        """实例监听的地址。"""
++        return self._bind_host
++
++    @property
++    def advertise_host(self) -> str:
++        """写进实例地址的主机。"""
++        return self._advertise_host
++
++    async def launch(self, request: LaunchRequest) -> LaunchedInstance:
++        """返回 ``instance_key`` 对应的运行中实例，没有时在新的临时端口上启动一个。
++
++        Raises:
++            RuntimeError: 启动器已关闭。
++            OSError: 无法监听。
++        """
++        if self._closed:
++            raise RuntimeError("the fake launcher is closed")
++        existing = self._by_key.get(request.instance_key)
++        if existing is not None:
++            return existing.instance
++        instance_id = f"fake-{uuid.uuid4().hex[:12]}"
++        sock = socket.create_server((self._bind_host, 0), family=socket_family(self._bind_host))
++        try:
++            server = await asyncio.start_server(
++                functools.partial(self._serve, instance_id), sock=sock, start_serving=False
++            )
++        except BaseException:
++            sock.close()
++            raise
++        port = sock.getsockname()[1]
++        state = _Instance(
++            key=request.instance_key,
++            instance=LaunchedInstance(
++                instance_id=instance_id,
++                url=instance_url(self._advertise_host, port),
++                protocol=EndpointProtocol.OPENAI_CHAT,
++            ),
++            model=request.spec.model.reference,
++            server=server,
++            port=port,
++        )
++        self._by_key[state.key] = state
++        self._by_id[instance_id] = state
++        try:
++            await server.start_serving()
++        except BaseException:
++            self._forget(state)
++            server.close()
++            raise
++        logger.info(
++            "fake instance started: instance_id=%s url=%s listen=%s:%d instance_key=%s",
++            instance_id,
++            state.instance.url,
++            self._bind_host,
++            port,
++            state.key,
++        )
++        return state.instance
++
++    async def verify(self, instance: LaunchedInstance) -> None:
++        """实例不在运行（如重启之前的实例）时立即抛出，否则检查它的 ``GET /health``。"""
++        state = self._by_id.get(instance.instance_id)
++        if state is None:
++            raise RuntimeError(f"instance {instance.instance_id} is not running")
++        if not await probe_health(self._probe_host, state.port):
++            raise RuntimeError(f"instance {instance.instance_id} does not answer GET /health")
++
++    async def stop(self, instance_id: str) -> None:
++        """停止监听并中断实例正在处理的请求，端口随之释放。"""
++        state = self._by_id.get(instance_id)
++        if state is not None:
++            self._forget(state)
++            await self._shutdown(state)
++
++    async def is_running(self, instance_id: str) -> bool:
++        return instance_id in self._by_id
++
++    async def aclose(self) -> None:
++        """停止全部实例；之后 :meth:`launch` 抛出 :class:`RuntimeError`。"""
++        self._closed = True
++        states = list(self._by_id.values())
++        for state in states:
++            self._forget(state)
++        await asyncio.gather(*(self._shutdown(state) for state in states))
++
++    def _forget(self, state: _Instance) -> None:
++        self._by_id.pop(state.instance.instance_id, None)
++        if self._by_key.get(state.key) is state:
++            del self._by_key[state.key]
++
++    async def _shutdown(self, state: _Instance) -> None:
++        state.server.close()
++        connections = list(state.connections)
++        for task in connections:
++            task.cancel()
++        await asyncio.gather(*connections, return_exceptions=True)
++        await state.server.wait_closed()
++        logger.info("fake instance stopped: instance_id=%s", state.instance.instance_id)
++
++    async def _serve(
++        self, instance_id: str, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
++    ) -> None:
++        state = self._by_id.get(instance_id)
++        task = asyncio.current_task()
++        if state is None or task is None:
++            writer.transport.abort()
++            return
++        state.connections.add(task)
++        try:
++            await self._exchange(state, reader, writer)
++        except asyncio.CancelledError:
++            writer.transport.abort()
++            raise
++        except Exception as exc:  # noqa: BLE001 - 客户端断开或发来无法解析的请求：只影响这个连接
++            logger.debug("fake instance %s dropped a connection: %r", instance_id, exc)
++            writer.transport.abort()
++        else:
++            writer.close()
++        finally:
++            state.connections.discard(task)
++
++    async def _exchange(
++        self, state: _Instance, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
++    ) -> None:
++        try:
++            async with asyncio.timeout(REQUEST_TIMEOUT_SECONDS):
++                method, path, headers = _parse_head(await reader.readuntil(b"\r\n\r\n"))
++                body = await _read_body(reader, writer, headers)
++            parts = self._handle(state, method, path, body)
++        except _HttpError as error:
++            parts = [_error_response(error)]
++        for part in parts:
++            writer.write(part)
++            await writer.drain()
++
++    def _handle(self, state: _Instance, method: str, path: str, body: bytes) -> list[bytes]:
++        """按路由生成响应：完整响应只有一段，流式响应是响应头加上每个事件。"""
++        if path == _HEALTH_PATH:
++            if method != "GET":
++                raise _HttpError(HTTPStatus.METHOD_NOT_ALLOWED, "use GET", allow="GET")
++            return [_response(HTTPStatus.OK, b"", "text/plain")]
++        if path == _CHAT_PATH:
++            if method != "POST":
++                raise _HttpError(HTTPStatus.METHOD_NOT_ALLOWED, "use POST", allow="POST")
++            return self._chat(state, body)
++        raise _HttpError(HTTPStatus.NOT_FOUND, f"no route for {path}")
++
++    def _chat(self, state: _Instance, body: bytes) -> list[bytes]:
++        try:
++            payload = json.loads(body)
++        except ValueError:
++            raise _HttpError(HTTPStatus.BAD_REQUEST, "the request body is not valid JSON") from None
++        messages = payload.get("messages") if isinstance(payload, dict) else None
++        if not isinstance(messages, list) or not messages:
++            raise _HttpError(
++                HTTPStatus.BAD_REQUEST, "the request needs a non-empty 'messages' array"
++            )
++        stream = payload.get("stream", False)
++        if not isinstance(stream, bool):
++            raise _HttpError(HTTPStatus.BAD_REQUEST, "'stream' must be a boolean")
++        model = payload.get("model")
++        common = {
++            "id": f"chatcmpl-{uuid.uuid4().hex}",
++            "created": int(time.time()),
++            "model": model if isinstance(model, str) else state.model,
++        }
++        text = f"Hello from the ForgeMesh fake instance {state.instance.instance_id}."
++        if not stream:
++            completion = {
++                **common,
++                "object": "chat.completion",
++                "choices": [
++                    {
++                        "index": 0,
++                        "message": {"role": "assistant", "content": text},
++                        "finish_reason": "stop",
++                    }
++                ],
++            }
++            return [_response(HTTPStatus.OK, json.dumps(completion).encode(), "application/json")]
++        words = text.split(" ")
++        deltas: list[dict[str, Any]] = [
++            {"role": "assistant", "content": ""},
++            {"content": words[0]},
++            *({"content": " " + word} for word in words[1:]),
++        ]
++        chunk = {**common, "object": "chat.completion.chunk"}
++        events = [
++            _event({**chunk, "choices": [{"index": 0, "delta": delta, "finish_reason": None}]})
++            for delta in deltas
++        ]
++        events.append(
++            _event({**chunk, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
++        )
++        head = (
++            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n"
++            "Connection: close\r\n\r\n"
++        )
++        return [head.encode("latin-1"), *events, b"data: [DONE]\n\n"]
++
++
++__all__ = ["DEFAULT_BIND_HOST", "FakeLauncher"]
+diff --git a/packages/control-plane/src/forgemesh/controlplane/deployment/network.py b/packages/control-plane/src/forgemesh/controlplane/deployment/network.py
+new file mode 100644
+index 0000000..5d94db1
+--- /dev/null
++++ b/packages/control-plane/src/forgemesh/controlplane/deployment/network.py
+@@ -0,0 +1,114 @@
++"""启动器共用的网络工具：监听地址与实例地址主机的校验、实例地址、健康检查。
++
++实例监听的地址（``bind_host``）与写进 ``status.endpoints`` 的主机（``advertise_host``）
++分开配置：容器中实例监听 ``0.0.0.0``，地址却要写成网关能解析到这个容器的名字。
++"""
++
++from __future__ import annotations
++
++import asyncio
++import ipaddress
++import re
++import socket
++
++#: DNS 主机名中的一个标签（RFC 1123）。
++_HOSTNAME_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?")
++
++
++def check_bind_host(host: str) -> str:
++    """校验监听地址并返回规范写法：须是 IP 地址，``0.0.0.0`` / ``::`` 监听全部地址。
++
++    Raises:
++        ValueError: 不是 IP 地址（主机名可能解析出多个地址，监听哪一个并不确定）。
++    """
++    try:
++        return str(ipaddress.ip_address(host))
++    except ValueError:
++        raise ValueError(f"{host!r} is not an IP address") from None
++
++
++def check_advertise_host(host: str) -> str:
++    """校验写进实例地址的主机：IP 地址（不能是 ``0.0.0.0`` / ``::``）或 DNS 主机名。
++
++    Raises:
++        ValueError: 既不是 IP 地址也不是主机名，或是无法连接的通配地址。
++    """
++    try:
++        address = ipaddress.ip_address(host)
++    except ValueError:
++        labels = host.split(".")
++        if len(host) <= 253 and all(_HOSTNAME_LABEL.fullmatch(label) for label in labels):
++            return host
++        raise ValueError(f"{host!r} is neither an IP address nor a host name") from None
++    if address.is_unspecified:
++        raise ValueError(f"{host!r} is a wildcard address that clients cannot connect to")
++    return str(address)
++
++
++def resolve_hosts(bind_host: str, advertise_host: str | None) -> tuple[str, str]:
++    """校验并返回 ``(bind_host, advertise_host)``。
++
++    ``advertise_host`` 为空时取监听地址；监听全部地址（``0.0.0.0`` / ``::``）时必须给出。
++
++    Raises:
++        ValueError: 地址非法，或监听全部地址却没有给出 ``advertise_host``。
++    """
++    bind = check_bind_host(bind_host)
++    if advertise_host is None:
++        if ipaddress.ip_address(bind).is_unspecified:
++            raise ValueError(f"an advertise host is required when listening on {bind}")
++        return bind, bind
++    return bind, check_advertise_host(advertise_host)
++
++
++def instance_url(host: str, port: int) -> str:
++    """实例基地址 ``http://host:port``（IPv6 地址加方括号）。"""
++    return f"http://[{host}]:{port}" if ":" in host else f"http://{host}:{port}"
++
++
++def local_address(bind_host: str) -> str:
++    """本机连接监听在 ``bind_host`` 上的服务所用的地址：通配地址换成回环地址。"""
++    address = ipaddress.ip_address(bind_host)
++    if address.is_unspecified:
++        return "::1" if address.version == 6 else "127.0.0.1"
++    return bind_host
++
++
++def socket_family(host: str) -> socket.AddressFamily:
++    """IP 地址 ``host`` 对应的套接字地址族。"""
++    return socket.AF_INET6 if ipaddress.ip_address(host).version == 6 else socket.AF_INET
++
++
++async def probe_health(host: str, port: int, *, timeout: float = 5.0) -> bool:
++    """``GET http://host:port/health`` 在 ``timeout`` 秒内返回 ``200`` 时为 ``True``。
++
++    连接失败、超时与其他状态码都返回 ``False``。直接用 asyncio 连接：实例与控制平面在
++    同一台机器上，不能像 urllib 那样按 ``HTTP_PROXY`` 等环境变量走代理，也不占用线程。
++    """
++    authority = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
++    request = f"GET /health HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n"
++    writer: asyncio.StreamWriter | None = None
++    try:
++        async with asyncio.timeout(timeout):
++            reader, writer = await asyncio.open_connection(host, port)
++            writer.write(request.encode("ascii"))
++            await writer.drain()
++            status_line = await reader.readline()
++    except (OSError, TimeoutError, ValueError):
++        return False
++    finally:
++        if writer is not None:
++            writer.close()
++    parts = status_line.split(None, 2)
++    return len(parts) >= 2 and parts[0].startswith(b"HTTP/") and parts[1] == b"200"
++
++
++__all__ = [
++    "check_advertise_host",
++    "check_bind_host",
++    "instance_url",
++    "local_address",
++    "probe_health",
++    "resolve_hosts",
++    "socket_family",
++]
+diff --git a/tests/unit/controlplane/test_fake_launcher.py b/tests/unit/controlplane/test_fake_launcher.py
+new file mode 100644
+index 0000000..d26090c
+--- /dev/null
++++ b/tests/unit/controlplane/test_fake_launcher.py
+@@ -0,0 +1,384 @@
++"""假启动器测试：每个实例是进程内的 OpenAI 兼容桩服务。
++
++* 实例在临时端口上提供 ``GET /health`` 与 ``POST /v1/chat/completions``（SSE 流式与一次性
++  响应），非法请求得到 OpenAI 风格的错误；
++* 同一实例幂等键返回同一实例；监听地址与写进实例地址的主机分开配置；
++* ``stop`` 释放端口并中断进行中的请求，``aclose`` 停止全部实例；不开线程，关闭后不留下
++  任务；不认识的实例立即验证失败。
++"""
++
++from __future__ import annotations
++
++import asyncio
++import contextlib
++import json
++import threading
++from typing import Any
++from urllib.parse import urlsplit
++
++import pytest
++from forgemesh.controlplane.deployment import (
++    FakeLauncher,
++    LaunchedInstance,
++    LaunchRequest,
++    deployment_run_key,
++)
++from forgemesh.controlplane.deployment import fake as fake_module
++from forgemesh.core.scheduler import AllocatedDevice, ResourceRef
++from forgemesh.resource.inference import (
++    AcceleratorSpec,
++    EndpointProtocol,
++    InferenceServiceSpec,
++    ModelRef,
++    ResourcesSpec,
++    RuntimeRef,
++)
++
++CHAT_PATH = "/v1/chat/completions"
++CHAT = {"model": "smoke", "messages": [{"role": "user", "content": "hi"}], "stream": True}
++
++
++def _request(uid: str = "uid-1") -> LaunchRequest:
++    return LaunchRequest(
++        instance_key=deployment_run_key(uid),
++        tenant_id="tenant-1",
++        resource=ResourceRef(kind="InferenceService", namespace="team-a", name="svc", uid=uid),
++        spec=InferenceServiceSpec(
++            model=ModelRef(reference="models/llama"),
++            runtime=RuntimeRef(provider="vllm"),
++            resources=ResourcesSpec(
++                accelerator=AcceleratorSpec(type="nvidia-gpu", minMemoryGiB=16)
++            ),
++        ),
++        allocation_id="alloc-1",
++        devices=(AllocatedDevice(node_id="node-a", device_id="gpu-0"),),
++    )
++
++
++def _port(instance: LaunchedInstance) -> int:
++    port = urlsplit(instance.url).port
++    assert port is not None
++    return port
++
++
++def _post(path: str, payload: Any) -> bytes:
++    body = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
++    head = (
++        f"POST {path} HTTP/1.1\r\nHost: instance\r\nContent-Type: application/json\r\n"
++        f"Content-Length: {len(body)}\r\n\r\n"
++    )
++    return head.encode() + body
++
++
++async def _http(port: int, request: bytes) -> tuple[int, dict[str, str], bytes]:
++    """发送一个请求并读到连接关闭，返回 ``(状态码, 小写头名的响应头, 响应体)``。"""
++    reader, writer = await asyncio.open_connection("127.0.0.1", port)
++    try:
++        writer.write(request)
++        await writer.drain()
++        raw = await reader.read()
++    finally:
++        writer.close()
++        await writer.wait_closed()
++    head, _, body = raw.partition(b"\r\n\r\n")
++    status_line, *lines = head.decode("latin-1").split("\r\n")
++    headers = {}
++    for line in lines:
++        name, _, value = line.partition(":")
++        headers[name.lower()] = value.strip()
++    return int(status_line.split()[1]), headers, body
++
++
++def _events(body: bytes) -> list[str]:
++    """SSE 响应体中每个事件的 ``data``。"""
++    events = [event for event in body.decode().split("\n\n") if event]
++    assert all(event.startswith("data: ") for event in events)
++    return [event.removeprefix("data: ") for event in events]
++
++
++async def _assert_refused(port: int) -> None:
++    with pytest.raises(ConnectionRefusedError):
++        await asyncio.open_connection("127.0.0.1", port)
++
++
++# ---------------------------------------------------------------------- #
++# 桩服务
++# ---------------------------------------------------------------------- #
++
++
++@pytest.mark.unit
++def test_an_instance_serves_health_and_streams_chat_completions() -> None:
++    launcher = FakeLauncher()
++
++    async def scenario() -> tuple[LaunchedInstance, int, Any, Any]:
++        instance = await launcher.launch(_request())
++        await launcher.verify(instance)
++        health = await _http(_port(instance), b"GET /health HTTP/1.1\r\nHost: instance\r\n\r\n")
++        chat = await _http(_port(instance), _post(f"{CHAT_PATH}?trace=1", CHAT))
++        await launcher.aclose()
++        return instance, _port(instance), health, chat
++
++    instance, port, health, (status, headers, body) = asyncio.run(scenario())
++
++    assert instance.url == f"http://127.0.0.1:{port}"
++    assert instance.instance_id.startswith("fake-")
++    assert instance.protocol is EndpointProtocol.OPENAI_CHAT
++    assert health[0] == 200
++    assert (status, headers["content-type"]) == (200, "text/event-stream")
++    events = _events(body)
++    assert events[-1] == "[DONE]"
++    chunks = [json.loads(event) for event in events[:-1]]
++    assert {(chunk["object"], chunk["model"]) for chunk in chunks} == {
++        ("chat.completion.chunk", "smoke")
++    }
++    assert len({chunk["id"] for chunk in chunks}) == 1
++    deltas = [chunk["choices"][0]["delta"] for chunk in chunks]
++    assert deltas[0]["role"] == "assistant"
++    assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
++    assert "".join(delta.get("content", "") for delta in deltas) == (
++        f"Hello from the ForgeMesh fake instance {instance.instance_id}."
++    )
++
++
++@pytest.mark.unit
++def test_a_request_without_stream_gets_one_chat_completion() -> None:
++    launcher = FakeLauncher()
++
++    async def scenario() -> tuple[LaunchedInstance, Any]:
++        instance = await launcher.launch(_request())
++        response = await _http(_port(instance), _post(CHAT_PATH, {"messages": CHAT["messages"]}))
++        await launcher.aclose()
++        return instance, response
++
++    instance, (status, headers, body) = asyncio.run(scenario())
++
++    completion = json.loads(body)
++    assert (status, headers["content-type"]) == (200, "application/json")
++    assert (completion["object"], completion["model"]) == ("chat.completion", "models/llama")
++    assert completion["choices"][0]["message"] == {
++        "role": "assistant",
++        "content": f"Hello from the ForgeMesh fake instance {instance.instance_id}.",
++    }
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize(
++    ("request_bytes", "status", "allow"),
++    [
++        (_post(CHAT_PATH, b"{not json"), 400, None),
++        (_post(CHAT_PATH, [1]), 400, None),
++        (_post(CHAT_PATH, {"messages": []}), 400, None),
++        (_post(CHAT_PATH, {"messages": "hi"}), 400, None),
++        (_post(CHAT_PATH, {**CHAT, "stream": "yes"}), 400, None),
++        (b"GET /v1/chat/completions HTTP/1.1\r\nHost: instance\r\n\r\n", 405, "POST"),
++        (b"POST /health HTTP/1.1\r\nHost: instance\r\nContent-Length: 0\r\n\r\n", 405, "GET"),
++        (b"GET /v1/models HTTP/1.1\r\nHost: instance\r\n\r\n", 404, None),
++        (
++            b"POST /v1/chat/completions HTTP/1.1\r\nHost: instance\r\n"
++            b"Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
++            411,
++            None,
++        ),
++        (
++            b"POST /v1/chat/completions HTTP/1.1\r\nHost: instance\r\n"
++            b"Content-Length: 2097152\r\n\r\n",
++            413,
++            None,
++        ),
++        (b"POST /v1/chat/completions HTTP/1.1\r\nContent-Length: x\r\n\r\n", 400, None),
++        (b"HELLO\r\n\r\n", 400, None),
++    ],
++    ids=[
++        "invalid-json",
++        "not-an-object",
++        "no-messages",
++        "messages-not-an-array",
++        "stream-not-a-boolean",
++        "get-chat",
++        "post-health",
++        "unknown-path",
++        "chunked-body",
++        "body-too-large",
++        "invalid-length",
++        "malformed-request-line",
++    ],
++)
++def test_invalid_requests_get_an_openai_style_error(
++    request_bytes: bytes, status: int, allow: str | None
++) -> None:
++    launcher = FakeLauncher()
++
++    async def scenario() -> tuple[int, dict[str, str], bytes]:
++        instance = await launcher.launch(_request())
++        response = await _http(_port(instance), request_bytes)
++        await launcher.aclose()
++        return response
++
++    actual, headers, body = asyncio.run(scenario())
++
++    assert actual == status
++    assert headers.get("allow") == allow
++    assert json.loads(body)["error"]["type"] == "invalid_request_error"
++
++
++@pytest.mark.unit
++def test_a_client_expecting_100_continue_is_told_to_send_the_body() -> None:
++    launcher = FakeLauncher()
++    body = json.dumps(CHAT).encode()
++
++    async def scenario() -> bytes:
++        instance = await launcher.launch(_request())
++        reader, writer = await asyncio.open_connection("127.0.0.1", _port(instance))
++        writer.write(
++            f"POST {CHAT_PATH} HTTP/1.1\r\nHost: instance\r\nExpect: 100-continue\r\n"
++            f"Content-Length: {len(body)}\r\n\r\n".encode()
++        )
++        interim = await reader.readuntil(b"\r\n\r\n")
++        writer.write(body)
++        rest = await reader.read()
++        writer.close()
++        await writer.wait_closed()
++        await launcher.aclose()
++        return interim + rest
++
++    response = asyncio.run(scenario())
++
++    assert response.startswith(b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\n")
++    assert response.endswith(b"data: [DONE]\n\n")
++
++
++# ---------------------------------------------------------------------- #
++# 启动器
++# ---------------------------------------------------------------------- #
++
++
++@pytest.mark.unit
++def test_launch_returns_the_running_instance_of_a_key_and_new_ones_otherwise() -> None:
++    launcher = FakeLauncher()
++
++    async def scenario() -> dict[str, LaunchedInstance]:
++        first = await launcher.launch(_request())
++        again = await launcher.launch(_request())
++        other = await launcher.launch(_request("uid-2"))
++        await launcher.stop(first.instance_id)
++        relaunched = await launcher.launch(_request())
++        running = {
++            name: await launcher.is_running(instance.instance_id)
++            for name, instance in {"first": first, "other": other, "new": relaunched}.items()
++        }
++        assert running == {"first": False, "other": True, "new": True}
++        await launcher.aclose()
++        return {"first": first, "again": again, "other": other, "relaunched": relaunched}
++
++    instances = asyncio.run(scenario())
++
++    assert instances["again"] == instances["first"]
++    assert len({instance.instance_id for instance in instances.values()}) == 3
++    assert len({_port(instance) for instance in instances.values()}) == 3
++
++
++@pytest.mark.unit
++def test_instances_can_listen_on_all_addresses_and_advertise_another_host() -> None:
++    launcher = FakeLauncher(bind_host="0.0.0.0", advertise_host="control-plane")
++
++    async def scenario() -> LaunchedInstance:
++        instance = await launcher.launch(_request())
++        await launcher.verify(instance)
++        await launcher.aclose()
++        return instance
++
++    instance = asyncio.run(scenario())
++
++    assert (launcher.bind_host, launcher.advertise_host) == ("0.0.0.0", "control-plane")
++    assert instance.url == f"http://control-plane:{_port(instance)}"
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize(
++    ("bind_host", "advertise_host", "message"),
++    [
++        ("localhost", None, "is not an IP address"),
++        ("0.0.0.0", None, "an advertise host is required"),
++        ("127.0.0.1", "0.0.0.0", "wildcard"),
++        ("127.0.0.1", "not a host", "neither an IP address nor a host name"),
++    ],
++)
++def test_unusable_addresses_are_rejected(
++    bind_host: str, advertise_host: str | None, message: str
++) -> None:
++    with pytest.raises(ValueError, match=message):
++        FakeLauncher(bind_host=bind_host, advertise_host=advertise_host)
++
++
++@pytest.mark.unit
++def test_stop_releases_the_port_and_interrupts_requests_in_flight() -> None:
++    launcher = FakeLauncher()
++
++    async def scenario() -> None:
++        instance = await launcher.launch(_request())
++        reader, writer = await asyncio.open_connection("127.0.0.1", _port(instance))
++        writer.write(f"POST {CHAT_PATH} HTTP/1.1\r\n".encode())
++        await writer.drain()
++        await launcher.verify(instance)
++
++        await launcher.stop(instance.instance_id)
++
++        with contextlib.suppress(ConnectionResetError):
++            assert await reader.read() == b""
++        writer.close()
++        with contextlib.suppress(ConnectionResetError):
++            await writer.wait_closed()
++        await _assert_refused(_port(instance))
++        assert not await launcher.is_running(instance.instance_id)
++        with pytest.raises(RuntimeError, match=f"instance {instance.instance_id} is not running"):
++            await launcher.verify(instance)
++        await launcher.stop(instance.instance_id)
++        await launcher.stop("fake-unknown")
++        assert asyncio.all_tasks() == {asyncio.current_task()}
++
++    asyncio.run(scenario())
++
++
++@pytest.mark.unit
++def test_aclose_stops_every_instance_without_threads_or_leftover_tasks() -> None:
++    launcher = FakeLauncher()
++    threads = set(threading.enumerate())
++
++    async def scenario() -> None:
++        instances = [await launcher.launch(_request(uid)) for uid in ("uid-1", "uid-2")]
++        assert set(threading.enumerate()) == threads
++
++        await launcher.aclose()
++
++        for instance in instances:
++            await _assert_refused(_port(instance))
++            assert not await launcher.is_running(instance.instance_id)
++        with pytest.raises(RuntimeError, match="the fake launcher is closed"):
++            await launcher.launch(_request())
++        assert asyncio.all_tasks() == {asyncio.current_task()}
++
++    asyncio.run(scenario())
++    assert set(threading.enumerate()) == threads
++
++
++@pytest.mark.unit
++def test_verify_fails_for_unknown_instances_and_unhealthy_ones(monkeypatch) -> None:
++    """重启之前的实例（启动器不认识）立即失败；``/health`` 不应答时同样失败。"""
++    launcher = FakeLauncher()
++    lost = LaunchedInstance(
++        instance_id="fake-lost", url="http://127.0.0.1:9", protocol="openai-chat"
++    )
++
++    async def unhealthy(host: str, port: int, *, timeout: float = 5.0) -> bool:
++        return False
++
++    async def scenario() -> None:
++        with pytest.raises(RuntimeError, match="instance fake-lost is not running"):
++            await launcher.verify(lost)
++        instance = await launcher.launch(_request())
++        monkeypatch.setattr(fake_module, "probe_health", unhealthy)
++        with pytest.raises(RuntimeError, match="does not answer GET /health"):
++            await launcher.verify(instance)
++        await launcher.aclose()
++
++    asyncio.run(scenario())
+diff --git a/tests/unit/controlplane/test_launcher_network.py b/tests/unit/controlplane/test_launcher_network.py
+new file mode 100644
+index 0000000..de9b954
+--- /dev/null
++++ b/tests/unit/controlplane/test_launcher_network.py
+@@ -0,0 +1,134 @@
++"""启动器网络工具测试：监听地址与实例地址主机的校验、实例地址、``GET /health`` 探测。"""
++
++from __future__ import annotations
++
++import asyncio
++import socket
++from collections.abc import Awaitable, Callable
++
++import pytest
++from forgemesh.controlplane.deployment.network import (
++    check_advertise_host,
++    check_bind_host,
++    instance_url,
++    local_address,
++    probe_health,
++    resolve_hosts,
++)
++
++Handler = Callable[[asyncio.StreamReader, asyncio.StreamWriter], Awaitable[None]]
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize(
++    ("host", "expected"),
++    [("127.0.0.1", "127.0.0.1"), ("0.0.0.0", "0.0.0.0"), ("0:0::0", "::"), ("::1", "::1")],
++)
++def test_bind_hosts_are_ip_addresses(host: str, expected: str) -> None:
++    assert check_bind_host(host) == expected
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize("host", ["localhost", "control-plane", "", "127.0.0.1:80"])
++def test_bind_hosts_that_are_not_ip_addresses_are_rejected(host: str) -> None:
++    with pytest.raises(ValueError, match="is not an IP address"):
++        check_bind_host(host)
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize(
++    "host", ["control-plane", "gpu-1.example.com", "localhost", "10.0.0.7", "::1", "a" * 63]
++)
++def test_advertise_hosts_are_host_names_or_ip_addresses(host: str) -> None:
++    assert check_advertise_host(host) == host
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize(
++    ("host", "message"),
++    [
++        ("0.0.0.0", "wildcard"),
++        ("::", "wildcard"),
++        ("", "neither"),
++        ("under_score", "neither"),
++        ("-leading", "neither"),
++        ("a..b", "neither"),
++        ("a" * 64, "neither"),
++        ("host:80", "neither"),
++        ("http://host", "neither"),
++    ],
++)
++def test_unusable_advertise_hosts_are_rejected(host: str, message: str) -> None:
++    with pytest.raises(ValueError, match=message):
++        check_advertise_host(host)
++
++
++@pytest.mark.unit
++def test_the_advertise_host_defaults_to_the_bind_host_unless_it_is_a_wildcard() -> None:
++    assert resolve_hosts("127.0.0.1", None) == ("127.0.0.1", "127.0.0.1")
++    assert resolve_hosts("0.0.0.0", "control-plane") == ("0.0.0.0", "control-plane")
++    with pytest.raises(ValueError, match="an advertise host is required when listening on ::"):
++        resolve_hosts("::", None)
++
++
++@pytest.mark.unit
++def test_instance_urls_and_local_addresses() -> None:
++    assert instance_url("control-plane", 8000) == "http://control-plane:8000"
++    assert instance_url("::1", 8000) == "http://[::1]:8000"
++    assert local_address("0.0.0.0") == "127.0.0.1"
++    assert local_address("::") == "::1"
++    assert local_address("10.0.0.7") == "10.0.0.7"
++
++
++async def _serve(handler: Handler, probe: Callable[[int], Awaitable[bool]]) -> bool:
++    server = await asyncio.start_server(handler, "127.0.0.1", 0)
++    try:
++        return await probe(server.sockets[0].getsockname()[1])
++    finally:
++        server.close()
++        await server.wait_closed()
++
++
++def _replying(status_line: bytes) -> Handler:
++    async def handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
++        request = await reader.readuntil(b"\r\n\r\n")
++        assert request.startswith(b"GET /health HTTP/1.1\r\n")
++        writer.write(status_line + b"\r\nContent-Length: 0\r\n\r\n")
++        await writer.drain()
++        writer.close()
++
++    return handler
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize(
++    ("status_line", "healthy"),
++    [
++        (b"HTTP/1.1 200 OK", True),
++        (b"HTTP/1.0 200 OK", True),
++        (b"HTTP/1.1 503 Service Unavailable", False),
++        (b"garbage", False),
++    ],
++)
++def test_probe_health_wants_a_200_from_get_health(status_line: bytes, healthy: bool) -> None:
++    async def probe(port: int) -> bool:
++        return await probe_health("127.0.0.1", port)
++
++    assert asyncio.run(_serve(_replying(status_line), probe)) is healthy
++
++
++@pytest.mark.unit
++def test_probe_health_reports_unreachable_and_silent_instances_as_unhealthy() -> None:
++    async def silent(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
++        await reader.read()
++        writer.close()
++
++    async def probe(port: int) -> bool:
++        return await probe_health("127.0.0.1", port, timeout=0.05)
++
++    with socket.socket() as sock:
++        sock.bind(("127.0.0.1", 0))
++        closed_port = sock.getsockname()[1]
++
++    assert asyncio.run(_serve(silent, probe)) is False
++    assert asyncio.run(probe_health("127.0.0.1", closed_port)) is False
+-- 
+2.43.0
+

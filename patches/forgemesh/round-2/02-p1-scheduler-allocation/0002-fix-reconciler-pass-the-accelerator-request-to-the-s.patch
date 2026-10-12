@@ -1,7 +1,7 @@
-From 8545fc6394265097f40f3135d50040c498ea772e Mon Sep 17 00:00:00 2001
+From bd06621ed7aaaa854e514e03c01605ad0a3c2478 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Mon, 12 Oct 2026 12:30:19 +0000
-Subject: [PATCH 2/8] fix(reconciler): pass the accelerator request to the
+Subject: [PATCH 2/9] fix(reconciler): pass the accelerator request to the
  scheduler
 
 _compute_diff always sent empty requirements, so a scheduler could not

@@ -1,7 +1,7 @@
-From bbcf6915c82dae60fe34983f4a5f8313e5ee054d Mon Sep 17 00:00:00 2001
+From e3f03d9a8f4729a75d4d31b41b682efbae1459e7 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Mon, 12 Oct 2026 12:23:24 +0000
-Subject: [PATCH 2/8] feat(plugin-sdk): sign plugin artifacts with Ed25519
+Subject: [PATCH 2/9] feat(plugin-sdk): sign plugin artifacts with Ed25519
 
 The artifact signer used HMAC-SHA256, so the "public" verification key
 was the signing key itself: whoever could verify a plugin could also

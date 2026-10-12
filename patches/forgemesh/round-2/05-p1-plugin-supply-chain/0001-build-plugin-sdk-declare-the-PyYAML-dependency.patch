@@ -1,7 +1,7 @@
-From e007509d313a12f5d08263218d26593609db7946 Mon Sep 17 00:00:00 2001
+From edbc08338f845c9787f15540c35450795979e00c Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Mon, 12 Oct 2026 13:56:07 +0000
-Subject: [PATCH 1/8] build(plugin-sdk): declare the PyYAML dependency
+Subject: [PATCH 1/9] build(plugin-sdk): declare the PyYAML dependency
 
 forgemesh.plugin.sdk imports yaml at module level to read manifest
 files, but forgemesh-plugin-sdk never declared PyYAML. Importing the

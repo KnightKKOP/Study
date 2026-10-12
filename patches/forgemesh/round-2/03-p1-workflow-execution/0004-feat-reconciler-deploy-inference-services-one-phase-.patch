@@ -1,7 +1,7 @@
-From 674022143837a0cd50a5ed5af0c6246f5969db0d Mon Sep 17 00:00:00 2001
+From 876aa75a437cef58eb06083ca20ab9d97eebdf53 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Mon, 12 Oct 2026 15:39:11 +0000
-Subject: [PATCH 4/5] feat(reconciler): deploy inference services one phase per
+Subject: [PATCH 4/6] feat(reconciler): deploy inference services one phase per
  pass
 
 The reconciler started an empty workflow and reported Ready=True right

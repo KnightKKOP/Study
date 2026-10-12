@@ -1,0 +1,368 @@
+From dbb48e6e0647eea22804953ac3ac7bd80d532765 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 12 Oct 2026 16:42:25 +0000
+Subject: [PATCH 03/10] feat(control-plane): degrade Ready services whose
+ instance was lost
+
+Instances of launchers that live inside the control plane process do
+not survive a restart, yet their Ready services kept pointing
+status.endpoints at them and the gateway kept routing to dead
+addresses.
+
+mark_lost_instances(registry, launcher), meant to run at startup
+before the controller, checks every Ready InferenceService: endpoints
+whose instance the launcher does not run (or that carry no instance id
+to check) become ready=false, the phase moves to Degraded and
+Ready=False reports InstanceLost with a message telling the user to
+delete and re-create the service. The gateway only routes to Ready
+services, so it stops sending requests there once its cache expires.
+Writes are compare-and-set on the version read; a service that changed
+meanwhile is skipped. Nothing is relaunched: a Degraded service keeps
+its allocation until it is deleted.
+---
+ .../controlplane/deployment/__init__.py       |   5 +
+ .../controlplane/deployment/recovery.py       | 124 ++++++++++++++++++
+ .../controlplane/test_deployment_lifecycle.py | 110 +++++++++++++++-
+ 3 files changed, 234 insertions(+), 5 deletions(-)
+ create mode 100644 packages/control-plane/src/forgemesh/controlplane/deployment/recovery.py
+
+diff --git a/packages/control-plane/src/forgemesh/controlplane/deployment/__init__.py b/packages/control-plane/src/forgemesh/controlplane/deployment/__init__.py
+index feeee84..60bffa1 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/deployment/__init__.py
++++ b/packages/control-plane/src/forgemesh/controlplane/deployment/__init__.py
+@@ -3,6 +3,8 @@
+ * :mod:`.launcher` —— 启动器契约 :class:`RuntimeLauncher` 及其请求 / 结果模型；
+ * :mod:`.workflow` —— 部署工作流定义、幂等键与步骤 handler :class:`DeploymentSteps`；
+ * :mod:`.release` —— 删除资源时取消部署、停止实例的 :class:`DeploymentReleaser`；
++* :mod:`.recovery` —— 重启之后把实例已不在运行的 ``Ready`` 服务转为 ``Degraded`` 的
++  :func:`mark_lost_instances`；
+ * :mod:`.memory` —— 测试替身 :class:`InMemoryLauncher`。
+ 
+ 本包只依赖工作流契约（``forgemesh-workflow-api``），不依赖具体的工作流运行时。
+@@ -12,6 +14,7 @@ from __future__ import annotations
+ 
+ from .launcher import LaunchedInstance, LaunchRequest, RuntimeLauncher
+ from .memory import InMemoryLauncher
++from .recovery import INSTANCE_LOST_REASON, mark_lost_instances
+ from .release import DeploymentReleaser
+ from .workflow import (
+     DEPLOYMENT_WORKFLOW,
+@@ -28,6 +31,7 @@ from .workflow import (
+ 
+ __all__ = [
+     "DEPLOYMENT_WORKFLOW",
++    "INSTANCE_LOST_REASON",
+     "LAUNCH_INSTANCE",
+     "PREPARE_MODEL",
+     "VERIFY_INSTANCE",
+@@ -42,4 +46,5 @@ __all__ = [
+     "deployment_run_key",
+     "deployment_workflow",
+     "launched_instance",
++    "mark_lost_instances",
+ ]
+diff --git a/packages/control-plane/src/forgemesh/controlplane/deployment/recovery.py b/packages/control-plane/src/forgemesh/controlplane/deployment/recovery.py
+new file mode 100644
+index 0000000..4aedb6a
+--- /dev/null
++++ b/packages/control-plane/src/forgemesh/controlplane/deployment/recovery.py
+@@ -0,0 +1,124 @@
++"""控制平面重启之后核对已部署的实例，不再对外宣告没能活过重启的实例。
++
++实例随控制平面进程结束的启动器（本进程内的假实例、子进程）在重启之后不认识重启之前的
++实例，``Ready`` 服务的 ``status.endpoints`` 却仍指向它们，网关会继续转发过去。应用在
++启动控制器之前调用 :func:`mark_lost_instances`：实例已不在运行的服务转为 ``Degraded``，
++这些实例的 endpoint 标记为未就绪，``Ready=False``（``InstanceLost``），网关不再向它们
++转发（网关缓存解析结果的几秒内除外）。
++
++不会自动重新部署：``Degraded`` 的服务保留分配，直到被删除；删除后重新创建即可再次部署。
++"""
++
++from __future__ import annotations
++
++import logging
++from typing import TYPE_CHECKING
++
++from forgemesh.core.errors import ConflictError, NotFoundError
++from forgemesh.resource.inference import Endpoint, InferencePhase, InferenceService
++
++from .launcher import RuntimeLauncher
++
++if TYPE_CHECKING:  # pragma: no cover - 仅静态类型检查使用
++    from ..registry import ResourceKey, SQLiteRegistry
++
++logger = logging.getLogger(__name__)
++
++#: 实例已不在运行时 ``Ready`` 条件的原因。
++INSTANCE_LOST_REASON = "InstanceLost"
++
++_KIND = "InferenceService"
++
++
++def _describe(endpoint: Endpoint) -> str:
++    if endpoint.instanceId is None:
++        return f"the instance at {endpoint.url}"
++    return f"instance {endpoint.instanceId} at {endpoint.url}"
++
++
++async def mark_lost_instances(
++    registry: SQLiteRegistry, launcher: RuntimeLauncher
++) -> list[ResourceKey]:
++    """把实例已不在运行的 ``Ready`` 服务转为 ``Degraded``，返回被转换的服务。
++
++    只检查 ``phase=Ready`` 的 ``InferenceService``：``status.endpoints`` 中启动器不在运行的
++    实例（没有 ``instanceId`` 的 endpoint 无从确认，同样算作不在运行）标记为
++    ``ready: false``，``phase`` 转为 ``Degraded``，``Ready=False``（``InstanceLost``）。
++    写入以读到的版本做 CAS，资源在此期间被修改或删除时跳过它。须在控制器启动之前调用。
++    """
++    marked: list[ResourceKey] = []
++    for key in await registry.list_resource_keys([_KIND]):
++        try:
++            resource, phase = await registry.get_with_phase(
++                key.kind, key.namespace, key.name, key.tenant_id
++            )
++        except NotFoundError:
++            continue
++        if phase != InferencePhase.READY or not isinstance(resource, InferenceService):
++            continue
++        endpoints = resource.status.endpoints
++        lost = [
++            endpoint.instanceId is None or not await launcher.is_running(endpoint.instanceId)
++            for endpoint in endpoints
++        ]
++        if not any(lost):
++            continue
++        described = " and ".join(
++            _describe(endpoint) for endpoint, gone in zip(endpoints, lost, strict=True) if gone
++        )
++        message = (
++            f"{described} did not survive the control plane restart; delete and re-create "
++            "the service to deploy it again"
++        )
++        patch = {
++            "phase": InferencePhase.DEGRADED.value,
++            "endpoints": [
++                endpoint.model_copy(update={"ready": endpoint.ready and not gone}).model_dump(
++                    mode="json"
++                )
++                for endpoint, gone in zip(endpoints, lost, strict=True)
++            ],
++            "conditions": [
++                {
++                    "type": "Ready",
++                    "status": "False",
++                    "reason": INSTANCE_LOST_REASON,
++                    "message": message,
++                }
++            ],
++        }
++        meta = resource.metadata
++        try:
++            await registry.update_status(
++                key.kind,
++                key.namespace,
++                key.name,
++                key.tenant_id,
++                patch,
++                expected_version=meta.resourceVersion,
++            )
++        except (ConflictError, NotFoundError) as exc:
++            logger.warning(
++                "lost instance not reported, the service changed meanwhile: namespace=%s "
++                "name=%s tenant_id=%s error=%s",
++                key.namespace,
++                key.name,
++                key.tenant_id,
++                exc,
++            )
++            continue
++        logger.warning(
++            "service degraded, its instance is gone: %s; kind=%s namespace=%s name=%s uid=%s "
++            "tenant_id=%s",
++            described,
++            key.kind,
++            key.namespace,
++            key.name,
++            meta.uid,
++            key.tenant_id,
++        )
++        marked.append(key)
++    return marked
++
++
++__all__ = ["INSTANCE_LOST_REASON", "mark_lost_instances"]
+diff --git a/tests/unit/controlplane/test_deployment_lifecycle.py b/tests/unit/controlplane/test_deployment_lifecycle.py
+index c2b209f..b910c91 100644
+--- a/tests/unit/controlplane/test_deployment_lifecycle.py
++++ b/tests/unit/controlplane/test_deployment_lifecycle.py
+@@ -4,7 +4,8 @@
+ * 创建的资源每轮推进一个 phase（``Pending`` → ``Scheduling`` → ``Preparing`` →
+   ``Deploying`` → ``Verifying`` → ``Ready``），``status.endpoints`` 是启动器返回的实例；
+ * 重启（``Ready`` 之后、启动部署的一轮被重放、启动实例的中途）不会启动第二个实例，也
+-  不会再分配；运行成功之后、写入 ``Ready`` 之前重启而实例已不在时，资源进入 ``Failed``；
++  不会再分配；实例没有活过重启时，``Ready`` 的服务转为 ``Degraded``（endpoint 标记为未
++  就绪），运行成功却还没写入 ``Ready`` 的服务进入 ``Failed``；
+ * 部署工作流没能启动时保留分配并重试；部署失败时实例被停止、分配释放，资源停在
+   ``Failed``；补偿没能停止的实例在删除资源时停止；
+ * 部署中途或 ``Ready`` 之后删除资源：取消运行、停止实例、释放分配、物理删除；
+@@ -35,6 +36,7 @@ from forgemesh.controlplane.deployment import (
+     RuntimeLauncher,
+     deployment_run_key,
+     launched_instance,
++    mark_lost_instances,
+ )
+ from forgemesh.controlplane.reconciler import (
+     ProcessedKeyStore,
+@@ -44,13 +46,14 @@ from forgemesh.controlplane.reconciler import (
+ from forgemesh.controlplane.registry import ResourceKey, SQLiteRegistry
+ from forgemesh.controlplane.scheduler import FirstFitScheduler, Inventory
+ from forgemesh.controlplane.sqlite import workflow_db_path
+-from forgemesh.core.errors import NotFoundError
++from forgemesh.core.errors import ConflictError, NotFoundError
+ from forgemesh.core.objects import ObjectMeta
+ from forgemesh.core.scheduler import AllocatedDevice
+ from forgemesh.policy.engine import DefaultPolicyEngine
+ from forgemesh.policy.rules import AuthzRule
+ from forgemesh.resource.inference import (
+     AcceleratorSpec,
++    Endpoint,
+     InferenceService,
+     InferenceServiceSpec,
+     ModelRef,
+@@ -175,8 +178,9 @@ def _runtime(launcher: RuntimeLauncher, store: WorkflowStore) -> LocalWorkflowRu
+ class _ControlPlane:
+     """一个控制平面进程的组件，组装方式与应用相同（在 ``async with`` 内使用）。
+ 
+-    进入时调用 ``recover()``（返回值存于 :attr:`recovered`）；退出时按应用的顺序关闭：
+-    控制器 → 工作流运行时 → 启动器 → 工作流存储 → 去重键存储 → 注册表。
++    进入时调用 ``recover()`` 与 ``mark_lost_instances()``（返回值存于 :attr:`recovered` 与
++    :attr:`lost`）；退出时按应用的顺序关闭：控制器 → 工作流运行时 → 启动器 → 工作流存储 →
++    去重键存储 → 注册表。
+     """
+ 
+     def __init__(self, db: str, launcher: RuntimeLauncher) -> None:
+@@ -198,9 +202,11 @@ class _ControlPlane:
+         )
+         self.manager = ControllerManager(self.registry, reconciler, poll_interval=POLL_SECONDS)
+         self.recovered: list[str] = []
++        self.lost: list[ResourceKey] = []
+ 
+     async def __aenter__(self) -> _ControlPlane:
+         self.recovered = await self.runtime.recover()
++        self.lost = await mark_lost_instances(self.registry, self.launcher)
+         return self
+ 
+     async def __aexit__(self, *exc_info: object) -> None:
+@@ -425,7 +431,8 @@ def test_restarting_a_ready_control_plane_neither_launches_nor_allocates_again(t
+ 
+         async with _ControlPlane(db, launcher) as plane:
+             await plane.manager.process(KEY)
+-            assert plane.recovered == []
++            assert (plane.recovered, plane.lost) == ([], [])
++            assert await plane.phase() == "Ready"
+             assert (await plane.service()).status.endpoints == endpoints
+             assert await plane.registry.list_allocations(TENANT) == allocations
+ 
+@@ -533,6 +540,99 @@ def test_an_instance_lost_between_a_successful_run_and_ready_fails_the_service(t
+     assert fresh.launches == []
+ 
+ 
++@pytest.mark.unit
++def test_a_ready_service_whose_instance_did_not_survive_a_restart_is_degraded(tmp_path):
++    """Ready 之后重启，实例没有活过重启：启动时服务转为 Degraded，endpoint 标记为未就绪，
++    ``Ready=False``（InstanceLost）；分配保留，之后的协调不再部署。删除时停止（已不存在的）
++    实例、释放分配。"""
++    db = str(tmp_path / "cp.db")
++    fresh = _ScriptedLauncher()
++
++    async def scenario() -> Endpoint:
++        async with _ControlPlane(db, _ScriptedLauncher()) as plane:
++            await plane.registry.put(_service())
++            await plane.deploy()
++            [endpoint] = (await plane.service()).status.endpoints
++
++        async with _ControlPlane(db, fresh) as plane:
++            assert plane.lost == [KEY]
++            await plane.manager.process(KEY)
++            service = await plane.service()
++            assert service.status.phase.value == "Degraded"
++            assert service.status.endpoints == [endpoint.model_copy(update={"ready": False})]
++            assert _ready(service) == (
++                "False",
++                "InstanceLost",
++                f"instance {endpoint.instanceId} at {endpoint.url} did not survive the control "
++                "plane restart; delete and re-create the service to deploy it again",
++            )
++            assert await plane.registry.get_active_allocation(UID, TENANT) is not None
++
++            assert await plane.delete() is False
++            await plane.manager.process(KEY)
++            await _assert_gone(plane)
++        return endpoint
++
++    endpoint = asyncio.run(scenario())
++    assert fresh.launches == []
++    assert fresh.stops == [endpoint.instanceId]
++
++
++@pytest.mark.unit
++def test_only_the_endpoints_whose_instance_is_gone_are_marked_not_ready():
++    """没有 ``instanceId`` 的 endpoint 无从确认，同样算作丢失；仍在运行的实例保持就绪。"""
++    launcher = _ScriptedLauncher()
++
++    async def scenario() -> InferenceService:
++        async with _ControlPlane(":memory:", launcher) as plane:
++            await plane.registry.put(_service())
++            await plane.deploy()
++            [running] = (await plane.service()).status.endpoints
++            unknown = Endpoint(url="http://10.0.0.9:8000", protocol="openai-chat")
++            await plane.registry.update_status(
++                KIND,
++                NAMESPACE,
++                NAME,
++                TENANT,
++                {"endpoints": [unknown.model_dump(mode="json"), running.model_dump(mode="json")]},
++            )
++
++            assert await mark_lost_instances(plane.registry, launcher) == [KEY]
++            return await plane.service()
++
++    service = asyncio.run(scenario())
++    [instance] = launcher.running.values()
++    assert service.status.phase.value == "Degraded"
++    assert [(e.url, e.ready) for e in service.status.endpoints] == [
++        ("http://10.0.0.9:8000", False),
++        (instance.url, True),
++    ]
++    assert _ready(service)[2] == (
++        "the instance at http://10.0.0.9:8000 did not survive the control plane restart; "
++        "delete and re-create the service to deploy it again"
++    )
++
++
++@pytest.mark.unit
++def test_a_service_changed_while_its_instances_are_checked_is_left_alone(monkeypatch):
++    """检查期间资源被修改（CAS 冲突）：跳过它，不覆盖新的状态。"""
++
++    async def scenario() -> None:
++        async with _ControlPlane(":memory:", _ScriptedLauncher()) as plane:
++            await plane.registry.put(_service())
++            await plane.deploy()
++
++            async def conflict(*args: Any, **kwargs: Any) -> Any:
++                raise ConflictError("changed meanwhile")
++
++            monkeypatch.setattr(plane.registry, "update_status", conflict)
++            assert await mark_lost_instances(plane.registry, _ScriptedLauncher()) == []
++            monkeypatch.undo()
++            assert await plane.phase() == "Ready"
++
++    asyncio.run(scenario())
++
++
+ # ---------------------------------------------------------------------- #
+ # 删除
+ # ---------------------------------------------------------------------- #
+-- 
+2.43.0
+

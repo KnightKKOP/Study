@@ -1,7 +1,7 @@
-From dc4742fd29b162fc5ff4de2e7a77d5e12d0ea3ae Mon Sep 17 00:00:00 2001
+From 60eea4d33832a5112d1899eff932e3536eb9be8e Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Mon, 12 Oct 2026 12:40:49 +0000
-Subject: [PATCH 3/8] feat(registry): record allocations per resource uid with
+Subject: [PATCH 3/9] feat(registry): record allocations per resource uid with
  exclusive devices
 
 Allocations did not record the devices they hold, and the only
