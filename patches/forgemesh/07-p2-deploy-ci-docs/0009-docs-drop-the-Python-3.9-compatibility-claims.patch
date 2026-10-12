@@ -1,0 +1,1376 @@
+From f8c9e2a97efc41a29be8c01095fd744061ff1603 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 12 Oct 2026 07:19:36 +0000
+Subject: [PATCH 9/9] docs: drop the Python 3.9 compatibility claims
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+85 module docstrings ended with "兼容 Python 3.9+" and 14 test fixtures said
+they support 3.9-3.12. Every package requires Python >= 3.12, and the code uses
+StrEnum (3.11+) and PEP 604 unions evaluated by Pydantic, so it cannot even be
+imported on 3.9. Remove the claims; keep the Pydantic v2 note where it was part
+of the same sentence.
+
+CONTRIBUTING asked for Optional[X] / List[X] instead of X | None, which the
+enforced ruff UP rules reject. Describe the convention the code follows.
+---
+ CHANGELOG.md                                                  | 1 +
+ CONTRIBUTING.md                                               | 2 +-
+ conftest.py                                                   | 2 --
+ packages/cli/src/forgemesh/cli/commands.py                    | 2 --
+ packages/cli/src/forgemesh/cli/main.py                        | 2 --
+ .../control-plane/src/forgemesh/controlplane/api/routes.py    | 2 --
+ packages/control-plane/src/forgemesh/controlplane/app.py      | 2 +-
+ packages/control-plane/src/forgemesh/controlplane/audit.py    | 2 --
+ .../control-plane/src/forgemesh/controlplane/diagnostics.py   | 2 --
+ .../control-plane/src/forgemesh/controlplane/heartbeat.py     | 2 --
+ .../control-plane/src/forgemesh/controlplane/observability.py | 2 --
+ packages/control-plane/src/forgemesh/controlplane/outbox.py   | 2 --
+ .../src/forgemesh/controlplane/plugin_manager.py              | 2 --
+ .../src/forgemesh/controlplane/reconciler/core.py             | 2 --
+ .../src/forgemesh/controlplane/registry/models.py             | 2 --
+ .../src/forgemesh/controlplane/registry/store.py              | 2 --
+ packages/control-plane/src/forgemesh/controlplane/tasks.py    | 2 --
+ packages/core-contracts/src/forgemesh/core/errors.py          | 2 --
+ packages/core-contracts/src/forgemesh/core/objects.py         | 2 +-
+ packages/core-contracts/src/forgemesh/core/registry.py        | 2 --
+ packages/decision-api/src/forgemesh/decision/degradation.py   | 2 --
+ packages/decision-api/src/forgemesh/decision/provider.py      | 2 --
+ packages/decision-api/src/forgemesh/decision/records.py       | 2 --
+ packages/decision-api/src/forgemesh/decision/router.py        | 2 --
+ packages/node-agent/src/forgemesh/nodeagent/health.py         | 2 +-
+ packages/node-agent/src/forgemesh/nodeagent/probe.py          | 2 +-
+ packages/node-agent/src/forgemesh/nodeagent/recover.py        | 2 +-
+ packages/node-agent/src/forgemesh/nodeagent/runtime.py        | 2 +-
+ packages/node-agent/src/forgemesh/nodeagent/server.py         | 2 +-
+ packages/plugin-sdk/src/forgemesh/plugin/isolation.py         | 2 --
+ packages/plugin-sdk/src/forgemesh/plugin/manifest.py          | 2 --
+ packages/plugin-sdk/src/forgemesh/plugin/scaffold.py          | 2 --
+ packages/plugin-sdk/src/forgemesh/plugin/sdk.py               | 2 --
+ packages/plugin-sdk/src/forgemesh/plugin/signing.py           | 2 --
+ packages/policy-engine/src/forgemesh/policy/api.py            | 2 --
+ packages/policy-engine/src/forgemesh/policy/engine.py         | 2 --
+ packages/policy-engine/src/forgemesh/policy/qos.py            | 2 --
+ packages/policy-engine/src/forgemesh/policy/quota.py          | 2 --
+ packages/policy-engine/src/forgemesh/policy/rules.py          | 2 --
+ packages/resource-model/src/forgemesh/resource/allocation.py  | 2 +-
+ packages/resource-model/src/forgemesh/resource/inference.py   | 2 +-
+ packages/resource-model/src/forgemesh/resource/node.py        | 2 +-
+ packages/resource-model/src/forgemesh/resource/states.py      | 2 --
+ packages/resource-model/src/forgemesh/resource/tenant.py      | 2 +-
+ packages/workflow-api/src/forgemesh/workflow/runtime.py       | 2 --
+ packages/workflow-api/src/forgemesh/workflow/states.py        | 2 --
+ .../src/forgemesh/workflowruntime/approval.py                 | 2 --
+ .../src/forgemesh/workflowruntime/compensate.py               | 2 --
+ .../workflow-runtime/src/forgemesh/workflowruntime/dsl.py     | 2 --
+ .../workflow-runtime/src/forgemesh/workflowruntime/exec.py    | 2 --
+ .../src/forgemesh/workflowruntime/gpu_onboarding.py           | 2 --
+ .../workflow-runtime/src/forgemesh/workflowruntime/store.py   | 2 --
+ plugins/decision-jev/provider.py                              | 2 --
+ plugins/decision-rules/provider.py                            | 2 --
+ plugins/decision-typesafe-jev/provider.py                     | 2 --
+ plugins/gpu-nvidia/discovery.py                               | 2 +-
+ plugins/gpu-nvidia/health.py                                  | 2 +-
+ plugins/gpu-nvidia/hetero.py                                  | 2 +-
+ plugins/gpu-nvidia/mig.py                                     | 2 +-
+ plugins/gpu-nvidia/preflight.py                               | 2 +-
+ plugins/metering-basic/provider.py                            | 2 --
+ plugins/metering-basic/usage.py                               | 2 --
+ plugins/qos-basic/provider.py                                 | 2 --
+ plugins/runtime-tgi/provider.py                               | 2 +-
+ plugins/runtime-vllm/deploy.py                                | 2 +-
+ plugins/runtime-vllm/model.py                                 | 2 +-
+ plugins/runtime-vllm/release.py                               | 2 +-
+ plugins/runtime-vllm/verify.py                                | 2 +-
+ plugins/workflow-reference/provider.py                        | 2 --
+ plugins/workflow-temporal/provider.py                         | 2 +-
+ tests/unit/decision/test_circuit_breaker.py                   | 2 --
+ tests/unit/decision/test_degradation.py                       | 2 --
+ tests/unit/decision/test_router.py                            | 4 +---
+ tests/unit/plugins/conftest.py                                | 2 --
+ tests/unit/plugins/test_decision_jev.py                       | 4 +---
+ tests/unit/plugins/test_decision_rules.py                     | 4 +---
+ tests/unit/plugins/test_decision_typesafe_jev.py              | 4 +---
+ tests/unit/plugins/test_gpu_hetero.py                         | 2 --
+ tests/unit/plugins/test_gpu_mig.py                            | 4 +---
+ tests/unit/plugins/test_gpu_nvidia.py                         | 4 +---
+ tests/unit/plugins/test_metering_basic.py                     | 4 +---
+ tests/unit/plugins/test_qos_basic.py                          | 4 +---
+ tests/unit/plugins/test_runtime_tgi.py                        | 2 +-
+ tests/unit/plugins/test_runtime_vllm.py                       | 4 +---
+ tests/unit/plugins/test_workflow_temporal.py                  | 2 +-
+ tests/unit/policy/test_engine.py                              | 4 +---
+ tests/unit/policy/test_qos.py                                 | 4 +---
+ tests/unit/policy/test_quota.py                               | 4 +---
+ tests/unit/workflow/test_states.py                            | 2 --
+ 89 files changed, 38 insertions(+), 163 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f4552c1..d4d33ff 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -51,6 +51,7 @@
+ - pytest 把 `RuntimeWarning` 与 `PytestUnraisableExceptionWarning` 视为错误：协程未被 await 时被调用的代码实际没有执行，测试现在会失败，而不是只打印一条警告。
+ - README 与 CONTRIBUTING 的安装命令改为 `make install`：在仓库根目录执行 `uv sync` 只会创建一个空的虚拟环境，随后 `make test` 找不到 pytest。README 目录树列出全部 10 个插件，并补充容器部署说明。
+ - [docs/architecture/module-mapping.md](docs/architecture/module-mapping.md)：更正网关文件与测试数量（33 / 17）和上游变量名（`GATEWAY_UPSTREAM_URL`），部署小节与 CI 小节按当前工件更新，偏差 D2 处置后移除。
++- 删除源码与测试 docstring 中「兼容 Python 3.9+」/「兼容 3.9–3.12」的说法（各子包 `requires-python` 已是 `>=3.12`，代码使用 `X | None` 与 `enum.StrEnum`，在 3.9 上无法导入）；CONTRIBUTING 的类型注解约定改为与 ruff `UP` 规则一致的 `list[X]` / `X | None`。
+ 
+ ### Deprecated
+ 
+diff --git a/CONTRIBUTING.md b/CONTRIBUTING.md
+index 7a80eb9..970bdd7 100644
+--- a/CONTRIBUTING.md
++++ b/CONTRIBUTING.md
+@@ -190,7 +190,7 @@ ADR 与上游架构基线冲突时，以 [`architecture.md`](docs/architecture/a
+ 
+ ## 9. 代码风格
+ 
+-- **Python**：ruff 配置见根 `pyproject.toml`（行宽 100，`py312` 目标）。统一类型注解，使用 `Optional[X]` / `List[X]` / `Dict[K, V]`（而非 PEP 604 `X | None`）；公共 API 使用 Pydantic 强类型模型，禁止以未校验的任意 dict 作为公共接口。
++- **Python**：ruff 配置见根 `pyproject.toml`（行宽 100，`py312` 目标）。统一类型注解，使用内置泛型与 PEP 604 写法 `list[X]` / `dict[K, V]` / `X | None`（ruff `UP` 规则会拒绝 `Optional[X]` / `List[X]`）；公共 API 使用 Pydantic 强类型模型，禁止以未校验的任意 dict 作为公共接口。
+ - **Go**：`gateway/` 内遵循 `gofmt` / `go vet`（CI 检查）；对外契约版本化。
+ - **通用**：命名清晰、函数单一职责、为复杂逻辑写注释说明"为什么"，不留 TODO 占位（除非关联 Issue）。
+ - 仓库文本统一使用 UTF-8，换行与缩进遵循 `.editorconfig`。
+\ No newline at end of file
+diff --git a/conftest.py b/conftest.py
+index 0563893..950f1de 100644
+--- a/conftest.py
++++ b/conftest.py
+@@ -6,8 +6,6 @@
+ 做法：以 ``pathlib`` 动态发现 ``<repo_root>/packages/*/src`` 目录，并将
+ 其绝对路径前置注入 ``sys.path``。该注入在 conftest 模块导入时立即生效，
+ 早于任何测试模块的收集与导入。
+-
+-兼容 Python 3.9+。
+ """
+ 
+ from __future__ import annotations
+diff --git a/packages/cli/src/forgemesh/cli/commands.py b/packages/cli/src/forgemesh/cli/commands.py
+index f93c570..8cbfa16 100644
+--- a/packages/cli/src/forgemesh/cli/commands.py
++++ b/packages/cli/src/forgemesh/cli/commands.py
+@@ -3,8 +3,6 @@
+ P1 简化：每个命令使用独立的内存 SQLite 库（``:memory:``），
+ 不跨命令持久化。后续阶段将切换为 HTTP 客户端模式，通过 ``--api-url``
+ 连接控制平面。
+-
+-兼容 Python 3.9+。
+ """
+ 
+ from __future__ import annotations
+diff --git a/packages/cli/src/forgemesh/cli/main.py b/packages/cli/src/forgemesh/cli/main.py
+index 79759b7..f054b7f 100644
+--- a/packages/cli/src/forgemesh/cli/main.py
++++ b/packages/cli/src/forgemesh/cli/main.py
+@@ -16,8 +16,6 @@
+ 
+ P1 简化：CLI 直接调用 :class:`SQLiteRegistry`（内存库），不走 HTTP。
+ 后续阶段将切换为 HTTP 客户端模式。
+-
+-兼容 Python 3.9+。
+ """
+ 
+ from __future__ import annotations
+diff --git a/packages/control-plane/src/forgemesh/controlplane/api/routes.py b/packages/control-plane/src/forgemesh/controlplane/api/routes.py
+index c335c59..5e592fe 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/api/routes.py
++++ b/packages/control-plane/src/forgemesh/controlplane/api/routes.py
+@@ -20,8 +20,6 @@
+ ``DecisionRouter``（见 :func:`.dependencies.init_workflow_runtime` 等）；
+ 错误统一使用 ``{"error": {"code", "message", "correlationId"}}`` 信封
+ （对齐 OpenAPI ``Error`` schema，见 :func:`forgemesh.controlplane.app.error_envelope`）。
+-
+-兼容 Python 3.9+。
+ """
+ 
+ from __future__ import annotations
+diff --git a/packages/control-plane/src/forgemesh/controlplane/app.py b/packages/control-plane/src/forgemesh/controlplane/app.py
+index 55474fd..0bfeece 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/app.py
++++ b/packages/control-plane/src/forgemesh/controlplane/app.py
+@@ -22,7 +22,7 @@
+ * **FastAPI 可选兜底**：若运行环境未安装 FastAPI，回退到纯标准库
+   ``http.server``，仅提供探针与 501 占位。
+ 
+-兼容 Python 3.9+ / Pydantic v2。
++基于 Pydantic v2。
+ """
+ 
+ from __future__ import annotations
+diff --git a/packages/control-plane/src/forgemesh/controlplane/audit.py b/packages/control-plane/src/forgemesh/controlplane/audit.py
+index 18812b3..4481ac3 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/audit.py
++++ b/packages/control-plane/src/forgemesh/controlplane/audit.py
+@@ -2,8 +2,6 @@
+ 
+ 对齐 development-plan 5.5 / INV-4。审计事件记录关键操作，
+ correlation_id 全链路贯穿，支持调用链查询。
+-
+-兼容 Python 3.9+。
+ """
+ 
+ from __future__ import annotations
+diff --git a/packages/control-plane/src/forgemesh/controlplane/diagnostics.py b/packages/control-plane/src/forgemesh/controlplane/diagnostics.py
+index 251af82..cc3fdce 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/diagnostics.py
++++ b/packages/control-plane/src/forgemesh/controlplane/diagnostics.py
+@@ -14,8 +14,6 @@
+   递归替换为 ``"***"``。
+ * **correlation_id 累计贯穿**：collect 优先复用 :class:`CorrelationContext`
+   中的 correlation_id，否则生成新 ID，写入 bundle 并贯穿全链路。
+-
+-兼容 Python 3.9+（运行环境 3.12）。
+ """
+ 
+ from __future__ import annotations
+diff --git a/packages/control-plane/src/forgemesh/controlplane/heartbeat.py b/packages/control-plane/src/forgemesh/controlplane/heartbeat.py
+index 5a3dd7f..2651ce8 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/heartbeat.py
++++ b/packages/control-plane/src/forgemesh/controlplane/heartbeat.py
+@@ -13,8 +13,6 @@ development-plan 5.9 / INV-4。
+   :meth:`HeartbeatManager.list_online_agents` 仅返回 ``ONLINE`` 状态的 Agent，
+   ``DEGRADED`` / ``OFFLINE`` 均不视为可用，避免将失联 Agent 的资源回收到
+   调度池。
+-
+-兼容 Python 3.9+（运行环境 3.12，使用 :class:`enum.StrEnum`）。
+ """
+ 
+ from __future__ import annotations
+diff --git a/packages/control-plane/src/forgemesh/controlplane/observability.py b/packages/control-plane/src/forgemesh/controlplane/observability.py
+index b1f05df..1184ce7 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/observability.py
++++ b/packages/control-plane/src/forgemesh/controlplane/observability.py
+@@ -9,8 +9,6 @@
+ * :class:`StructuredLogger` —— 结构化日志（JSON），自动对敏感字段脱敏。
+ * :class:`TraceSpan` / :class:`TraceRecorder` —— 分布式追踪 span，
+   correlation_id 累计贯穿所有 span，parent span 通过 contextvars 传播。
+-
+-兼容 Python 3.9+（运行环境 3.12）。
+ """
+ 
+ from __future__ import annotations
+diff --git a/packages/control-plane/src/forgemesh/controlplane/outbox.py b/packages/control-plane/src/forgemesh/controlplane/outbox.py
+index 80b02dd..63b0a4b 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/outbox.py
++++ b/packages/control-plane/src/forgemesh/controlplane/outbox.py
+@@ -4,8 +4,6 @@
+ 同一 SQLite 事务中写入业务状态和事件记录，Dispatcher 异步发布。
+ 
+ 幂等保证：消费者按 event_id 去重，重复投递不产生重复副作用。
+-
+-兼容 Python 3.9+。
+ """
+ 
+ from __future__ import annotations
+diff --git a/packages/control-plane/src/forgemesh/controlplane/plugin_manager.py b/packages/control-plane/src/forgemesh/controlplane/plugin_manager.py
+index 935da1b..5587093 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/plugin_manager.py
++++ b/packages/control-plane/src/forgemesh/controlplane/plugin_manager.py
+@@ -16,8 +16,6 @@
+ 
+ 生命周期转移表直接复用契约 :data:`forgemesh.plugin.manifest.PLUGIN_TRANSITIONS`，
+ 非法转移抛 :class:`forgemesh.core.errors.InvalidStateTransition`。
+-
+-兼容 Python 3.9+。
+ """
+ 
+ from __future__ import annotations
+diff --git a/packages/control-plane/src/forgemesh/controlplane/reconciler/core.py b/packages/control-plane/src/forgemesh/controlplane/reconciler/core.py
+index e023307..436a409 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/reconciler/core.py
++++ b/packages/control-plane/src/forgemesh/controlplane/reconciler/core.py
+@@ -30,8 +30,6 @@
+ 2. 移除默认 release finalizer（``forgemesh.io/resource-release``）并 CAS 写回；
+ 3. finalizers 全部清空后：释放关联 Allocation（若存在 Active）→ 物理 DELETE
+    → 记审计日志。
+-
+-兼容 Python 3.9+。
+ """
+ 
+ from __future__ import annotations
+diff --git a/packages/control-plane/src/forgemesh/controlplane/registry/models.py b/packages/control-plane/src/forgemesh/controlplane/registry/models.py
+index 284de57..324f914 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/registry/models.py
++++ b/packages/control-plane/src/forgemesh/controlplane/registry/models.py
+@@ -3,8 +3,6 @@
+ 提供资源准入校验（``apiVersion`` / ``kind`` / ``metadata.name`` 非空）与
+ spec 变更时的 generation 自增（委托 :meth:`Resource.with_generation_bump`，
+ 保持不可变派生语义）。
+-
+-兼容 Python 3.9+。
+ """
+ 
+ from __future__ import annotations
+diff --git a/packages/control-plane/src/forgemesh/controlplane/registry/store.py b/packages/control-plane/src/forgemesh/controlplane/registry/store.py
+index 9f76035..7352389 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/registry/store.py
++++ b/packages/control-plane/src/forgemesh/controlplane/registry/store.py
+@@ -53,8 +53,6 @@ Active 分配」；``release_allocation`` 走 ``ALLOCATION_STATE_MACHINE`` 校
+ :class:`~forgemesh.core.errors.NotFoundError`，不泄露存在性。
+ :meth:`SQLiteRegistry.list_resource_keys` 与 :meth:`SQLiteRegistry.changes_since`
+ 是例外：它们跨租户返回资源键，仅供控制平面内部的控制器使用，不得暴露给 API。
+-
+-兼容 Python 3.9+。
+ """
+ 
+ from __future__ import annotations
+diff --git a/packages/control-plane/src/forgemesh/controlplane/tasks.py b/packages/control-plane/src/forgemesh/controlplane/tasks.py
+index b73a8d8..a716d52 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/tasks.py
++++ b/packages/control-plane/src/forgemesh/controlplane/tasks.py
+@@ -12,8 +12,6 @@
+   :func:`asyncio.to_thread` 包装同步 sqlite3 调用，``check_same_thread=False``。
+ * **去重器**：:class:`TaskDeduplicator` 提供进程内轻量去重（与 SQLite 幂等互补，
+   用于下发前的快速判重）。
+-
+-兼容 Python 3.9+（运行环境 3.12，使用 :class:`enum.StrEnum`）。
+ """
+ 
+ from __future__ import annotations
+diff --git a/packages/core-contracts/src/forgemesh/core/errors.py b/packages/core-contracts/src/forgemesh/core/errors.py
+index 86108fc..752e311 100644
+--- a/packages/core-contracts/src/forgemesh/core/errors.py
++++ b/packages/core-contracts/src/forgemesh/core/errors.py
+@@ -10,8 +10,6 @@
+ * ``ForbiddenError``   —— 鉴权/准入被拒绝（Policy deny）。
+ * ``PreconditionFailedError`` —— 前置条件不满足（如需要审批、版本漂移后 spec 已变）。
+ * ``InvalidStateTransition``  —— 状态机非法转移（对齐 workflow/resource 状态机）。
+-
+-兼容 Python 3.9+。
+ """
+ 
+ from __future__ import annotations
+diff --git a/packages/core-contracts/src/forgemesh/core/objects.py b/packages/core-contracts/src/forgemesh/core/objects.py
+index 5c33454..6236afc 100644
+--- a/packages/core-contracts/src/forgemesh/core/objects.py
++++ b/packages/core-contracts/src/forgemesh/core/objects.py
+@@ -14,7 +14,7 @@
+ ``metadata.resourceVersion`` 为乐观并发 CAS 依据，每次成功写入递增。本模块的
+ :meth:`Resource.with_generation_bump` 提供不可变的 generation 递增（返回副本）。
+ 
+-兼容 Python 3.9+ / Pydantic v2。
++基于 Pydantic v2。
+ """
+ 
+ from __future__ import annotations
+diff --git a/packages/core-contracts/src/forgemesh/core/registry.py b/packages/core-contracts/src/forgemesh/core/registry.py
+index 50c6411..676dcfa 100644
+--- a/packages/core-contracts/src/forgemesh/core/registry.py
++++ b/packages/core-contracts/src/forgemesh/core/registry.py
+@@ -19,8 +19,6 @@ PostgreSQL 存储）在控制平面子包中提供。
+ 
+ * ``list`` 按 kind/namespace/labels 过滤返回集合（强制注入租户边界）。
+ * ``delete`` 删除资源；不存在时抛 :class:`~forgemesh.core.errors.NotFoundError`。
+-
+-兼容 Python 3.9+。
+ """
+ 
+ from __future__ import annotations
+diff --git a/packages/decision-api/src/forgemesh/decision/degradation.py b/packages/decision-api/src/forgemesh/decision/degradation.py
+index 0340c0f..dffd5d4 100644
+--- a/packages/decision-api/src/forgemesh/decision/degradation.py
++++ b/packages/decision-api/src/forgemesh/decision/degradation.py
+@@ -8,8 +8,6 @@
+ 
+ 降级策略仅回答「是否应尝试备用 Provider」，**不**执行降级、**不**授权、
+ **不**改写资源终态。最终是否放行仍由 Policy 与 Scheduler 决定。
+-
+-兼容 Python 3.9+。
+ """
+ 
+ from __future__ import annotations
+diff --git a/packages/decision-api/src/forgemesh/decision/provider.py b/packages/decision-api/src/forgemesh/decision/provider.py
+index 77007c1..d884b2f 100644
+--- a/packages/decision-api/src/forgemesh/decision/provider.py
++++ b/packages/decision-api/src/forgemesh/decision/provider.py
+@@ -3,8 +3,6 @@
+ JEV 只回答「有哪些候选动作」，**不**分配资源、**不**写资源终态
+ （架构不变量 INV-1 / INV-3）。候选的 ``confidence`` 仅用于排序与解释，
+ 绝不作为授权凭证。
+-
+-兼容 Python 3.9+。
+ """
+ 
+ from __future__ import annotations
+diff --git a/packages/decision-api/src/forgemesh/decision/records.py b/packages/decision-api/src/forgemesh/decision/records.py
+index 21d89c6..db0d5c0 100644
+--- a/packages/decision-api/src/forgemesh/decision/records.py
++++ b/packages/decision-api/src/forgemesh/decision/records.py
+@@ -7,8 +7,6 @@
+ * ``"pending"`` —— 待审批；
+ * ``"approved"`` —— 已通过；
+ * ``"rejected"`` —— 已拒绝。
+-
+-兼容 Python 3.9+。
+ """
+ 
+ from __future__ import annotations
+diff --git a/packages/decision-api/src/forgemesh/decision/router.py b/packages/decision-api/src/forgemesh/decision/router.py
+index c344261..62642ee 100644
+--- a/packages/decision-api/src/forgemesh/decision/router.py
++++ b/packages/decision-api/src/forgemesh/decision/router.py
+@@ -21,8 +21,6 @@
+         不自动采用，交 Policy/审批                            执行）
+ 全失败   返回 status=FAILED，交人工处理                      ✅（禁止默认放行）
+ ======  ==============================================  ==========
+-
+-兼容 Python 3.9+。
+ """
+ 
+ from __future__ import annotations
+diff --git a/packages/node-agent/src/forgemesh/nodeagent/health.py b/packages/node-agent/src/forgemesh/nodeagent/health.py
+index bef0f3e..86adc50 100644
+--- a/packages/node-agent/src/forgemesh/nodeagent/health.py
++++ b/packages/node-agent/src/forgemesh/nodeagent/health.py
+@@ -10,7 +10,7 @@
+ 
+ :class:`MetricsCollector` 采集利用率/显存等指标，供心跳附带上报。
+ 
+-兼容 Python 3.9+ / Pydantic v2。
++基于 Pydantic v2。
+ """
+ 
+ from __future__ import annotations
+diff --git a/packages/node-agent/src/forgemesh/nodeagent/probe.py b/packages/node-agent/src/forgemesh/nodeagent/probe.py
+index 3ed5a44..0ea0595 100644
+--- a/packages/node-agent/src/forgemesh/nodeagent/probe.py
++++ b/packages/node-agent/src/forgemesh/nodeagent/probe.py
+@@ -8,7 +8,7 @@ Accelerators + DeviceInstances 的资源快照（JSON 兼容 dict），供
+ :class:`SnapshotReporter` 上报控制平面。
+ 
+ 对齐 architecture 5.1（核心资源模型）与 ADR-010（能力驱动异构资源模型）。
+-兼容 Python 3.9+ / Pydantic v2。
++基于 Pydantic v2。
+ """
+ 
+ from __future__ import annotations
+diff --git a/packages/node-agent/src/forgemesh/nodeagent/recover.py b/packages/node-agent/src/forgemesh/nodeagent/recover.py
+index caa9dde..addad00 100644
+--- a/packages/node-agent/src/forgemesh/nodeagent/recover.py
++++ b/packages/node-agent/src/forgemesh/nodeagent/recover.py
+@@ -12,7 +12,7 @@
+ :class:`IdempotencyGuard` 以 ``task_id`` + ``idempotency_key`` 去重，防止重连后
+ 重复执行同一幂等任务。
+ 
+-对齐 architecture 10.3（重连/幂等语义）与 ADR-009。兼容 Python 3.9+。
++对齐 architecture 10.3（重连/幂等语义）与 ADR-009。
+ """
+ 
+ from __future__ import annotations
+diff --git a/packages/node-agent/src/forgemesh/nodeagent/runtime.py b/packages/node-agent/src/forgemesh/nodeagent/runtime.py
+index 5eb8e8b..d8dffa7 100644
+--- a/packages/node-agent/src/forgemesh/nodeagent/runtime.py
++++ b/packages/node-agent/src/forgemesh/nodeagent/runtime.py
+@@ -7,7 +7,7 @@
+ 
+ 本模块为内存管理器（不拉起真实进程），适合在 Node Agent 内部维护运行时拓扑并
+ 向控制平面上报。对齐 architecture 10.1（Node Agent 受控执行）与 ADR-011（版本固定）。
+-兼容 Python 3.9+ / Pydantic v2。
++基于 Pydantic v2。
+ """
+ 
+ from __future__ import annotations
+diff --git a/packages/node-agent/src/forgemesh/nodeagent/server.py b/packages/node-agent/src/forgemesh/nodeagent/server.py
+index 057bfdc..2f52418 100644
+--- a/packages/node-agent/src/forgemesh/nodeagent/server.py
++++ b/packages/node-agent/src/forgemesh/nodeagent/server.py
+@@ -15,7 +15,7 @@
+ 单元测试中引入真实网络依赖。
+ 
+ 对齐 architecture 10.1（Node Agent 受控注册）与 ADR-009（最小权限/类型化任务）。
+-兼容 Python 3.9+ / Pydantic v2。
++基于 Pydantic v2。
+ """
+ 
+ from __future__ import annotations
+diff --git a/packages/plugin-sdk/src/forgemesh/plugin/isolation.py b/packages/plugin-sdk/src/forgemesh/plugin/isolation.py
+index b4d49c7..350c456 100644
+--- a/packages/plugin-sdk/src/forgemesh/plugin/isolation.py
++++ b/packages/plugin-sdk/src/forgemesh/plugin/isolation.py
+@@ -16,8 +16,6 @@
+ 
+ ``IsolationError`` 复用 :class:`forgemesh.core.errors.ForgeMeshError` 统一异常体系；
+ 若核心包未就绪，则回退到本地兜底基类。
+-
+-兼容 Python 3.9+。
+ """
+ 
+ from __future__ import annotations
+diff --git a/packages/plugin-sdk/src/forgemesh/plugin/manifest.py b/packages/plugin-sdk/src/forgemesh/plugin/manifest.py
+index a204461..aea4646 100644
+--- a/packages/plugin-sdk/src/forgemesh/plugin/manifest.py
++++ b/packages/plugin-sdk/src/forgemesh/plugin/manifest.py
+@@ -11,8 +11,6 @@
+ 
+ 非法生命周期转移抛出 :class:`forgemesh.core.errors.InvalidStateTransition`；
+ 若核心包未就绪，则回退到本地同名兜底异常类。
+-
+-兼容 Python 3.9+。
+ """
+ 
+ from __future__ import annotations
+diff --git a/packages/plugin-sdk/src/forgemesh/plugin/scaffold.py b/packages/plugin-sdk/src/forgemesh/plugin/scaffold.py
+index 6890ebf..e22a72f 100644
+--- a/packages/plugin-sdk/src/forgemesh/plugin/scaffold.py
++++ b/packages/plugin-sdk/src/forgemesh/plugin/scaffold.py
+@@ -22,8 +22,6 @@
+ * **合法标识符**：插件名只允许 ``[a-z][a-z0-9-]*``；目录名保留连字符，
+   Python 模块名用下划线形式，测试骨架用 ``importlib`` 按文件路径加载
+   ``provider.py``，兼容连字符目录。
+-
+-兼容 Python 3.9+。
+ """
+ 
+ from __future__ import annotations
+diff --git a/packages/plugin-sdk/src/forgemesh/plugin/sdk.py b/packages/plugin-sdk/src/forgemesh/plugin/sdk.py
+index 6d5b3c0..f085b32 100644
+--- a/packages/plugin-sdk/src/forgemesh/plugin/sdk.py
++++ b/packages/plugin-sdk/src/forgemesh/plugin/sdk.py
+@@ -16,8 +16,6 @@
+ * **发布可模拟**：``publish`` 支持 ``memory://`` 协议用于本地/测试环境；
+   ``http(s)://`` 走真实上传，失败时返回 ``success=False`` 而非抛异常，
+   便于 CI 重试。
+-
+-兼容 Python 3.9+。
+ """
+ 
+ from __future__ import annotations
+diff --git a/packages/plugin-sdk/src/forgemesh/plugin/signing.py b/packages/plugin-sdk/src/forgemesh/plugin/signing.py
+index 59afb34..4f4d6b6 100644
+--- a/packages/plugin-sdk/src/forgemesh/plugin/signing.py
++++ b/packages/plugin-sdk/src/forgemesh/plugin/signing.py
+@@ -10,8 +10,6 @@
+ 
+ ``SigningError`` 复用 :class:`forgemesh.core.errors.ForgeMeshError` 统一异常体系；
+ 若核心包未就绪，则回退到本地兜底基类。
+-
+-兼容 Python 3.9+。
+ """
+ 
+ from __future__ import annotations
+diff --git a/packages/policy-engine/src/forgemesh/policy/api.py b/packages/policy-engine/src/forgemesh/policy/api.py
+index 9e66609..5821ffe 100644
+--- a/packages/policy-engine/src/forgemesh/policy/api.py
++++ b/packages/policy-engine/src/forgemesh/policy/api.py
+@@ -5,8 +5,6 @@ Policy 负责授权、准入、配额规则与审批要求，**最终授权在 P
+ * JEV（DecisionProvider）的高置信推荐**不等于**授权（INV-3）。
+ * Policy 只回答「是否允许」，不负责具体资源分配（分配由 Scheduler 唯一负责）。
+ * 任何分配必须先 Policy 后 Scheduler；跳过即抛治理绕过错误（编排层强制）。
+-
+-兼容 Python 3.9+。
+ """
+ 
+ from __future__ import annotations
+diff --git a/packages/policy-engine/src/forgemesh/policy/engine.py b/packages/policy-engine/src/forgemesh/policy/engine.py
+index 59ce9be..a811811 100644
+--- a/packages/policy-engine/src/forgemesh/policy/engine.py
++++ b/packages/policy-engine/src/forgemesh/policy/engine.py
+@@ -7,8 +7,6 @@
+ 评估流水线：**授权 → 配额 → 高风险审批**，任一 deny 即 deny；
+ 全部通过返回 allow；条件授权/配额接近上限等降级类信息合并进
+ obligations（不改变 allow 语义），高风险操作返回 require_approval。
+-
+-兼容 Python 3.9+。
+ """
+ from __future__ import annotations
+ 
+diff --git a/packages/policy-engine/src/forgemesh/policy/qos.py b/packages/policy-engine/src/forgemesh/policy/qos.py
+index 53595c1..a60e1ef 100644
+--- a/packages/policy-engine/src/forgemesh/policy/qos.py
++++ b/packages/policy-engine/src/forgemesh/policy/qos.py
+@@ -9,8 +9,6 @@
+ * :class:`RateLimiter` —— 令牌桶限流器，恒定速率补充令牌，支持突发。
+ * :class:`PriorityQueue` —— 优先级队列，按 :class:`Priority` 排序、同优先级 FIFO。
+ * :class:`QoSManager` —— 准入管理器，组合优先级 + 限流 + 全局并发数判断。
+-
+-兼容 Python 3.9+。
+ """
+ from __future__ import annotations
+ 
+diff --git a/packages/policy-engine/src/forgemesh/policy/quota.py b/packages/policy-engine/src/forgemesh/policy/quota.py
+index 3a06b1c..26a3a29 100644
+--- a/packages/policy-engine/src/forgemesh/policy/quota.py
++++ b/packages/policy-engine/src/forgemesh/policy/quota.py
+@@ -9,8 +9,6 @@
+ * 以 ``"{tenant_id}:{resource_type}"`` 为键存储 :class:`QuotaLimit`，强制多租户隔离。
+ * :meth:`QuotaPolicy.consume` 在锁内完成「检查 + 递增」，避免 check-then-act 竞态。
+ * :meth:`QuotaPolicy.get_usage` 返回副本，防止外部修改内部状态。
+-
+-兼容 Python 3.9+。
+ """
+ from __future__ import annotations
+ 
+diff --git a/packages/policy-engine/src/forgemesh/policy/rules.py b/packages/policy-engine/src/forgemesh/policy/rules.py
+index f9ce748..d5c845d 100644
+--- a/packages/policy-engine/src/forgemesh/policy/rules.py
++++ b/packages/policy-engine/src/forgemesh/policy/rules.py
+@@ -8,8 +8,6 @@ development-plan 5.6 与 architecture 7.5（degraded 降级放行已移除，
+   （条件记入 obligations，不改变 allow 语义）。
+ * :class:`QuotaRule` —— 配额规则，超限 deny、接近上限 allow + 告警约束。
+ * :class:`RuleSet` —— 规则集合，组合授权与配额检查。
+-
+-兼容 Python 3.9+。
+ """
+ from __future__ import annotations
+ 
+diff --git a/packages/resource-model/src/forgemesh/resource/allocation.py b/packages/resource-model/src/forgemesh/resource/allocation.py
+index 6eeca20..2ba6875 100644
+--- a/packages/resource-model/src/forgemesh/resource/allocation.py
++++ b/packages/resource-model/src/forgemesh/resource/allocation.py
+@@ -13,7 +13,7 @@
+ * ``idempotency_key`` 保证重复分配请求幂等（不产生重复副作用）。
+ 
+ 字段命名与 DDL 保持一致（snake_case），便于持久化层直接映射。
+-兼容 Python 3.9+ / Pydantic v2。
++基于 Pydantic v2。
+ """
+ 
+ from __future__ import annotations
+diff --git a/packages/resource-model/src/forgemesh/resource/inference.py b/packages/resource-model/src/forgemesh/resource/inference.py
+index eabdd71..875a4d3 100644
+--- a/packages/resource-model/src/forgemesh/resource/inference.py
++++ b/packages/resource-model/src/forgemesh/resource/inference.py
+@@ -9,7 +9,7 @@
+ * ADR-011（运行时版本固定）。
+ 
+ 字段命名与资源 API/JSON 表示保持一致（camelCase），便于网关 / CLI / OpenAPI 直接互通。
+-兼容 Python 3.9+ / Pydantic v2。
++基于 Pydantic v2。
+ """
+ 
+ from __future__ import annotations
+diff --git a/packages/resource-model/src/forgemesh/resource/node.py b/packages/resource-model/src/forgemesh/resource/node.py
+index 79df8a9..e91d93b 100644
+--- a/packages/resource-model/src/forgemesh/resource/node.py
++++ b/packages/resource-model/src/forgemesh/resource/node.py
+@@ -9,7 +9,7 @@
+ 
+ 这些实体是控制平面观测到的事实（Observed），不直接作为声明式资源对外暴露；
+ 字段命名与 DDL 保持一致（snake_case），便于持久化层直接映射。
+-兼容 Python 3.9+ / Pydantic v2。
++基于 Pydantic v2。
+ """
+ 
+ from __future__ import annotations
+diff --git a/packages/resource-model/src/forgemesh/resource/states.py b/packages/resource-model/src/forgemesh/resource/states.py
+index 7ebf1aa..8a084ec 100644
+--- a/packages/resource-model/src/forgemesh/resource/states.py
++++ b/packages/resource-model/src/forgemesh/resource/states.py
+@@ -27,8 +27,6 @@
+ 
+     Active → {Released, Expired}
+     Released / Expired → ∅（终态）
+-
+-兼容 Python 3.9+。
+ """
+ 
+ from __future__ import annotations
+diff --git a/packages/resource-model/src/forgemesh/resource/tenant.py b/packages/resource-model/src/forgemesh/resource/tenant.py
+index bb2beb9..146736d 100644
+--- a/packages/resource-model/src/forgemesh/resource/tenant.py
++++ b/packages/resource-model/src/forgemesh/resource/tenant.py
+@@ -8,7 +8,7 @@
+ * 多租户隔离（``tenant_id`` 贯穿身份、资源、事件与计量边界）。
+ 
+ 字段命名与 DDL 保持一致（snake_case），便于持久化层直接映射。
+-兼容 Python 3.9+ / Pydantic v2。
++基于 Pydantic v2。
+ """
+ 
+ from __future__ import annotations
+diff --git a/packages/workflow-api/src/forgemesh/workflow/runtime.py b/packages/workflow-api/src/forgemesh/workflow/runtime.py
+index 3f4125d..7fa93b4 100644
+--- a/packages/workflow-api/src/forgemesh/workflow/runtime.py
++++ b/packages/workflow-api/src/forgemesh/workflow/runtime.py
+@@ -14,8 +14,6 @@ Temporal/Cadence 等）都必须满足同一语义，业务模型不与之耦合
+ * **审批**：等待人工或外部事件的运行进入 ``WAITING``，由外部信号唤醒。
+ * **版本固定**：运行实例固定其 ``definition_version``，升级定义不影响既有实例。
+ * **结果查询**：不确定状态下应先查询真实状态，不得盲目重试不可幂等操作。
+-
+-兼容 Python 3.9+。
+ """
+ 
+ from __future__ import annotations
+diff --git a/packages/workflow-api/src/forgemesh/workflow/states.py b/packages/workflow-api/src/forgemesh/workflow/states.py
+index 2e544d0..bacb3d3 100644
+--- a/packages/workflow-api/src/forgemesh/workflow/states.py
++++ b/packages/workflow-api/src/forgemesh/workflow/states.py
+@@ -9,8 +9,6 @@
+ 
+ 非法转移统一抛出 :class:`forgemesh.core.errors.InvalidStateTransition`。
+ 若核心包尚未安装，则回退到本模块内定义的同名兜底异常类，保证契约可独立加载。
+-
+-兼容 Python 3.9+。
+ """
+ 
+ from __future__ import annotations
+diff --git a/packages/workflow-runtime/src/forgemesh/workflowruntime/approval.py b/packages/workflow-runtime/src/forgemesh/workflowruntime/approval.py
+index 1a6205f..c989436 100644
+--- a/packages/workflow-runtime/src/forgemesh/workflowruntime/approval.py
++++ b/packages/workflow-runtime/src/forgemesh/workflowruntime/approval.py
+@@ -8,8 +8,6 @@
+ * **ApprovalGate**：用 :class:`asyncio.Event` 管理审批等待，支持通过/拒绝/超时。
+ * **CommitRevalidator**：审批通过后重校验输入/状态一致性，防止审批期间状态漂移
+   导致盲目 commit（对齐 runtime.py docstring「commit 步骤重新校验」语义）。
+-
+-兼容 Python 3.9+。
+ """
+ 
+ from __future__ import annotations
+diff --git a/packages/workflow-runtime/src/forgemesh/workflowruntime/compensate.py b/packages/workflow-runtime/src/forgemesh/workflowruntime/compensate.py
+index 7e4c7c3..ff83d6e 100644
+--- a/packages/workflow-runtime/src/forgemesh/workflowruntime/compensate.py
++++ b/packages/workflow-runtime/src/forgemesh/workflowruntime/compensate.py
+@@ -9,8 +9,6 @@
+ * **无补偿跳过**：未注册补偿 handler 的步骤标记为 ``SKIPPED``。
+ * **补偿失败不中断**：某步补偿失败标记为 ``COMPENSATION_FAILED``，仍继续补偿其余步骤，
+   以最大化清理效果。
+-
+-兼容 Python 3.9+。
+ """
+ 
+ from __future__ import annotations
+diff --git a/packages/workflow-runtime/src/forgemesh/workflowruntime/dsl.py b/packages/workflow-runtime/src/forgemesh/workflowruntime/dsl.py
+index 8502613..76c5b7b 100644
+--- a/packages/workflow-runtime/src/forgemesh/workflowruntime/dsl.py
++++ b/packages/workflow-runtime/src/forgemesh/workflowruntime/dsl.py
+@@ -2,8 +2,6 @@
+ 
+ 从 dict 解析工作流定义，校验步骤 DAG 无环、id 唯一、needs 引用合法。
+ 对齐 development-plan 5.4。
+-
+-兼容 Python 3.9+。
+ """
+ 
+ from __future__ import annotations
+diff --git a/packages/workflow-runtime/src/forgemesh/workflowruntime/exec.py b/packages/workflow-runtime/src/forgemesh/workflowruntime/exec.py
+index 0999834..0799223 100644
+--- a/packages/workflow-runtime/src/forgemesh/workflowruntime/exec.py
++++ b/packages/workflow-runtime/src/forgemesh/workflowruntime/exec.py
+@@ -13,8 +13,6 @@
+   最后一次错误。
+ * **超时**：步骤超时抛 :class:`ExecutionError`（``timeout_level=STEP``）；
+   工作流超时抛 :class:`ExecutionError`（``timeout_level=WORKFLOW``）。
+-
+-兼容 Python 3.9+。
+ """
+ 
+ from __future__ import annotations
+diff --git a/packages/workflow-runtime/src/forgemesh/workflowruntime/gpu_onboarding.py b/packages/workflow-runtime/src/forgemesh/workflowruntime/gpu_onboarding.py
+index 55b2972..09a86ef 100644
+--- a/packages/workflow-runtime/src/forgemesh/workflowruntime/gpu_onboarding.py
++++ b/packages/workflow-runtime/src/forgemesh/workflowruntime/gpu_onboarding.py
+@@ -15,8 +15,6 @@
+ 
+ 本模块仅定义工作流结构，不执行真实副作用；执行由
+ :class:`forgemesh.workflowruntime.exec.WorkflowExecutor` 驱动。
+-
+-兼容 Python 3.9+。
+ """
+ 
+ from __future__ import annotations
+diff --git a/packages/workflow-runtime/src/forgemesh/workflowruntime/store.py b/packages/workflow-runtime/src/forgemesh/workflowruntime/store.py
+index 23bf168..c4357b4 100644
+--- a/packages/workflow-runtime/src/forgemesh/workflowruntime/store.py
++++ b/packages/workflow-runtime/src/forgemesh/workflowruntime/store.py
+@@ -15,8 +15,6 @@
+ * **恢复**：``list_pending_runs`` 列出所有非终态运行，供进程重启后恢复。
+ * **线程安全**：SQLite 以 ``check_same_thread=False`` 打开，所有异步方法通过
+   :func:`asyncio.to_thread` 在独立线程执行同步 sqlite3 调用。
+-
+-兼容 Python 3.9+。
+ """
+ 
+ from __future__ import annotations
+diff --git a/plugins/decision-jev/provider.py b/plugins/decision-jev/provider.py
+index 141338e..0a0a47b 100644
+--- a/plugins/decision-jev/provider.py
++++ b/plugins/decision-jev/provider.py
+@@ -18,8 +18,6 @@ JEV 表达式语法::
+     {"and": [expr1, expr2]}                     → all(expr_i)
+     {"or":  [expr1, expr2]}                     → any(expr_i)
+     {"not": expr}                               → not expr
+-
+-兼容 Python 3.9+。
+ """
+ 
+ from __future__ import annotations
+diff --git a/plugins/decision-rules/provider.py b/plugins/decision-rules/provider.py
+index 006eb76..43e782c 100644
+--- a/plugins/decision-rules/provider.py
++++ b/plugins/decision-rules/provider.py
+@@ -7,8 +7,6 @@
+ 
+ * **决策 ≠ 授权**（INV-1/INV-3）：仅产出候选，不分配资源、不改写资源终态。
+ * **可解释**：每条规则携带 ``rationale`` 供审计。
+-
+-兼容 Python 3.9+。
+ """
+ 
+ from __future__ import annotations
+diff --git a/plugins/decision-typesafe-jev/provider.py b/plugins/decision-typesafe-jev/provider.py
+index bb171e8..7730d00 100644
+--- a/plugins/decision-typesafe-jev/provider.py
++++ b/plugins/decision-typesafe-jev/provider.py
+@@ -15,8 +15,6 @@
+ 外部依赖（TypeSafe 云端 API）经 :class:`JevClient` 协议注入：默认实现
+ :class:`HttpJevClient` 仅使用标准库（不引入第三方 HTTP 依赖）；测试可注入
+ :class:`StaticJevClient`，无需真实网络。
+-
+-兼容 Python 3.9+。
+ """
+ 
+ from __future__ import annotations
+diff --git a/plugins/gpu-nvidia/discovery.py b/plugins/gpu-nvidia/discovery.py
+index a6560d8..f5860c4 100644
+--- a/plugins/gpu-nvidia/discovery.py
++++ b/plugins/gpu-nvidia/discovery.py
+@@ -9,7 +9,7 @@
+   探测结果验证后才视为实际支持。
+ * **测试友好**：枚举函数可注入，无真实 GPU 时用 mock 即可测试。
+ 
+-兼容 Python 3.9+ / Pydantic v2。
++基于 Pydantic v2。
+ """
+ 
+ from __future__ import annotations
+diff --git a/plugins/gpu-nvidia/health.py b/plugins/gpu-nvidia/health.py
+index 97fb9c7..886d37a 100644
+--- a/plugins/gpu-nvidia/health.py
++++ b/plugins/gpu-nvidia/health.py
+@@ -11,7 +11,7 @@
+ * **观测 ≠ 授权**：健康状态仅描述事实，不直接改变调度决策。
+ * **测试友好**：检查函数可注入 mock，监控循环支持 ``max_iterations`` 限制。
+ 
+-兼容 Python 3.9+ / Pydantic v2。
++基于 Pydantic v2。
+ """
+ 
+ from __future__ import annotations
+diff --git a/plugins/gpu-nvidia/hetero.py b/plugins/gpu-nvidia/hetero.py
+index 34275c2..b6cada1 100644
+--- a/plugins/gpu-nvidia/hetero.py
++++ b/plugins/gpu-nvidia/hetero.py
+@@ -13,7 +13,7 @@ NVIDIA 不完全一致。本模块**显式报告所有能力差异，不隐藏
+   ``critical`` / ``warning`` / ``info``，关键字段差异直接影响调度正确性。
+ * **人类可读**：``format_report`` 生成可直接展示的差异报告文本。
+ 
+-兼容 Python 3.9+ / Pydantic v2。
++基于 Pydantic v2。
+ """
+ 
+ from __future__ import annotations
+diff --git a/plugins/gpu-nvidia/mig.py b/plugins/gpu-nvidia/mig.py
+index bf55662..f0b7505 100644
+--- a/plugins/gpu-nvidia/mig.py
++++ b/plugins/gpu-nvidia/mig.py
+@@ -20,7 +20,7 @@
+                      Healthy / Degraded ──destroy──▶ Destroyed
+                      Healthy ⇄ Degraded（健康检查可反复执行）
+ 
+-兼容 Python 3.9+ / Pydantic v2。
++基于 Pydantic v2。
+ """
+ 
+ from __future__ import annotations
+diff --git a/plugins/gpu-nvidia/preflight.py b/plugins/gpu-nvidia/preflight.py
+index ca27d1c..e46698d 100644
+--- a/plugins/gpu-nvidia/preflight.py
++++ b/plugins/gpu-nvidia/preflight.py
+@@ -10,7 +10,7 @@
+ * **可诊断**：失败时携带 ``details``，便于运维定位。
+ * **测试友好**：各检查函数可注入 mock。
+ 
+-兼容 Python 3.9+ / Pydantic v2。
++基于 Pydantic v2。
+ """
+ 
+ from __future__ import annotations
+diff --git a/plugins/metering-basic/provider.py b/plugins/metering-basic/provider.py
+index 97d158a..1af35b1 100644
+--- a/plugins/metering-basic/provider.py
++++ b/plugins/metering-basic/provider.py
+@@ -9,8 +9,6 @@
+   多租户隔离、异步线程池执行等逻辑均由 ``UsageStore`` 承担。
+ * **追加式不可变**（IVT-10）：记录只插入不更新；计量修正通过新增
+   ``correction_of`` 记录实现，原记录始终保留，保证审计可追溯。
+-
+-兼容 Python 3.9+。
+ """
+ 
+ from __future__ import annotations
+diff --git a/plugins/metering-basic/usage.py b/plugins/metering-basic/usage.py
+index 6b72874..b6b13ae 100644
+--- a/plugins/metering-basic/usage.py
++++ b/plugins/metering-basic/usage.py
+@@ -7,8 +7,6 @@
+ * **多租户隔离**：所有查询按 ``tenant_id`` 过滤，跨租户访问视为不存在。
+ * **异步非阻塞**：SQLite 操作通过 ``asyncio.to_thread`` 在线程池执行，
+   避免阻塞事件循环。
+-
+-兼容 Python 3.9+。
+ """
+ 
+ from __future__ import annotations
+diff --git a/plugins/qos-basic/provider.py b/plugins/qos-basic/provider.py
+index 8371e25..2fe52c0 100644
+--- a/plugins/qos-basic/provider.py
++++ b/plugins/qos-basic/provider.py
+@@ -11,8 +11,6 @@
+   与 ``priority``；缺失字段使用合理默认，降低调用方耦合。
+ * **优先级可移植**：:class:`QoSProviderResult.priority` 以字符串形式返回
+   优先级名称（如 ``"NORMAL"``），避免跨进程传递枚举序列化问题。
+-
+-兼容 Python 3.9+。
+ """
+ 
+ from __future__ import annotations
+diff --git a/plugins/runtime-tgi/provider.py b/plugins/runtime-tgi/provider.py
+index d94aaec..ccd9b38 100644
+--- a/plugins/runtime-tgi/provider.py
++++ b/plugins/runtime-tgi/provider.py
+@@ -24,7 +24,7 @@ TGI 特定参数：
+ * **契约一致性**：与 runtime-vllm 行为一致（deploy → verify → release 闭环）。
+ * **测试友好**：实例启动器、HTTP 客户端、租约释放与分配核验函数均可注入 mock。
+ 
+-兼容 Python 3.9+ / Pydantic v2。
++基于 Pydantic v2。
+ """
+ 
+ from __future__ import annotations
+diff --git a/plugins/runtime-vllm/deploy.py b/plugins/runtime-vllm/deploy.py
+index 77ddf20..be3a001 100644
+--- a/plugins/runtime-vllm/deploy.py
++++ b/plugins/runtime-vllm/deploy.py
+@@ -15,7 +15,7 @@
+   占用的设备与并行度，不隐式抢占。
+ * **测试友好**：实例启动器（launcher）可注入，无真实 vLLM 进程时用 mock 即可测试。
+ 
+-兼容 Python 3.9+ / Pydantic v2。
++基于 Pydantic v2。
+ """
+ 
+ from __future__ import annotations
+diff --git a/plugins/runtime-vllm/model.py b/plugins/runtime-vllm/model.py
+index 2be8358..201066f 100644
+--- a/plugins/runtime-vllm/model.py
++++ b/plugins/runtime-vllm/model.py
+@@ -14,7 +14,7 @@
+   不返回 ``False``，调用方无需二次判断。
+ * **测试友好**：拉取函数可注入，无真实模型仓库时用 mock 即可测试。
+ 
+-兼容 Python 3.9+ / Pydantic v2。
++基于 Pydantic v2。
+ """
+ 
+ from __future__ import annotations
+diff --git a/plugins/runtime-vllm/release.py b/plugins/runtime-vllm/release.py
+index f8d1b04..3f42922 100644
+--- a/plugins/runtime-vllm/release.py
++++ b/plugins/runtime-vllm/release.py
+@@ -14,7 +14,7 @@
+ * **不虚占**：``verify_allocation`` 检查设备实际状态，而非仅信任租约释放返回值。
+ * **测试友好**：租约释放与分配核验函数均可注入 mock。
+ 
+-兼容 Python 3.9+ / Pydantic v2。
++基于 Pydantic v2。
+ """
+ 
+ from __future__ import annotations
+diff --git a/plugins/runtime-vllm/verify.py b/plugins/runtime-vllm/verify.py
+index 5251ef5..dcb1072 100644
+--- a/plugins/runtime-vllm/verify.py
++++ b/plugins/runtime-vllm/verify.py
+@@ -8,7 +8,7 @@
+ * **验收标准可配**：延迟超阈值或错误率超阈值 → ``passed=False``。
+ * **测试友好**：HTTP 客户端可注入，无真实服务时用 mock 即可测试。
+ 
+-兼容 Python 3.9+ / Pydantic v2。
++基于 Pydantic v2。
+ """
+ 
+ from __future__ import annotations
+diff --git a/plugins/workflow-reference/provider.py b/plugins/workflow-reference/provider.py
+index 2588b9b..51ea78c 100644
+--- a/plugins/workflow-reference/provider.py
++++ b/plugins/workflow-reference/provider.py
+@@ -5,8 +5,6 @@
+ 
+ 对齐 development-plan 5.4 / ADR-003。本插件不产出资源终态（INV-1/INV-3），
+ 任何状态写入必须经 Registry 由 Controller 完成。
+-
+-兼容 Python 3.9+。
+ """
+ 
+ from __future__ import annotations
+diff --git a/plugins/workflow-temporal/provider.py b/plugins/workflow-temporal/provider.py
+index 8ee5112..228f521 100644
+--- a/plugins/workflow-temporal/provider.py
++++ b/plugins/workflow-temporal/provider.py
+@@ -17,7 +17,7 @@
+ * **信号**：``signal`` 直接映射为 Temporal Signal，用于审批唤醒。
+ * **幂等**：同一 ``idempotency_key`` 复用既有 workflow_id，不产生重复副作用。
+ 
+-兼容 Python 3.9+ / Pydantic v2。
++基于 Pydantic v2。
+ """
+ 
+ from __future__ import annotations
+diff --git a/tests/unit/decision/test_circuit_breaker.py b/tests/unit/decision/test_circuit_breaker.py
+index 208196c..df82e8c 100644
+--- a/tests/unit/decision/test_circuit_breaker.py
++++ b/tests/unit/decision/test_circuit_breaker.py
+@@ -2,8 +2,6 @@
+ 
+ 覆盖三态状态机：closed → open → half_open → closed/open，
+ 以及多 Provider 注册表的按 provider_id 隔离。
+-
+-兼容 Python 3.9+。
+ """
+ 
+ from __future__ import annotations
+diff --git a/tests/unit/decision/test_degradation.py b/tests/unit/decision/test_degradation.py
+index b25dc70..048c5f7 100644
+--- a/tests/unit/decision/test_degradation.py
++++ b/tests/unit/decision/test_degradation.py
+@@ -7,8 +7,6 @@
+ * 超过最大尝试次数 → 不再降级。
+ * 主 Provider 成功 → 不降级。
+ * 无备用 Provider → fail。
+-
+-兼容 Python 3.9+。
+ """
+ 
+ from __future__ import annotations
+diff --git a/tests/unit/decision/test_router.py b/tests/unit/decision/test_router.py
+index c1b86ad..2a5fec5 100644
+--- a/tests/unit/decision/test_router.py
++++ b/tests/unit/decision/test_router.py
+@@ -11,8 +11,6 @@
+ * ``deadline_ms`` 生效：与全局 ``timeout_seconds`` 取较小值。
+ 
+ 按要求使用 ``asyncio.get_event_loop().run_until_complete`` 驱动协程。
+-
+-兼容 Python 3.9+。
+ """
+ 
+ from __future__ import annotations
+@@ -77,7 +75,7 @@ class BoomProvider(DecisionProvider):
+ 
+ @pytest.fixture(autouse=True)
+ def _fresh_event_loop():
+-    """为每个测试提供干净的 current event loop（兼容 3.9–3.12）。"""
++    """为每个测试提供干净的 current event loop。"""
+     loop = asyncio.new_event_loop()
+     asyncio.set_event_loop(loop)
+     try:
+diff --git a/tests/unit/plugins/conftest.py b/tests/unit/plugins/conftest.py
+index a2ba365..cbfd6b8 100644
+--- a/tests/unit/plugins/conftest.py
++++ b/tests/unit/plugins/conftest.py
+@@ -8,8 +8,6 @@
+ 
+ 根级 ``conftest.py`` 已将 ``packages/*/src`` 注入 ``sys.path``，故
+ ``forgemesh.decision.*`` / ``forgemesh.resource.*`` 在本 conftest 执行时已可导入。
+-
+-兼容 Python 3.9+。
+ """
+ 
+ from __future__ import annotations
+diff --git a/tests/unit/plugins/test_decision_jev.py b/tests/unit/plugins/test_decision_jev.py
+index e61c9cd..a33787b 100644
+--- a/tests/unit/plugins/test_decision_jev.py
++++ b/tests/unit/plugins/test_decision_jev.py
+@@ -6,8 +6,6 @@
+ * ``JEVProvider.decide``：多规则匹配、无匹配返回空、provider_id/version。
+ * ``JEVProvider.from_file``：从 JSON 文件加载。
+ * 与 ``DecisionRouter`` 集成。
+-
+-兼容 Python 3.9+。
+ """
+ 
+ from __future__ import annotations
+@@ -27,7 +25,7 @@ from forgemesh.decision.router import DecisionRouter
+ 
+ @pytest.fixture(autouse=True)
+ def _fresh_event_loop():
+-    """为每个测试提供干净的 current event loop（兼容 3.9–3.12）。"""
++    """为每个测试提供干净的 current event loop。"""
+     loop = asyncio.new_event_loop()
+     asyncio.set_event_loop(loop)
+     try:
+diff --git a/tests/unit/plugins/test_decision_rules.py b/tests/unit/plugins/test_decision_rules.py
+index fcba848..8acfe71 100644
+--- a/tests/unit/plugins/test_decision_rules.py
++++ b/tests/unit/plugins/test_decision_rules.py
+@@ -5,8 +5,6 @@
+ * ``Rule`` 匹配（条件 True/False）与候选转换。
+ * ``RulesProvider.decide``：多规则匹配、无匹配返回空、provider_id/version。
+ * 与 ``DecisionRouter`` 集成：主 Provider 返回候选 → 路由成功。
+-
+-兼容 Python 3.9+。
+ """
+ 
+ from __future__ import annotations
+@@ -25,7 +23,7 @@ from forgemesh.decision.router import DecisionRouter
+ 
+ @pytest.fixture(autouse=True)
+ def _fresh_event_loop():
+-    """为每个测试提供干净的 current event loop（兼容 3.9–3.12）。"""
++    """为每个测试提供干净的 current event loop。"""
+     loop = asyncio.new_event_loop()
+     asyncio.set_event_loop(loop)
+     try:
+diff --git a/tests/unit/plugins/test_decision_typesafe_jev.py b/tests/unit/plugins/test_decision_typesafe_jev.py
+index b8cdcfa..9babf5f 100644
+--- a/tests/unit/plugins/test_decision_typesafe_jev.py
++++ b/tests/unit/plugins/test_decision_typesafe_jev.py
+@@ -15,8 +15,6 @@
+ 
+ 另覆盖辅助类 ``JevQuestion`` / ``JevDecision`` / ``StaticJevClient`` /
+ ``HttpJevClient`` 的行为与边界。
+-
+-兼容 Python 3.9+。
+ """
+ 
+ from __future__ import annotations
+@@ -47,7 +45,7 @@ from pydantic import ValidationError
+ 
+ @pytest.fixture(autouse=True)
+ def _fresh_event_loop():
+-    """为每个测试提供干净的 current event loop（兼容 3.9–3.12）。"""
++    """为每个测试提供干净的 current event loop。"""
+     loop = asyncio.new_event_loop()
+     asyncio.set_event_loop(loop)
+     try:
+diff --git a/tests/unit/plugins/test_gpu_hetero.py b/tests/unit/plugins/test_gpu_hetero.py
+index bb348d3..ac8735e 100644
+--- a/tests/unit/plugins/test_gpu_hetero.py
++++ b/tests/unit/plugins/test_gpu_hetero.py
+@@ -7,8 +7,6 @@
+ * **format_report** — 空报告 / 含差异报告 / 汇总统计。
+ 
+ 核心原则验证：**能力差异不隐藏**，所有差异必须被显式报告。
+-
+-兼容 Python 3.9+。
+ """
+ 
+ from __future__ import annotations
+diff --git a/tests/unit/plugins/test_gpu_mig.py b/tests/unit/plugins/test_gpu_mig.py
+index ee96c88..9a352cb 100644
+--- a/tests/unit/plugins/test_gpu_mig.py
++++ b/tests/unit/plugins/test_gpu_mig.py
+@@ -10,8 +10,6 @@
+ * **get_capability_report** — 显存 / 切片总量、已用、可用。
+ * **状态机** — 非法转移被拒。
+ * **并发互斥** — 同 GPU 并发创建不超分。
+-
+-兼容 Python 3.9+。
+ """
+ 
+ from __future__ import annotations
+@@ -39,7 +37,7 @@ from gpu_nvidia_plugin.mig import (
+ 
+ @pytest.fixture(autouse=True)
+ def _fresh_event_loop() -> Any:
+-    """为每个测试提供干净的 current event loop（兼容 3.9–3.12）。"""
++    """为每个测试提供干净的 current event loop。"""
+     loop = asyncio.new_event_loop()
+     asyncio.set_event_loop(loop)
+     try:
+diff --git a/tests/unit/plugins/test_gpu_nvidia.py b/tests/unit/plugins/test_gpu_nvidia.py
+index d6450e8..7ab15d6 100644
+--- a/tests/unit/plugins/test_gpu_nvidia.py
++++ b/tests/unit/plugins/test_gpu_nvidia.py
+@@ -8,8 +8,6 @@
+   通过/失败、``validate_all`` 汇总、可诊断信息。
+ * **health** — ``check_device`` Healthy/Degraded/Unhealthy、``check_all``、
+   温度/ECC 阈值、``monitor_loop`` 周期循环。
+-
+-兼容 Python 3.9+。
+ """
+ 
+ from __future__ import annotations
+@@ -35,7 +33,7 @@ from gpu_nvidia_plugin.preflight import (
+ 
+ @pytest.fixture(autouse=True)
+ def _fresh_event_loop():
+-    """为每个测试提供干净的 current event loop（兼容 3.9–3.12）。"""
++    """为每个测试提供干净的 current event loop。"""
+     loop = asyncio.new_event_loop()
+     asyncio.set_event_loop(loop)
+     try:
+diff --git a/tests/unit/plugins/test_metering_basic.py b/tests/unit/plugins/test_metering_basic.py
+index 59840cd..1b0a228 100644
+--- a/tests/unit/plugins/test_metering_basic.py
++++ b/tests/unit/plugins/test_metering_basic.py
+@@ -9,8 +9,6 @@
+ * ``correct`` 计量修正（原记录保留 + 新增 ``correction_of`` 记录，IVT-10）。
+ * 追加式不可修改（重复 ``record_id`` 抛 ``ConflictError``）。
+ * 多租户隔离。
+-
+-兼容 Python 3.9+。
+ """
+ 
+ from __future__ import annotations
+@@ -24,7 +22,7 @@ from metering_basic_plugin import UsageRecord, UsageStore, UsageSummary
+ 
+ @pytest.fixture(autouse=True)
+ def _fresh_event_loop():
+-    """为每个测试提供干净的 current event loop（兼容 3.9–3.12）。"""
++    """为每个测试提供干净的 current event loop。"""
+     loop = asyncio.new_event_loop()
+     asyncio.set_event_loop(loop)
+     try:
+diff --git a/tests/unit/plugins/test_qos_basic.py b/tests/unit/plugins/test_qos_basic.py
+index d97ff14..0d74029 100644
+--- a/tests/unit/plugins/test_qos_basic.py
++++ b/tests/unit/plugins/test_qos_basic.py
+@@ -8,8 +8,6 @@
+ * ``QoSProviderResult`` 字段正确性。
+ * 优先级解析（字符串 / int / 默认 / 无法识别回退）。
+ * 与 :class:`QoSManager` 集成（``release_slot`` 后恢复准入）。
+-
+-兼容 Python 3.9+。
+ """
+ 
+ from __future__ import annotations
+@@ -23,7 +21,7 @@ from qos_basic_plugin import QoSProvider, QoSProviderResult
+ 
+ @pytest.fixture(autouse=True)
+ def _fresh_event_loop():
+-    """为每个测试提供干净的 current event loop（兼容 3.9–3.12）。"""
++    """为每个测试提供干净的 current event loop。"""
+     loop = asyncio.new_event_loop()
+     asyncio.set_event_loop(loop)
+     try:
+diff --git a/tests/unit/plugins/test_runtime_tgi.py b/tests/unit/plugins/test_runtime_tgi.py
+index 5583b6b..d9f2eea 100644
+--- a/tests/unit/plugins/test_runtime_tgi.py
++++ b/tests/unit/plugins/test_runtime_tgi.py
+@@ -29,7 +29,7 @@ from runtime_tgi_plugin.provider import (
+ 
+ @pytest.fixture(autouse=True)
+ def _fresh_event_loop():
+-    """为每个测试提供干净的 current event loop（兼容 3.9–3.12）。"""
++    """为每个测试提供干净的 current event loop。"""
+     loop = asyncio.new_event_loop()
+     asyncio.set_event_loop(loop)
+     try:
+diff --git a/tests/unit/plugins/test_runtime_vllm.py b/tests/unit/plugins/test_runtime_vllm.py
+index 1919290..0673f79 100644
+--- a/tests/unit/plugins/test_runtime_vllm.py
++++ b/tests/unit/plugins/test_runtime_vllm.py
+@@ -9,8 +9,6 @@
+   ``measure_error_rate`` / ``verify``（延迟超限/错误率超限/全部通过）。
+ * **release** — ``stop_instance`` / ``release_lease`` / ``verify_allocation`` /
+   ``release`` 完整流程。
+-
+-兼容 Python 3.9+。
+ """
+ 
+ from __future__ import annotations
+@@ -36,7 +34,7 @@ from runtime_vllm_plugin.verify import (
+ 
+ @pytest.fixture(autouse=True)
+ def _fresh_event_loop():
+-    """为每个测试提供干净的 current event loop（兼容 3.9–3.12）。"""
++    """为每个测试提供干净的 current event loop。"""
+     loop = asyncio.new_event_loop()
+     asyncio.set_event_loop(loop)
+     try:
+diff --git a/tests/unit/plugins/test_workflow_temporal.py b/tests/unit/plugins/test_workflow_temporal.py
+index f6267a2..19b7eb5 100644
+--- a/tests/unit/plugins/test_workflow_temporal.py
++++ b/tests/unit/plugins/test_workflow_temporal.py
+@@ -30,7 +30,7 @@ from workflow_temporal_plugin.provider import (
+ 
+ @pytest.fixture(autouse=True)
+ def _fresh_event_loop():
+-    """为每个测试提供干净的 current event loop（兼容 3.9–3.12）。"""
++    """为每个测试提供干净的 current event loop。"""
+     loop = asyncio.new_event_loop()
+     asyncio.set_event_loop(loop)
+     try:
+diff --git a/tests/unit/policy/test_engine.py b/tests/unit/policy/test_engine.py
+index 430d283..d0dd6d1 100644
+--- a/tests/unit/policy/test_engine.py
++++ b/tests/unit/policy/test_engine.py
+@@ -10,8 +10,6 @@
+ * 租户隔离：租户 A 的规则不影响租户 B；
+ * 有条件授权 → allow + 条件约束；
+ * PolicyDecision 的 policy_id / approvers 审计字段。
+-
+-兼容 Python 3.9+。
+ """
+ from __future__ import annotations
+ 
+@@ -27,7 +25,7 @@ from pydantic import ValidationError
+ 
+ @pytest.fixture(autouse=True)
+ def _fresh_event_loop():
+-    """为每个测试提供干净的 current event loop（兼容 3.9–3.12）。"""
++    """为每个测试提供干净的 current event loop。"""
+     loop = asyncio.new_event_loop()
+     asyncio.set_event_loop(loop)
+     try:
+diff --git a/tests/unit/policy/test_qos.py b/tests/unit/policy/test_qos.py
+index 63e77d6..e469ab3 100644
+--- a/tests/unit/policy/test_qos.py
++++ b/tests/unit/policy/test_qos.py
+@@ -6,8 +6,6 @@
+ * PriorityQueue 优先级排序 + FIFO；
+ * QoSManager admit（优先级准入 + 限流 + 并发数限制）；
+ * release_slot 释放并发槽。
+-
+-兼容 Python 3.9+。
+ """
+ from __future__ import annotations
+ 
+@@ -28,7 +26,7 @@ from forgemesh.policy.qos import (
+ 
+ @pytest.fixture(autouse=True)
+ def _fresh_event_loop():
+-    """为每个测试提供干净的 current event loop（兼容 3.9–3.12）。"""
++    """为每个测试提供干净的 current event loop。"""
+     loop = asyncio.new_event_loop()
+     asyncio.set_event_loop(loop)
+     try:
+diff --git a/tests/unit/policy/test_quota.py b/tests/unit/policy/test_quota.py
+index 000a70f..1b001e6 100644
+--- a/tests/unit/policy/test_quota.py
++++ b/tests/unit/policy/test_quota.py
+@@ -6,8 +6,6 @@
+ * release 回收；
+ * set_limit / get_usage；
+ * 多租户隔离（不同租户独立配额）。
+-
+-兼容 Python 3.9+。
+ """
+ from __future__ import annotations
+ 
+@@ -20,7 +18,7 @@ from forgemesh.policy.quota import QuotaDecision, QuotaLimit, QuotaPolicy
+ 
+ @pytest.fixture(autouse=True)
+ def _fresh_event_loop():
+-    """为每个测试提供干净的 current event loop（兼容 3.9–3.12）。"""
++    """为每个测试提供干净的 current event loop。"""
+     loop = asyncio.new_event_loop()
+     asyncio.set_event_loop(loop)
+     try:
+diff --git a/tests/unit/workflow/test_states.py b/tests/unit/workflow/test_states.py
+index 0b7efc3..f27582b 100644
+--- a/tests/unit/workflow/test_states.py
++++ b/tests/unit/workflow/test_states.py
+@@ -4,8 +4,6 @@
+ * 合法转移通过；
+ * 非法转移（如 ``SUCCEEDED -> RUNNING``）抛 ``InvalidStateTransition``；
+ * :class:`StepStatus` 恰好 10 态、:class:`WorkflowStatus` 恰好 8 态。
+-
+-兼容 Python 3.9+。
+ """
+ 
+ from __future__ import annotations
+-- 
+2.43.0
+

@@ -20,6 +20,7 @@
 | 4 | `04-p1-inference-routing` / `cursor/p1-inference-routing-b108` | 4 | P1-1：`status.endpoints` 定义为 `{url, ready, instanceId, protocol}` 并进入资源模型、Schema 与 OpenAPI；status 子资源可写入实例地址；网关新增带命名空间的推理路由，只转发到 ready 实例，并按 `protocol` 映射实例上的推理路径（不再原样拼接入站路径） |
 | 5 | `05-p1-gateway-hardening` / `cursor/p1-gateway-hardening-b108` | 7 | P1-8 / P2-2：网关在拨号时检查实例地址（`GATEWAY_INSTANCE_ALLOWED_CIDRS`，默认拒绝回环、链路本地与云元数据地址）、请求体上限（`413`）、放宽空闲连接池、解析器合并并发回源并短暂缓存"不存在 / 未就绪"、`/readyz` 改为请求控制平面的 `/readyz`、实例错误响应保留 `Content-Type` |
 | 6 | `06-p2-sqlite-storage` / `cursor/p2-sqlite-storage-b108` | 3 | P2-1（部分）：控制平面的 SQLite 存储以 WAL 模式打开并启用外键约束；去重键查询不再每次删除过期键；备份文档改为 `VACUUM INTO` / `Connection.backup` 在线快照（原来的 checkpoint + `cp` 在写入期间可能得到损坏的备份），恢复时保留旧库的 `-wal` |
+| 7 | `07-p2-deploy-ci-docs` / `cursor/p2-deploy-ci-docs-b108` | 9 | P2-4 / P2-5 / P2-6（部分）：控制平面与网关的 Dockerfile（非 root、只读根文件系统可运行）；compose 改为可运行的拓扑（共用 key 文件、只发布在 127.0.0.1、数据卷持久化）；Kubernetes 清单改用 PVC + `Recreate` + Secret；`scripts/compose_smoke.sh` 端到端冒烟进 CI；CI 增加 `gofmt` / `go vet` / `-race`；pytest 把未 await 的协程视为失败；容器中的备份恢复步骤；README / CONTRIBUTING / module-mapping 事实更正（`uv sync` 实际装不上依赖等），删除"兼容 Python 3.9+"的说法 |
 
 ## 推送到你的 fork
 
@@ -41,12 +42,13 @@ cd ForgeMesh
 
 ```bash
 make install    # 默认的 python3 低于 3.12 时：make install PY=python3.12
-make test       # 六个分支都应用后：1244 passed（基线为 1115）
+make test       # 七个分支都应用后：1244 passed（基线为 1115）
 make lint
-(cd gateway && go vet ./... && go test -race ./...)
+(cd gateway && test -z "$(gofmt -l .)" && go vet ./... && go test -race ./...)
 for s in validate_manifests openapi_semantic_check check_metadata_consistency plugin_entrypoint_smoke; do
   .venv/bin/python scripts/$s.py
 done
+scripts/compose_smoke.sh   # 需要 Docker 与 Compose v2：构建镜像、经网关读写、重启后数据仍在
 ```
 
-启动方式（认证配置、key 生成、`dev` 模式）见 ForgeMesh 根目录 README 的「运行控制平面」一节。
+启动方式（认证配置、key 生成、`dev` 模式）见 ForgeMesh 根目录 README 的「运行控制平面」一节，容器部署见「容器部署」一节。

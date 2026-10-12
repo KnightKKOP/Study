@@ -1,0 +1,52 @@
+From 7e05df9938a9d9f7273f46b29d2e084298da5935 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 12 Oct 2026 06:57:19 +0000
+Subject: [PATCH 4/9] test: fail the suite on coroutines that are never awaited
+
+test_legacy_db_migration_adds_columns called the async
+SQLiteRegistry.close() without awaiting it, so neither registry was
+closed and pytest only printed a RuntimeWarning.
+
+The test now runs close() to completion, and pytest treats
+RuntimeWarning as an error. The "never awaited" warning is emitted
+while the coroutine object is finalized, where pytest reports it as
+PytestUnraisableExceptionWarning, so that category is an error too;
+filtering RuntimeWarning alone lets the test pass.
+---
+ pyproject.toml                           | 6 ++++++
+ tests/unit/controlplane/test_registry.py | 4 ++--
+ 2 files changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/pyproject.toml b/pyproject.toml
+index 7d689e3..5df788c 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -29,6 +29,12 @@ python_files = ["test_*.py", "*_test.py"]
+ python_classes = ["Test*"]
+ python_functions = ["test_*"]
+ addopts = "-ra --strict-markers"
++# 未 await 的协程只产生一条 RuntimeWarning，被调用的代码实际没有执行。这条警告在协程对象
++# 回收时发出，pytest 把它转成 PytestUnraisableExceptionWarning，因此两类都要视为错误。
++filterwarnings = [
++    "error::RuntimeWarning",
++    "error::pytest.PytestUnraisableExceptionWarning",
++]
+ markers = [
+     "unit: 单元测试（每次 PR）",
+     "contract: 契约测试（每次 PR）",
+diff --git a/tests/unit/controlplane/test_registry.py b/tests/unit/controlplane/test_registry.py
+index 3d63969..f29bcde 100644
+--- a/tests/unit/controlplane/test_registry.py
++++ b/tests/unit/controlplane/test_registry.py
+@@ -599,6 +599,6 @@ def test_legacy_db_migration_adds_columns(tmp_path) -> None:
+     got = _run(reg.get(KIND, "team-a", "old", TENANT_A))
+     assert got.finalizers == []
+     # 重复打开幂等
+-    reg.close()
++    _run(reg.close())
+     reg2 = SQLiteRegistry(str(db_file))
+-    reg2.close()
++    _run(reg2.close())
+-- 
+2.43.0
+

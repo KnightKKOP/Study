@@ -1,0 +1,113 @@
+From b064f35b00cdfbb4e39645e6366a35704617cb89 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 12 Oct 2026 06:56:04 +0000
+Subject: [PATCH 1/9] build: add container images for the control plane and the
+ gateway
+
+deploy/docker/docker-compose.yaml has referenced
+deploy/docker/Dockerfile.control-plane since stage 0, but the
+repository contained no Dockerfile at all.
+
+The control plane image installs all forgemesh-* packages it needs
+from packages/ in a single pip command, so their dependencies on each
+other are satisfied by the local directories instead of being looked
+up on PyPI. It runs as uid 10001, keeps the SQLite database in
+/var/lib/forgemesh and writes nothing else, so it can run with a
+read-only root file system.
+
+The gateway image is a static build on distroless (nonroot). The
+build context is the repository root; .dockerignore limits it to
+packages/ and gateway/.
+---
+ .dockerignore                          |  8 ++++++
+ deploy/docker/Dockerfile.control-plane | 40 ++++++++++++++++++++++++++
+ deploy/docker/Dockerfile.gateway       | 15 ++++++++++
+ 3 files changed, 63 insertions(+)
+ create mode 100644 .dockerignore
+ create mode 100644 deploy/docker/Dockerfile.control-plane
+ create mode 100644 deploy/docker/Dockerfile.gateway
+
+diff --git a/.dockerignore b/.dockerignore
+new file mode 100644
+index 0000000..2c04bc1
+--- /dev/null
++++ b/.dockerignore
+@@ -0,0 +1,8 @@
++# 镜像只需要 packages/（控制平面）与 gateway/（网关），见 deploy/docker/Dockerfile.*
++*
++!packages/
++!gateway/
++**/__pycache__/
++**/*.egg-info/
++**/.pytest_cache/
++gateway/bin/
+diff --git a/deploy/docker/Dockerfile.control-plane b/deploy/docker/Dockerfile.control-plane
+new file mode 100644
+index 0000000..df57205
+--- /dev/null
++++ b/deploy/docker/Dockerfile.control-plane
+@@ -0,0 +1,40 @@
++# ForgeMesh 控制平面镜像。构建上下文为仓库根目录：
++#   docker build -f deploy/docker/Dockerfile.control-plane -t forgemesh/control-plane:0.0.1 .
++#
++# 以非 root 用户（uid 10001）运行；SQLite 数据库位于 /var/lib/forgemesh，应挂载持久卷。
++# 镜像内不写其他路径，可以只读根文件系统运行（/tmp 另挂 tmpfs）。
++FROM python:3.12-slim AS build
++
++ENV PIP_NO_CACHE_DIR=1 \
++    PIP_DISABLE_PIP_VERSION_CHECK=1
++RUN python -m venv /opt/forgemesh
++COPY packages/ /src/packages/
++# 在同一条命令里安装全部本地包：forgemesh-* 之间的依赖由这里列出的目录满足，不会去 PyPI 查找同名包。
++RUN /opt/forgemesh/bin/pip install \
++      /src/packages/core-contracts \
++      /src/packages/resource-model \
++      /src/packages/workflow-api \
++      /src/packages/decision-api \
++      /src/packages/policy-engine \
++      /src/packages/plugin-sdk \
++      "/src/packages/control-plane[api]"
++
++FROM python:3.12-slim
++
++RUN groupadd --system --gid 10001 forgemesh \
++    && useradd --uid 10001 --gid forgemesh --no-create-home \
++       --home-dir /nonexistent --shell /usr/sbin/nologin forgemesh \
++    && install -d -o forgemesh -g forgemesh -m 0750 /var/lib/forgemesh
++COPY --from=build /opt/forgemesh /opt/forgemesh
++
++ENV PATH=/opt/forgemesh/bin:$PATH \
++    PYTHONDONTWRITEBYTECODE=1 \
++    PYTHONUNBUFFERED=1 \
++    FORGEMESH_HOST=0.0.0.0 \
++    FORGEMESH_PORT=8080 \
++    FORGEMESH_DB_PATH=/var/lib/forgemesh/forgemesh.db
++
++USER 10001:10001
++WORKDIR /var/lib/forgemesh
++EXPOSE 8080
++CMD ["forgemesh-control-plane"]
+diff --git a/deploy/docker/Dockerfile.gateway b/deploy/docker/Dockerfile.gateway
+new file mode 100644
+index 0000000..6404fb4
+--- /dev/null
++++ b/deploy/docker/Dockerfile.gateway
+@@ -0,0 +1,15 @@
++# ForgeMesh 网关镜像。构建上下文为仓库根目录：
++#   docker build -f deploy/docker/Dockerfile.gateway -t forgemesh/gateway:0.0.1 .
++#
++# 静态编译（网关只依赖标准库），运行在 distroless 镜像中，用户为 nonroot（uid 65532）。
++FROM golang:1.22 AS build
++
++WORKDIR /src
++COPY gateway/ ./
++RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/gateway ./cmd/gateway
++
++FROM gcr.io/distroless/static-debian12:nonroot
++
++COPY --from=build /out/gateway /gateway
++EXPOSE 8081
++ENTRYPOINT ["/gateway"]
+-- 
+2.43.0
+
