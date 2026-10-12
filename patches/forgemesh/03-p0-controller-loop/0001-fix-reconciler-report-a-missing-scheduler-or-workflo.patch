@@ -1,0 +1,354 @@
+From ac9e4d876320bec58d6e207d1d2247ded98faa7c Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 12 Oct 2026 04:50:32 +0000
+Subject: [PATCH 1/8] fix(reconciler): report a missing scheduler or workflow
+ runtime as Ready=False
+
+When a resource needed an allocation or a workflow but no scheduler or
+workflow runtime was injected, the reconciler skipped those steps, recorded
+the dedup key and reported Ready=True "Reconciled" although nothing had
+been done.
+
+Check for the required executors before any side effect and return
+Ready=False with reason SchedulerUnavailable or WorkflowRuntimeUnavailable
+instead, without recording the dedup key. Nothing is allocated when there
+is no runtime to deploy it.
+---
+ .../forgemesh/controlplane/reconciler/core.py | 40 +++++++-
+ .../performance/test_reconcile_throughput.py  | 10 ++
+ tests/unit/controlplane/test_dedup_store.py   | 13 +++
+ tests/unit/controlplane/test_reconciler.py    | 96 +++++++++++++++++--
+ 4 files changed, 151 insertions(+), 8 deletions(-)
+
+diff --git a/packages/control-plane/src/forgemesh/controlplane/reconciler/core.py b/packages/control-plane/src/forgemesh/controlplane/reconciler/core.py
+index 9a8991e..70981a6 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/reconciler/core.py
++++ b/packages/control-plane/src/forgemesh/controlplane/reconciler/core.py
+@@ -15,6 +15,10 @@
+ 8. **重观察**：收集执行后的新观测状态（P1 简化为标记完成）。
+ 9. **更新 status + 安排下次**：写回 status patch，返回 requeue_after。
+ 
++需要分配或执行工作流、却未注入对应组件时，在任何副作用之前返回
++``Ready=False``（``SchedulerUnavailable`` / ``WorkflowRuntimeUnavailable``），
++而不是跳过该步骤后宣称协调完成。
++
+ 终止协调（Terminating，对齐 architecture.md §5.3/§12.4 与 development-plan
+ 第 7 章删除闭环）
+ --------------------------------------------------------------------
+@@ -75,8 +79,10 @@ class ReconciliationController(Reconciler):
+         registry: 资源注册表（权威状态，``ResourceRegistry`` 实例）。
+         policy_engine: 策略引擎（授权校验，不可绕过）。
+         decision_provider: 可选决策 Provider（生成候选动作，仅建议非授权）。
+-        scheduler: 可选调度器（资源分配的唯一执行点）。
+-        workflow_runtime: 可选工作流运行时（执行协调工作流）。
++        scheduler: 可选调度器（资源分配的唯一执行点）；未注入时，需要分配的
++            资源报告 ``Ready=False``（``SchedulerUnavailable``）。
++        workflow_runtime: 可选工作流运行时（执行协调工作流）；未注入时，需要
++            执行工作流的资源报告 ``Ready=False``（``WorkflowRuntimeUnavailable``）。
+         release_provider: 可选受控释放 Provider（``Terminating`` 时释放外部
+             副作用）；``None`` 为 Noop 语义——仅移除 finalizer 后物理删除。
+         processed_store: 可选去重键持久化存储（对齐 architecture §5.5"不能
+@@ -202,6 +208,25 @@ class ReconciliationController(Reconciler):
+                 },
+             )
+ 
++        # 必须先于任何副作用检查：否则可能分配了资源却没有运行时部署它。
++        missing = self._missing_executor(diff)
++        if missing is not None:
++            reason, message = missing
++            return ReconcileResult(
++                done=False,
++                requeue_after=None,
++                status_patch={
++                    "conditions": [
++                        {
++                            "type": "Ready",
++                            "status": "False",
++                            "reason": reason,
++                            "message": message,
++                        }
++                    ]
++                },
++            )
++
+         # 步骤 6：Scheduler 分配（如果需要且调度器可用）
+         allocation_ref = None
+         if self._scheduler is not None and diff.get("needs_allocation"):
+@@ -270,6 +295,17 @@ class ReconciliationController(Reconciler):
+             status_patch={"conditions": conditions},
+         )
+ 
++    def _missing_executor(self, diff: dict[str, Any]) -> tuple[str, str] | None:
++        """返回本轮所需但未注入的执行组件对应的 ``(reason, message)``；齐备时返回 ``None``。"""
++        if diff.get("needs_allocation") and self._scheduler is None:
++            return "SchedulerUnavailable", "no scheduler is configured to allocate resources"
++        if diff.get("needs_workflow") and self._workflow is None:
++            return (
++                "WorkflowRuntimeUnavailable",
++                "no workflow runtime is configured to run the reconcile workflow",
++            )
++        return None
++
+     # ------------------------------------------------------------------ #
+     # 去重键登记（持久化 store 优先，回退内存 set）
+     # ------------------------------------------------------------------ #
+diff --git a/tests/performance/test_reconcile_throughput.py b/tests/performance/test_reconcile_throughput.py
+index 2ce2d5b..b8ae378 100644
+--- a/tests/performance/test_reconcile_throughput.py
++++ b/tests/performance/test_reconcile_throughput.py
+@@ -76,6 +76,15 @@ class _BenchmarkScheduler:
+         return AllocationRef(allocation_id="alloc-bench", resource_id="node-bench")
+ 
+ 
++class _BenchmarkWorkflowRuntime:
++    """无外部副作用的 WorkflowRuntime 测试替身（排除真实工作流执行开销）。"""
++
++    async def start(self, defn, inputs, idempotency_key):  # noqa: ANN001
++        from forgemesh.workflow.runtime import RunRef
++
++        return RunRef(run_id=idempotency_key, definition_version=1)
++
++
+ def _make_resource(index: int) -> Resource:
+     """构造第 ``index`` 个测试资源（独立 name/generation → 独立 dedup_key）。"""
+     return Resource(
+@@ -98,6 +107,7 @@ def test_reconcile_throughput_and_p99() -> None:
+             registry=registry,
+             policy_engine=_AllowPolicy(),
+             scheduler=_BenchmarkScheduler(),
++            workflow_runtime=_BenchmarkWorkflowRuntime(),
+         )
+         latencies: list[float] = []
+         loop_start = time.perf_counter()
+diff --git a/tests/unit/controlplane/test_dedup_store.py b/tests/unit/controlplane/test_dedup_store.py
+index a1a70c7..313a269 100644
+--- a/tests/unit/controlplane/test_dedup_store.py
++++ b/tests/unit/controlplane/test_dedup_store.py
+@@ -167,6 +167,15 @@ class _CountingScheduler:
+         return AllocationRef(allocation_id=f"alloc-{self.allocate_count}", resource_id="node-1")
+ 
+ 
++class _NoopWorkflowRuntime:
++    """总是成功启动的 WorkflowRuntime 测试替身。"""
++
++    async def start(self, defn, inputs, idempotency_key):  # noqa: ANN001
++        from forgemesh.workflow.runtime import RunRef
++
++        return RunRef(run_id=idempotency_key, definition_version=1)
++
++
+ def _make_ctx(dedup_key: str) -> ReconcileContext:
+     resource = Resource(
+         kind="Widget",
+@@ -199,6 +208,7 @@ def test_controller_with_processed_store_is_idempotent_across_restart(
+             registry=None,
+             policy_engine=_AllowPolicy(),
+             scheduler=scheduler,
++            workflow_runtime=_NoopWorkflowRuntime(),
+             processed_store=store,
+         )
+         result = await controller.reconcile(_make_ctx("key-1"))
+@@ -217,6 +227,7 @@ def test_controller_with_processed_store_is_idempotent_across_restart(
+             registry=None,
+             policy_engine=_AllowPolicy(),
+             scheduler=scheduler,
++            workflow_runtime=_NoopWorkflowRuntime(),
+             processed_store=restarted_store,
+         )
+         after_restart = await restarted_controller.reconcile(_make_ctx("key-1"))
+@@ -242,6 +253,7 @@ def test_controller_default_keeps_memory_behavior() -> None:
+             registry=None,
+             policy_engine=_AllowPolicy(),
+             scheduler=scheduler,
++            workflow_runtime=_NoopWorkflowRuntime(),
+         )
+         assert controller._processed_store is None
+         first = await controller.reconcile(_make_ctx("key-1"))
+@@ -254,6 +266,7 @@ def test_controller_default_keeps_memory_behavior() -> None:
+             registry=None,
+             policy_engine=_AllowPolicy(),
+             scheduler=scheduler,
++            workflow_runtime=_NoopWorkflowRuntime(),
+         )
+         third = await fresh.reconcile(_make_ctx("key-1"))
+         assert third.done is True
+diff --git a/tests/unit/controlplane/test_reconciler.py b/tests/unit/controlplane/test_reconciler.py
+index c18de33..ae4e9f7 100644
+--- a/tests/unit/controlplane/test_reconciler.py
++++ b/tests/unit/controlplane/test_reconciler.py
+@@ -2,7 +2,8 @@
+ 
+ 覆盖：幂等去重键、差异计算、Policy 三态
+ （allow/deny/require_approval——degraded 已按 architecture 7.5 移除）、
+-Scheduler 分配成功与失败、幂等性，以及 Terminating 受控删除闭环
++Scheduler 分配成功与失败、缺少调度器/工作流运行时时如实报告 ``Ready=False``、
++幂等性，以及 Terminating 受控删除闭环
+ （ReleaseProvider 释放 → 移除 finalizer → 释放 Allocation → 物理删除）。
+ """
+ 
+@@ -112,6 +113,19 @@ class MockScheduler:
+         pass
+ 
+ 
++class StubWorkflowRuntime:
++    """Stub WorkflowRuntime：记录每次 start 收到的幂等键。"""
++
++    def __init__(self) -> None:
++        self.idempotency_keys: list[str] = []
++
++    async def start(self, defn, inputs, idempotency_key):  # noqa: ANN001
++        from forgemesh.workflow.runtime import RunRef
++
++        self.idempotency_keys.append(idempotency_key)
++        return RunRef(run_id=f"run-{len(self.idempotency_keys)}", definition_version=1)
++
++
+ # ---------------------------------------------------------------------- #
+ # 去重键测试
+ # ---------------------------------------------------------------------- #
+@@ -193,7 +207,12 @@ def test_reconcile_policy_allow_proceeds():
+     observed = {"phase": "Pending"}
+     ctx = make_context(resource, observed)
+     allow = PolicyDecision(decision="allow", reason="ok")
+-    controller = ReconciliationController(registry=None, policy_engine=MockPolicyEngine(allow))
++    controller = ReconciliationController(
++        registry=None,
++        policy_engine=MockPolicyEngine(allow),
++        scheduler=MockScheduler(),
++        workflow_runtime=StubWorkflowRuntime(),
++    )
+     result = asyncio.run(controller.reconcile(ctx))
+     assert result.done is True
+     conditions = result.status_patch["conditions"]
+@@ -201,6 +220,49 @@ def test_reconcile_policy_allow_proceeds():
+     assert any(c["reason"] == "Reconciled" for c in conditions)
+ 
+ 
++@pytest.mark.unit
++def test_reconcile_without_scheduler_reports_unavailable():
++    """需要分配但未注入调度器 → Ready=False（SchedulerUnavailable），不宣称已协调。"""
++    ctx = make_context(make_resource(generation=1, observed_generation=0), {"phase": "Pending"})
++    workflow = StubWorkflowRuntime()
++    controller = ReconciliationController(
++        registry=None,
++        policy_engine=MockPolicyEngine(PolicyDecision(decision="allow", reason="ok")),
++        workflow_runtime=workflow,
++    )
++    result = asyncio.run(controller.reconcile(ctx))
++    assert result.done is False
++    assert result.requeue_after is None
++    assert result.status_patch["conditions"] == [
++        {
++            "type": "Ready",
++            "status": "False",
++            "reason": "SchedulerUnavailable",
++            "message": "no scheduler is configured to allocate resources",
++        }
++    ]
++    assert workflow.idempotency_keys == []
++    assert ctx.dedup_key not in controller._processed_keys
++
++
++@pytest.mark.unit
++def test_reconcile_without_workflow_runtime_does_not_allocate():
++    """需要执行工作流但未注入运行时 → WorkflowRuntimeUnavailable，且不先分配资源。"""
++    ctx = make_context(make_resource(generation=1, observed_generation=0), {"phase": "Pending"})
++    scheduler = MockScheduler()
++    controller = ReconciliationController(
++        registry=None,
++        policy_engine=MockPolicyEngine(PolicyDecision(decision="allow", reason="ok")),
++        scheduler=scheduler,
++    )
++    result = asyncio.run(controller.reconcile(ctx))
++    assert result.done is False
++    assert result.requeue_after is None
++    assert result.status_patch["conditions"][0]["reason"] == "WorkflowRuntimeUnavailable"
++    assert scheduler.allocate_called is False
++    assert ctx.dedup_key not in controller._processed_keys
++
++
+ @pytest.mark.unit
+ def test_reconcile_policy_require_approval_blocks():
+     """Policy 返回 require_approval → 不产生副作用，requeue 等人工审批。"""
+@@ -231,7 +293,14 @@ def test_reconcile_idempotent():
+     observed = {"phase": "Pending"}
+     ctx = make_context(resource, observed, dedup_key="dup-1")
+     allow = PolicyDecision(decision="allow", reason="ok")
+-    controller = ReconciliationController(registry=None, policy_engine=MockPolicyEngine(allow))
++    scheduler = MockScheduler()
++    workflow = StubWorkflowRuntime()
++    controller = ReconciliationController(
++        registry=None,
++        policy_engine=MockPolicyEngine(allow),
++        scheduler=scheduler,
++        workflow_runtime=workflow,
++    )
+     # 第一次调用：正常处理
+     result1 = asyncio.run(controller.reconcile(ctx))
+     assert result1.done is True
+@@ -241,6 +310,8 @@ def test_reconcile_idempotent():
+     assert result2.done is True
+     assert result2.requeue_after is None
+     assert result2.status_patch == {}
++    assert scheduler.allocate_count == 1
++    assert workflow.idempotency_keys == ["dup-1"]
+ 
+ 
+ @pytest.mark.unit
+@@ -252,7 +323,10 @@ def test_reconcile_with_allocation():
+     allow = PolicyDecision(decision="allow", reason="ok")
+     scheduler = MockScheduler()
+     controller = ReconciliationController(
+-        registry=None, policy_engine=MockPolicyEngine(allow), scheduler=scheduler
++        registry=None,
++        policy_engine=MockPolicyEngine(allow),
++        scheduler=scheduler,
++        workflow_runtime=StubWorkflowRuntime(),
+     )
+     result = asyncio.run(controller.reconcile(ctx))
+     assert result.done is True
+@@ -269,7 +343,10 @@ def test_reconcile_allocation_failure():
+     allow = PolicyDecision(decision="allow", reason="ok")
+     scheduler = MockScheduler(fail=True)
+     controller = ReconciliationController(
+-        registry=None, policy_engine=MockPolicyEngine(allow), scheduler=scheduler
++        registry=None,
++        policy_engine=MockPolicyEngine(allow),
++        scheduler=scheduler,
++        workflow_runtime=StubWorkflowRuntime(),
+     )
+     result = asyncio.run(controller.reconcile(ctx))
+     assert result.done is False
+@@ -319,6 +396,7 @@ def test_reconcile_requeue_after_policy_block_is_reevaluated(first_decision, mak
+         registry=None,
+         policy_engine=policy,
+         scheduler=scheduler,
++        workflow_runtime=StubWorkflowRuntime(),
+         processed_store=make_store(),
+     )
+ 
+@@ -343,6 +421,7 @@ def test_reconcile_requeue_after_allocation_failure_retries_allocation(make_stor
+         registry=None,
+         policy_engine=MockPolicyEngine(PolicyDecision(decision="allow", reason="ok")),
+         scheduler=scheduler,
++        workflow_runtime=StubWorkflowRuntime(),
+         processed_store=make_store(),
+     )
+ 
+@@ -535,7 +614,12 @@ def test_non_terminating_phase_skips_delete_path():
+     reg = SQLiteRegistry()
+     asyncio.run(reg.put(make_inference_service(phase=InferencePhase.PENDING)))
+     allow = PolicyDecision(decision="allow", reason="ok")
+-    controller = ReconciliationController(registry=reg, policy_engine=MockPolicyEngine(allow))
++    controller = ReconciliationController(
++        registry=reg,
++        policy_engine=MockPolicyEngine(allow),
++        scheduler=MockScheduler(),
++        workflow_runtime=StubWorkflowRuntime(),
++    )
+     resource = make_resource(generation=1, observed_generation=0)
+     ctx = make_context(resource, {"phase": "Pending"})
+     result = asyncio.run(controller.reconcile(ctx))
+-- 
+2.43.0
+

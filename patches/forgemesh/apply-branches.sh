@@ -44,6 +44,7 @@ base=5a0be13fcd506d3e61454e14bfc1a4a6330304c2
 topics="
 01-p0-correctness-fixes:cursor/p0-correctness-fixes-b108
 02-p0-auth-tenant-binding:cursor/p0-auth-tenant-binding-b108
+03-p0-controller-loop:cursor/p0-controller-loop-b108
 "
 
 cd "$repo"

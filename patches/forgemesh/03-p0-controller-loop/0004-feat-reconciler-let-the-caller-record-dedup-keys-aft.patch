@@ -1,0 +1,131 @@
+From 079684f29462b3eaf311424fe656843ac916792d Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 12 Oct 2026 05:00:12 +0000
+Subject: [PATCH 4/8] feat(reconciler): let the caller record dedup keys after
+ persisting status
+
+reconcile() records the dedup key before it returns its status_patch.
+If the caller then fails to persist that status, the requeued call hits
+the idempotency short-circuit and the status is never written for that
+generation.
+
+Add record_dedup_keys=False, under which reconcile() still checks dedup
+keys but leaves recording to the caller through the now public
+mark_processed(), to be called once the status has been written. The
+default keeps today's behaviour.
+---
+ .../forgemesh/controlplane/reconciler/core.py | 20 +++++++++++--
+ tests/unit/controlplane/test_reconciler.py    | 29 +++++++++++++++++++
+ 2 files changed, 47 insertions(+), 2 deletions(-)
+
+diff --git a/packages/control-plane/src/forgemesh/controlplane/reconciler/core.py b/packages/control-plane/src/forgemesh/controlplane/reconciler/core.py
+index 70981a6..e023307 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/reconciler/core.py
++++ b/packages/control-plane/src/forgemesh/controlplane/reconciler/core.py
+@@ -88,6 +88,9 @@ class ReconciliationController(Reconciler):
+         processed_store: 可选去重键持久化存储（对齐 architecture §5.5"不能
+             依赖单进程内存状态保证全局正确性"）；``None``（默认）时回退
+             内存 set 行为，向后兼容既有测试与单进程部署。
++        record_dedup_keys: 为 ``False`` 时 :meth:`reconcile` 只检查、不登记去重键，
++            由调用方在持久化 ``status_patch`` 之后调用 :meth:`mark_processed`，
++            避免"已登记、状态却没写进去"（控制器管理器使用）。默认 ``True``。
+     """
+ 
+     def __init__(
+@@ -99,6 +102,7 @@ class ReconciliationController(Reconciler):
+         workflow_runtime: Any | None = None,
+         release_provider: ReleaseProvider | None = None,
+         processed_store: ProcessedKeyStore | None = None,
++        record_dedup_keys: bool = True,
+     ) -> None:
+         self._registry = registry
+         self._policy = policy_engine
+@@ -107,16 +111,23 @@ class ReconciliationController(Reconciler):
+         self._workflow = workflow_runtime
+         self._release_provider = release_provider
+         self._processed_store = processed_store
++        self._record_dedup_keys = record_dedup_keys
+         # 已处理的去重键（内存级回退路径；processed_store 注入时以 SQLite
+         # 持久化为准——architecture §5.5 不依赖单进程内存状态）。
+         self._processed_keys: set[str] = set()
+ 
++    @property
++    def records_dedup_keys(self) -> bool:
++        """:meth:`reconcile` 是否自行登记去重键。"""
++        return self._record_dedup_keys
++
+     async def reconcile(self, ctx: ReconcileContext) -> ReconcileResult:
+         """执行一轮 9 步协调（或 Terminating 受控释放子流程）。
+ 
+         幂等保证：若 ``ctx.dedup_key`` 已处理过，直接返回 ``done=True``，
+         不产生任何重复副作用。注入 ``processed_store`` 时该检查基于
+-        SQLite 持久化状态（进程重启后依然生效）。
++        SQLite 持久化状态（进程重启后依然生效）。``record_dedup_keys=False``
++        时本方法不登记去重键，由调用方调用 :meth:`mark_processed`。
+ 
+         Args:
+             ctx: 协调上下文（含资源、观测状态、租户边界、去重键）。
+@@ -310,7 +321,7 @@ class ReconciliationController(Reconciler):
+     # 去重键登记（持久化 store 优先，回退内存 set）
+     # ------------------------------------------------------------------ #
+ 
+-    async def _mark_processed(self, key: str) -> None:
++    async def mark_processed(self, key: str) -> None:
+         """登记已处理去重键。
+ 
+         注入 ``processed_store`` 时写入 SQLite（进程重启后仍可见，对齐
+@@ -321,6 +332,11 @@ class ReconciliationController(Reconciler):
+         else:
+             self._processed_keys.add(key)
+ 
++    async def _mark_processed(self, key: str) -> None:
++        """:meth:`reconcile` 内部的登记点；``record_dedup_keys=False`` 时留给调用方。"""
++        if self._record_dedup_keys:
++            await self.mark_processed(key)
++
+     # ------------------------------------------------------------------ #
+     # 终止协调（受控释放 → 清空 finalizer → 物理删除）
+     # ------------------------------------------------------------------ #
+diff --git a/tests/unit/controlplane/test_reconciler.py b/tests/unit/controlplane/test_reconciler.py
+index ae4e9f7..6e56a9f 100644
+--- a/tests/unit/controlplane/test_reconciler.py
++++ b/tests/unit/controlplane/test_reconciler.py
+@@ -314,6 +314,35 @@ def test_reconcile_idempotent():
+     assert workflow.idempotency_keys == ["dup-1"]
+ 
+ 
++@pytest.mark.unit
++@pytest.mark.parametrize("make_store", [lambda: None, lambda: ProcessedKeyStore(":memory:")])
++def test_caller_records_dedup_keys_when_reconciler_does_not(make_store):
++    """record_dedup_keys=False：reconcile 只检查去重键，由调用方在写入 status 后登记。"""
++    ctx = make_context(make_resource(generation=1, observed_generation=0), {"phase": "Pending"})
++    scheduler = MockScheduler()
++    store = make_store()
++    controller = ReconciliationController(
++        registry=None,
++        policy_engine=MockPolicyEngine(PolicyDecision(decision="allow", reason="ok")),
++        scheduler=scheduler,
++        workflow_runtime=StubWorkflowRuntime(),
++        processed_store=store,
++        record_dedup_keys=False,
++    )
++
++    first = asyncio.run(controller.reconcile(ctx))
++    assert first.done is True
++    assert controller.records_dedup_keys is False
++    assert ctx.dedup_key not in controller._processed_keys
++    if store is not None:
++        assert asyncio.run(store.seen(ctx.dedup_key)) is False
++
++    asyncio.run(controller.mark_processed(ctx.dedup_key))
++    again = asyncio.run(controller.reconcile(ctx))
++    assert again.status_patch == {}
++    assert scheduler.allocate_count == 1
++
++
+ @pytest.mark.unit
+ def test_reconcile_with_allocation():
+     """需要分配且 scheduler 可用 → 调用 scheduler.allocate。"""
+-- 
+2.43.0
+

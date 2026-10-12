@@ -1,0 +1,1061 @@
+From 8a4f3a4abacf516843a20dd0e1da13c3e8786cee Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 12 Oct 2026 05:07:43 +0000
+Subject: [PATCH 6/8] feat(control-plane): add a controller manager that drives
+ the reconciler
+
+Nothing ran ReconciliationController outside of tests, so resources
+written through the API were never reconciled. Add a controller package:
+
+- WorkQueue: a keyed delay queue with client-go semantics. A key is
+  processed by at most one worker at a time, delayed adds keep the
+  earliest due time, and failures back off exponentially with jitter.
+- ControllerManager: records the current change sequence, lists all
+  managed resources to rebuild the queue, then polls resource_changes
+  incrementally (pruning what it has read) with a periodic full resync
+  as a safety net. Status changes, including its own writes, do not
+  trigger a reconcile.
+- Status is written with a CAS on the version read before reconciling.
+  On a conflict the resource is re-read; the write is retried only if
+  uid, generation and operation (reconcile/terminate) are unchanged,
+  otherwise the result is dropped and the resource is requeued.
+- Dedup keys are recorded by the manager only after the status write
+  succeeds, so a crash in between causes a retry instead of a resource
+  whose outcome was never persisted. The reconciler must therefore be
+  built with record_dedup_keys=False.
+- requeue_after is honoured; None means wait for the next change or
+  resync. stop() lets in-flight reconciles finish before cancelling.
+
+The controller is a single writer (ADR-013): it runs inside the API
+process and must not run in several processes or replicas at once.
+---
+ .../controlplane/controller/__init__.py       |   8 +
+ .../controlplane/controller/manager.py        | 268 ++++++++++
+ .../controlplane/controller/queue.py          | 143 ++++++
+ .../controlplane/test_controller_manager.py   | 457 ++++++++++++++++++
+ .../controlplane/test_controller_queue.py     | 109 +++++
+ 5 files changed, 985 insertions(+)
+ create mode 100644 packages/control-plane/src/forgemesh/controlplane/controller/__init__.py
+ create mode 100644 packages/control-plane/src/forgemesh/controlplane/controller/manager.py
+ create mode 100644 packages/control-plane/src/forgemesh/controlplane/controller/queue.py
+ create mode 100644 tests/unit/controlplane/test_controller_manager.py
+ create mode 100644 tests/unit/controlplane/test_controller_queue.py
+
+diff --git a/packages/control-plane/src/forgemesh/controlplane/controller/__init__.py b/packages/control-plane/src/forgemesh/controlplane/controller/__init__.py
+new file mode 100644
+index 0000000..fb1351d
+--- /dev/null
++++ b/packages/control-plane/src/forgemesh/controlplane/controller/__init__.py
+@@ -0,0 +1,8 @@
++"""ForgeMesh 控制平面 — 控制器：发现资源变更并驱动协调器（P0-10）。"""
++
++from __future__ import annotations
++
++from .manager import DEFAULT_KINDS, ControllerManager
++from .queue import WorkQueue
++
++__all__ = ["DEFAULT_KINDS", "ControllerManager", "WorkQueue"]
+diff --git a/packages/control-plane/src/forgemesh/controlplane/controller/manager.py b/packages/control-plane/src/forgemesh/controlplane/controller/manager.py
+new file mode 100644
+index 0000000..f37f0bf
+--- /dev/null
++++ b/packages/control-plane/src/forgemesh/controlplane/controller/manager.py
+@@ -0,0 +1,268 @@
++"""控制器管理器：发现资源变更，按资源排队，驱动协调器并回写 status。
++
++数据流::
++
++    resource_changes ──轮询──▶ WorkQueue ──worker──▶ ReconciliationController
++           ▲                                                  │ status_patch
++           └────────── SQLiteRegistry.update_status ◀─────────┘
++
++* **变更来源**：启动时先记下当前变更序号，再全量列出资源键重建队列，之后按
++  序号增量轮询 ``resource_changes`` 并清理已读记录，另有周期性全量同步兜底。
++  ``status`` 变更（包括控制器自己的写入）不触发协调。
++* **并发**：``workers`` 个 worker 协程；同一资源同一时刻只由一个 worker 处理。
++* **status 回写**：以协调前读到的 ``resource_version`` 做 CAS。冲突时重读：
++  ``uid``、``generation`` 与操作（reconcile / terminate）都没变就以新版本重试，
++  否则丢弃这次结果并立即重新排队。
++* **去重键**：协调器以 ``record_dedup_keys=False`` 构造，管理器在 status 写入
++  成功之后才登记去重键，避免"已登记、状态却没写进去"。
++* **重新排队**：``requeue_after`` 非空时按该延迟重试；为空时不再定时重试，等待
++  资源变更或下一次全量同步；协调抛出异常时按资源指数退避。
++* **单写者**（ADR-013）：控制器随 API 进程运行，不得在多个进程或副本中同时运行。
++"""
++
++from __future__ import annotations
++
++import asyncio
++import logging
++from collections.abc import Collection
++from typing import Any
++from uuid import uuid4
++
++from forgemesh.core.errors import ConflictError, NotFoundError
++from forgemesh.core.objects import Resource
++from forgemesh.core.reconciler import ReconcileContext
++
++from ..reconciler import ReconciliationController, compute_dedup_key
++from ..registry import ChangeType, ResourceKey, SQLiteRegistry
++from .queue import WorkQueue
++
++logger = logging.getLogger(__name__)
++
++#: 默认协调的资源 kind。
++DEFAULT_KINDS: tuple[str, ...] = ("InferenceService",)
++
++#: 读取变更记录连续失败时的最长退避（秒）。
++MAX_POLL_BACKOFF_SECONDS = 30.0
++
++_TERMINATING = "Terminating"
++
++
++def _operation(phase: str | None) -> str:
++    return "terminate" if phase == _TERMINATING else "reconcile"
++
++
++def _describe(key: ResourceKey) -> str:
++    return f"{key.kind} {key.tenant_id}/{key.namespace or ''}/{key.name}"
++
++
++class ControllerManager:
++    """驱动 :class:`ReconciliationController` 的控制器管理器。
++
++    Args:
++        registry: 权威注册中心。
++        reconciler: 以 ``record_dedup_keys=False`` 构造的协调器。
++        kinds: 要协调的资源 kind。
++        workers: worker 协程数。
++        poll_interval: 轮询变更记录的间隔（秒），即发现变更的最大延迟。
++        resync_period: 全量同步周期（秒）。
++        batch_size: 每次读取的变更记录条数上限。
++        status_write_attempts: status 写入遇到版本冲突时的最多尝试次数。
++        queue: 工作队列；为空时新建（测试可注入）。
++    """
++
++    def __init__(
++        self,
++        registry: SQLiteRegistry,
++        reconciler: ReconciliationController,
++        *,
++        kinds: Collection[str] = DEFAULT_KINDS,
++        workers: int = 2,
++        poll_interval: float = 0.5,
++        resync_period: float = 600.0,
++        batch_size: int = 500,
++        status_write_attempts: int = 3,
++        queue: WorkQueue[ResourceKey] | None = None,
++    ) -> None:
++        if reconciler.records_dedup_keys:
++            raise ValueError(
++                "the reconciler must be built with record_dedup_keys=False so that dedup keys "
++                "are recorded only after the status has been written"
++            )
++        if workers < 1 or batch_size < 1 or status_write_attempts < 1:
++            raise ValueError("workers, batch_size and status_write_attempts must be >= 1")
++        if poll_interval <= 0 or resync_period <= 0:
++            raise ValueError("poll_interval and resync_period must be > 0")
++        self._registry = registry
++        self._reconciler = reconciler
++        self._kinds = frozenset(kinds)
++        self._worker_count = workers
++        self._poll_interval = poll_interval
++        self._resync_period = resync_period
++        self._batch_size = batch_size
++        self._status_write_attempts = status_write_attempts
++        self._queue: WorkQueue[ResourceKey] = queue if queue is not None else WorkQueue()
++        self._cursor = 0
++        self._started = False
++        self._watchers: list[asyncio.Task[None]] = []
++        self._workers: list[asyncio.Task[None]] = []
++
++    async def start(self) -> None:
++        """重建工作队列，然后启动变更轮询、全量同步与 worker 任务。"""
++        if self._started:
++            raise RuntimeError("a controller manager can only be started once")
++        self._started = True
++        self._cursor = await self._registry.latest_change_seq()
++        await self.resync()
++        self._watchers = [
++            asyncio.create_task(self._watch_changes(), name="forgemesh-controller-changes"),
++            asyncio.create_task(self._resync_periodically(), name="forgemesh-controller-resync"),
++        ]
++        self._workers = [
++            asyncio.create_task(self._work(), name=f"forgemesh-controller-worker-{index}")
++            for index in range(self._worker_count)
++        ]
++        logger.info(
++            "controller manager started: kinds=%s workers=%d",
++            sorted(self._kinds),
++            len(self._workers),
++        )
++
++    async def stop(self, timeout: float = 10.0) -> None:
++        """停止接收新键；worker 处理完手头的资源后退出，超过 ``timeout`` 秒则取消。"""
++        self._queue.shutdown()
++        for task in self._watchers:
++            task.cancel()
++        if self._workers:
++            _, pending = await asyncio.wait(self._workers, timeout=timeout)
++            for task in pending:
++                logger.warning("controller worker did not finish in %.1fs; cancelling", timeout)
++                task.cancel()
++        await asyncio.gather(*self._watchers, *self._workers, return_exceptions=True)
++        self._watchers = []
++        self._workers = []
++
++    async def resync(self) -> None:
++        """全量列出受管资源并加入队列。"""
++        for key in await self._registry.list_resource_keys(self._kinds):
++            self._queue.add(key)
++
++    async def poll_changes(self) -> int:
++        """读取一批新的变更记录，把相关资源加入队列并清理已读记录，返回读到的条数。"""
++        changes = await self._registry.changes_since(self._cursor, limit=self._batch_size)
++        if not changes:
++            return 0
++        for change in changes:
++            if change.change is not ChangeType.STATUS and change.key.kind in self._kinds:
++                self._queue.add(change.key)
++        self._cursor = changes[-1].seq
++        await self._registry.prune_changes(self._cursor)
++        return len(changes)
++
++    async def process(self, key: ResourceKey) -> None:
++        """协调一个资源：读取、协调、回写 status、登记去重键、安排下一次。"""
++        try:
++            resource, phase = await self._registry.get_with_phase(
++                key.kind, key.namespace, key.name, key.tenant_id
++            )
++        except NotFoundError:
++            self._queue.forget(key)
++            return
++        operation = _operation(phase)
++        meta = resource.metadata
++        dedup_key = compute_dedup_key(
++            key.kind, key.namespace, key.name, meta.uid, meta.generation, operation
++        ).key
++        result = await self._reconciler.reconcile(
++            ReconcileContext(
++                resource=resource,
++                observed={"phase": phase} if phase is not None else {},
++                correlation_id=uuid4().hex,
++                tenant_id=key.tenant_id,
++                dedup_key=dedup_key,
++            )
++        )
++        if result.status_patch and not await self._write_status(
++            key, resource, operation, result.status_patch
++        ):
++            self._queue.add(key)
++            return
++        if result.done:
++            await self._reconciler.mark_processed(dedup_key)
++        self._queue.forget(key)
++        if result.requeue_after is not None:
++            self._queue.add_after(key, result.requeue_after)
++
++    async def _write_status(
++        self,
++        key: ResourceKey,
++        resource: Resource,
++        operation: str,
++        patch: dict[str, Any],
++    ) -> bool:
++        """以协调前读到的版本 CAS 写入 status；资源已变得不适用这次结果时返回 ``False``。"""
++        target = (resource.metadata.uid, resource.metadata.generation, operation)
++        expected_version = resource.metadata.resourceVersion
++        for _ in range(self._status_write_attempts):
++            try:
++                await self._registry.update_status(
++                    key.kind,
++                    key.namespace,
++                    key.name,
++                    key.tenant_id,
++                    patch,
++                    observed_generation=resource.metadata.generation,
++                    expected_version=expected_version,
++                )
++                return True
++            except NotFoundError:
++                return False
++            except ConflictError:
++                try:
++                    current, phase = await self._registry.get_with_phase(
++                        key.kind, key.namespace, key.name, key.tenant_id
++                    )
++                except NotFoundError:
++                    return False
++                if (current.metadata.uid, current.metadata.generation, _operation(phase)) != target:
++                    return False
++                expected_version = current.metadata.resourceVersion
++        return False
++
++    async def _work(self) -> None:
++        while (key := await self._queue.get()) is not None:
++            try:
++                await self.process(key)
++            except Exception:  # noqa: BLE001 - 单个资源失败不得影响其他资源
++                delay = self._queue.add_rate_limited(key)
++                logger.exception(
++                    "reconcile failed for %s; retrying in %.1fs", _describe(key), delay
++                )
++            finally:
++                self._queue.done(key)
++
++    async def _watch_changes(self) -> None:
++        failures = 0
++        while True:
++            try:
++                count = await self.poll_changes()
++            except Exception:  # noqa: BLE001 - 存储故障时退避重试，不终止控制器
++                failures += 1
++                logger.exception("controller failed to read resource changes")
++                await asyncio.sleep(
++                    min(self._poll_interval * 2**failures, MAX_POLL_BACKOFF_SECONDS)
++                )
++                continue
++            failures = 0
++            if count < self._batch_size:
++                await asyncio.sleep(self._poll_interval)
++
++    async def _resync_periodically(self) -> None:
++        while True:
++            await asyncio.sleep(self._resync_period)
++            try:
++                await self.resync()
++            except Exception:  # noqa: BLE001 - 下一个周期重试
++                logger.exception("controller resync failed")
++
++
++__all__ = ["DEFAULT_KINDS", "ControllerManager"]
+diff --git a/packages/control-plane/src/forgemesh/controlplane/controller/queue.py b/packages/control-plane/src/forgemesh/controlplane/controller/queue.py
+new file mode 100644
+index 0000000..43b324c
+--- /dev/null
++++ b/packages/control-plane/src/forgemesh/controlplane/controller/queue.py
+@@ -0,0 +1,143 @@
++"""按键去重的延迟工作队列。
++
++语义参照 client-go ``workqueue``：
++
++* :meth:`WorkQueue.add` 对同一键去重；键正在处理时再次加入，会在
++  :meth:`WorkQueue.done` 之后重新排队，因此同一键不会被两个 worker 同时处理；
++* :meth:`WorkQueue.add_after` 延迟加入，同一键只保留最早的到期时间；
++* :meth:`WorkQueue.add_rate_limited` 按该键的连续失败次数指数退避（有上限、
++  带随机抖动），:meth:`WorkQueue.forget` 清零；
++* :meth:`WorkQueue.shutdown` 之后 :meth:`WorkQueue.get` 立即返回 ``None``，
++  尚未处理的键被丢弃（控制器下次启动时全量重建队列）。
++
++只能在单个事件循环中使用，不是线程安全的。
++"""
++
++from __future__ import annotations
++
++import asyncio
++import contextlib
++import heapq
++import itertools
++import random
++import time
++from collections import deque
++from collections.abc import Hashable
++
++
++class WorkQueue[K: Hashable]:
++    """按键去重的延迟工作队列。
++
++    Args:
++        base_delay: 第一次失败后的退避秒数。
++        max_delay: 退避上限（秒）。
++        jitter: 随机抖动比例，实际退避落在 ``[delay * (1 - jitter), delay]``。
++        rng: 随机数源（测试可注入以固定抖动）。
++    """
++
++    def __init__(
++        self,
++        *,
++        base_delay: float = 0.5,
++        max_delay: float = 300.0,
++        jitter: float = 0.1,
++        rng: random.Random | None = None,
++    ) -> None:
++        if base_delay <= 0 or max_delay < base_delay:
++            raise ValueError("require 0 < base_delay <= max_delay")
++        if not 0 <= jitter < 1:
++            raise ValueError("jitter must be in [0, 1)")
++        self._base_delay = base_delay
++        self._max_delay = max_delay
++        self._jitter = jitter
++        self._rng = rng or random.Random()
++        self._ready: deque[K] = deque()
++        self._dirty: set[K] = set()
++        self._processing: set[K] = set()
++        self._waiting: list[tuple[float, int, K]] = []
++        self._due: dict[K, float] = {}
++        self._sequence = itertools.count()
++        self._failures: dict[K, int] = {}
++        self._wakeup = asyncio.Event()
++        self._shutting_down = False
++
++    def __len__(self) -> int:
++        """可立即取出的键数量（不含延迟中的键）。"""
++        return len(self._ready)
++
++    def add(self, key: K) -> None:
++        """加入键；已在队列中则忽略，正在处理则在 :meth:`done` 后重新排队。"""
++        if self._shutting_down or key in self._dirty:
++            return
++        self._dirty.add(key)
++        if key not in self._processing:
++            self._ready.append(key)
++            self._wakeup.set()
++
++    def add_after(self, key: K, delay: float) -> None:
++        """``delay`` 秒后加入键；同一键已有更早的到期时间时保留更早的。"""
++        if self._shutting_down:
++            return
++        if delay <= 0:
++            self.add(key)
++            return
++        due = time.monotonic() + delay
++        current = self._due.get(key)
++        if current is not None and current <= due:
++            return
++        self._due[key] = due
++        heapq.heappush(self._waiting, (due, next(self._sequence), key))
++        self._wakeup.set()
++
++    def add_rate_limited(self, key: K) -> float:
++        """按连续失败次数退避后加入键，返回本次退避秒数。"""
++        failures = self._failures.get(key, 0)
++        self._failures[key] = failures + 1
++        delay = min(self._max_delay, self._base_delay * 2 ** min(failures, 32))
++        delay *= 1 - self._jitter * self._rng.random()
++        self.add_after(key, delay)
++        return delay
++
++    def forget(self, key: K) -> None:
++        """清零键的连续失败次数。"""
++        self._failures.pop(key, None)
++
++    def failures(self, key: K) -> int:
++        """键的连续失败次数。"""
++        return self._failures.get(key, 0)
++
++    async def get(self) -> K | None:
++        """取出下一个键并标记为处理中；队列关闭后返回 ``None``。"""
++        while True:
++            if self._shutting_down:
++                return None
++            self._promote_due()
++            if self._ready:
++                key = self._ready.popleft()
++                self._dirty.discard(key)
++                self._processing.add(key)
++                return key
++            self._wakeup.clear()
++            timeout = self._waiting[0][0] - time.monotonic() if self._waiting else None
++            with contextlib.suppress(TimeoutError):
++                await asyncio.wait_for(self._wakeup.wait(), timeout)
++
++    def done(self, key: K) -> None:
++        """标记键处理完毕；处理期间再次加入过的键重新排队。"""
++        self._processing.discard(key)
++        if key in self._dirty and not self._shutting_down:
++            self._ready.append(key)
++            self._wakeup.set()
++
++    def shutdown(self) -> None:
++        """关闭队列：之后的加入被忽略，等待中的 :meth:`get` 返回 ``None``。"""
++        self._shutting_down = True
++        self._wakeup.set()
++
++    def _promote_due(self) -> None:
++        now = time.monotonic()
++        while self._waiting and self._waiting[0][0] <= now:
++            due, _, key = heapq.heappop(self._waiting)
++            if self._due.get(key) == due:
++                del self._due[key]
++                self.add(key)
+diff --git a/tests/unit/controlplane/test_controller_manager.py b/tests/unit/controlplane/test_controller_manager.py
+new file mode 100644
+index 0000000..85d77e1
+--- /dev/null
++++ b/tests/unit/controlplane/test_controller_manager.py
+@@ -0,0 +1,457 @@
++"""控制器管理器单元测试。
++
++覆盖改进计划 4.10 的验收项：新资源在有限时间内得到带原因的 status；重启后
++从注册中心重建工作队列；同一 generation 不重复产生副作用。另覆盖 status 回写
++的 CAS 冲突处理、去重键的登记时机、受控删除、重新排队、失败退避与优雅停止。
++"""
++
++from __future__ import annotations
++
++import asyncio
++import time
++from collections.abc import Awaitable, Callable
++from typing import Any
++
++import pytest
++from forgemesh.controlplane.controller import ControllerManager, WorkQueue
++from forgemesh.controlplane.reconciler import (
++    ProcessedKeyStore,
++    ReconciliationController,
++    compute_dedup_key,
++)
++from forgemesh.controlplane.registry import ResourceKey, SQLiteRegistry
++from forgemesh.core.errors import NotFoundError
++from forgemesh.core.objects import Condition, ObjectMeta, Resource
++from forgemesh.policy.api import PolicyDecision
++from forgemesh.resource.inference import (
++    AcceleratorSpec,
++    InferencePhase,
++    InferenceService,
++    InferenceServiceSpec,
++    InferenceServiceStatus,
++    ModelRef,
++    ResourcesSpec,
++    RuntimeRef,
++)
++
++KIND = "InferenceService"
++TENANT = "tenant-a"
++NAMESPACE = "default"
++
++
++def _run(coro):
++    """同步驱动协程（不依赖 pytest-asyncio）。"""
++    return asyncio.run(coro)
++
++
++def _service(name: str = "svc", phase: InferencePhase = InferencePhase.PENDING) -> InferenceService:
++    return InferenceService(
++        metadata=ObjectMeta(name=name, namespace=NAMESPACE, tenant_id=TENANT, uid=f"uid-{name}"),
++        spec=InferenceServiceSpec(
++            model=ModelRef(reference="models/llama"),
++            runtime=RuntimeRef(provider="vllm"),
++            resources=ResourcesSpec(
++                accelerator=AcceleratorSpec(type="nvidia-gpu", minMemoryGiB=16)
++            ),
++        ),
++        status=InferenceServiceStatus(phase=phase),
++    )
++
++
++def _key(name: str = "svc") -> ResourceKey:
++    return ResourceKey(TENANT, KIND, NAMESPACE, name)
++
++
++class AllowPolicy:
++    async def check(self, ctx, action):  # noqa: ANN001
++        return PolicyDecision(decision="allow", reason="ok")
++
++
++class DenyPolicy:
++    async def check(self, ctx, action):  # noqa: ANN001
++        return PolicyDecision(decision="deny", reason="quota exceeded")
++
++
++class FailingPolicy:
++    def __init__(self) -> None:
++        self.calls = 0
++
++    async def check(self, ctx, action):  # noqa: ANN001
++        self.calls += 1
++        raise RuntimeError("policy backend unavailable")
++
++
++class ConcurrentWritePolicy:
++    """协调期间模拟一次并发写入：改标签，可选地同时递增 generation。"""
++
++    def __init__(self, registry: SQLiteRegistry, bump_generation: bool = False) -> None:
++        self._registry = registry
++        self._bump_generation = bump_generation
++
++    async def check(self, ctx, action):  # noqa: ANN001
++        current = await self._registry.get(KIND, NAMESPACE, "svc", TENANT)
++        current.metadata.labels["touched"] = "yes"
++        if self._bump_generation:
++            current.metadata.generation += 1
++        await self._registry.put(current, expected_version=current.metadata.resourceVersion)
++        return PolicyDecision(decision="allow", reason="ok")
++
++
++class GatedPolicy:
++    """在放行前阻塞，模拟停止时仍在进行的协调。"""
++
++    def __init__(self) -> None:
++        self.entered = asyncio.Event()
++        self.release = asyncio.Event()
++
++    async def check(self, ctx, action):  # noqa: ANN001
++        self.entered.set()
++        await self.release.wait()
++        return PolicyDecision(decision="allow", reason="ok")
++
++
++class CountingScheduler:
++    def __init__(self) -> None:
++        self.allocate_count = 0
++
++    async def allocate(self, req):  # noqa: ANN001
++        from forgemesh.core.scheduler import AllocationRef
++
++        self.allocate_count += 1
++        return AllocationRef(allocation_id=f"alloc-{self.allocate_count}", resource_id="node-1")
++
++
++class RecordingWorkflow:
++    def __init__(self) -> None:
++        self.idempotency_keys: list[str] = []
++
++    async def start(self, defn, inputs, idempotency_key):  # noqa: ANN001
++        from forgemesh.workflow.runtime import RunRef
++
++        self.idempotency_keys.append(idempotency_key)
++        return RunRef(run_id=idempotency_key, definition_version=1)
++
++
++class RecordingRelease:
++    def __init__(self) -> None:
++        self.released: list[str] = []
++
++    async def release(self, resource: Resource) -> None:
++        self.released.append(resource.metadata.name)
++
++
++class RecordingQueue(WorkQueue[ResourceKey]):
++    def __init__(self) -> None:
++        super().__init__()
++        self.delays: list[tuple[ResourceKey, float]] = []
++
++    def add_after(self, key: ResourceKey, delay: float) -> None:
++        self.delays.append((key, delay))
++        super().add_after(key, delay)
++
++
++def _manager(
++    registry: SQLiteRegistry,
++    *,
++    policy: Any = None,
++    scheduler: Any = None,
++    workflow: Any = None,
++    release: Any = None,
++    store: ProcessedKeyStore | None = None,
++    **kwargs: Any,
++) -> ControllerManager:
++    reconciler = ReconciliationController(
++        registry=registry,
++        policy_engine=policy or AllowPolicy(),
++        scheduler=scheduler,
++        workflow_runtime=workflow,
++        release_provider=release,
++        processed_store=store,
++        record_dedup_keys=False,
++    )
++    return ControllerManager(registry, reconciler, **kwargs)
++
++
++async def _conditions(registry: SQLiteRegistry, name: str = "svc") -> list[Condition]:
++    service = await registry.get(KIND, NAMESPACE, name, TENANT)
++    return service.status.conditions
++
++
++async def _eventually(check: Callable[[], Awaitable[bool]], timeout: float = 5.0) -> None:
++    deadline = time.monotonic() + timeout
++    while not await check():
++        if time.monotonic() > deadline:
++            raise AssertionError("condition was not met in time")
++        await asyncio.sleep(0.01)
++
++
++@pytest.mark.unit
++def test_manager_needs_a_reconciler_that_leaves_dedup_keys_to_it() -> None:
++    registry = SQLiteRegistry()
++    reconciler = ReconciliationController(registry=registry, policy_engine=AllowPolicy())
++
++    with pytest.raises(ValueError):
++        ControllerManager(registry, reconciler)
++
++
++@pytest.mark.unit
++def test_new_service_gets_a_reasoned_status_instead_of_staying_pending() -> None:
++    async def scenario() -> Resource:
++        registry = SQLiteRegistry()
++        manager = _manager(registry, poll_interval=0.01)
++        await manager.start()
++        try:
++            await registry.put(_service())
++
++            async def reported() -> bool:
++                return bool(await _conditions(registry))
++
++            await _eventually(reported)
++        finally:
++            await manager.stop()
++        service = await registry.get(KIND, NAMESPACE, "svc", TENANT)
++        await registry.close()
++        return service
++
++    service = _run(scenario())
++    [ready] = service.status.conditions
++    assert (ready.type, ready.status, ready.reason) == ("Ready", "False", "SchedulerUnavailable")
++    assert service.status.phase == "Pending"
++    assert service.status.observedGeneration == service.metadata.generation
++
++
++@pytest.mark.unit
++def test_work_queue_is_rebuilt_from_the_registry_after_a_restart(tmp_path) -> None:
++    db_path = str(tmp_path / "cp.db")
++
++    async def scenario() -> None:
++        before_crash = SQLiteRegistry(db_path)
++        await before_crash.put(_service("a"))
++        await before_crash.put(_service("b"))
++        await before_crash.close()
++
++        registry = SQLiteRegistry(db_path)
++        manager = _manager(registry, poll_interval=60)
++        await manager.start()
++        try:
++
++            async def both_reported() -> bool:
++                return bool(await _conditions(registry, "a")) and bool(
++                    await _conditions(registry, "b")
++                )
++
++            await _eventually(both_reported)
++        finally:
++            await manager.stop()
++            await registry.close()
++
++    _run(scenario())
++
++
++@pytest.mark.unit
++def test_same_generation_is_not_reconciled_twice_even_across_restarts(tmp_path) -> None:
++    db_path = str(tmp_path / "cp.db")
++    scheduler = CountingScheduler()
++    workflow = RecordingWorkflow()
++
++    async def scenario() -> Resource:
++        registry = SQLiteRegistry(db_path)
++        store = ProcessedKeyStore(db_path)
++        await registry.put(_service())
++        manager = _manager(registry, scheduler=scheduler, workflow=workflow, store=store)
++        await manager.process(_key())
++        await manager.process(_key())
++        await store.close()
++        await registry.close()
++
++        registry = SQLiteRegistry(db_path)
++        store = ProcessedKeyStore(db_path)
++        restarted = _manager(registry, scheduler=scheduler, workflow=workflow, store=store)
++        await restarted.process(_key())
++        service = await registry.get(KIND, NAMESPACE, "svc", TENANT)
++        await store.close()
++        await registry.close()
++        return service
++
++    service = _run(scenario())
++    assert scheduler.allocate_count == 1
++    assert len(workflow.idempotency_keys) == 1
++    assert [condition.reason for condition in service.status.conditions] == ["Reconciled"]
++
++
++@pytest.mark.unit
++def test_dedup_key_is_recorded_only_after_the_status_is_written(monkeypatch) -> None:
++    async def failing_write(*args: Any, **kwargs: Any) -> Any:
++        raise RuntimeError("disk I/O error")
++
++    async def scenario() -> None:
++        registry = SQLiteRegistry()
++        store = ProcessedKeyStore()
++        created = await registry.put(_service())
++        dedup_key = compute_dedup_key(
++            KIND, NAMESPACE, "svc", created.metadata.uid, created.metadata.generation, "reconcile"
++        ).key
++        manager = _manager(
++            registry, scheduler=CountingScheduler(), workflow=RecordingWorkflow(), store=store
++        )
++
++        monkeypatch.setattr(registry, "update_status", failing_write)
++        with pytest.raises(RuntimeError):
++            await manager.process(_key())
++        assert await store.seen(dedup_key) is False
++
++        monkeypatch.undo()
++        await manager.process(_key())
++        assert await store.seen(dedup_key) is True
++        assert [condition.reason for condition in await _conditions(registry)] == ["Reconciled"]
++        await store.close()
++        await registry.close()
++
++    _run(scenario())
++
++
++@pytest.mark.unit
++def test_status_write_retries_after_a_concurrent_write_to_the_same_generation() -> None:
++    async def scenario() -> Resource:
++        registry = SQLiteRegistry()
++        await registry.put(_service())
++        manager = _manager(registry, policy=ConcurrentWritePolicy(registry))
++        await manager.process(_key())
++        service = await registry.get(KIND, NAMESPACE, "svc", TENANT)
++        await registry.close()
++        return service
++
++    service = _run(scenario())
++    assert [condition.reason for condition in service.status.conditions] == ["SchedulerUnavailable"]
++    assert service.metadata.labels == {"touched": "yes"}
++    assert service.metadata.resourceVersion == "2"
++
++
++@pytest.mark.unit
++def test_result_for_an_outdated_generation_is_dropped_and_requeued() -> None:
++    async def scenario() -> tuple[Resource, int]:
++        registry = SQLiteRegistry()
++        queue: WorkQueue[ResourceKey] = WorkQueue()
++        await registry.put(_service())
++        manager = _manager(
++            registry, policy=ConcurrentWritePolicy(registry, bump_generation=True), queue=queue
++        )
++        await manager.process(_key())
++        service = await registry.get(KIND, NAMESPACE, "svc", TENANT)
++        await registry.close()
++        return service, len(queue)
++
++    service, queued = _run(scenario())
++    assert service.status.conditions == []
++    assert service.metadata.generation == 1
++    assert queued == 1
++
++
++@pytest.mark.unit
++def test_deleted_service_is_released_and_removed() -> None:
++    async def scenario() -> list[str]:
++        registry = SQLiteRegistry()
++        await registry.put(_service(phase=InferencePhase.READY))
++        await registry.request_delete(KIND, NAMESPACE, "svc", TENANT)
++        release = RecordingRelease()
++        manager = _manager(registry, release=release)
++
++        await manager.process(_key())
++
++        with pytest.raises(NotFoundError):
++            await registry.get(KIND, NAMESPACE, "svc", TENANT)
++        await registry.close()
++        return release.released
++
++    assert _run(scenario()) == ["svc"]
++
++
++@pytest.mark.unit
++def test_only_non_status_changes_of_managed_kinds_are_queued() -> None:
++    async def scenario() -> None:
++        registry = SQLiteRegistry()
++        queue: WorkQueue[ResourceKey] = WorkQueue()
++        manager = _manager(registry, queue=queue)
++        await registry.put(_service())
++        await registry.put(
++            Resource(
++                kind="Widget", metadata=ObjectMeta(name="w", namespace=NAMESPACE, tenant_id=TENANT)
++            )
++        )
++
++        assert await manager.poll_changes() == 2
++        assert len(queue) == 1
++        key = await queue.get()
++        assert key == _key()
++        await manager.process(key)
++        queue.done(key)
++
++        assert await manager.poll_changes() == 1
++        assert len(queue) == 0
++        assert await registry.changes_since(0) == []
++        await registry.close()
++
++    _run(scenario())
++
++
++@pytest.mark.unit
++def test_requeue_after_from_the_reconciler_schedules_the_next_attempt() -> None:
++    async def scenario() -> tuple[list[tuple[ResourceKey, float]], list[str]]:
++        registry = SQLiteRegistry()
++        queue = RecordingQueue()
++        await registry.put(_service())
++        manager = _manager(registry, policy=DenyPolicy(), queue=queue)
++        await manager.process(_key())
++        reasons = [condition.reason for condition in await _conditions(registry)]
++        await registry.close()
++        return queue.delays, reasons
++
++    delays, reasons = _run(scenario())
++    assert delays == [(_key(), 30.0)]
++    assert reasons == ["PolicyDenied"]
++
++
++@pytest.mark.unit
++def test_failing_reconciles_back_off_per_resource() -> None:
++    async def scenario() -> int:
++        registry = SQLiteRegistry()
++        queue: WorkQueue[ResourceKey] = WorkQueue(base_delay=0.01, max_delay=0.05, jitter=0)
++        policy = FailingPolicy()
++        await registry.put(_service())
++        manager = _manager(registry, policy=policy, queue=queue, poll_interval=0.01)
++        await manager.start()
++        try:
++
++            async def retried() -> bool:
++                return queue.failures(_key()) >= 3
++
++            await _eventually(retried)
++        finally:
++            await manager.stop()
++            await registry.close()
++        return policy.calls
++
++    assert _run(scenario()) >= 3
++
++
++@pytest.mark.unit
++def test_stop_lets_an_in_flight_reconcile_finish() -> None:
++    async def scenario() -> list[str]:
++        registry = SQLiteRegistry()
++        await registry.put(_service())
++        policy = GatedPolicy()
++        manager = _manager(registry, policy=policy)
++        await manager.start()
++        await asyncio.wait_for(policy.entered.wait(), 5)
++
++        stopping = asyncio.create_task(manager.stop())
++        await asyncio.sleep(0.05)
++        assert not stopping.done()
++        policy.release.set()
++        await asyncio.wait_for(stopping, 5)
++
++        reasons = [condition.reason for condition in await _conditions(registry)]
++        await registry.close()
++        return reasons
++
++    assert _run(scenario()) == ["SchedulerUnavailable"]
+diff --git a/tests/unit/controlplane/test_controller_queue.py b/tests/unit/controlplane/test_controller_queue.py
+new file mode 100644
+index 0000000..5e4600a
+--- /dev/null
++++ b/tests/unit/controlplane/test_controller_queue.py
+@@ -0,0 +1,109 @@
++"""控制器工作队列单元测试：按键去重、同键串行、延迟加入、退避与关闭。"""
++
++from __future__ import annotations
++
++import asyncio
++import random
++import time
++
++import pytest
++from forgemesh.controlplane.controller import WorkQueue
++
++
++def _run(coro):
++    """同步驱动协程（不依赖 pytest-asyncio）。"""
++    return asyncio.run(coro)
++
++
++@pytest.mark.unit
++def test_keys_are_deduplicated_and_never_handed_out_twice_at_once() -> None:
++    async def scenario() -> None:
++        queue: WorkQueue[str] = WorkQueue()
++        queue.add("a")
++        queue.add("a")
++        queue.add("b")
++        assert len(queue) == 2
++
++        assert await queue.get() == "a"
++        queue.add("a")
++        assert await queue.get() == "b"
++        assert len(queue) == 0
++
++        queue.done("b")
++        queue.done("a")
++        assert await asyncio.wait_for(queue.get(), 1) == "a"
++
++    _run(scenario())
++
++
++@pytest.mark.unit
++def test_add_after_delays_a_key_and_keeps_its_earliest_due_time() -> None:
++    async def scenario() -> float:
++        queue: WorkQueue[str] = WorkQueue()
++        started = time.monotonic()
++        queue.add_after("a", 60)
++        queue.add_after("a", 0.05)
++        queue.add_after("a", 30)
++        assert len(queue) == 0
++
++        assert await asyncio.wait_for(queue.get(), 1) == "a"
++        elapsed = time.monotonic() - started
++        queue.done("a")
++        with pytest.raises(TimeoutError):
++            await asyncio.wait_for(queue.get(), 0.1)
++        return elapsed
++
++    assert 0.04 <= _run(scenario()) < 1
++
++
++@pytest.mark.unit
++def test_rate_limited_requeue_backs_off_exponentially_up_to_the_cap() -> None:
++    async def scenario() -> None:
++        queue: WorkQueue[str] = WorkQueue(base_delay=1, max_delay=5, jitter=0)
++        assert [queue.add_rate_limited("a") for _ in range(5)] == [1, 2, 4, 5, 5]
++        assert queue.failures("a") == 5
++        assert queue.failures("b") == 0
++
++        queue.forget("a")
++        assert queue.add_rate_limited("a") == 1
++
++    _run(scenario())
++
++
++@pytest.mark.unit
++def test_jitter_only_shortens_the_backoff() -> None:
++    async def scenario() -> list[float]:
++        queue: WorkQueue[int] = WorkQueue(
++            base_delay=1, max_delay=8, jitter=0.5, rng=random.Random(7)
++        )
++        return [queue.add_rate_limited(key) for key in range(100)]
++
++    delays = _run(scenario())
++    assert all(0.5 <= delay <= 1 for delay in delays)
++    assert len(set(delays)) > 1
++
++
++@pytest.mark.unit
++def test_shutdown_releases_waiting_workers_and_ignores_new_keys() -> None:
++    async def scenario() -> None:
++        queue: WorkQueue[str] = WorkQueue()
++        waiters = [asyncio.create_task(queue.get()) for _ in range(3)]
++        await asyncio.sleep(0)
++
++        queue.shutdown()
++
++        assert await asyncio.gather(*waiters) == [None, None, None]
++        queue.add("a")
++        assert await queue.get() is None
++
++    _run(scenario())
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize(
++    "kwargs",
++    [{"base_delay": 0}, {"base_delay": 2, "max_delay": 1}, {"jitter": 1}, {"jitter": -0.1}],
++)
++def test_invalid_backoff_settings_are_rejected(kwargs) -> None:
++    with pytest.raises(ValueError):
++        WorkQueue(**kwargs)
+-- 
+2.43.0
+

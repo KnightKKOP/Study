@@ -1,0 +1,233 @@
+From 43df9eb2c9ef30ebd466c49c7dc2f31e13a63ce7 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 12 Oct 2026 05:12:49 +0000
+Subject: [PATCH 7/8] feat(control-plane): run the controller in the
+ application lifespan
+
+Start a ControllerManager when the application starts and stop it on
+shutdown, so resources created through the API are reconciled and get a
+status that explains their state. Without a scheduler, which is the case
+for every deployment today, a new InferenceService now reports
+Ready=False with reason SchedulerUnavailable instead of staying Pending
+forever.
+
+- Dedup keys live in the same database file as the resources, so a
+  restart neither loses pending work nor repeats side effects.
+- DefaultPolicyEngine denies everything without rules; the application
+  allows the "reconcile" action, since creating and deleting resources
+  is already guarded by authentication and scopes.
+- Startup and shutdown now use an AsyncExitStack, so a failure while
+  starting the controller still closes the registry and resets the
+  authenticator.
+
+The controller is a single writer (ADR-013): run the application as a
+single process and do not use uvicorn --workers.
+---
+ .../src/forgemesh/controlplane/app.py         | 41 +++++++--
+ tests/unit/controlplane/test_app.py           | 89 ++++++++++++++++++-
+ 2 files changed, 120 insertions(+), 10 deletions(-)
+
+diff --git a/packages/control-plane/src/forgemesh/controlplane/app.py b/packages/control-plane/src/forgemesh/controlplane/app.py
+index bacbd63..55474fd 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/app.py
++++ b/packages/control-plane/src/forgemesh/controlplane/app.py
+@@ -12,6 +12,10 @@
+ * **认证**：启动时按 ``FORGEMESH_AUTH_MODE`` 构造认证器（默认 ``apikey``，需要
+   ``FORGEMESH_API_KEYS_FILE``），配置缺失或非法时拒绝启动；``dev`` 模式只允许
+   监听回环地址（见 :mod:`forgemesh.controlplane.auth`）。
++* **控制器**：lifespan 中启动 :class:`~forgemesh.controlplane.controller.ControllerManager`，
++  自动协调 ``InferenceService`` 并回写 status；去重键与资源存放在同一个数据库
++  文件中。控制器是单写者（ADR-013），本应用只能以单进程运行（不要使用
++  ``uvicorn --workers``）。
+ * **无导入副作用**：数据库在应用启动（lifespan）时才打开，导入本模块不会
+   创建文件。
+ * **探针**：``/healthz``（存活）恒为 ok；``/readyz``（就绪）探测权威存储可用。
+@@ -28,9 +32,11 @@ import json
+ import logging
+ import os
+ from collections.abc import AsyncIterator
+-from contextlib import asynccontextmanager
++from contextlib import AsyncExitStack, asynccontextmanager
+ from typing import TYPE_CHECKING, Any
+ 
++from forgemesh.policy.engine import DefaultPolicyEngine
++from forgemesh.policy.rules import AuthzRule
+ from pydantic import BaseModel
+ 
+ from .auth import (
+@@ -41,9 +47,12 @@ from .auth import (
+     auth_mode_from_env,
+     authenticator_from_env,
+ )
++from .controller import ControllerManager
++from .reconciler import ProcessedKeyStore, ReconciliationController
+ 
+ if TYPE_CHECKING:  # pragma: no cover - 仅静态类型检查使用
+     from .auth import Authenticator
++    from .registry import SQLiteRegistry
+ 
+ try:  # pragma: no cover - 取决于运行环境是否安装 FastAPI
+     from fastapi import FastAPI
+@@ -115,6 +124,18 @@ def resolve_db_path(db_path: str | None = None) -> str:
+     return db_path or os.environ.get(DB_PATH_ENV) or DEFAULT_DB_PATH
+ 
+ 
++def _build_controller(
++    registry: SQLiteRegistry, processed_store: ProcessedKeyStore
++) -> ControllerManager:
++    # 没有授权规则的 DefaultPolicyEngine 拒绝一切操作。资源的创建和删除已经由 API 的
++    # 认证与 scope 把关，协调只是推进这些已被接受的期望状态，因此放行 reconcile。
++    policy = DefaultPolicyEngine(authz_rules=[AuthzRule(action="reconcile", effect="allow")])
++    reconciler = ReconciliationController(
++        registry, policy, processed_store=processed_store, record_dedup_keys=False
++    )
++    return ControllerManager(registry, reconciler)
++
++
+ if _FASTAPI_AVAILABLE:
+ 
+     def create_app(
+@@ -149,14 +170,18 @@ if _FASTAPI_AVAILABLE:
+                     AUTH_MODE_DEV,
+                 )
+             path = resolve_db_path(db_path)
+-            registry = init_registry(path)
+-            logger.info("control plane registry opened: %s", path)
+-            init_authenticator(auth)
+-            try:
++            async with AsyncExitStack() as cleanup:
++                registry = init_registry(path)
++                cleanup.push_async_callback(registry.close)
++                logger.info("control plane registry opened: %s", path)
++                init_authenticator(auth)
++                cleanup.callback(reset_authenticator)
++                processed_store = ProcessedKeyStore(path)
++                cleanup.push_async_callback(processed_store.close)
++                controller = _build_controller(registry, processed_store)
++                cleanup.push_async_callback(controller.stop)
++                await controller.start()
+                 yield
+-            finally:
+-                await registry.close()
+-                reset_authenticator()
+ 
+         application = FastAPI(
+             title="ForgeMesh Control Plane API",
+diff --git a/tests/unit/controlplane/test_app.py b/tests/unit/controlplane/test_app.py
+index aa0d233..9be205d 100644
+--- a/tests/unit/controlplane/test_app.py
++++ b/tests/unit/controlplane/test_app.py
+@@ -1,12 +1,26 @@
+-"""控制平面应用入口测试：真实路由已挂载、存储可配置、探针反映存储状态。"""
++"""控制平面应用入口测试：真实路由已挂载、存储可配置、探针反映存储状态、控制器随应用运行。"""
+ 
+ from __future__ import annotations
+ 
++import asyncio
++import sqlite3
++import time
++from pathlib import Path
++from typing import Any
++
+ import pytest
+ from fastapi.testclient import TestClient
+-from forgemesh.controlplane.api.dependencies import get_registry, reset_runtime_components
++from forgemesh.controlplane.api.dependencies import (
++    ComponentNotReadyError,
++    get_authenticator,
++    get_registry,
++    reset_runtime_components,
++)
+ from forgemesh.controlplane.app import DB_PATH_ENV, create_app
+ from forgemesh.controlplane.auth import AUTH_MODE_DEV, AUTH_MODE_ENV
++from forgemesh.controlplane.controller import ControllerManager
++from forgemesh.controlplane.registry import SQLiteRegistry
++from forgemesh.resource.inference import InferenceService
+ 
+ HEADERS = {"X-Tenant-Id": "acme"}
+ BODY = {
+@@ -28,6 +42,33 @@ def _reset_components(monkeypatch):
+     reset_runtime_components()
+ 
+ 
++def _wait_for_ready_condition(client: TestClient, timeout: float = 5.0) -> dict[str, Any]:
++    """轮询直到控制器为 ``llama`` 写入 ``Ready`` 条件。"""
++    deadline = time.monotonic() + timeout
++    while True:
++        response = client.get(
++            "/api/v1/inference-services/llama", params={"namespace": "default"}, headers=HEADERS
++        )
++        assert response.status_code == 200
++        for condition in response.json()["status"]["conditions"]:
++            if condition["type"] == "Ready":
++                return condition
++        assert time.monotonic() < deadline, "the controller did not report a Ready condition"
++        time.sleep(0.02)
++
++
++async def _store_service(db_file: Path) -> None:
++    registry = SQLiteRegistry(str(db_file))
++    try:
++        await registry.put(
++            InferenceService.model_validate(
++                {**BODY, "metadata": {**BODY["metadata"], "tenantId": "acme", "uid": "uid-llama"}}
++            )
++        )
++    finally:
++        await registry.close()
++
++
+ @pytest.mark.unit
+ def test_api_routes_are_served_and_persisted_across_restarts(tmp_path) -> None:
+     db_file = tmp_path / "cp.db"
+@@ -123,3 +164,47 @@ def test_runtime_endpoints_report_missing_components_instead_of_501(tmp_path) ->
+         response = client.post("/api/v1/decisions", json={"question": "q"}, headers=HEADERS)
+         assert response.status_code == 503
+         assert response.json()["error"]["code"] == "DECISION_ROUTER_UNAVAILABLE"
++
++
++@pytest.mark.unit
++def test_controller_reports_why_a_new_service_is_not_ready(tmp_path) -> None:
++    with TestClient(create_app(db_path=str(tmp_path / "cp.db"))) as client:
++        created = client.post("/api/v1/inference-services", json=BODY, headers=HEADERS)
++        assert created.status_code == 201
++
++        ready = _wait_for_ready_condition(client)
++
++    assert ready["status"] == "False"
++    assert ready["reason"] == "SchedulerUnavailable"
++
++
++@pytest.mark.unit
++def test_controller_picks_up_services_stored_while_it_was_not_running(tmp_path) -> None:
++    db_file = tmp_path / "cp.db"
++    asyncio.run(_store_service(db_file))
++
++    with TestClient(create_app(db_path=str(db_file))) as client:
++        ready = _wait_for_ready_condition(client)
++
++    assert ready["reason"] == "SchedulerUnavailable"
++
++
++@pytest.mark.unit
++def test_failed_controller_start_releases_the_registry_and_authenticator(
++    tmp_path, monkeypatch
++) -> None:
++    async def failing_start(self: ControllerManager) -> None:
++        raise RuntimeError("controller failed to start")
++
++    monkeypatch.setattr(ControllerManager, "start", failing_start)
++
++    with (
++        pytest.raises(RuntimeError, match="controller failed to start"),
++        TestClient(create_app(db_path=str(tmp_path / "cp.db"))),
++    ):
++        pass
++
++    with pytest.raises(ComponentNotReadyError):
++        get_authenticator()
++    with pytest.raises(sqlite3.ProgrammingError):
++        asyncio.run(get_registry().ping())
+-- 
+2.43.0
+

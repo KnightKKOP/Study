@@ -1,0 +1,102 @@
+From 8574446b22714617a422196b733f808079ff8dd5 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 12 Oct 2026 05:00:37 +0000
+Subject: [PATCH 5/8] feat(registry): read a resource together with its
+ recorded phase
+
+Base resources have no status subtree, so request_delete records
+Terminating only in the phase column and get() cannot tell that such a
+resource is being deleted. A controller deciding between the normal
+reconcile and the controlled-release path needs that phase.
+
+Add get_with_phase(), which returns the resource and the phase column
+from the same read.
+---
+ .../forgemesh/controlplane/registry/store.py  | 31 +++++++++++++++++++
+ .../controlplane/test_registry_changes.py     | 24 +++++++++++++-
+ 2 files changed, 54 insertions(+), 1 deletion(-)
+
+diff --git a/packages/control-plane/src/forgemesh/controlplane/registry/store.py b/packages/control-plane/src/forgemesh/controlplane/registry/store.py
+index 8108b39..cab6eaa 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/registry/store.py
++++ b/packages/control-plane/src/forgemesh/controlplane/registry/store.py
+@@ -886,6 +886,37 @@ class SQLiteRegistry(ResourceRegistry):
+     # 控制器读取（跨租户，仅供控制平面内部使用）
+     # ------------------------------------------------------------------ #
+ 
++    async def get_with_phase(
++        self,
++        kind: str,
++        namespace: str | None,
++        name: str,
++        tenant_id: str,
++    ) -> tuple[Resource, str | None]:
++        """读取资源及 ``phase`` 列记录的生命周期阶段。
++
++        基类资源的 payload 没有 ``status`` 子树，``Terminating`` 只记录在 ``phase``
++        列（见 :meth:`request_delete`），只读 payload 无法判断是否进入受控删除。
++
++        Raises:
++            NotFoundError: 资源不存在（或跨租户不可见）。
++        """
++
++        def _get_with_phase() -> tuple[Resource, str | None]:
++            row = self._conn.execute(
++                "SELECT body, phase FROM resources "
++                "WHERE tenant_id=? AND kind=? AND namespace IS ? AND name=?",
++                (tenant_id, kind, namespace, name),
++            ).fetchone()
++            if row is None:
++                raise NotFoundError(
++                    f"resource not found: kind={kind} "
++                    f"namespace={namespace!r} name={name} tenant_id={tenant_id}",
++                )
++            return self._row_to_resource(row), row["phase"]
++
++        return await self._run(_get_with_phase)
++
+     async def list_resource_keys(
+         self, kinds: Collection[str] | None = None
+     ) -> builtins.list[ResourceKey]:
+diff --git a/tests/unit/controlplane/test_registry_changes.py b/tests/unit/controlplane/test_registry_changes.py
+index f320b03..e314348 100644
+--- a/tests/unit/controlplane/test_registry_changes.py
++++ b/tests/unit/controlplane/test_registry_changes.py
+@@ -1,4 +1,8 @@
+-"""注册中心变更记录单元测试：同事务追加、增量读取、清理，以及跨租户键列表。"""
++"""注册中心变更记录与控制器读取的单元测试。
++
++覆盖变更记录的同事务追加、增量读取与清理，以及控制器使用的跨租户键列表和
++带 phase 的读取。
++"""
+ 
+ from __future__ import annotations
+ 
+@@ -140,6 +144,24 @@ def test_changes_since_rejects_non_positive_limit() -> None:
+         _run(SQLiteRegistry().changes_since(0, limit=0))
+ 
+ 
++@pytest.mark.unit
++def test_get_with_phase_reports_termination_of_base_resources() -> None:
++    reg = SQLiteRegistry()
++    widget = _resource("w", kind="Widget").model_copy(update={"finalizers": ["example.com/x"]})
++    _run(reg.put(widget))
++    _run(reg.put(_ready_service("svc")))
++    _run(reg.request_delete("Widget", NAMESPACE, "w", TENANT))
++
++    resource, phase = _run(reg.get_with_phase("Widget", NAMESPACE, "w", TENANT))
++    service, service_phase = _run(reg.get_with_phase(KIND, NAMESPACE, "svc", TENANT))
++
++    assert phase == "Terminating"
++    assert not hasattr(resource, "status")
++    assert service_phase == service.status.phase == "Ready"
++    with pytest.raises(NotFoundError):
++        _run(reg.get_with_phase(KIND, NAMESPACE, "svc", "tenant-b"))
++
++
+ @pytest.mark.unit
+ def test_list_resource_keys_spans_tenants_and_filters_kinds() -> None:
+     reg = SQLiteRegistry()
+-- 
+2.43.0
+
