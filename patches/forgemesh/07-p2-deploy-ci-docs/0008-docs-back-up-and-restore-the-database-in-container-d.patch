@@ -1,7 +1,7 @@
 From 5090091e9149ba06dc7432fa457efabbb52766d5 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Mon, 12 Oct 2026 07:17:33 +0000
-Subject: [PATCH 8/9] docs: back up and restore the database in container
+Subject: [PATCH 08/11] docs: back up and restore the database in container
  deployments
 
 The backup script needs the sqlite3 command line tool, which the control plane

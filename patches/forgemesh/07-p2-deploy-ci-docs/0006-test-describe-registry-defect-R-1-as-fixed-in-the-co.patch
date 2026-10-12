@@ -1,7 +1,7 @@
 From dfe35e40cf659bc12d5413a77aca0787279f512a Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Mon, 12 Oct 2026 07:15:31 +0000
-Subject: [PATCH 6/9] test: describe registry defect R-1 as fixed in the
+Subject: [PATCH 06/11] test: describe registry defect R-1 as fixed in the
  contract tests
 
 The module docstrings of three contract tests still said that the shared

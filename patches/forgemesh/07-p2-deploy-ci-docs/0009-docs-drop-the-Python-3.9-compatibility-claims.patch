@@ -1,7 +1,7 @@
 From f8c9e2a97efc41a29be8c01095fd744061ff1603 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Mon, 12 Oct 2026 07:19:36 +0000
-Subject: [PATCH 9/9] docs: drop the Python 3.9 compatibility claims
+Subject: [PATCH 09/11] docs: drop the Python 3.9 compatibility claims
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit

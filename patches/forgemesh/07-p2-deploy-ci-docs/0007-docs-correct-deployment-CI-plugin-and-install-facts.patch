@@ -1,7 +1,7 @@
 From 0cd366a97f53572dd078bb06bfaa78e9cdf51958 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Mon, 12 Oct 2026 07:16:22 +0000
-Subject: [PATCH 7/9] docs: correct deployment, CI, plugin and install facts
+Subject: [PATCH 07/11] docs: correct deployment, CI, plugin and install facts
 
 - README and CONTRIBUTING told contributors to run `uv sync`. The root
   pyproject.toml only holds tool configuration, so `uv sync` creates an empty

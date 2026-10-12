@@ -1,7 +1,8 @@
 From 7e05df9938a9d9f7273f46b29d2e084298da5935 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Mon, 12 Oct 2026 06:57:19 +0000
-Subject: [PATCH 4/9] test: fail the suite on coroutines that are never awaited
+Subject: [PATCH 04/11] test: fail the suite on coroutines that are never
+ awaited
 
 test_legacy_db_migration_adds_columns called the async
 SQLiteRegistry.close() without awaiting it, so neither registry was

@@ -1,7 +1,7 @@
 From 28c55110987d277673af6d5d07703c81304a0b05 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Mon, 12 Oct 2026 06:56:14 +0000
-Subject: [PATCH 3/9] fix(deploy): persist the Kubernetes control plane
+Subject: [PATCH 03/11] fix(deploy): persist the Kubernetes control plane
  database
 
 The deployment kept the SQLite database in the container file system,

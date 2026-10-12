@@ -1,8 +1,8 @@
 From 1a5abb7750f19805a65caaa224239194017d913a Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Mon, 12 Oct 2026 06:57:47 +0000
-Subject: [PATCH 5/9] ci: vet the gateway, run its tests with the race detector
- and smoke-test compose
+Subject: [PATCH 05/11] ci: vet the gateway, run its tests with the race
+ detector and smoke-test compose
 
 The Go job only built and tested the gateway. It now also fails on
 files that are not gofmt-formatted, runs go vet and runs the tests
