@@ -1,40 +1,41 @@
 # ForgeMesh 改进优化方案与实现
 
-本仓库是对 [Mekoforge/ForgeMesh](https://github.com/Mekoforge/ForgeMesh)（基线提交 `5a0be13`）做代码审查后的产出：
+本仓库是对 [Mekoforge/ForgeMesh](https://github.com/Mekoforge/ForgeMesh) 做代码审查后的产出：一份改进优化文档，以及按文档实现、以 `git format-patch` 格式保存的两轮主题分支。每个分支对应一个上游 PR。
 
 | 路径 | 内容 |
 |---|---|
-| [`docs/forgemesh-improvement-plan.md`](docs/forgemesh-improvement-plan.md) | 改进优化文档：P0/P1/P2 问题清单（附基线代码位置）、修复与设计方案、验收标准、分阶段路线图 |
-| [`patches/forgemesh/`](patches/forgemesh/) | 按文档实现的代码，每个子目录是一个主题分支（对应一个上游 PR），`git format-patch` 格式 |
-| [`patches/forgemesh/apply-branches.sh`](patches/forgemesh/apply-branches.sh) | 在你的 ForgeMesh 克隆里重建这些分支，可选签署 DCO、改作者、推送到 fork |
+| [`docs/forgemesh-improvement-plan.md`](docs/forgemesh-improvement-plan.md) | 改进优化文档：P0/P1/P2 问题清单（附基线代码位置）、修复与设计方案、验收标准、分阶段路线图与实施情况 |
+| [`patches/forgemesh/`](patches/forgemesh/) | 第一轮：7 个分支，基于 `5a0be13`，已作为 [#5](https://github.com/Mekoforge/ForgeMesh/pull/5) 至 [#11](https://github.com/Mekoforge/ForgeMesh/pull/11) 合入上游 |
+| [`patches/forgemesh/round-2/`](patches/forgemesh/round-2/) | 第二轮：5 个分支，基于第一轮合入后的上游 `main`（`3dc1342`） |
 
-## 主题分支
+两轮各有一个 `apply-branches.sh`，在 ForgeMesh 克隆里按顺序重建该轮的全部分支，可选签署 DCO、改作者、推送到 fork。
 
-分支是叠放的：每个分支以前一个分支为基础，第一个基于上游 `main`（`5a0be13`），共 50 个提交。向上游提 PR 时按顺序提交，前一个合入后再提下一个（或者先提出来、在描述里注明依赖）。每个提交的完整标题见改进文档的附录 A。
+## 第二轮主题分支
+
+分支是叠放的：每个分支以前一个分支为基础，第一个基于 `3dc1342`，共 37 个提交。治理分支不依赖其他分支，可以单独合入；其余分支按顺序合入。
 
 | 顺序 | 目录 / 分支 | 提交数 | 内容 |
 |---|---|---|---|
-| 1 | `01-p0-correctness-fixes` / `cursor/p0-correctness-fixes-b108` | 9 | P0-1 ~ P0-8：注册中心并发与 CAS、空 namespace 唯一性、分页过滤、调和去重、可运行入口、依赖声明、创建接口校验；CHANGELOG / README / OpenAPI 同步 |
-| 2 | `02-p0-auth-tenant-binding` / `cursor/p0-auth-tenant-binding-b108` | 8 | P0-9：绑定租户的 API key 认证（网关与控制平面各自校验）、scope、统一错误信封、凭证不再转发给推理实例、按已验证租户限流；ADR-014 与文档 |
-| 3 | `03-p0-controller-loop` / `cursor/p0-controller-loop-b108` | 8 | P0-10：控制器随应用启动，增量读取变更记录、按资源排队与退避、经 status 子资源（CAS）回写协调结果、写入成功后才登记去重键；缺少调度器时报告 `Ready=False`（`SchedulerUnavailable`），不再误报 `Ready=True` |
-| 4 | `04-p1-inference-routing` / `cursor/p1-inference-routing-b108` | 4 | P1-1：`status.endpoints` 定义为 `{url, ready, instanceId, protocol}` 并进入资源模型、Schema 与 OpenAPI；status 子资源可写入实例地址；网关新增带命名空间的推理路由，只转发到 ready 实例，并按 `protocol` 映射实例上的推理路径（不再原样拼接入站路径） |
-| 5 | `05-p1-gateway-hardening` / `cursor/p1-gateway-hardening-b108` | 7 | P1-8 / P2-2：网关在拨号时检查实例地址（`GATEWAY_INSTANCE_ALLOWED_CIDRS`，默认拒绝回环、链路本地与云元数据地址）、请求体上限（`413`）、放宽空闲连接池、解析器合并并发回源并短暂缓存"不存在 / 未就绪"、`/readyz` 改为请求控制平面的 `/readyz`、实例错误响应保留 `Content-Type` |
-| 6 | `06-p2-sqlite-storage` / `cursor/p2-sqlite-storage-b108` | 3 | P2-1（部分）：控制平面的 SQLite 存储以 WAL 模式打开并启用外键约束；去重键查询不再每次删除过期键；备份文档改为 `VACUUM INTO` / `Connection.backup` 在线快照（原来的 checkpoint + `cp` 在写入期间可能得到损坏的备份），恢复时保留旧库的 `-wal` |
-| 7 | `07-p2-deploy-ci-docs` / `cursor/p2-deploy-ci-docs-b108` | 11 | P2-4 / P2-5 / P2-6（部分）：控制平面与网关的 Dockerfile（非 root、只读根文件系统可运行）；compose 改为可运行的拓扑（共用 key 文件、只发布在 127.0.0.1、数据卷持久化）；Kubernetes 清单改用 PVC + `Recreate` + Secret；`scripts/compose_smoke.sh` 端到端冒烟进 CI；CI 增加 `gofmt` / `go vet` / `-race`；pytest 把未 await 的协程视为失败；容器中的备份恢复步骤；README / CONTRIBUTING / module-mapping 事实更正（`uv sync` 实际装不上依赖等），删除"兼容 Python 3.9+"的说法；最后两个提交更正前面分支的契约文档：CHANGELOG 写明 `endpoints` 的 `protocol` 必填，OpenAPI 补上 GET / DELETE 单个服务时的 `namespace` 参数 |
+| 1 | `01-governance-preview-status` / `cursor/governance-preview-status-b108` | 3 | 治理：ADR-014 改为 Accepted；API 稳定性标注由 `stable` 更正为 `beta`（OpenAPI、README、SECURITY.md、弃用政策新增 1.4 节）；1.0.0 中与实现不符的能力表述改为勘误，README 功能概览逐条注明现状 |
+| 2 | `02-p1-scheduler-allocation` / `cursor/p1-scheduler-allocation-b108` | 9 | P1-2：静态加速器清单（`FORGEMESH_INVENTORY_FILE`）上的 first-fit 调度器；分配按资源 uid 关联、设备独占由数据库保证、按 uid + generation 幂等；持有分配的资源删除时一律走 `Terminating` |
+| 3 | `03-p1-workflow-execution` / `cursor/p1-workflow-execution-b108` | 6 | P1-3：参考工作流运行时在后台执行步骤并在重启后恢复；部署工作流（准备模型 → 启动实例 → 验证实例）与启动器契约；协调器按状态机逐阶段推进，到 `Ready` 才写 `status.endpoints`，失败时停实例、释放分配 |
+| 4 | `04-p1-runtime-launcher-e2e` / `cursor/p1-runtime-launcher-e2e-b108` | 10 | P1-6：`fake`（进程内 OpenAI 兼容桩服务）与 `vllm-process` 两个启动器（`FORGEMESH_RUNTIME_LAUNCHER`）；重启后实例丢失的服务转为 `Degraded`；compose 冒烟经网关覆盖完整闭环 |
+| 5 | `05-p1-plugin-supply-chain` / `cursor/p1-plugin-supply-chain-b108` | 9 | P1-7：Ed25519 制品签名并在注册时验签；权限按管理员授予判定；统一权限词表；10 个插件的入口改为 `<模块>:<类>`；清单如实声明进程内隔离 |
 
-## 推送到你的 fork
+## 重建并推送到 fork
 
 ```bash
 git clone https://github.com/<你的账号>/ForgeMesh.git
 cd ForgeMesh
-/path/to/this/repo/patches/forgemesh/apply-branches.sh . --signoff --reset-author --push origin
+git fetch https://github.com/Mekoforge/ForgeMesh.git main   # fork 的 main 落后时，取回基线 3dc1342
+/path/to/this/repo/patches/forgemesh/round-2/apply-branches.sh . --signoff --reset-author --push origin
 ```
 
 - `--signoff`：给每个提交加上你的 `Signed-off-by`。上游 CONTRIBUTING 要求 DCO 签署，这一步必须由你本人确认。
 - `--reset-author`：把提交作者改成你的 git 身份；不加则保留 `Cursor Agent <cursoragent@cursor.com>`。
 - `--push origin`：把全部分支推到 fork；不加则只在本地创建分支。
 
-脚本要求工作区干净、目标分支不存在；应用后的代码树与这里验证过的结果逐字节一致。
+脚本要求克隆中有基线提交、工作区干净、目标分支不存在；重建后的代码树与这里验证过的结果逐字节一致。第一轮的脚本是 `patches/forgemesh/apply-branches.sh`，用法相同，基线为 `5a0be13`。
 
 ## 验证
 
@@ -42,15 +43,13 @@ cd ForgeMesh
 
 ```bash
 make install    # 默认的 python3 低于 3.12 时：make install PY=python3.12
-make test       # 七个分支都应用后：1244 passed（基线为 1115）
+make test       # 第二轮五个分支都应用后：1800 passed（3dc1342 上为 1244）
 make lint
 (cd gateway && test -z "$(gofmt -l .)" && go vet ./... && go test -race ./...)
 for s in validate_manifests openapi_semantic_check check_metadata_consistency plugin_entrypoint_smoke; do
   .venv/bin/python scripts/$s.py
 done
-scripts/compose_smoke.sh   # 需要 Docker 与 Compose v2：构建镜像、经网关读写、重启后数据仍在
+scripts/compose_smoke.sh   # 需要 Docker、Compose v2 与 jq：经网关跑通创建、Ready、流式对话、删除、重建与重启
 ```
 
-不用 Docker 的手工冒烟（包括用桩服务验证经网关的流式请求和受控删除），以及“新测试在基线代码上失败”的复现方法，见改进文档的附录 B。
-
-启动方式（认证配置、key 生成、`dev` 模式）见 ForgeMesh 根目录 README 的「运行控制平面」一节，容器部署见「容器部署」一节。
+部署推理服务（设备清单、启动器、本地用假运行时跑通闭环）见 ForgeMesh 根目录 README 的「部署推理服务」一节。
