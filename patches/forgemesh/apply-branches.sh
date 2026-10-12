@@ -45,6 +45,7 @@ topics="
 01-p0-correctness-fixes:cursor/p0-correctness-fixes-b108
 02-p0-auth-tenant-binding:cursor/p0-auth-tenant-binding-b108
 03-p0-controller-loop:cursor/p0-controller-loop-b108
+04-p1-inference-routing:cursor/p1-inference-routing-b108
 "
 
 cd "$repo"

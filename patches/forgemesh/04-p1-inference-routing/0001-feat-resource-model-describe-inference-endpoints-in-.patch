@@ -1,0 +1,330 @@
+From 111b76f5ea3f7b6b4d4186d1df7db0a8fcc75bf6 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 12 Oct 2026 05:22:38 +0000
+Subject: [PATCH 1/4] feat(resource-model): describe inference endpoints in the
+ status
+
+The gateway resolves a service by reading status.endpoints, but the
+model forbade unknown status fields and defined no such field, the JSON
+Schema declared a singular "endpoint" string the model rejected, and
+OpenAPI left status untyped. No endpoint could ever be stored, so
+streaming routes could never resolve an instance.
+
+Add Endpoint(url, ready, instanceId, protocol) and
+InferenceServiceStatus.endpoints. The url must be a plain http(s) base
+URL without credentials, query or fragment; protocol is "openai-chat"
+(POST /v1/chat/completions) or "tgi-generate" (POST /generate_stream)
+and tells the gateway which path to call. An endpoint without "ready"
+is ready.
+
+Replace the schema's "endpoint" with "endpoints", describe status and
+Endpoint in OpenAPI, and drop the cross-representation test's
+workaround for the old field.
+---
+ api/openapi/openapi.yaml                      | 43 ++++++++++++++++-
+ api/schemas/inference-service.schema.json     | 28 +++++++++--
+ examples/single-node/inference-service.yaml   |  2 +-
+ .../src/forgemesh/resource/__init__.py        |  4 ++
+ .../src/forgemesh/resource/inference.py       | 46 ++++++++++++++++++-
+ tests/contract/test_cross_representation.py   |  7 +--
+ tests/unit/resource/test_inference.py         | 39 ++++++++++++++++
+ 7 files changed, 156 insertions(+), 13 deletions(-)
+
+diff --git a/api/openapi/openapi.yaml b/api/openapi/openapi.yaml
+index b588063..a3ab2fd 100644
+--- a/api/openapi/openapi.yaml
++++ b/api/openapi/openapi.yaml
+@@ -288,8 +288,47 @@ components:
+           type: object
+           additionalProperties: true
+         status:
+-          type: object
+-          additionalProperties: true
++          $ref: "#/components/schemas/InferenceServiceStatus"
++    InferenceServiceStatus:
++      type: object
++      description: 实际状态，只由控制器写入；创建请求中的 status 会被忽略。
++      additionalProperties: true
++      properties:
++        phase:
++          type: string
++        observedGeneration:
++          type: integer
++          minimum: 0
++        conditions:
++          type: array
++          items:
++            type: object
++            additionalProperties: true
++        endpoints:
++          type: array
++          description: 实例访问地址；网关只向 ready 的实例转发推理请求。
++          items:
++            $ref: "#/components/schemas/Endpoint"
++    Endpoint:
++      type: object
++      required: [url, protocol]
++      additionalProperties: false
++      properties:
++        url:
++          type: string
++          format: uri
++          description: 实例基地址（http / https，不带凭证、查询串与片段），如 http://10.0.0.1:8000。
++        ready:
++          type: boolean
++          default: true
++        instanceId:
++          type: [string, "null"]
++        protocol:
++          type: string
++          enum: [openai-chat, tgi-generate]
++          description: >-
++            决定网关把推理请求转发到实例的哪个路径：openai-chat 为 POST /v1/chat/completions，
++            tgi-generate 为 POST /generate_stream。
+     InferenceServiceList:
+       type: object
+       required: [items]
+diff --git a/api/schemas/inference-service.schema.json b/api/schemas/inference-service.schema.json
+index 4fbd6f8..dba019e 100644
+--- a/api/schemas/inference-service.schema.json
++++ b/api/schemas/inference-service.schema.json
+@@ -184,12 +184,34 @@
+           "type": "array",
+           "items": {"$ref": "#/$defs/Condition"}
+         },
+-        "endpoint": {
+-          "type": ["string", "null"],
+-          "description": "服务就绪后的访问端点；未就绪为 null。"
++        "endpoints": {
++          "type": "array",
++          "description": "实例访问地址，由控制器写入；网关只向 ready 的实例转发。",
++          "items": {"$ref": "#/$defs/Endpoint"}
+         },
+         "lastError": {"type": ["string", "null"]}
+       }
++    },
++    "Endpoint": {
++      "type": "object",
++      "description": "推理实例的访问地址。",
++      "required": ["url", "protocol"],
++      "additionalProperties": false,
++      "properties": {
++        "url": {
++          "type": "string",
++          "format": "uri",
++          "pattern": "^https?://",
++          "description": "实例基地址，不带凭证、查询串与片段，如 http://10.0.0.1:8000。"
++        },
++        "ready": {"type": "boolean", "default": true},
++        "instanceId": {"type": ["string", "null"]},
++        "protocol": {
++          "type": "string",
++          "description": "openai-chat：POST /v1/chat/completions；tgi-generate：POST /generate_stream。",
++          "enum": ["openai-chat", "tgi-generate"]
++        }
++      }
+     }
+   }
+ }
+\ No newline at end of file
+diff --git a/examples/single-node/inference-service.yaml b/examples/single-node/inference-service.yaml
+index cbd322a..3d520d9 100644
+--- a/examples/single-node/inference-service.yaml
++++ b/examples/single-node/inference-service.yaml
+@@ -27,4 +27,4 @@ status:
+   phase: Pending
+   observedGeneration: 0
+   conditions: []
+-  endpoint: null
++  endpoints: []
+diff --git a/packages/resource-model/src/forgemesh/resource/__init__.py b/packages/resource-model/src/forgemesh/resource/__init__.py
+index 8dff266..0748033 100644
+--- a/packages/resource-model/src/forgemesh/resource/__init__.py
++++ b/packages/resource-model/src/forgemesh/resource/__init__.py
+@@ -18,6 +18,8 @@ from .allocation import Allocation, AllocationStatus, ResourceLease
+ from .inference import (
+     AcceleratorSpec,
+     Availability,
++    Endpoint,
++    EndpointProtocol,
+     InferencePhase,
+     InferenceService,
+     InferenceServiceSpec,
+@@ -53,6 +55,8 @@ __all__ = [
+     "AcceleratorSpec",
+     "Availability",
+     "InferenceServiceSpec",
++    "EndpointProtocol",
++    "Endpoint",
+     "InferenceServiceStatus",
+     "InferenceService",
+     # node
+diff --git a/packages/resource-model/src/forgemesh/resource/inference.py b/packages/resource-model/src/forgemesh/resource/inference.py
+index 116c058..eabdd71 100644
+--- a/packages/resource-model/src/forgemesh/resource/inference.py
++++ b/packages/resource-model/src/forgemesh/resource/inference.py
+@@ -16,9 +16,10 @@ from __future__ import annotations
+ 
+ from enum import StrEnum
+ from typing import Literal
++from urllib.parse import urlsplit
+ 
+ from forgemesh.core.objects import Condition, Resource
+-from pydantic import BaseModel, ConfigDict, Field
++from pydantic import BaseModel, ConfigDict, Field, field_validator
+ 
+ 
+ class InferencePhase(StrEnum):
+@@ -127,6 +128,45 @@ class InferenceServiceSpec(BaseModel):
+     availability: Availability = Field(default_factory=Availability)
+ 
+ 
++class EndpointProtocol(StrEnum):
++    """推理实例提供的协议，决定网关把推理请求转发到实例的哪个路径。"""
++
++    OPENAI_CHAT = "openai-chat"
++    """OpenAI 兼容的 ``POST /v1/chat/completions``（如 vLLM）。"""
++    TGI_GENERATE = "tgi-generate"
++    """Hugging Face TGI 的 ``POST /generate_stream``。"""
++
++
++class Endpoint(BaseModel):
++    """推理实例的访问地址，由控制器写入 ``status.endpoints``。
++
++    Attributes:
++        url: 实例基地址，必须是不带凭证、查询串与片段的 ``http`` / ``https`` URL，
++            如 ``http://10.0.0.1:8000``。
++        ready: 实例能否接收请求；网关只向就绪的实例转发。
++        instanceId: 实例标识（可选）。
++        protocol: 实例协议，见 :class:`EndpointProtocol`。
++    """
++
++    model_config = ConfigDict(extra="forbid")
++
++    url: str
++    ready: bool = True
++    instanceId: str | None = None
++    protocol: EndpointProtocol
++
++    @field_validator("url")
++    @classmethod
++    def _require_base_url(cls, value: str) -> str:
++        parts = urlsplit(value)
++        if parts.scheme not in ("http", "https") or not parts.hostname:
++            raise ValueError("url must be an absolute http or https URL")
++        if parts.username or parts.password or parts.query or parts.fragment:
++            raise ValueError("url must not contain credentials, a query or a fragment")
++        _ = parts.port  # 端口非法时抛 ValueError
++        return value
++
++
+ class InferenceServiceStatus(BaseModel):
+     """``InferenceService`` 实际状态（Observed State，ADR-002）。
+ 
+@@ -134,6 +174,7 @@ class InferenceServiceStatus(BaseModel):
+         phase: 当前生命周期阶段，默认 ``Pending``。
+         observedGeneration: 控制器已处理到的 ``metadata.generation``。
+         conditions: 结构化状态条件集合。
++        endpoints: 实例访问地址，由控制器经 status 子资源写入；网关据此转发推理请求。
+     """
+ 
+     model_config = ConfigDict(extra="forbid")
+@@ -141,6 +182,7 @@ class InferenceServiceStatus(BaseModel):
+     phase: InferencePhase = InferencePhase.PENDING
+     observedGeneration: int = 0
+     conditions: list[Condition] = Field(default_factory=list)
++    endpoints: list[Endpoint] = Field(default_factory=list)
+ 
+ 
+ class InferenceService(Resource):
+@@ -163,6 +205,8 @@ __all__ = [
+     "ResourcesSpec",
+     "Availability",
+     "InferenceServiceSpec",
++    "EndpointProtocol",
++    "Endpoint",
+     "InferenceServiceStatus",
+     "InferenceService",
+ ]
+diff --git a/tests/contract/test_cross_representation.py b/tests/contract/test_cross_representation.py
+index 9a8dbe0..8d9bde3 100644
+--- a/tests/contract/test_cross_representation.py
++++ b/tests/contract/test_cross_representation.py
+@@ -68,16 +68,11 @@ def test_inference_service_cross_representation() -> None:
+       4. 用 ``Draft202012Validator`` 校验序列化后的 dict 符合 Schema；
+       5. 验证 ``spec.resources.accelerator`` 结构正确（不是扁平 ``spec.accelerator``）。
+ 
+-    注：示例 YAML 的 ``status.endpoint`` 与 Python ``InferenceServiceStatus``
+-    尚未对齐（阶段 0 已知限制），构造前剔除该字段以聚焦已实现字段的一致性。
+-    同理，``Resource`` 基类的顶层 ``conditions`` / ``finalizers``（受控删除
++    注：``Resource`` 基类的顶层 ``conditions`` / ``finalizers``（受控删除
+     生命周期字段）不在 InferenceService Schema 顶层定义，序列化后剔除再校验。
+     """
+     yaml_dict = _load_yaml(EXAMPLES_DIR / "single-node" / "inference-service.yaml")
+ 
+-    # 阶段 0 已知限制：Python InferenceServiceStatus 尚未实现 endpoint/lastError。
+-    yaml_dict["status"].pop("endpoint", None)
+-
+     # Python 模型构造
+     obj = InferenceService(**yaml_dict)
+     assert obj.kind == "InferenceService"
+diff --git a/tests/unit/resource/test_inference.py b/tests/unit/resource/test_inference.py
+index 5d06394..1a02e22 100644
+--- a/tests/unit/resource/test_inference.py
++++ b/tests/unit/resource/test_inference.py
+@@ -15,6 +15,8 @@ from forgemesh.core.objects import Condition, ObjectMeta
+ from forgemesh.resource.inference import (
+     AcceleratorSpec,
+     Availability,
++    Endpoint,
++    EndpointProtocol,
+     InferencePhase,
+     InferenceService,
+     InferenceServiceSpec,
+@@ -141,6 +143,43 @@ def test_status_can_be_provided_explicitly() -> None:
+     assert service.status.observedGeneration == 3
+ 
+ 
++def test_status_endpoints_default_to_empty_and_ready() -> None:
++    """status.endpoints 默认为空；未声明 ready 的实例视为就绪。"""
++    endpoint = Endpoint(url="http://10.0.0.1:8000", protocol="openai-chat")
++
++    assert _make_service().status.endpoints == []
++    assert endpoint.ready is True
++    assert endpoint.protocol is EndpointProtocol.OPENAI_CHAT
++    assert endpoint.model_dump(mode="json") == {
++        "url": "http://10.0.0.1:8000",
++        "ready": True,
++        "instanceId": None,
++        "protocol": "openai-chat",
++    }
++
++
++@pytest.mark.parametrize(
++    "url",
++    [
++        "10.0.0.1:8000",
++        "ftp://10.0.0.1",
++        "http://",
++        "http://user:secret@10.0.0.1:8000",
++        "http://10.0.0.1:8000/?debug=1",
++        "http://10.0.0.1:8000/#frag",
++        "http://10.0.0.1:notaport",
++    ],
++)
++def test_endpoint_url_must_be_a_plain_http_base_url(url: str) -> None:
++    with pytest.raises(ValidationError):
++        Endpoint(url=url, protocol="openai-chat")
++
++
++def test_endpoint_protocol_must_be_known() -> None:
++    with pytest.raises(ValidationError):
++        Endpoint(url="http://10.0.0.1:8000", protocol="grpc")
++
++
+ def test_inference_phase_has_eleven_states() -> None:
+     """InferencePhase 应覆盖 11 个生命周期阶段。"""
+     assert len(InferencePhase) == 11
+-- 
+2.43.0
+

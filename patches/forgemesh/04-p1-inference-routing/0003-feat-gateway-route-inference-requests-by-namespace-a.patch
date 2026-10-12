@@ -1,0 +1,1000 @@
+From 2eb7a2d75fd064542b5371ec7eeca6d341ba5b8c Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 12 Oct 2026 05:31:30 +0000
+Subject: [PATCH 3/4] feat(gateway): route inference requests by namespace and
+ endpoint protocol
+
+The resolver reads the structured status.endpoints written by the
+control plane, keeps only ready endpoints with a known protocol, and
+forwards each request to the inference path of that protocol
+(openai-chat: /v1/chat/completions, tgi-generate: /generate_stream)
+instead of appending the inbound gateway path to the instance URL.
+
+Requests to /api/v1/namespaces/{ns}/inference/{svc}/chat resolve the
+service in that namespace; /api/v1/inference/{svc}/chat keeps resolving
+services without a namespace. The cache key includes the namespace so
+same-named services in different namespaces stay apart.
+---
+ gateway/internal/router/resolver_test.go   |   8 +-
+ gateway/internal/router/router.go          |  19 ++-
+ gateway/internal/router/router_test.go     |  45 ++++++-
+ gateway/internal/stream/proxy.go           |  53 ++++----
+ gateway/internal/stream/proxy_test.go      | 140 +++++++++++++++++----
+ gateway/internal/upstream/resolver.go      | 111 ++++++++++++----
+ gateway/internal/upstream/resolver_test.go | 133 +++++++++++++++-----
+ 7 files changed, 391 insertions(+), 118 deletions(-)
+
+diff --git a/gateway/internal/router/resolver_test.go b/gateway/internal/router/resolver_test.go
+index bc26317..d508ec3 100644
+--- a/gateway/internal/router/resolver_test.go
++++ b/gateway/internal/router/resolver_test.go
+@@ -111,15 +111,15 @@ func (e *resolverEnv) doChat(t *testing.T, svc string) *httptest.ResponseRecorde
+ 	return rec
+ }
+ 
+-// readyEndpointsJSON 构造控制平面 status.endpoints 响应体。
++// readyEndpointsJSON 构造控制平面 status.endpoints 响应体，每个地址都是 openai-chat 实例。
+ func readyEndpointsJSON(phase string, eps []string) string {
+-	quoted := make([]string, 0, len(eps))
++	items := make([]string, 0, len(eps))
+ 	for _, ep := range eps {
+-		quoted = append(quoted, fmt.Sprintf("%q", ep))
++		items = append(items, fmt.Sprintf(`{"url":%q,"protocol":"openai-chat"}`, ep))
+ 	}
+ 	return fmt.Sprintf(`{"apiVersion":"forgemesh/v1","kind":"InferenceService",`+
+ 		`"metadata":{"name":"svc-a"},"spec":{},`+
+-		`"status":{"phase":%q,"endpoints":[%s]}}`, phase, strings.Join(quoted, ","))
++		`"status":{"phase":%q,"endpoints":[%s]}}`, phase, strings.Join(items, ","))
+ }
+ 
+ // TestResolver_TTLCacheServesStaleUntilExpiry 验证 TTL 缓存语义：
+diff --git a/gateway/internal/router/router.go b/gateway/internal/router/router.go
+index 40d808e..23312ef 100644
+--- a/gateway/internal/router/router.go
++++ b/gateway/internal/router/router.go
+@@ -8,9 +8,11 @@
+ //	ANY  /api/v1/inference-services[/...]      反代到 Python 控制平面
+ //	ANY  /api/v1/workflows[/...]               反代到 Python 控制平面
+ //	ANY  /api/v1/decisions[/...]               反代到 Python 控制平面
+-//	ANY  /api/v1/inference/{svc}/chat          SSE 流式代理（{svc} 经 Resolver
+-//	                                          解析为实例 endpoint，轮询分发；
+-//	                                          要求 read 作用域）
++//	ANY  /api/v1/namespaces/{ns}/inference/{svc}/chat
++//	                                          SSE 流式代理（服务经 Resolver 解析为
++//	                                          ready 实例，轮询分发，按实例协议映射
++//	                                          路径；要求 read 作用域）
++//	ANY  /api/v1/inference/{svc}/chat          同上，用于不带命名空间的服务
+ //
+ // 中间件链（执行顺序）：Recovery → Correlation → Authenticate → RateLimit → Route。
+ // Recovery 作为最外层兜底全量请求；探针刻意不经过认证/限流，保证健康检查可用。
+@@ -42,8 +44,11 @@ var proxyRoutes = []string{
+ 	"/api/v1/decisions",
+ }
+ 
+-// streamRoutePattern 是流式（SSE）代理路由，{svc} 为推理服务标识。
+-const streamRoutePattern = "/api/v1/inference/{svc}/chat"
++// 流式（SSE）代理路由：{ns} 为命名空间，{svc} 为推理服务名。
++const (
++	streamRoutePattern            = "/api/v1/namespaces/{ns}/inference/{svc}/chat"
++	streamWithoutNamespacePattern = "/api/v1/inference/{svc}/chat"
++)
+ 
+ // Router 组装路由表与中间件链，实现 http.Handler。
+ type Router struct {
+@@ -92,7 +97,9 @@ func New(cfg config.Config, logger *log.Logger) (*Router, error) {
+ 	}
+ 	// 推理调用读取服务的 status.endpoints 并调用实例，不修改资源，故要求 read 作用域；
+ 	// 在网关侧检查，使命中 Resolver 缓存的请求同样受作用域约束。
+-	apiMux.Handle(streamRoutePattern, middleware.RequireScope(middleware.ScopeRead)(streamProxy))
++	streamHandler := middleware.RequireScope(middleware.ScopeRead)(streamProxy)
++	apiMux.Handle(streamRoutePattern, streamHandler)
++	apiMux.Handle(streamWithoutNamespacePattern, streamHandler)
+ 
+ 	// API 中间件链：Correlation → Authenticate → RateLimit。
+ 	limiter := middleware.NewRateLimiter(cfg.RateLimitRPS, cfg.RateLimitBurst)
+diff --git a/gateway/internal/router/router_test.go b/gateway/internal/router/router_test.go
+index cacbc70..383a17c 100644
+--- a/gateway/internal/router/router_test.go
++++ b/gateway/internal/router/router_test.go
+@@ -151,7 +151,8 @@ func TestInferenceChat_ResolvesEndpoint(t *testing.T) {
+ 		w.Header().Set("Content-Type", "application/json")
+ 		_, _ = io.WriteString(w, fmt.Sprintf(
+ 			`{"apiVersion":"forgemesh/v1","kind":"InferenceService","metadata":{"name":"svc-a"},`+
+-				`"spec":{},"status":{"phase":"Ready","endpoints":[%q]}}`, instance.URL))
++				`"spec":{},"status":{"phase":"Ready","endpoints":[{"url":%q,"protocol":"openai-chat"}]}}`,
++			instance.URL))
+ 	}))
+ 	defer controlPlane.Close()
+ 
+@@ -171,14 +172,52 @@ func TestInferenceChat_ResolvesEndpoint(t *testing.T) {
+ 	if ct := rec.Header().Get("Content-Type"); ct != "text/event-stream" {
+ 		t.Fatalf("Content-Type 应为 text/event-stream，实际 %q", ct)
+ 	}
+-	if instanceGotPath != "/api/v1/inference/svc-a/chat" {
+-		t.Fatalf("实例收到路径不符: %q", instanceGotPath)
++	if instanceGotPath != "/v1/chat/completions" {
++		t.Fatalf("实例收到的路径应为 openai-chat 的推理路径，实际 %q", instanceGotPath)
+ 	}
+ 	if instanceGotTenant != "tenant-a" {
+ 		t.Fatalf("租户头应透传到实例，实际 %q", instanceGotTenant)
+ 	}
+ }
+ 
++// TestInferenceChat_NamespacedRoute 验证带命名空间的推理路由：控制平面按 namespace 查询服务，
++// 请求转发到实例协议（tgi-generate）的推理路径。
++func TestInferenceChat_NamespacedRoute(t *testing.T) {
++	var instanceGotPath string
++	instance := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
++		instanceGotPath = req.URL.Path
++		_, _ = io.WriteString(w, "data: ok\n\n")
++	}))
++	defer instance.Close()
++
++	var cpGotPath, cpGotNamespace string
++	controlPlane := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
++		cpGotPath, cpGotNamespace = req.URL.Path, req.URL.Query().Get("namespace")
++		w.Header().Set("Content-Type", "application/json")
++		_, _ = io.WriteString(w, fmt.Sprintf(
++			`{"status":{"phase":"Ready","endpoints":[{"url":%q,"protocol":"tgi-generate"}]}}`,
++			instance.URL))
++	}))
++	defer controlPlane.Close()
++
++	r := newTestRouter(t, controlPlane.URL)
++
++	rec := httptest.NewRecorder()
++	req := httptest.NewRequest(http.MethodPost, "/api/v1/namespaces/team-a/inference/svc-a/chat", nil)
++	req.Header.Set("X-Tenant-ID", "tenant-a")
++	r.ServeHTTP(rec, req)
++
++	if rec.Code != http.StatusOK {
++		t.Fatalf("推理请求应 200，实际 %d（body=%s）", rec.Code, rec.Body.String())
++	}
++	if cpGotPath != "/api/v1/inference-services/svc-a" || cpGotNamespace != "team-a" {
++		t.Fatalf("控制平面应按 team-a/svc-a 查询，实际 path=%q namespace=%q", cpGotPath, cpGotNamespace)
++	}
++	if instanceGotPath != "/generate_stream" {
++		t.Fatalf("实例收到的路径应为 tgi-generate 的推理路径，实际 %q", instanceGotPath)
++	}
++}
++
+ // TestInferenceChat_ServiceNotFound 验证服务不存在时返回 503 与 NO_HEALTHY_UPSTREAM 信封。
+ func TestInferenceChat_ServiceNotFound(t *testing.T) {
+ 	controlPlane := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+diff --git a/gateway/internal/stream/proxy.go b/gateway/internal/stream/proxy.go
+index 066cbee..40dbe19 100644
+--- a/gateway/internal/stream/proxy.go
++++ b/gateway/internal/stream/proxy.go
+@@ -5,9 +5,11 @@
+ //   - 逐块读取上游响应并立即 Flush，保证 token 实时到达客户端。
+ //   - 通过继承客户端请求的 context，客户端断开会自动取消上游请求，避免资源泄漏。
+ //
+-// 路由语义：入站路径 /api/v1/inference/{svc}/chat 中的 {svc} 通过 Resolver
+-// 解析为推理服务实例 endpoint，按简单轮询选择一个实例转发（实例级负载均衡），
+-// 并依据转发成败向 Resolver 上报，驱动健康摘流与冷却恢复。
++// 路由语义：入站路径 /api/v1/namespaces/{ns}/inference/{svc}/chat 或
++// /api/v1/inference/{svc}/chat（不带命名空间的服务）中的服务通过 Resolver 解析为
++// 推理实例 endpoint，按简单轮询选择一个实例转发（实例级负载均衡），并依据转发
++// 成败向 Resolver 上报，驱动健康摘流与冷却恢复。请求转发到实例协议对应的路径
++// （如 openai-chat 为 /v1/chat/completions），查询串原样保留。
+ //
+ // 安全约束（见开发计划 §14.1）：仅做转发，不缓存、不落盘任何响应内容；
+ // 调用方的平台凭证（Authorization、Cookie）不会转发给实例。
+@@ -32,14 +34,14 @@ import (
+ // readBufferSize 是单次读取上游响应体的缓冲区大小。
+ const readBufferSize = 32 * 1024
+ 
+-// Resolver 抽象「推理服务名 → 实例 endpoint 列表」的解析与健康上报，
++// Resolver 抽象「推理服务 → 实例 endpoint 列表」的解析与健康上报，
+ // 由 upstream.Resolver 实现；以接口注入便于测试替换。
+ type Resolver interface {
+-	// Resolve 返回服务的健康实例 endpoint 列表（如 "http://10.0.0.1:8000"）。
+-	Resolve(ctx context.Context, svc, tenantID string) ([]string, error)
+-	// ReportFailure 上报一次实例转发失败（驱动摘流）。
++	// Resolve 返回服务的健康实例 endpoint 列表。
++	Resolve(ctx context.Context, svc upstream.ServiceRef, tenantID string) ([]upstream.Endpoint, error)
++	// ReportFailure 上报一次实例转发失败（驱动摘流），endpoint 为实例 URL。
+ 	ReportFailure(endpoint string)
+-	// ReportSuccess 上报一次实例转发成功（清零失败计数）。
++	// ReportSuccess 上报一次实例转发成功（清零失败计数），endpoint 为实例 URL。
+ 	ReportSuccess(endpoint string)
+ }
+ 
+@@ -87,10 +89,10 @@ func New(resolver Resolver, tenantHeader string, logger *log.Logger) *Proxy {
+ 	}
+ }
+ 
+-// ServeHTTP 解析 {svc} → 选择实例 → 转发单个流式请求。
++// ServeHTTP 解析 {ns}/{svc} → 选择实例 → 转发单个流式请求。
+ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+-	svc := r.PathValue("svc")
+-	if svc == "" {
++	svc := upstream.ServiceRef{Namespace: r.PathValue("ns"), Name: r.PathValue("svc")}
++	if svc.Name == "" {
+ 		writeJSONError(w, http.StatusBadRequest, "MISSING_SERVICE", "路径缺少推理服务名 {svc}")
+ 		return
+ 	}
+@@ -107,32 +109,33 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 	}
+ 	if len(endpoints) == 0 {
+ 		writeJSONError(w, http.StatusServiceUnavailable, "NO_HEALTHY_UPSTREAM",
+-			"推理服务 "+svc+" 当前没有可用实例")
++			"推理服务 "+svc.String()+" 当前没有可用实例")
+ 		return
+ 	}
+ 
+ 	// 简单轮询：原子递增取模，保证多实例间均匀分发。
+ 	endpoint := endpoints[int(p.rr.Add(1))%len(endpoints)]
+-	target, err := url.Parse(endpoint)
+-	if err != nil || target.Scheme == "" || target.Host == "" {
+-		p.logger.Printf("stream invalid endpoint: corr=%s svc=%s endpoint=%q err=%v",
+-			r.Header.Get("X-Correlation-ID"), svc, endpoint, err)
+-		p.resolver.ReportFailure(endpoint)
++	target, err := url.Parse(endpoint.URL)
++	path, known := endpoint.Protocol.Path()
++	if err != nil || target.Scheme == "" || target.Host == "" || !known {
++		p.logger.Printf("stream invalid endpoint: corr=%s svc=%s endpoint=%q protocol=%q err=%v",
++			r.Header.Get("X-Correlation-ID"), svc, endpoint.URL, endpoint.Protocol, err)
++		p.resolver.ReportFailure(endpoint.URL)
+ 		writeJSONError(w, http.StatusBadGateway, "INVALID_UPSTREAM",
+-			"实例地址非法: "+endpoint)
++			"实例地址或协议非法: "+endpoint.URL)
+ 		return
+ 	}
+ 
+-	p.forward(w, r, target, endpoint)
++	p.forward(w, r, buildUpstreamURL(target, path, r.URL.RawQuery), endpoint.URL)
+ }
+ 
+ // forward 执行单次流式转发，并依据结果向 Resolver 上报健康度。
+-func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, target *url.URL, endpoint string) {
++func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, upstreamURL, endpoint string) {
+ 	// 使用客户端请求的 context：客户端断开时，Go 运行时会取消该 context，
+ 	// 进而取消这里的上游请求，实现“断连即取消上游”。
+ 	ctx := r.Context()
+ 
+-	req, err := http.NewRequestWithContext(ctx, r.Method, buildUpstreamURL(target, r.URL), r.Body)
++	req, err := http.NewRequestWithContext(ctx, r.Method, upstreamURL, r.Body)
+ 	if err != nil {
+ 		http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
+ 		return
+@@ -255,11 +258,11 @@ func writeJSONError(w http.ResponseWriter, status int, code, message string) {
+ 	_ = json.NewEncoder(w).Encode(body)
+ }
+ 
+-// buildUpstreamURL 拼接实例基路径与入站请求路径，避免出现双斜杠。
+-func buildUpstreamURL(base *url.URL, in *url.URL) string {
++// buildUpstreamURL 拼接实例基路径与协议的推理路径（避免出现双斜杠），并带上查询串。
++func buildUpstreamURL(base *url.URL, path, rawQuery string) string {
+ 	u := *base
+-	u.Path = singleJoiningSlash(base.Path, in.Path)
+-	u.RawQuery = in.RawQuery
++	u.Path = singleJoiningSlash(base.Path, path)
++	u.RawQuery = rawQuery
+ 	return u.String()
+ }
+ 
+diff --git a/gateway/internal/stream/proxy_test.go b/gateway/internal/stream/proxy_test.go
+index 22f82a6..e71da6a 100644
+--- a/gateway/internal/stream/proxy_test.go
++++ b/gateway/internal/stream/proxy_test.go
+@@ -18,16 +18,26 @@ import (
+ // fakeResolver 是测试用的解析器替身：返回固定 endpoint 列表并记录上报调用。
+ type fakeResolver struct {
+ 	mu        sync.Mutex
+-	endpoints []string
++	endpoints []upstream.Endpoint
+ 	err       error
+ 
+ 	failures map[string]int
+ 	success  map[string]int
+-	// resolveCalls 记录 Resolve 调用参数，供断言。
+-	lastSvc, lastTenant string
++	// lastSvc / lastTenant 记录最近一次 Resolve 的参数，供断言。
++	lastSvc    upstream.ServiceRef
++	lastTenant string
+ }
+ 
+-func newFakeResolver(endpoints []string, err error) *fakeResolver {
++// newFakeResolver 把每个 URL 当作 openai-chat 实例。
++func newFakeResolver(urls []string, err error) *fakeResolver {
++	endpoints := make([]upstream.Endpoint, 0, len(urls))
++	for _, u := range urls {
++		endpoints = append(endpoints, upstream.Endpoint{URL: u, Protocol: upstream.ProtocolOpenAIChat})
++	}
++	return newFakeResolverWithEndpoints(endpoints, err)
++}
++
++func newFakeResolverWithEndpoints(endpoints []upstream.Endpoint, err error) *fakeResolver {
+ 	return &fakeResolver{
+ 		endpoints: endpoints,
+ 		err:       err,
+@@ -36,7 +46,7 @@ func newFakeResolver(endpoints []string, err error) *fakeResolver {
+ 	}
+ }
+ 
+-func (f *fakeResolver) Resolve(_ context.Context, svc, tenantID string) ([]string, error) {
++func (f *fakeResolver) Resolve(_ context.Context, svc upstream.ServiceRef, tenantID string) ([]upstream.Endpoint, error) {
+ 	f.mu.Lock()
+ 	defer f.mu.Unlock()
+ 	f.lastSvc, f.lastTenant = svc, tenantID
+@@ -240,7 +250,7 @@ func TestProxy_SSEForwarding(t *testing.T) {
+ }
+ 
+ // TestProxy_RoundRobin 验证轮询分发：4 次请求在 2 个实例间均匀分配，
+-// 且每次请求都打到当前选中实例的原始路径。
++// 且每次请求都打到实例协议对应的推理路径。
+ func TestProxy_RoundRobin(t *testing.T) {
+ 	var hitsA, hitsB atomic.Int64
+ 	var mu sync.Mutex
+@@ -277,12 +287,94 @@ func TestProxy_RoundRobin(t *testing.T) {
+ 	mu.Lock()
+ 	defer mu.Unlock()
+ 	for _, p := range gotPaths {
+-		if p != "/api/v1/inference/svc-a/chat" {
+-			t.Fatalf("实例收到的路径应保持入站路径，实际 %q", p)
++		if p != "/v1/chat/completions" {
++			t.Fatalf("实例收到的路径应为 openai-chat 的推理路径，实际 %q", p)
+ 		}
+ 	}
+ }
+ 
++// TestProxy_MapsProtocolToInstancePath 验证请求转发到实例协议对应的推理路径：
++// 实例地址的路径前缀与入站查询串保留，入站路径本身不拼接到实例上。
++func TestProxy_MapsProtocolToInstancePath(t *testing.T) {
++	cases := []struct {
++		protocol upstream.Protocol
++		want     string
++	}{
++		{upstream.ProtocolOpenAIChat, "/llama/v1/chat/completions?stream=true"},
++		{upstream.ProtocolTGIGenerate, "/llama/generate_stream?stream=true"},
++	}
++	for _, tc := range cases {
++		t.Run(string(tc.protocol), func(t *testing.T) {
++			requests := make(chan string, 1)
++			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				requests <- r.URL.RequestURI()
++				_, _ = w.Write([]byte("data: ok\n\n"))
++			}))
++			defer srv.Close()
++
++			res := newFakeResolverWithEndpoints(
++				[]upstream.Endpoint{{URL: srv.URL + "/llama", Protocol: tc.protocol}}, nil)
++			req := newChatRequest("svc-a")
++			req.URL.RawQuery = "stream=true"
++			rec := httptest.NewRecorder()
++			New(res, "X-Tenant-ID", nil).ServeHTTP(rec, req)
++
++			if rec.Code != http.StatusOK {
++				t.Fatalf("转发应返回 200，实际 %d（body=%s）", rec.Code, rec.Body.String())
++			}
++			select {
++			case got := <-requests:
++				if got != tc.want {
++					t.Fatalf("实例收到的请求应为 %q，实际 %q", tc.want, got)
++				}
++			default:
++				t.Fatal("实例没有收到请求")
++			}
++		})
++	}
++}
++
++// TestProxy_UnknownProtocol 验证 Resolver 返回协议未知的实例时不转发，计一次失败并返回 502。
++func TestProxy_UnknownProtocol(t *testing.T) {
++	var hits atomic.Int64
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		hits.Add(1)
++	}))
++	defer srv.Close()
++
++	res := newFakeResolverWithEndpoints([]upstream.Endpoint{{URL: srv.URL, Protocol: "grpc"}}, nil)
++	rec := httptest.NewRecorder()
++	New(res, "X-Tenant-ID", nil).ServeHTTP(rec, newChatRequest("svc-a"))
++
++	if rec.Code != http.StatusBadGateway {
++		t.Fatalf("未知协议应 502，实际 %d", rec.Code)
++	}
++	if !strings.Contains(rec.Body.String(), `"code":"INVALID_UPSTREAM"`) {
++		t.Fatalf("错误体应含 INVALID_UPSTREAM，实际: %s", rec.Body.String())
++	}
++	if got := hits.Load(); got != 0 {
++		t.Fatalf("未知协议的实例不应收到请求，实际 %d 次", got)
++	}
++	if got := res.failureCount(srv.URL); got != 1 {
++		t.Fatalf("未知协议应上报 1 次失败，实际 %d", got)
++	}
++}
++
++// TestProxy_PassesNamespaceToResolver 验证带命名空间的路由把 {ns} 与 {svc} 一起交给 Resolver。
++func TestProxy_PassesNamespaceToResolver(t *testing.T) {
++	res := newFakeResolver(nil, upstream.ErrServiceNotFound)
++	req := httptest.NewRequest(http.MethodPost, "/api/v1/namespaces/team-a/inference/svc-a/chat", nil)
++	req.SetPathValue("ns", "team-a")
++	req.SetPathValue("svc", "svc-a")
++	req.Header.Set("X-Tenant-ID", "tenant-a")
++	New(res, "X-Tenant-ID", nil).ServeHTTP(httptest.NewRecorder(), req)
++
++	want := upstream.ServiceRef{Namespace: "team-a", Name: "svc-a"}
++	if res.lastSvc != want {
++		t.Fatalf("Resolver 应收到 %+v，实际 %+v", want, res.lastSvc)
++	}
++}
++
+ // TestProxy_HopByHopHeadersFiltered 验证实例响应中的 hop-by-hop 头被过滤不转发给客户端。
+ func TestProxy_HopByHopHeadersFiltered(t *testing.T) {
+ 	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+@@ -367,8 +459,8 @@ func TestProxy_ForwardsClientHeaders(t *testing.T) {
+ 	if receivedTenant != "tenant-a" {
+ 		t.Fatalf("X-Tenant-ID 头应转发，实际 %q", receivedTenant)
+ 	}
+-	if res.lastSvc != "svc-a" {
+-		t.Fatalf("Resolver 应收到 svc=svc-a，实际 %q", res.lastSvc)
++	if want := (upstream.ServiceRef{Name: "svc-a"}); res.lastSvc != want {
++		t.Fatalf("Resolver 应收到 %+v，实际 %+v", want, res.lastSvc)
+ 	}
+ 	if res.lastTenant != "tenant-a" {
+ 		t.Fatalf("Resolver 应收到 tenant=tenant-a，实际 %q", res.lastTenant)
+@@ -487,43 +579,39 @@ func TestProxy_Upstream5xxCountsFailure(t *testing.T) {
+ 	}
+ }
+ 
+-// TestBuildUpstreamURL 验证实例基址与入站路径的拼接逻辑。
++// TestBuildUpstreamURL 验证实例基址、协议推理路径与查询串的拼接逻辑。
+ func TestBuildUpstreamURL(t *testing.T) {
+ 	cases := []struct {
+ 		name     string
+ 		upstream string
+-		reqPath  string
+-		reqQuery string
++		path     string
++		rawQuery string
+ 		want     string
+ 	}{
+ 		{
+ 			name:     "基础拼接",
+ 			upstream: "http://instance:8000",
+-			reqPath:  "/api/v1/inference/svc-a/chat",
+-			want:     "http://instance:8000/api/v1/inference/svc-a/chat",
++			path:     "/v1/chat/completions",
++			want:     "http://instance:8000/v1/chat/completions",
+ 		},
+ 		{
+ 			name:     "带 query 透传",
+ 			upstream: "http://instance:8000",
+-			reqPath:  "/api/v1/inference/svc-a/chat",
+-			reqQuery: "stream=true",
+-			want:     "http://instance:8000/api/v1/inference/svc-a/chat?stream=true",
++			path:     "/v1/chat/completions",
++			rawQuery: "stream=true",
++			want:     "http://instance:8000/v1/chat/completions?stream=true",
+ 		},
+ 		{
+ 			name:     "endpoint 带路径前缀",
+-			upstream: "http://instance:8000/v1",
+-			reqPath:  "/chat",
+-			want:     "http://instance:8000/v1/chat",
++			upstream: "http://instance:8000/llama/",
++			path:     "/generate_stream",
++			want:     "http://instance:8000/llama/generate_stream",
+ 		},
+ 	}
+ 	for _, tc := range cases {
+ 		t.Run(tc.name, func(t *testing.T) {
+ 			u, _ := url.Parse(tc.upstream)
+-			in, _ := url.Parse(tc.reqPath)
+-			if tc.reqQuery != "" {
+-				in.RawQuery = tc.reqQuery
+-			}
+-			got := buildUpstreamURL(u, in)
++			got := buildUpstreamURL(u, tc.path, tc.rawQuery)
+ 			if got != tc.want {
+ 				t.Fatalf("buildUpstreamURL = %q, want %q", got, tc.want)
+ 			}
+diff --git a/gateway/internal/upstream/resolver.go b/gateway/internal/upstream/resolver.go
+index 5862d1d..91be87e 100644
+--- a/gateway/internal/upstream/resolver.go
++++ b/gateway/internal/upstream/resolver.go
+@@ -1,12 +1,14 @@
+-// resolver.go 实现推理服务名 → 实例 endpoint 列表的解析。
++// resolver.go 实现推理服务 → 实例 endpoint 列表的解析。
+ //
+-// 数据源：控制平面 GET /api/v1/inference-services/{svc}（携带 X-Tenant-Id 与调用方的
+-// Authorization，控制平面据此独立校验调用方，见 WithAuthorization），
+-// 从响应 status.endpoints[] 取实例地址（如 "http://10.0.0.1:8000"）。
++// 数据源：控制平面 GET /api/v1/inference-services/{svc}[?namespace={ns}]（携带
++// X-Tenant-Id 与调用方的 Authorization，控制平面据此独立校验调用方，见
++// WithAuthorization），从响应 status.endpoints[] 取就绪实例的地址与协议
++// （如 {"url": "http://10.0.0.1:8000", "protocol": "openai-chat"}）。
+ //
+ // 设计要点：
+ //   - 内存缓存：service→(endpoints, expiry)，TTL 内复用，减少控制平面压力；
+-//     缓存 key 含租户 ID，保证多租户同名服务互相隔离。
++//     缓存 key 含租户 ID 与命名空间，保证多租户、多命名空间的同名服务互相隔离。
++//   - 只返回 ready 且协议已知的实例；协议决定实例上的推理路径（见 Protocol.Path）。
+ //   - 健康摘流：每个 endpoint 维护连续失败计数，达到阈值（3 次）即标记
+ //     unhealthy 进入冷却期；冷却结束后按 half-open 语义重新放行（计数清零，
+ //     给实例一次探测机会，避免"一次失败即永久摘除"或"反复抖动"）。
+@@ -39,7 +41,7 @@ var (
+ 	ErrForbidden = errors.New("credentials may not read the inference service")
+ 	// ErrNotReady 资源 status.phase 不为 Ready：服务尚未就绪。
+ 	ErrNotReady = errors.New("inference service not Ready")
+-	// ErrNoEndpoints status.endpoints 为空（或全部无法解析）：没有可用实例地址。
++	// ErrNoEndpoints status.endpoints 中没有就绪、协议已知且地址合法的实例。
+ 	ErrNoEndpoints = errors.New("inference service has no usable endpoints")
+ 	// ErrNoHealthyEndpoints 注册的实例全部处于不健康冷却期。
+ 	ErrNoHealthyEndpoints = errors.New("no healthy endpoints available")
+@@ -59,13 +61,62 @@ const (
+ 	maxResolveBodySize = 1 << 20 // 1 MiB
+ )
+ 
++// ServiceRef 标识一个推理服务。Namespace 为空表示不带命名空间的服务，与控制平面
++// GET /api/v1/inference-services/{name} 不带 namespace 参数时的语义一致。
++type ServiceRef struct {
++	Namespace string
++	Name      string
++}
++
++// String 返回 "namespace/name"，不带命名空间时只有 name。
++func (s ServiceRef) String() string {
++	if s.Namespace == "" {
++		return s.Name
++	}
++	return s.Namespace + "/" + s.Name
++}
++
++// Protocol 是推理实例提供的协议（对齐资源模型 EndpointProtocol）。
++type Protocol string
++
++// 已知的实例协议。
++const (
++	ProtocolOpenAIChat  Protocol = "openai-chat"
++	ProtocolTGIGenerate Protocol = "tgi-generate"
++)
++
++// protocolPaths 是各协议在实例上的推理路径。
++var protocolPaths = map[Protocol]string{
++	ProtocolOpenAIChat:  "/v1/chat/completions",
++	ProtocolTGIGenerate: "/generate_stream",
++}
++
++// Path 返回协议在实例上的推理路径；未知协议返回 false。
++func (p Protocol) Path() (string, bool) {
++	path, ok := protocolPaths[p]
++	return path, ok
++}
++
++// Endpoint 是一个可以转发推理请求的实例。
++type Endpoint struct {
++	URL      string
++	Protocol Protocol
++}
++
++// endpointPayload 对应资源模型的 Endpoint；ready 缺省视为就绪（与资源模型默认值一致）。
++type endpointPayload struct {
++	URL      string   `json:"url"`
++	Ready    *bool    `json:"ready"`
++	Protocol Protocol `json:"protocol"`
++}
++
+ // inferenceServicePayload 是控制平面响应的最小解析结构（camelCase 对齐资源 JSON）。
+ // 只声明路由关心的字段，字段缺失（旧版本控制平面）时取零值：
+ // phase="" 视为非 Ready、endpoints=nil 视为无实例。
+ type inferenceServicePayload struct {
+ 	Status struct {
+-		Phase     string   `json:"phase"`
+-		Endpoints []string `json:"endpoints"`
++		Phase     string            `json:"phase"`
++		Endpoints []endpointPayload `json:"endpoints"`
+ 	} `json:"status"`
+ }
+ 
+@@ -82,7 +133,7 @@ func WithAuthorization(ctx context.Context, value string) context.Context {
+ 
+ // cacheEntry 是服务级缓存条目。
+ type cacheEntry struct {
+-	endpoints []string
++	endpoints []Endpoint
+ 	expiry    time.Time
+ }
+ 
+@@ -102,7 +153,7 @@ type Resolver struct {
+ 	logger           *log.Logger
+ 
+ 	mu     sync.Mutex
+-	cache  map[string]cacheEntry      // key: tenantID + "\x00" + svc
++	cache  map[string]cacheEntry      // key: 见 cacheKey
+ 	health map[string]*endpointHealth // key: endpoint URL 字符串
+ }
+ 
+@@ -136,11 +187,11 @@ func NewResolver(controlPlaneURL string, client *http.Client, ttl, cooldown time
+ 	}
+ }
+ 
+-// Resolve 返回 svc 的健康实例 endpoint 列表（已过滤冷却期内的实例）。
++// Resolve 返回服务的健康实例 endpoint 列表（已过滤冷却期内的实例）。
+ //
+ // 返回哨兵错误：ErrServiceNotFound / ErrNotReady / ErrNoEndpoints /
+ // ErrNoHealthyEndpoints；网络错误与控制平面异常返回包装后的普通错误。
+-func (r *Resolver) Resolve(ctx context.Context, svc, tenantID string) ([]string, error) {
++func (r *Resolver) Resolve(ctx context.Context, svc ServiceRef, tenantID string) ([]Endpoint, error) {
+ 	key := cacheKey(tenantID, svc)
+ 
+ 	// 先查缓存（TTL 内直接命中，不发请求）。
+@@ -173,9 +224,12 @@ func (r *Resolver) Resolve(ctx context.Context, svc, tenantID string) ([]string,
+ 	return healthy, nil
+ }
+ 
+-// fetch 调用控制平面 GET /api/v1/inference-services/{svc} 并提取 endpoints。
+-func (r *Resolver) fetch(ctx context.Context, svc, tenantID string) ([]string, error) {
+-	reqURL := r.controlPlaneURL + "/api/v1/inference-services/" + url.PathEscape(svc)
++// fetch 调用控制平面 GET /api/v1/inference-services/{svc}[?namespace={ns}] 并提取 endpoints。
++func (r *Resolver) fetch(ctx context.Context, svc ServiceRef, tenantID string) ([]Endpoint, error) {
++	reqURL := r.controlPlaneURL + "/api/v1/inference-services/" + url.PathEscape(svc.Name)
++	if svc.Namespace != "" {
++		reqURL += "?" + url.Values{"namespace": {svc.Namespace}}.Encode()
++	}
+ 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("resolver: 构造请求失败: %w", err)
+@@ -216,13 +270,20 @@ func (r *Resolver) fetch(ctx context.Context, svc, tenantID string) ([]string, e
+ 		return nil, fmt.Errorf("%w: svc=%s phase=%q", ErrNotReady, svc, payload.Status.Phase)
+ 	}
+ 
+-	usable := make([]string, 0, len(payload.Status.Endpoints))
++	usable := make([]Endpoint, 0, len(payload.Status.Endpoints))
+ 	for _, ep := range payload.Status.Endpoints {
+-		if u, err := url.Parse(ep); err != nil || u.Scheme == "" || u.Host == "" {
+-			r.logger.Printf("resolver: 跳过非法 endpoint %q (svc=%s)", ep, svc)
++		if ep.Ready != nil && !*ep.Ready {
++			continue
++		}
++		if _, known := ep.Protocol.Path(); !known {
++			r.logger.Printf("resolver: 跳过协议未知的 endpoint %q protocol=%q (svc=%s)", ep.URL, ep.Protocol, svc)
++			continue
++		}
++		if u, err := url.Parse(ep.URL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
++			r.logger.Printf("resolver: 跳过非法 endpoint %q (svc=%s)", ep.URL, svc)
+ 			continue
+ 		}
+-		usable = append(usable, ep)
++		usable = append(usable, Endpoint{URL: ep.URL, Protocol: ep.Protocol})
+ 	}
+ 	if len(usable) == 0 {
+ 		return nil, fmt.Errorf("%w: svc=%s", ErrNoEndpoints, svc)
+@@ -259,11 +320,11 @@ func (r *Resolver) ReportSuccess(endpoint string) {
+ //
+ // 冷却期结束的实例按 half-open 语义放行：清零失败计数，给实例一次
+ // 重新证明健康的机会；若再连续失败会再次进入冷却。
+-func (r *Resolver) filterHealthyLocked(endpoints []string) []string {
++func (r *Resolver) filterHealthyLocked(endpoints []Endpoint) []Endpoint {
+ 	now := time.Now()
+-	healthy := make([]string, 0, len(endpoints))
++	healthy := make([]Endpoint, 0, len(endpoints))
+ 	for _, ep := range endpoints {
+-		h, ok := r.health[ep]
++		h, ok := r.health[ep.URL]
+ 		if !ok {
+ 			healthy = append(healthy, ep)
+ 			continue
+@@ -281,7 +342,7 @@ func (r *Resolver) filterHealthyLocked(endpoints []string) []string {
+ 	return healthy
+ }
+ 
+-// cacheKey 生成租户隔离的缓存 key（"\x00" 不会出现在合法 svc 名中）。
+-func cacheKey(tenantID, svc string) string {
+-	return tenantID + "\x00" + svc
++// cacheKey 生成按租户与命名空间隔离的缓存 key（"\x00" 不会出现在合法的名字中）。
++func cacheKey(tenantID string, svc ServiceRef) string {
++	return tenantID + "\x00" + svc.Namespace + "\x00" + svc.Name
+ }
+diff --git a/gateway/internal/upstream/resolver_test.go b/gateway/internal/upstream/resolver_test.go
+index 6340bbf..263c6f9 100644
+--- a/gateway/internal/upstream/resolver_test.go
++++ b/gateway/internal/upstream/resolver_test.go
+@@ -14,11 +14,15 @@ import (
+ 	"time"
+ )
+ 
+-// readyBody 构造控制平面 GET /inference-services/{name} 的响应体。
++// svcA 是测试用的不带命名空间的推理服务。
++var svcA = ServiceRef{Name: "svc-a"}
++
++// readyBody 构造控制平面 GET /inference-services/{name} 的响应体，每个 endpoint 使用
++// openai-chat 协议。
+ func readyBody(phase string, endpoints ...string) string {
+ 	eps := ""
+ 	for _, ep := range endpoints {
+-		eps += fmt.Sprintf("%q,", ep)
++		eps += fmt.Sprintf(`{"url":%q,"protocol":"openai-chat"},`, ep)
+ 	}
+ 	if len(eps) > 0 {
+ 		eps = eps[:len(eps)-1]
+@@ -65,11 +69,11 @@ func TestResolve_Success(t *testing.T) {
+ 	})
+ 
+ 	r := newTestResolver(srv.URL, time.Second, time.Second)
+-	eps, err := r.Resolve(context.Background(), "svc-a", "tenant-a")
++	eps, err := r.Resolve(context.Background(), svcA, "tenant-a")
+ 	if err != nil {
+ 		t.Fatalf("Resolve 应成功，实际错误: %v", err)
+ 	}
+-	if len(eps) != 2 || eps[0] != "http://10.0.0.1:8000" || eps[1] != "http://10.0.0.2:8000" {
++	if len(eps) != 2 || eps[0].URL != "http://10.0.0.1:8000" || eps[1].URL != "http://10.0.0.2:8000" {
+ 		t.Fatalf("endpoints 不符: %v", eps)
+ 	}
+ 	if gotPath != "/api/v1/inference-services/svc-a" {
+@@ -99,11 +103,11 @@ func TestResolve_ForwardsCallerAuthorization(t *testing.T) {
+ 	})
+ 	r := newTestResolver(srv.URL, time.Nanosecond, time.Second)
+ 
+-	if _, err := r.Resolve(WithAuthorization(context.Background(), "Bearer fmk_k"), "svc-a", "tenant-a"); err != nil {
++	if _, err := r.Resolve(WithAuthorization(context.Background(), "Bearer fmk_k"), svcA, "tenant-a"); err != nil {
+ 		t.Fatalf("Resolve 应成功: %v", err)
+ 	}
+ 	time.Sleep(time.Millisecond)
+-	if _, err := r.Resolve(WithAuthorization(context.Background(), ""), "svc-a", "tenant-a"); err != nil {
++	if _, err := r.Resolve(WithAuthorization(context.Background(), ""), svcA, "tenant-a"); err != nil {
+ 		t.Fatalf("Resolve 应成功: %v", err)
+ 	}
+ 
+@@ -121,7 +125,7 @@ func TestResolve_Forbidden(t *testing.T) {
+ 	})
+ 	r := newTestResolver(srv.URL, time.Second, time.Second)
+ 
+-	if _, err := r.Resolve(context.Background(), "svc-a", "tenant-a"); !errors.Is(err, ErrForbidden) {
++	if _, err := r.Resolve(context.Background(), svcA, "tenant-a"); !errors.Is(err, ErrForbidden) {
+ 		t.Fatalf("403 应映射为 ErrForbidden，实际 %v", err)
+ 	}
+ }
+@@ -132,7 +136,7 @@ func TestResolve_CacheHit(t *testing.T) {
+ 	r := newTestResolver(srv.URL, time.Minute, time.Second)
+ 
+ 	for i := 0; i < 3; i++ {
+-		if _, err := r.Resolve(context.Background(), "svc-a", "tenant-a"); err != nil {
++		if _, err := r.Resolve(context.Background(), svcA, "tenant-a"); err != nil {
+ 			t.Fatalf("第 %d 次 Resolve 失败: %v", i+1, err)
+ 		}
+ 	}
+@@ -146,11 +150,11 @@ func TestResolve_CacheExpiry(t *testing.T) {
+ 	srv, calls := newControlPlane(t, nil)
+ 	r := newTestResolver(srv.URL, 50*time.Millisecond, time.Second)
+ 
+-	if _, err := r.Resolve(context.Background(), "svc-a", "tenant-a"); err != nil {
++	if _, err := r.Resolve(context.Background(), svcA, "tenant-a"); err != nil {
+ 		t.Fatalf("首次 Resolve 失败: %v", err)
+ 	}
+ 	time.Sleep(70 * time.Millisecond)
+-	if _, err := r.Resolve(context.Background(), "svc-a", "tenant-a"); err != nil {
++	if _, err := r.Resolve(context.Background(), svcA, "tenant-a"); err != nil {
+ 		t.Fatalf("过期后 Resolve 失败: %v", err)
+ 	}
+ 	if got := calls.Load(); got != 2 {
+@@ -163,10 +167,10 @@ func TestResolve_TenantIsolation(t *testing.T) {
+ 	srv, calls := newControlPlane(t, nil)
+ 	r := newTestResolver(srv.URL, time.Minute, time.Second)
+ 
+-	if _, err := r.Resolve(context.Background(), "svc-a", "tenant-a"); err != nil {
++	if _, err := r.Resolve(context.Background(), svcA, "tenant-a"); err != nil {
+ 		t.Fatalf("tenant-a Resolve 失败: %v", err)
+ 	}
+-	if _, err := r.Resolve(context.Background(), "svc-a", "tenant-b"); err != nil {
++	if _, err := r.Resolve(context.Background(), svcA, "tenant-b"); err != nil {
+ 		t.Fatalf("tenant-b Resolve 失败: %v", err)
+ 	}
+ 	if got := calls.Load(); got != 2 {
+@@ -182,7 +186,7 @@ func TestResolve_NotFound(t *testing.T) {
+ 	})
+ 	r := newTestResolver(srv.URL, time.Second, time.Second)
+ 
+-	_, err := r.Resolve(context.Background(), "svc-a", "tenant-a")
++	_, err := r.Resolve(context.Background(), svcA, "tenant-a")
+ 	if !errors.Is(err, ErrServiceNotFound) {
+ 		t.Fatalf("应返回 ErrServiceNotFound，实际: %v", err)
+ 	}
+@@ -195,7 +199,7 @@ func TestResolve_ServerError(t *testing.T) {
+ 	})
+ 	r := newTestResolver(srv.URL, time.Second, time.Second)
+ 
+-	_, err := r.Resolve(context.Background(), "svc-a", "tenant-a")
++	_, err := r.Resolve(context.Background(), svcA, "tenant-a")
+ 	if err == nil {
+ 		t.Fatal("控制平面 500 应返回错误")
+ 	}
+@@ -209,7 +213,7 @@ func TestResolve_ServerError(t *testing.T) {
+ // TestResolve_NetworkError 验证控制平面不可达时返回普通错误。
+ func TestResolve_NetworkError(t *testing.T) {
+ 	r := newTestResolver("http://127.0.0.1:1", time.Second, time.Second)
+-	_, err := r.Resolve(context.Background(), "svc-a", "tenant-a")
++	_, err := r.Resolve(context.Background(), svcA, "tenant-a")
+ 	if err == nil {
+ 		t.Fatal("网络不可达应返回错误")
+ 	}
+@@ -225,7 +229,7 @@ func TestResolve_EmptyEndpoints(t *testing.T) {
+ 	})
+ 	r := newTestResolver(srv.URL, time.Second, time.Second)
+ 
+-	_, err := r.Resolve(context.Background(), "svc-a", "tenant-a")
++	_, err := r.Resolve(context.Background(), svcA, "tenant-a")
+ 	if !errors.Is(err, ErrNoEndpoints) {
+ 		t.Fatalf("应返回 ErrNoEndpoints，实际: %v", err)
+ 	}
+@@ -240,7 +244,7 @@ func TestResolve_MissingEndpointsField(t *testing.T) {
+ 	})
+ 	r := newTestResolver(srv.URL, time.Second, time.Second)
+ 
+-	_, err := r.Resolve(context.Background(), "svc-a", "tenant-a")
++	_, err := r.Resolve(context.Background(), svcA, "tenant-a")
+ 	if !errors.Is(err, ErrNoEndpoints) {
+ 		t.Fatalf("缺失 endpoints 字段应返回 ErrNoEndpoints，实际: %v", err)
+ 	}
+@@ -253,11 +257,11 @@ func TestResolve_InvalidEndpointsFiltered(t *testing.T) {
+ 	})
+ 	r := newTestResolver(srv.URL, time.Second, time.Second)
+ 
+-	eps, err := r.Resolve(context.Background(), "svc-a", "tenant-a")
++	eps, err := r.Resolve(context.Background(), svcA, "tenant-a")
+ 	if err != nil {
+ 		t.Fatalf("Resolve 应成功: %v", err)
+ 	}
+-	if len(eps) != 1 || eps[0] != "http://10.0.0.1:8000" {
++	if len(eps) != 1 || eps[0].URL != "http://10.0.0.1:8000" {
+ 		t.Fatalf("应仅保留合法 endpoint，实际: %v", eps)
+ 	}
+ }
+@@ -269,7 +273,7 @@ func TestResolve_NotReady(t *testing.T) {
+ 	})
+ 	r := newTestResolver(srv.URL, time.Second, time.Second)
+ 
+-	_, err := r.Resolve(context.Background(), "svc-a", "tenant-a")
++	_, err := r.Resolve(context.Background(), svcA, "tenant-a")
+ 	if !errors.Is(err, ErrNotReady) {
+ 		t.Fatalf("应返回 ErrNotReady，实际: %v", err)
+ 	}
+@@ -286,7 +290,7 @@ func TestResolve_FailureEjection(t *testing.T) {
+ 	// 前 2 次失败：仍有两个 endpoint。
+ 	r.ReportFailure("http://10.0.0.1:8000")
+ 	r.ReportFailure("http://10.0.0.1:8000")
+-	eps, err := r.Resolve(context.Background(), "svc-a", "tenant-a")
++	eps, err := r.Resolve(context.Background(), svcA, "tenant-a")
+ 	if err != nil {
+ 		t.Fatalf("未达阈值不应摘流: %v", err)
+ 	}
+@@ -296,11 +300,11 @@ func TestResolve_FailureEjection(t *testing.T) {
+ 
+ 	// 第 3 次失败：达到阈值，实例 A 被摘流。
+ 	r.ReportFailure("http://10.0.0.1:8000")
+-	eps, err = r.Resolve(context.Background(), "svc-a", "tenant-a")
++	eps, err = r.Resolve(context.Background(), svcA, "tenant-a")
+ 	if err != nil {
+ 		t.Fatalf("摘流一个实例后仍应可解析: %v", err)
+ 	}
+-	if len(eps) != 1 || eps[0] != "http://10.0.0.2:8000" {
++	if len(eps) != 1 || eps[0].URL != "http://10.0.0.2:8000" {
+ 		t.Fatalf("应只剩实例 B，实际: %v", eps)
+ 	}
+ 
+@@ -308,7 +312,7 @@ func TestResolve_FailureEjection(t *testing.T) {
+ 	r.ReportFailure("http://10.0.0.2:8000")
+ 	r.ReportFailure("http://10.0.0.2:8000")
+ 	r.ReportFailure("http://10.0.0.2:8000")
+-	_, err = r.Resolve(context.Background(), "svc-a", "tenant-a")
++	_, err = r.Resolve(context.Background(), svcA, "tenant-a")
+ 	if !errors.Is(err, ErrNoHealthyEndpoints) {
+ 		t.Fatalf("全部摘流应返回 ErrNoHealthyEndpoints，实际: %v", err)
+ 	}
+@@ -324,16 +328,16 @@ func TestResolve_CooldownRecovery(t *testing.T) {
+ 	for i := 0; i < defaultFailureThreshold; i++ {
+ 		r.ReportFailure("http://10.0.0.1:8000")
+ 	}
+-	if _, err := r.Resolve(context.Background(), "svc-a", "tenant-a"); !errors.Is(err, ErrNoHealthyEndpoints) {
++	if _, err := r.Resolve(context.Background(), svcA, "tenant-a"); !errors.Is(err, ErrNoHealthyEndpoints) {
+ 		t.Fatalf("摘流期应返回 ErrNoHealthyEndpoints，实际: %v", err)
+ 	}
+ 
+ 	time.Sleep(80 * time.Millisecond) // 等待冷却结束（half-open 放行）。
+-	eps, err := r.Resolve(context.Background(), "svc-a", "tenant-a")
++	eps, err := r.Resolve(context.Background(), svcA, "tenant-a")
+ 	if err != nil {
+ 		t.Fatalf("冷却结束后应恢复可用: %v", err)
+ 	}
+-	if len(eps) != 1 || eps[0] != "http://10.0.0.1:8000" {
++	if len(eps) != 1 || eps[0].URL != "http://10.0.0.1:8000" {
+ 		t.Fatalf("恢复后应返回原 endpoint，实际: %v", eps)
+ 	}
+ }
+@@ -352,7 +356,7 @@ func TestReportSuccess_ResetsFailures(t *testing.T) {
+ 	r.ReportFailure("http://10.0.0.1:8000")
+ 	r.ReportFailure("http://10.0.0.1:8000")
+ 
+-	if _, err := r.Resolve(context.Background(), "svc-a", "tenant-a"); err != nil {
++	if _, err := r.Resolve(context.Background(), svcA, "tenant-a"); err != nil {
+ 		t.Fatalf("穿插成功后连续失败未达阈值，不应摘流: %v", err)
+ 	}
+ }
+@@ -384,10 +388,81 @@ func TestResolve_Concurrent(t *testing.T) {
+ 		wg.Add(1)
+ 		go func(i int) {
+ 			defer wg.Done()
+-			_, _ = r.Resolve(context.Background(), "svc-a", "tenant-a")
++			_, _ = r.Resolve(context.Background(), svcA, "tenant-a")
+ 			r.ReportFailure(fmt.Sprintf("http://10.0.0.%d:8000", i%2+1))
+ 			r.ReportSuccess(fmt.Sprintf("http://10.0.0.%d:8000", i%2+1))
+ 		}(i)
+ 	}
+ 	wg.Wait()
+ }
++
++// TestResolve_QueriesTheServiceNamespace 验证带命名空间的服务以 namespace 参数查询，
++// 不带命名空间的服务不发送该参数（与控制平面的语义一致）。
++func TestResolve_QueriesTheServiceNamespace(t *testing.T) {
++	var mu sync.Mutex
++	var queries []string
++	srv, _ := newControlPlane(t, func(w http.ResponseWriter, r *http.Request) {
++		mu.Lock()
++		queries = append(queries, r.URL.Path+"?"+r.URL.RawQuery)
++		mu.Unlock()
++		_, _ = io.WriteString(w, readyBody("Ready", "http://10.0.0.1:8000"))
++	})
++	r := newTestResolver(srv.URL, time.Minute, time.Second)
++
++	if _, err := r.Resolve(context.Background(), ServiceRef{Namespace: "team a", Name: "svc-a"}, "tenant-a"); err != nil {
++		t.Fatalf("带命名空间的 Resolve 失败: %v", err)
++	}
++	if _, err := r.Resolve(context.Background(), svcA, "tenant-a"); err != nil {
++		t.Fatalf("不带命名空间的 Resolve 失败: %v", err)
++	}
++
++	want := []string{
++		"/api/v1/inference-services/svc-a?namespace=team+a",
++		"/api/v1/inference-services/svc-a?",
++	}
++	if fmt.Sprint(queries) != fmt.Sprint(want) {
++		t.Fatalf("查询不符（命名空间也应区分缓存）:\n got %v\nwant %v", queries, want)
++	}
++}
++
++// TestResolve_KeepsOnlyReadyEndpointsWithKnownProtocols 验证未就绪、协议未知或缺失协议、
++// 非 http(s) 的实例被跳过，保留的实例带上协议。
++func TestResolve_KeepsOnlyReadyEndpointsWithKnownProtocols(t *testing.T) {
++	srv, _ := newControlPlane(t, func(w http.ResponseWriter, r *http.Request) {
++		_, _ = io.WriteString(w, `{"kind":"InferenceService","status":{"phase":"Ready","endpoints":[
++			{"url":"http://10.0.0.1:8000","protocol":"openai-chat","ready":false},
++			{"url":"http://10.0.0.2:8000","protocol":"grpc"},
++			{"url":"http://10.0.0.3:8000"},
++			{"url":"ftp://10.0.0.4","protocol":"tgi-generate"},
++			{"url":"http://10.0.0.5:8080","protocol":"tgi-generate","ready":true},
++			{"url":"http://10.0.0.6:8000","protocol":"openai-chat"}]}}`)
++	})
++	r := newTestResolver(srv.URL, time.Minute, time.Second)
++
++	eps, err := r.Resolve(context.Background(), svcA, "tenant-a")
++	if err != nil {
++		t.Fatalf("Resolve 应成功: %v", err)
++	}
++	want := []Endpoint{
++		{URL: "http://10.0.0.5:8080", Protocol: ProtocolTGIGenerate},
++		{URL: "http://10.0.0.6:8000", Protocol: ProtocolOpenAIChat},
++	}
++	if fmt.Sprint(eps) != fmt.Sprint(want) {
++		t.Fatalf("endpoints 不符:\n got %v\nwant %v", eps, want)
++	}
++}
++
++// TestProtocolPath 验证协议到实例推理路径的映射。
++func TestProtocolPath(t *testing.T) {
++	for protocol, want := range map[Protocol]string{
++		ProtocolOpenAIChat:  "/v1/chat/completions",
++		ProtocolTGIGenerate: "/generate_stream",
++	} {
++		if got, ok := protocol.Path(); !ok || got != want {
++			t.Fatalf("%s 应映射到 %s，实际 %q (ok=%v)", protocol, want, got, ok)
++		}
++	}
++	if _, ok := Protocol("grpc").Path(); ok {
++		t.Fatal("未知协议不应有路径")
++	}
++}
+-- 
+2.43.0
+

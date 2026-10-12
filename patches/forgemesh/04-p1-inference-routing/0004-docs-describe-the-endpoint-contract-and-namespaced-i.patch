@@ -1,0 +1,127 @@
+From 26b4a37f9aefa99c897c91689c0e48dbdbb09680 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 12 Oct 2026 05:33:01 +0000
+Subject: [PATCH 4/4] docs: describe the endpoint contract and namespaced
+ inference route
+
+---
+ CHANGELOG.md                        |  5 +++++
+ docs/architecture/architecture.md   |  2 +-
+ docs/architecture/module-mapping.md |  2 +-
+ docs/design-decisions/adr-014.md    |  2 +-
+ gateway/README.md                   | 21 +++++++++++++++++----
+ 5 files changed, 25 insertions(+), 7 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 57a43ff..eaaaddf 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -20,6 +20,8 @@
+ - 控制器：控制平面在应用启动（lifespan）时运行 `ControllerManager`，自动协调 `InferenceService` 并回写 `status`。Registry 每次写入时在同一事务中追加一条 `resource_changes` 变更记录，控制器按序号增量读取并清理已读记录；启动时全量重建工作队列，另每 10 分钟全量同步一次。工作队列按资源去重、支持延迟重试，失败时指数退避；`status` 以 `resource_version` 做 CAS 写入，去重键在写入成功之后才登记。控制器是单写者（ADR-013），应用只能以单进程运行。
+ - Registry status 子资源写入 `update_status`：只修改 `conditions` / `phase` / `observedGeneration`，不递增 `generation`；条件按 `type` 合并，`status` 不变时保留 `lastTransitionTime`；支持以 `resource_version` 做 CAS，未建模的 payload 字段原样保留。另新增 `get_with_phase`、`list_resource_keys`、`changes_since`、`latest_change_seq`、`prune_changes`。
+ - `ReconciliationController` 新增 `record_dedup_keys` 参数与 `mark_processed()`：调用方可以在持久化 `status` 之后再登记去重键。
++- `InferenceServiceStatus.endpoints`：每个实例包含 `url`（http/https 基地址，不含凭证、查询串与片段）、`ready`（默认 `true`）、可选的 `instanceId` 与 `protocol`（`openai-chat` / `tgi-generate`），资源模型、JSON Schema 与 OpenAPI 一致；`update_status` 可以整体替换 `endpoints`，写入前逐项校验。
++- 网关新增带命名空间的推理路由 `/api/v1/namespaces/{ns}/inference/{svc}/chat`：Resolver 以 `?namespace=` 查询控制平面，缓存按租户与命名空间隔离；`/api/v1/inference/{svc}/chat` 继续解析不带命名空间的服务。
+ 
+ ### Changed
+ 
+@@ -33,6 +35,7 @@
+ - **破坏性**：网关的 `401` 响应体由纯文本改为统一错误信封 `{"error": {"code", "message", "correlationId"}}`（新增的 `403` 同样使用信封）；推理实例不再收到调用方的 `Authorization` / `Cookie`。
+ - 控制平面全部错误响应统一为错误信封：框架层 404 / 405 不再返回 `{"detail": ...}`，请求校验失败由 `422` 改为 `400`，未捕获异常返回不含内部细节的 `500 INTERNAL_ERROR`（细节写入日志）。
+ - 网关接受任意大小写的 `Bearer` scheme（如 `bearer`）。
++- **破坏性**：网关消费的 `status.endpoints` 由字符串数组改为对象数组（见 Added），只使用 `ready` 且协议已知的实例；JSON Schema 中资源模型从未实现的单数 `status.endpoint` 一并移除。
+ 
+ ### Deprecated
+ 
+@@ -51,6 +54,8 @@
+ - 调和器在 deny / require_approval / 分配失败等无副作用路径上也记录去重键，重新入队后命中幂等短路，被阻塞的资源在 spec 变更或 24h 去重 TTL 过期前不会被重新评估：这些路径不再记录去重键。
+ - 生产代码中没有任何地方驱动调和器，创建的资源永远停在 `Pending`、`status` 从不更新：现由控制器驱动（见 Added）。
+ - 调和器在没有注入调度器或工作流运行时的情况下跳过分配与部署、登记去重键并报告 `Ready=True`（`Reconciled`），实际什么都没做：现在任何副作用之前检查，返回 `Ready=False`，原因为 `SchedulerUnavailable` 或 `WorkflowRuntimeUnavailable`，且不登记去重键。目前仓库没有调度器实现，默认部署中新建的服务会停在 `Pending` 并带有 `Ready=False`（`SchedulerUnavailable`）。
++- 网关把入站路径原样拼接到实例地址，请求以 `/api/v1/inference/{svc}/chat` 到达推理运行时，而 vLLM 与 TGI 都不提供这个路径：现按实例的 `protocol` 转发到 `/v1/chat/completions`（`openai-chat`）或 `/generate_stream`（`tgi-generate`），查询串保留。
++- 网关解析推理服务时不带命名空间，控制平面因此只查找不带命名空间的服务，带命名空间的服务无法经网关调用：现由带命名空间的路由解析（见 Added）。
+ 
+ ### Security
+ 
+diff --git a/docs/architecture/architecture.md b/docs/architecture/architecture.md
+index e58e62d..67cb768 100644
+--- a/docs/architecture/architecture.md
++++ b/docs/architecture/architecture.md
+@@ -1337,7 +1337,7 @@ Foundation
+ 
+ ## 20.6 已知限制
+ 
+-- 控制平面的 `InferenceServiceStatus` 尚无 `endpoints` 字段，而数据平面网关已按契约消费 `status.endpoints`：字段缺失或无可健康实例时，网关明确返回 503，不静默降级。该字段在控制平面补齐后，推理流量路由链路自动打通，是 v1.1 的演进方向。
++- `InferenceServiceStatus.endpoints`（实例地址、`ready`、`protocol`）已进入资源模型、JSON Schema 与 OpenAPI，可经 status 子资源写入，网关按 `protocol` 映射实例上的推理路径；但目前没有调度器与运行时启动器写入真实实例地址，服务停在 `Pending`，网关对推理请求明确返回 503，不静默降级。
+ 
+ # 附录 A. 状态转移矩阵
+ 
+diff --git a/docs/architecture/module-mapping.md b/docs/architecture/module-mapping.md
+index b476351..744dff6 100644
+--- a/docs/architecture/module-mapping.md
++++ b/docs/architecture/module-mapping.md
+@@ -76,7 +76,7 @@
+ |---|---|
+ | 架构模块 | Data Plane Gateway（L1 推理流量入口，architecture.md 3.1 L1 / Dev-5） |
+ | 当前代码路径 | `gateway/cmd/gateway/main.go`；`gateway/internal/{config,health,middleware,router,stream,upstream}/`（共 20 个 `.go` 文件，glob 核对）；`gateway/go.mod`（`github.com/Mekoforge/ForgeMesh/gateway`，go 1.22）；`gateway/Makefile`、`gateway/README.md` |
+-| 核心契约 | `/api/v1/` REST + SSE 流式转发（见 openapi.yaml）；中间件链 `Recovery → Correlation → Authenticate → RateLimit → Route`；API key 认证（ADR-014，`middleware/{authz,apikey}.go`）；上游解析 `upstream/resolver.go`（endpoint 解析与健康摘流） |
++| 核心契约 | `/api/v1/` REST + SSE 流式转发（见 openapi.yaml）；中间件链 `Recovery → Correlation → Authenticate → RateLimit → Route`；API key 认证（ADR-014，`middleware/{authz,apikey}.go`）；上游解析 `upstream/resolver.go`（按命名空间解析 ready 实例、`protocol` → 实例推理路径、健康摘流） |
+ | 运行形态 | 独立进程（Go 二进制），经 `FORGEMESH_UPSTREAM` 转发至控制平面 |
+ | 数据所有权 | 无权威数据（运行态转发；端点解析缓存为派生数据） |
+ | 允许依赖 | 控制平面 HTTP API（上游）、Go 标准库 |
+diff --git a/docs/design-decisions/adr-014.md b/docs/design-decisions/adr-014.md
+index 8e38130..4ec3006 100644
+--- a/docs/design-decisions/adr-014.md
++++ b/docs/design-decisions/adr-014.md
+@@ -38,7 +38,7 @@ v1.0.x 中租户身份完全来自客户端可以随意填写的请求头，没
+    - 字段只认上述 JSON 名称；未知字段、重复 `id`、重复摘要、未知 scope 都是配置错误，服务拒绝启动。
+    - `scopes` 省略时为 `["read", "write"]`；`[]` 表示没有任何权限；`null` 非法。
+ 3. **租户来源**：租户只来自 key 绑定的 `tenantId`。请求可以不带 `X-Tenant-Id`；如果带了，任何一个取值与 key 绑定的租户不一致都返回 `403 FORBIDDEN`，而不是静默改写到另一个租户。网关在转发前把租户头覆写为已验证的值。
+-4. **授权（scope）**：`read` 允许读接口（GET）与推理调用（`/api/v1/inference/{svc}/chat`）；`write` 允许写接口（POST / DELETE，包括启动工作流与请求决策）；`*` 表示全部。控制平面对每个端点检查 scope；网关对推理路由检查 `read`，使命中 Resolver 缓存、不经过控制平面的请求同样受约束。
++4. **授权（scope）**：`read` 允许读接口（GET）与推理调用（`/api/v1/namespaces/{ns}/inference/{svc}/chat` 与 `/api/v1/inference/{svc}/chat`）；`write` 允许写接口（POST / DELETE，包括启动工作流与请求决策）；`*` 表示全部。控制平面对每个端点检查 scope；网关对推理路由检查 `read`，使命中 Resolver 缓存、不经过控制平面的请求同样受约束。
+ 5. **纵深防御**：控制平面不假设请求一定经过网关，自行校验凭证。网关把调用方的 `Authorization` 转发给控制平面（资源反代与 Resolver 查询），但**不**把 `Authorization` / `Cookie` 转发给推理实例。
+ 6. **默认拒绝**：两端默认 `apikey` 模式，缺少 key 文件即拒绝启动；未知模式拒绝启动，绝不退化为信任请求头。控制平面应用未注入认证器时，受保护端点返回 `503 AUTHENTICATOR_UNAVAILABLE`。
+ 7. **开发模式**：`dev`（`GATEWAY_AUTH_MODE=dev` / `FORGEMESH_AUTH_MODE=dev`）直接信任租户请求头，视为拥有全部 scope；只允许监听回环地址，启动时打印警告。
+diff --git a/gateway/README.md b/gateway/README.md
+index eb9b1df..f7eb7d6 100644
+--- a/gateway/README.md
++++ b/gateway/README.md
+@@ -38,9 +38,21 @@ ForgeMesh 的**统一外部入口**与**高性能流式代理**。与 Python 控
+ | ANY | `/api/v1/inference-services[/...]` | 反代 → Python 控制平面 | 全链 |
+ | ANY | `/api/v1/workflows[/...]` | 反代 → Python 控制平面 | 全链 |
+ | ANY | `/api/v1/decisions[/...]` | 反代 → Python 控制平面 | 全链 |
+-| ANY | `/api/v1/inference/{svc}/chat` | **SSE 流式代理** | 全链 + `read` scope |
++| ANY | `/api/v1/namespaces/{ns}/inference/{svc}/chat` | **SSE 流式代理**（命名空间 `{ns}` 中的服务） | 全链 + `read` scope |
++| ANY | `/api/v1/inference/{svc}/chat` | **SSE 流式代理**（不带命名空间的服务） | 全链 + `read` scope |
+ 
+-`{svc}` 为 Go 1.22 `net/http.ServeMux` 的路径变量语法，表示单个路径段（推理服务标识）。
++`{ns}`、`{svc}` 为 Go 1.22 `net/http.ServeMux` 的路径变量语法，各表示单个路径段（命名空间与推理服务名）。
++
++推理请求不按入站路径转发。Resolver 从控制平面读取服务的 `status.endpoints`，只保留
++`ready` 且协议已知的实例；网关按实例的 `protocol` 把请求转发到对应路径，查询串原样保留，
++实例地址带路径前缀时（如 `http://10.0.0.1:8000/llama`）协议路径接在前缀之后：
++
++| `protocol` | 实例上的路径 |
++| --- | --- |
++| `openai-chat` | `/v1/chat/completions` |
++| `tgi-generate` | `/generate_stream` |
++
++网关不转换请求体，客户端按服务实例的协议格式发送请求。
+ 
+ ### 中间件链
+ 
+@@ -198,9 +210,10 @@ flowchart LR
+     RL --> RT{Route}
+     RT -->|/healthz /readyz| H[Probe]
+     RT -->|/api/v1/resources 等| UP[ReverseProxy]
+-    RT -->|/api/v1/inference/{svc}/chat| SP[SSE StreamProxy]
++    RT -->|/api/v1/namespaces/{ns}/inference/{svc}/chat 等| SP[SSE StreamProxy]
+     UP --> CP[(Python 控制平面)]
+-    SP --> CP
++    SP -->|解析 status.endpoints| CP
++    SP -->|按 protocol 映射路径| INS[(推理实例)]
+ ```
+ 
+ ---
+-- 
+2.43.0
+
