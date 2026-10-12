@@ -1,7 +1,7 @@
 # ForgeMesh 改进优化方案
 
 > **基线**：[Mekoforge/ForgeMesh](https://github.com/Mekoforge/ForgeMesh) `main` 分支，提交 `5a0be13`（`5a0be13fcd506d3e61454e14bfc1a4a6330304c2`，CHANGELOG 中为 v1.1.0 Unreleased）
-> **配套实现**：[`patches/forgemesh/`](../patches/forgemesh/) 下 7 个叠放的主题分支，共 50 个提交，每个分支对应一个上游 PR（见[第 3 节](#3-实施情况与验证)）
+> **配套实现**：两轮叠放的主题分支，每个分支对应一个上游 PR（见[第 3 节](#3-实施情况与验证)）。第一轮在 [`patches/forgemesh/`](../patches/forgemesh/)，7 个分支、50 个提交，已作为 #5 至 #11 合入上游；第二轮在 [`patches/forgemesh/round-2/`](../patches/forgemesh/round-2/)，5 个分支、37 个提交（见 [3.5](#35-第二轮实施)）
 > **编写日期**：2026-10-12（同日按实施结果更新）
 
 **阅读说明**
@@ -39,7 +39,7 @@ ForgeMesh 目前是一套“契约 + 组件原型”。资源模型、状态机�
 
 本文给出分阶段的改进方案，顺序是：先止血（数据正确性、能运行），再打通最小闭环，然后加固安全和供应链，最后做性能和工程化。
 
-**实施情况**：全部 P0、P1 中的三项和 P2 的一部分已经实现，拆成 7 个叠放的主题分支（50 个提交，见[第 3 节](#3-实施情况与验证)），每个分支对应一个上游 PR。
+**实施情况**：分两轮实施，每个分支对应一个上游 PR。第一轮的 7 个分支（50 个提交，见[第 3 节](#3-实施情况与验证)）已作为 #5 至 #11 合入上游，覆盖下面四条：全部 P0、P1 中的三项和 P2 的一部分。第二轮的 5 个分支（37 个提交）打通了 1.1 节的最小闭环，并完成了插件供应链的大部分和治理事项，见 [3.5](#35-第二轮实施)。
 
 - **P0 全部 10 项**：注册中心正确性与可运行入口（P0-1 至 P0-8，分支 1）；绑定租户的 API key 认证，网关和控制平面各自校验（P0-9，分支 2）；控制器驱动协调器并回写状态（P0-10，分支 3）。
 - **P1**：路由契约（P1-1，分支 4）；网关转发安全（P1-8，分支 2、5）；限流按已认证的租户分桶（P1-9，分支 2）；P1-10 中错误格式和认证状态码的部分（分支 1、2）。
@@ -47,9 +47,9 @@ ForgeMesh 目前是一套“契约 + 组件原型”。资源模型、状态机�
 
 全量测试从 1115 个增加到 1244 个，全部通过；网关的 Go 测试函数从 92 个增加到 134 个，`gofmt`、`go vet`、`go test -race` 通过。每个分支单独检出时，测试和检查同样全部通过。compose 端到端冒烟，以及 kind 集群上的部署与备份恢复演练也都通过。
 
-**还没有做的**：调度（P1-2）、工作流执行（P1-3）、Outbox 与工作单元（P1-4）、Node Agent 网络传输（P1-5）、真实的运行时 launcher（P1-6）、插件供应链（P1-7）、CLI（P1-11）、P1-10 的其余部分，以及指标和追踪的导出（P2-3）。
+**还没有做的**：Outbox 与工作单元（P1-4）、Node Agent 网络传输（P1-5）、CLI（P1-11）、P1-10 的其余部分、指标和追踪的导出（P2-3），以及 P1-6、P1-7 中的部分内容：TGI 与容器启动器、插件接入控制平面应用、插件的进程隔离（见 3.5）。
 
-因为还没有调度器，默认部署中新建的推理服务会停在 `Pending`，并带上 `Ready=False`（原因为 `SchedulerUnavailable`）。这是如实报告，不像基线那样永远没有任何状态，但 1.1 节的最小闭环仍然跑不通，要等 P1-2、P1-3、P1-6 完成。在那之前，ForgeMesh 不应该对外称为“稳定版”。
+第二轮之后，设置了设备清单（`FORGEMESH_INVENTORY_FILE`）和启动器（`FORGEMESH_RUNTIME_LAUNCHER`）的部署可以跑通 1.1 节的链路：创建、调度、部署实例、写入 `status.endpoints`、经网关流式请求、受控删除；CI 的 compose 冒烟用假运行时覆盖了整条链路。不设置时，新建的推理服务仍停在 `Pending`，并如实报告原因。API 的稳定性标注已由 stable 更正为 beta（第二轮治理分支）；改回 stable 之前，应当满足 architecture.md 第 20 节的架构验收标准。
 
 ---
 
@@ -71,11 +71,11 @@ ForgeMesh 目前是一套“契约 + 组件原型”。资源模型、状态机�
 | 步骤 | 状态 |
 |---|---|
 | 1. 创建 | 已实现（分支 1） |
-| 2. 协调 | 控制器已经驱动协调器，Policy 校验照常执行（分支 3）。仓库里没有调度器和真正执行步骤的工作流运行时（P1-2、P1-3），资源停在 `Pending`，并报告 `Ready=False`（`SchedulerUnavailable`） |
-| 3. 状态回写 | `conditions` 和 `observedGeneration` 经 status 子资源写回（分支 3）。`endpoints` 已经进入资源模型，status 子资源也能写入（分支 4），但要等运行时部署完成（P1-3、P1-6）才会有人写 |
+| 2. 协调 | 控制器驱动协调器（第一轮分支 3）；调度器与部署工作流在第二轮实现：设置清单和启动器后，服务依次经过 `Scheduling`、`Preparing`、`Deploying`、`Verifying` 到达 `Ready`；不设置时停在 `Pending`，报告 `Ready=False`（`SchedulerUnavailable` 或 `WorkflowRuntimeUnavailable`） |
+| 3. 状态回写 | `conditions`、`phase`、`observedGeneration` 和 `endpoints` 都经 status 子资源写回（第一轮分支 3、4）；部署工作流成功后，由控制器写入 `endpoints`（第二轮） |
 | 4. 路由 | 网关按命名空间和服务名解析 ready 实例，按实例协议映射路径（分支 4）；连接实例时校验地址（分支 5） |
 | 5. 可观测 | 未做（P2-3） |
-| 6. 删除 | 有 finalizer 的资源进入 `Terminating` 后，控制器执行受控删除：调用释放接口、清空 finalizer、物理删除（分支 3）。停止实例和释放分配要等 P1-2、P1-6 提供真正的实现 |
+| 6. 删除 | 资源进入 `Terminating` 后，控制器取消进行中的部署、停止实例、按 uid 释放分配、清空 finalizer、物理删除（第一轮分支 3；第二轮调度、工作流、运行时分支） |
 
 ### 1.2 原则
 
@@ -120,12 +120,12 @@ ForgeMesh 目前是一套“契约 + 组件原型”。资源模型、状态机�
 | 编号 | 问题 | 位置 | 状态 |
 |---|---|---|---|
 | P1-1 | **网关路由契约断裂**：解析器读取 `status.endpoints`，但资源模型禁止额外字段，又没有定义这个字段，OpenAPI 和 JSON Schema 里也没有；解析时不带 `namespace`；流式请求路径被原样拼到实例地址后面 | `gw/upstream/resolver.go:61-66,163`；`packages/resource-model/src/forgemesh/resource/inference.py:130-143`；`gw/stream/proxy.go:254-260` | 已实现（分支 4），见 5.1 |
-| P1-2 | **没有调度**：仓库里没有任何 `Scheduler` 实现；`ScheduleRequest` 不含资源身份和幂等键；协调器传给调度器的 `requirements` 永远是 `{}`；释放分配时用的键忽略 `namespace`，“一个资源一个活跃分配”的唯一索引不含 `tenant_id`；处于 `Scheduling`/`Unknown` 的资源会被直接物理删除，不检查它是否还持有分配 | `packages/core-contracts/src/forgemesh/core/scheduler.py:22-35,70`；`cp/reconciler/core.py:388,459`；`cp/registry/store.py:86,120-121,528-544` | 未开始 |
-| P1-3 | **工作流不执行**：API 和协调器都用空步骤列表启动工作流；`ReferenceWorkflowRuntime.start` 只把状态改成 Running，从不调用它持有的执行器；工作流启动失败时协调器仍然报 `Ready=True` | `cp/api/routes.py:287`；`cp/reconciler/core.py:237-260`；`plugins/workflow-reference/provider.py:55,60-83` | 未开始；分支 3 修正了缺少工作流运行时却报告 `Ready=True` 的问题，启动失败的情形仍未修正 |
+| P1-2 | **没有调度**：仓库里没有任何 `Scheduler` 实现；`ScheduleRequest` 不含资源身份和幂等键；协调器传给调度器的 `requirements` 永远是 `{}`；释放分配时用的键忽略 `namespace`，“一个资源一个活跃分配”的唯一索引不含 `tenant_id`；处于 `Scheduling`/`Unknown` 的资源会被直接物理删除，不检查它是否还持有分配 | `packages/core-contracts/src/forgemesh/core/scheduler.py:22-35,70`；`cp/reconciler/core.py:388,459`；`cp/registry/store.py:86,120-121,528-544` | 已实现（第二轮调度分支），见 3.5；租约到期回收与以 Node Agent 心跳作为清单来源未做 |
+| P1-3 | **工作流不执行**：API 和协调器都用空步骤列表启动工作流；`ReferenceWorkflowRuntime.start` 只把状态改成 Running，从不调用它持有的执行器；工作流启动失败时协调器仍然报 `Ready=True` | `cp/api/routes.py:287`；`cp/reconciler/core.py:237-260`；`plugins/workflow-reference/provider.py:55,60-83` | 已实现（第二轮工作流分支），见 3.5；部署失败进入终态 `Failed`，不自动重试 |
 | P1-4 | **Outbox、审计、任务存储没有接入，且语义有缺陷**：`Outbox.put` 自己提交事务；发布失败的事件被标成 `failed` 后永远不会重试；Dispatcher 的“已处理”集合无限增长；`TaskStore`、`Outbox` 同样共用连接不加锁 | `cp/outbox.py:91-110,134-145,199`；`cp/tasks.py:153-158`；`cp/audit.py:74-77` | 未开始；分支 6 只把这些存储改成 WAL 模式，`TaskStore`、`Outbox` 仍然没有加锁 |
 | P1-5 | **Node Agent 没有网络传输**：客户端直接拿服务端的 Python 对象调用方法；`api/protobuf/agent.proto` 没有生成任何代码 | `packages/node-agent/src/forgemesh/nodeagent/server.py:146-170` | 未开始 |
-| P1-6 | **运行时插件没有真实启动器**：vLLM、TGI 的默认 launcher 直接抛 `NotImplementedError`；Temporal 插件只有内存客户端 | `plugins/runtime-vllm/deploy.py:96-104`；`plugins/runtime-tgi/provider.py:174-191`；`plugins/workflow-temporal/provider.py` | 未开始 |
-| P1-7 | **插件供应链与隔离**：HMAC 对称签名；不带制品内容时跳过摘要校验；注册时不验签；权限由插件清单自己授予；“隔离”只是枚举映射；10 个插件声明的 `entrypoint` 模块全部不存在，CI 的入口冒烟脚本也不检查 | `packages/plugin-sdk/src/forgemesh/plugin/signing.py:5-7,142-146`；`cp/plugin_manager.py:71-89,209-211`；`scripts/plugin_entrypoint_smoke.py:116-137` | 未开始 |
+| P1-6 | **运行时插件没有真实启动器**：vLLM、TGI 的默认 launcher 直接抛 `NotImplementedError`；Temporal 插件只有内存客户端 | `plugins/runtime-vllm/deploy.py:96-104`；`plugins/runtime-tgi/provider.py:174-191`；`plugins/workflow-temporal/provider.py` | 部分（第二轮运行时分支）：控制平面自带 `fake` 与 `vllm-process` 两个启动器；TGI 与容器启动器未做，插件中的默认 launcher 仍未实现，Temporal 仍只有内存客户端 |
+| P1-7 | **插件供应链与隔离**：HMAC 对称签名；不带制品内容时跳过摘要校验；注册时不验签；权限由插件清单自己授予；“隔离”只是枚举映射；10 个插件声明的 `entrypoint` 模块全部不存在，CI 的入口冒烟脚本也不检查 | `packages/plugin-sdk/src/forgemesh/plugin/signing.py:5-7,142-146`；`cp/plugin_manager.py:71-89,209-211`；`scripts/plugin_entrypoint_smoke.py:116-137` | 大部分（第二轮插件分支）：Ed25519 签名与注册时验签、管理员授权、统一权限词表、可加载的入口、如实声明进程内隔离；插件尚未接入控制平面应用，没有进程隔离 |
 | P1-8 | **网关转发安全**：客户端的 `Authorization`、`Cookie` 原样转发给推理实例；实例地址没有白名单（SSRF）；无条件信任 `X-Forwarded-For` | `gw/stream/proxy.go:298-309`；`gw/upstream/resolver.go:199-205`；`gw/middleware/ratelimit.go:161-169` | 已实现（分支 2、5），与方案的差异见 5.8 |
 | P1-9 | **限流可以绕过**：按未经认证的租户头分桶，换一个租户头就是一个新桶 | `gw/middleware/ratelimit.go:150-158` | 已实现（分支 2），见 5.9 |
 | P1-10 | **API 契约不一致**：没有更新接口和 status 子资源；错误格式混用；缺少租户返回 400（契约是 401）；列表不返回 `nextPageToken`；决策 API 不传风险等级，导致高风险保护永远不会触发；等等 | 见 [5.10](#510-api-契约一致性p1-10) | 部分实现（分支 1、2）：错误信封、认证状态码、`securitySchemes`、`limit` 与 `namespace` 参数 |
@@ -140,7 +140,7 @@ ForgeMesh 目前是一套“契约 + 组件原型”。资源模型、状态机�
 | P2-3 | 可观测性 | 内存中的指标和追踪接入 Prometheus 与 OTLP 导出，网关与控制平面关联 | 未开始 |
 | P2-4 | 部署 | 补 Dockerfile；修正 compose 的变量名和端口；Kubernetes 加持久卷和 `Recreate` 策略 | 大部分（分支 7）：网关的 Kubernetes 清单未做，见 6.4 |
 | P2-5 | CI 门禁 | 格式检查、`go vet`、`-race`、覆盖率阈值、类型检查、端到端冒烟、契约漂移测试、依赖漏洞扫描 | 部分（分支 7）：`gofmt`、`go vet`、`-race`、compose 冒烟、未 await 的协程报错，见 6.5 |
-| P2-6 | 文档与发布治理 | 版本稳定性表述、CHANGELOG 中不实的条目、README 错误、注释里的 Python 版本声明 | 部分（分支 1、7）：版本表述和 CHANGELOG `[1.0.0]` 留给维护者决定，见 6.6 |
+| P2-6 | 文档与发布治理 | 版本稳定性表述、CHANGELOG 中不实的条目、README 错误、注释里的 Python 版本声明 | 已完成（第一轮分支 1、7，第二轮治理分支）：API 稳定性标注更正为 beta，1.0.0 的不实条目改为勘误，ADR-014 改为 Accepted |
 
 ---
 
@@ -286,6 +286,33 @@ git am /path/to/patches/forgemesh/01-p0-correctness-fixes/*.patch
 15. **SQLite 改为 WAL 模式（分支 6）**：运行期间数据库文件旁边有 `-wal`、`-shm` 文件，不能再直接复制数据库文件做备份，要用 `VACUUM INTO` 或在线备份 API；数据库所在的文件系统必须支持共享内存，不能是 NFS 一类的网络文件系统。
 16. **部署配置（分支 7）**：compose 需要事先生成 `deploy/docker/api-keys.json`，服务只发布在 `127.0.0.1` 上，postgres 移到 `postgres` profile，默认不启动。Kubernetes 清单需要事先创建 Secret `forgemesh-api-keys`；数据库放在 PVC 上，更新策略为 `Recreate`，所以更新期间会有短暂的停机。
 17. **pytest 把 `RuntimeWarning` 和 `PytestUnraisableExceptionWarning` 视为错误（分支 7）**：调用了协程却没有 await 的测试会直接失败。
+
+### 3.5 第二轮实施
+
+第一轮的 7 个分支已作为 [#5](https://github.com/Mekoforge/ForgeMesh/pull/5) 至 [#11](https://github.com/Mekoforge/ForgeMesh/pull/11) 以合并提交的方式合入上游，合入后 `main` 为 `3dc1342`，每个 PR 与合入后 `main` 上的 CI 全部通过。第二轮基于 `3dc1342`，拆成 5 个叠放的分支，补丁在 `patches/forgemesh/round-2/`，重建脚本的用法与 3.2 相同：
+
+| 顺序 | 分支 | 提交数 | 解决的问题 | Python 测试（累计） |
+|---|---|---|---|---|
+| — | 上游 `main` `3dc1342` | — | — | 1244 |
+| 1 | `cursor/governance-preview-status-b108` | 3 | P2-6 的治理部分：ADR-014 改为 Accepted；API 稳定性标注由 stable 更正为 beta，弃用政策新增 1.4 节；1.0.0 的不实条目改为勘误，README 功能概览逐条注明现状 | 1244 |
+| 2 | `cursor/p1-scheduler-allocation-b108` | 9 | P1-2：静态加速器清单上的 first-fit 调度器；分配按资源 uid 关联、按 uid + generation 幂等，设备独占由数据库保证；持有分配的资源删除时一律走 `Terminating` | 1350 |
+| 3 | `cursor/p1-workflow-execution-b108` | 6 | P1-3：工作流在后台执行并在重启后恢复；部署工作流与启动器契约；协调器按状态机逐阶段推进，到 `Ready` 才写入 `endpoints`，失败时停实例、释放分配 | 1479 |
+| 4 | `cursor/p1-runtime-launcher-e2e-b108` | 10 | P1-6 的一部分：`fake` 与 `vllm-process` 启动器；重启后实例丢失的服务转为 `Degraded`；compose 冒烟经网关覆盖 1.1 节的闭环 | 1623 |
+| 5 | `cursor/p1-plugin-supply-chain-b108` | 9 | P1-7 的大部分：Ed25519 签名与注册时验签、管理员授权、统一权限词表、10 个插件的入口、如实声明进程内隔离 | 1800 |
+
+**验证**：37 个提交逐个检出，全量测试与 `ruff check .` 都通过；最上层的 CI 校验脚本全部通过；compose 冒烟 24 项检查全部通过，覆盖创建、`Ready`、经网关的流式对话、删除、同名重建和重启后的 `Degraded`；在上游的全新克隆上用重建脚本重建 5 个分支，代码树逐字节一致。网关代码没有改动，Go 测试仍为 134 个测试函数。
+
+**与方案不同的地方**：
+
+- 部署失败进入 `Failed` 后不自动重试（5.3 方案第 3 条写的是退避重试）：资源状态机中 `Failed` 只能转到 `Terminating`。只有工作流启动失败这类暂时性错误，才停在原阶段退避重试。
+- 部署工作流的幂等键是 `deployment:{uid}`，不含 `generation`：还没有更新流程，`generation` 变化不能启动第二次部署。分配的幂等键仍是 `{uid}:{generation}`。
+- 进度靠协调器轮询工作流运行（默认 2 秒），没有使用完成事件。
+- 启动器在控制平面包内实现，没有复用 `runtime-vllm` 插件，因为控制平面不导入插件模块；`vllm-process` 只在控制平面所在的主机上启动实例。
+- 插件策略文件没有对应的环境变量，因为控制平面应用还没有创建 `PluginManager`。
+
+**行为变化**（均已写入 CHANGELOG）：新增 `FORGEMESH_INVENTORY_FILE`、`FORGEMESH_RUNTIME_LAUNCHER` 等配置；持有分配的资源 `DELETE` 一律返回 202；`ScheduleRequest`、工作流契约与插件协议有破坏性变更；部署推理服务时控制平面多一个数据库文件 `forgemesh.workflows.db`，备份时要与主库作为一组处理（见 backup-restore）。
+
+**还没有做的**：租约到期回收；更新已部署的服务（PUT/PATCH 与重新部署）；TGI、容器与 Kubernetes 启动器；实例在运行中退出后的检测与重新启动；`vllm-process` 在真实 GPU 上的验证；插件接入应用与进程隔离。
 
 ---
 
@@ -903,19 +930,19 @@ CHANGELOG `[1.0.0]` 中“所有端点从 501 Not Implemented 占位升级为正
 flowchart LR
   R["P0-1 至 P0-4 注册中心正确性（分支 1，已实现）"] --> C["P0-10 控制器与状态回写（分支 3，已实现）"]
   E["P0-5 至 P0-8 协调器、入口、API（分支 1，已实现）"] --> C
-  C --> S["P1-2 调度"]
-  S --> W["P1-3 工作流执行"]
-  L["P1-6 运行时 launcher"] --> W
+  C --> S["P1-2 调度（第二轮，已实现）"]
+  S --> W["P1-3 工作流执行（第二轮，已实现）"]
+  L["P1-6 运行时 launcher（第二轮，部分实现）"] --> W
   C --> RT["P1-1 路由契约（分支 4，已实现）"]
-  W --> MVL["最小闭环端到端测试"]
+  W --> MVL["最小闭环端到端测试（第二轮，已进入 CI）"]
   RT --> MVL
   AUTH["P0-9 认证（分支 2，已实现）"] --> RL["P1-9 限流（分支 2，已实现）"]
   AUTH --> API["P1-10 契约一致性（部分实现）"]
   OB["P1-4 Outbox 与工作单元"] --> NA["P1-5 Node Agent 传输"]
   classDef implemented fill:#d4edda,stroke:#2e7d32,color:#1b1b1b
   classDef partial fill:#fff3cd,stroke:#b8860b,color:#1b1b1b
-  class R,E,C,RT,AUTH,RL implemented
-  class API partial
+  class R,E,C,RT,AUTH,RL,S,W,MVL implemented
+  class API,L partial
 ```
 
 ### 阶段 A：止血
@@ -934,7 +961,7 @@ flowchart LR
 - **退出条件**：1.1 节六步链路的端到端测试通过：创建；变为 `Ready` 并写入 `endpoints`；经网关的流式请求成功；删除后分配被释放、实例被停止、资源消失。
 - **涉及组件**：新增的控制器模块、注册中心的 status 子资源、资源模型与 Schema、调度器、工作流运行时、运行时插件、网关的解析器和路由。
 - **风险**：崩溃恢复场景下，调度和工作流的幂等边界。需要用故障注入测试覆盖“分配之后崩溃”“工作流执行到一半崩溃”等时间点。
-- **状态**：P0-10（分支 3）和 P1-1（分支 4）已完成；P1-2、P1-3、P1-6 还没有开始，所以退出条件中的端到端测试还写不出来。已经验证过的是这条链路的两段：控制器把新服务协调为 `Ready=False`（`SchedulerUnavailable`）并回写状态，这有自动化测试，compose 冒烟也会检查；经 status 子资源写入实例之后，网关能把流式请求转发给 SSE 桩服务，这一段在注册中心和网关两侧各有单元测试，连起来的验证是手工做的（步骤见附录 B）。分支 3 还处理了上面风险中的一部分：status 写入成功之后才登记去重键，重启后同一个 `generation` 只分配一次、只启动一次工作流。但分配本身还不是幂等的：分配成功、status 写入却被丢弃时，下一轮协调会再分配一次，要等 P1-2 加上幂等键（见 4.10 的遗留问题）。
+- **状态**：已完成（第一轮分支 3、4，第二轮的调度、工作流、运行时分支）。退出条件中的端到端测试以 compose 冒烟的形式进入了 CI：经网关创建、等到 `Ready`、流式对话、删除，并在一块设备的清单上同名重建，证明分配已经释放。风险中“分配之后崩溃”由按 uid + generation 幂等的分配处理，“工作流执行到一半崩溃”由运行时在重启后恢复未结束的运行处理。P1-6 只完成了一部分：没有 TGI 与容器启动器，`vllm-process` 只用替身程序测试过，还要在有 GPU 的节点上验证。
 
 ### 阶段 C：安全加固与执行面
 
@@ -942,7 +969,7 @@ flowchart LR
 - **进入条件**：阶段 B 的端到端测试稳定。
 - **退出条件**：安全回归测试集（伪造租户、SSRF、凭证泄漏、篡改插件、自授权限）全部通过；契约漂移测试进入 CI；控制平面与 Node Agent 两个进程联调通过。
 - **风险**：插件的真实隔离（独立进程或容器）会改变插件的调用方式和性能特征，需要先确定插件的 RPC 协议。
-- **状态**：P1-8（分支 2、5）和 P1-9（分支 2）已完成，P1-10 部分完成（见 5.10 的进展表），P1-4、P1-5、P1-7、P1-11 还没有开始。安全回归测试集中，伪造租户、SSRF、凭证泄漏三类已经有测试；篡改插件、自授权限两类要等 P1-7。P1-8、P1-9 不依赖阶段 B，所以先做了：凭证不转发和限流键（分支 2）与 P0-9 改的是同一批网关中间件，放在一起改动最小；P1-1 让 `status.endpoints` 真正可以写入之后，实例地址白名单（分支 5）就成了必需的，5.1 的方案第 4 条也把它列为路由契约的一部分。
+- **状态**：P1-8（分支 2、5）和 P1-9（分支 2）已完成，P1-10 部分完成（见 5.10 的进展表），P1-7 大部分完成（第二轮插件分支；插件尚未接入应用，没有进程隔离），P1-4、P1-5、P1-11 还没有开始。安全回归测试集中的五类（伪造租户、SSRF、凭证泄漏、篡改插件、自授权限）都已经有测试，后两类在第二轮插件分支中加入。P1-8、P1-9 不依赖阶段 B，所以先做了：凭证不转发和限流键（分支 2）与 P0-9 改的是同一批网关中间件，放在一起改动最小；P1-1 让 `status.endpoints` 真正可以写入之后，实例地址白名单（分支 5）就成了必需的，5.1 的方案第 4 条也把它列为路由契约的一部分。
 
 ### 阶段 D：性能、运维与发布
 
@@ -950,7 +977,7 @@ flowchart LR
 - **进入条件**：阶段 C 完成。
 - **退出条件**：有压测基线（网关首字节时延 P99、控制平面写入吞吐）；compose 和 Kubernetes 都能一键部署；文档、CHANGELOG 与代码一致。满足这些条件之后，再发布真正的 v1.0。
 - **风险**：从 SQLite 迁移到 PostgreSQL 时的数据迁移与双写过渡。
-- **状态**：P2-4 大部分完成，P2-1、P2-2、P2-5、P2-6 部分完成，P2-3 还没有开始；PostgreSQL 与 leader 选举没有开始，压测基线也没有做。完成的部分不依赖阶段 B、C，所以提前做了：WAL 模式消除了注册中心与去重键存储之间的锁等待（6.1）；compose 冒烟进入 CI 之后，每个 PR 都会经网关检查认证、读写和控制器回写，前面几个分支的行为也在其中。
+- **状态**：P2-6 已完成（第二轮治理分支补上了稳定性表述与 1.0.0 勘误），P2-4 大部分完成，P2-1、P2-2、P2-5 部分完成，P2-3 还没有开始；PostgreSQL 与 leader 选举没有开始，压测基线也没有做。完成的部分不依赖阶段 B、C，所以提前做了：WAL 模式消除了注册中心与去重键存储之间的锁等待（6.1）；compose 冒烟进入 CI 之后，每个 PR 都会经网关检查认证、读写和控制器回写，前面几个分支的行为也在其中。
 
 ---
 
@@ -974,16 +1001,16 @@ flowchart LR
 
 - [x] 控制器自动协调新资源并回写状态（P0-10，分支 3）
 - [x] `status.endpoints` 进入资源模型和契约，网关可以按命名空间路由（P1-1，分支 4）
-- [ ] 调度器实现幂等分配，删除不会泄漏分配（P1-2）
-- [ ] 工作流真正执行步骤，失败时补偿并正确报告状态（P1-3）。缺少工作流运行时的情况已经报告 `Ready=False`（分支 3），启动失败的情况还没有
-- [ ] 至少一个真实运行时 launcher，加一个供 CI 使用的假运行时（P1-6）
-- [ ] 1.1 节的最小闭环端到端测试进入 CI。compose 冒烟（分支 7）覆盖了创建、控制器回写和重启后的数据，路由和删除还没有覆盖
+- [x] 调度器实现幂等分配，删除不会泄漏分配（P1-2，第二轮调度分支）
+- [x] 工作流真正执行步骤，失败时补偿并正确报告状态（P1-3，第二轮工作流分支）。部署失败进入终态 `Failed`，不自动重试
+- [ ] 至少一个真实运行时 launcher，加一个供 CI 使用的假运行时（P1-6）。假运行时与 vLLM 进程启动器已完成（第二轮运行时分支），vLLM 启动器还没有在 GPU 上验证
+- [x] 1.1 节的最小闭环端到端测试进入 CI（第二轮运行时分支：compose 冒烟使用假运行时，经网关覆盖创建、`Ready`、流式对话、删除与重建）
 
 **阶段 C**
 
 - [ ] 资源、事件、审计在同一个事务里写入，失败的事件可以重试（P1-4）
 - [ ] Node Agent 通过 gRPC 加 mTLS 跨进程通信（P1-5）
-- [ ] 插件使用非对称签名、强制验签、由管理员授予权限、入口可以启动（P1-7）
+- [x] 插件使用非对称签名、强制验签、由管理员授予权限、入口可以启动（P1-7，第二轮插件分支）。插件尚未接入控制平面应用，进程隔离未做
 - [x] 转发不泄漏凭证，实例地址有白名单（P1-8，分支 2、5；做法与方案的差异见 5.8）
 - [x] 限流无法通过轮换请求头绕过（P1-9，分支 2）
 - [ ] 契约漂移测试通过，错误格式统一（P1-10）。错误格式已经统一（分支 2），契约漂移测试没有做
@@ -996,7 +1023,7 @@ flowchart LR
 - [ ] 指标和追踪可以导出（P2-3）
 - [ ] compose 和 Kubernetes 一键部署（P2-4）。compose 可以一键启动，并且有 CI 冒烟（分支 7）；Kubernetes 上只有控制平面的清单，网关的清单没有做
 - [ ] CI 门禁齐全（P2-5）。`gofmt`、`go vet`、`-race`、compose 冒烟、未 await 的协程报错已经加上（分支 7），其余见 6.5
-- [ ] 文档、CHANGELOG 与代码一致（P2-6）。事实性错误已经更正（分支 1、7），版本的稳定性表述和 CHANGELOG `[1.0.0]` 中不实的条目留给维护者决定
+- [x] 文档、CHANGELOG 与代码一致（P2-6，第一轮分支 1、7，第二轮治理分支）
 
 ---
 
