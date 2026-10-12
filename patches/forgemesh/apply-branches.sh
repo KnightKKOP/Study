@@ -47,6 +47,7 @@ topics="
 03-p0-controller-loop:cursor/p0-controller-loop-b108
 04-p1-inference-routing:cursor/p1-inference-routing-b108
 05-p1-gateway-hardening:cursor/p1-gateway-hardening-b108
+06-p2-sqlite-storage:cursor/p2-sqlite-storage-b108
 "
 
 cd "$repo"

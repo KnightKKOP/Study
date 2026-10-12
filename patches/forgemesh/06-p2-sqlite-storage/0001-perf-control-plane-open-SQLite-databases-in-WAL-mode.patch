@@ -1,0 +1,296 @@
+From 23cd9a2e6318102f836534d37333cdeaa588b93b Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 12 Oct 2026 06:13:35 +0000
+Subject: [PATCH 1/3] perf(control-plane): open SQLite databases in WAL mode
+
+The control plane opens the registry and the dedup key store on the
+same database file. In the default rollback-journal mode an open read
+on one connection blocked commits on the other one until the
+five-second busy timeout expired, and the commit then failed with
+"database is locked".
+
+All control-plane stores (registry, dedup keys, tasks, audit log and
+outbox) now open their connections through
+forgemesh.controlplane.sqlite.connect, which enables WAL and foreign
+key enforcement. synchronous stays FULL, because NORMAL lets a
+committed write that was already acknowledged disappear after a power
+loss in WAL mode; the busy timeout stays at the five-second default
+of sqlite3.connect.
+---
+ .../src/forgemesh/controlplane/audit.py       |  4 +-
+ .../src/forgemesh/controlplane/outbox.py      |  4 +-
+ .../controlplane/reconciler/dedup.py          |  5 +-
+ .../forgemesh/controlplane/registry/store.py  |  5 +-
+ .../src/forgemesh/controlplane/sqlite.py      | 36 ++++++++
+ .../src/forgemesh/controlplane/tasks.py       |  5 +-
+ tests/contract/test_registry_consistency.py   |  2 +-
+ tests/unit/controlplane/test_sqlite.py        | 88 +++++++++++++++++++
+ 8 files changed, 140 insertions(+), 9 deletions(-)
+ create mode 100644 packages/control-plane/src/forgemesh/controlplane/sqlite.py
+ create mode 100644 tests/unit/controlplane/test_sqlite.py
+
+diff --git a/packages/control-plane/src/forgemesh/controlplane/audit.py b/packages/control-plane/src/forgemesh/controlplane/audit.py
+index ec40fac..18812b3 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/audit.py
++++ b/packages/control-plane/src/forgemesh/controlplane/audit.py
+@@ -16,6 +16,8 @@ from typing import Any
+ 
+ from pydantic import BaseModel, ConfigDict, Field
+ 
++from .sqlite import connect
++
+ _SCHEMA_SQL = """\
+ CREATE TABLE IF NOT EXISTS audit_events (
+     audit_id TEXT PRIMARY KEY,
+@@ -72,7 +74,7 @@ class AuditLog:
+     """
+ 
+     def __init__(self, db_path: str = ":memory:") -> None:
+-        self._conn = sqlite3.connect(db_path, check_same_thread=False)
++        self._conn = connect(db_path)
+         self._conn.row_factory = sqlite3.Row
+         self._init_schema()
+ 
+diff --git a/packages/control-plane/src/forgemesh/controlplane/outbox.py b/packages/control-plane/src/forgemesh/controlplane/outbox.py
+index 384e309..80b02dd 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/outbox.py
++++ b/packages/control-plane/src/forgemesh/controlplane/outbox.py
+@@ -20,6 +20,8 @@ from typing import Any
+ 
+ from pydantic import BaseModel, ConfigDict, Field
+ 
++from .sqlite import connect
++
+ _SCHEMA_SQL = """\
+ CREATE TABLE IF NOT EXISTS outbox_events (
+     event_id TEXT PRIMARY KEY,
+@@ -74,7 +76,7 @@ class Outbox:
+ 
+     def __init__(self, db_path: str = ":memory:", conn: sqlite3.Connection | None = None) -> None:
+         self._db_path = db_path
+-        self._conn = conn or sqlite3.connect(db_path, check_same_thread=False)
++        self._conn = conn or connect(db_path)
+         self._conn.row_factory = sqlite3.Row
+         self._init_schema()
+ 
+diff --git a/packages/control-plane/src/forgemesh/controlplane/reconciler/dedup.py b/packages/control-plane/src/forgemesh/controlplane/reconciler/dedup.py
+index 4d20dc0..3fdc641 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/reconciler/dedup.py
++++ b/packages/control-plane/src/forgemesh/controlplane/reconciler/dedup.py
+@@ -18,6 +18,8 @@ from datetime import UTC, datetime, timedelta
+ 
+ from pydantic import BaseModel, ConfigDict
+ 
++from ..sqlite import connect
++
+ 
+ class DedupKey(BaseModel):
+     """幂等去重键。
+@@ -127,8 +129,7 @@ class ProcessedKeyStore:
+     ) -> None:
+         self._db_path = db_path
+         self._ttl_seconds = ttl_seconds
+-        # check_same_thread=False：asyncio.to_thread 会在不同线程执行 sqlite 调用。
+-        self._conn = sqlite3.connect(db_path, check_same_thread=False)
++        self._conn = connect(db_path)
+         self._conn.row_factory = sqlite3.Row
+         self._lock = threading.Lock()
+         self._init_schema()
+diff --git a/packages/control-plane/src/forgemesh/controlplane/registry/store.py b/packages/control-plane/src/forgemesh/controlplane/registry/store.py
+index 2e0a48d..9f76035 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/registry/store.py
++++ b/packages/control-plane/src/forgemesh/controlplane/registry/store.py
+@@ -81,6 +81,8 @@ from forgemesh.resource.inference import Endpoint, InferenceService
+ from forgemesh.resource.states import ALLOCATION_STATE_MACHINE, INFERENCE_STATE_MACHINE
+ from pydantic import ValidationError
+ 
++from ..sqlite import connect
++
+ logger = logging.getLogger(__name__)
+ 
+ _T = TypeVar("_T")
+@@ -233,8 +235,7 @@ class SQLiteRegistry(ResourceRegistry):
+ 
+     def __init__(self, db_path: str = ":memory:") -> None:
+         self._db_path = db_path
+-        # check_same_thread=False：asyncio.to_thread 会在不同线程执行 sqlite 调用。
+-        self._conn = sqlite3.connect(db_path, check_same_thread=False)
++        self._conn = connect(db_path)
+         self._conn.row_factory = sqlite3.Row
+         self._lock = threading.RLock()
+         self._init_schema()
+diff --git a/packages/control-plane/src/forgemesh/controlplane/sqlite.py b/packages/control-plane/src/forgemesh/controlplane/sqlite.py
+new file mode 100644
+index 0000000..18633ed
+--- /dev/null
++++ b/packages/control-plane/src/forgemesh/controlplane/sqlite.py
+@@ -0,0 +1,36 @@
++"""控制平面 SQLite 连接的统一设置。
++
++控制平面的各个存储（资源注册表、去重键等）在同一个数据库文件上各自打开连接，
++全部经 :func:`connect` 打开：
++
++* ``journal_mode=WAL``：读写互不阻塞，同一文件上的多个连接只在写入时排队。WAL 是
++  数据库文件的持久属性，运行期间文件旁会有 ``-wal`` / ``-shm`` 文件，已提交的数据
++  可能只在 ``-wal`` 中：不要只复制主库文件做备份（见
++  ``docs/operations/backup-restore.md``），也不要把数据库放在网络文件系统上。
++* ``foreign_keys=ON``：SQLite 默认不检查外键约束，且该设置只对当前连接生效。
++* ``synchronous`` 保持默认的 ``FULL``：WAL 模式下 ``NORMAL`` 可能让已提交、已向客户端
++  确认的事务在掉电后丢失，权威存储不接受。
++* 等待锁的时长沿用 :func:`sqlite3.connect` 默认的 5 秒（``timeout``，即 ``busy_timeout``）。
++"""
++
++from __future__ import annotations
++
++import sqlite3
++
++__all__ = ["connect"]
++
++
++def connect(db_path: str) -> sqlite3.Connection:
++    """打开控制平面使用的 SQLite 连接（允许跨线程使用）。
++
++    Args:
++        db_path: 数据库文件路径；``:memory:`` 时 WAL 不适用，仍为内存日志。
++
++    Returns:
++        已启用 WAL 与外键约束的连接。
++    """
++    # check_same_thread=False：asyncio.to_thread 会在不同线程执行 sqlite 调用。
++    conn = sqlite3.connect(db_path, check_same_thread=False)
++    conn.execute("PRAGMA journal_mode=WAL")
++    conn.execute("PRAGMA foreign_keys=ON")
++    return conn
+diff --git a/packages/control-plane/src/forgemesh/controlplane/tasks.py b/packages/control-plane/src/forgemesh/controlplane/tasks.py
+index bc1c3e3..b73a8d8 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/tasks.py
++++ b/packages/control-plane/src/forgemesh/controlplane/tasks.py
+@@ -26,6 +26,8 @@ from enum import StrEnum
+ from forgemesh.core.errors import NotFoundError
+ from pydantic import BaseModel, ConfigDict
+ 
++from .sqlite import connect
++
+ # ---------------------------------------------------------------------- #
+ # 枚举
+ # ---------------------------------------------------------------------- #
+@@ -152,8 +154,7 @@ class TaskStore:
+ 
+     def __init__(self, db_path: str = ":memory:") -> None:
+         self._db_path = db_path
+-        # check_same_thread=False：asyncio.to_thread 会在不同线程执行 sqlite 调用。
+-        self._conn = sqlite3.connect(db_path, check_same_thread=False)
++        self._conn = connect(db_path)
+         self._conn.row_factory = sqlite3.Row
+         self._init_schema()
+ 
+diff --git a/tests/contract/test_registry_consistency.py b/tests/contract/test_registry_consistency.py
+index ac496aa..8b0e3a1 100644
+--- a/tests/contract/test_registry_consistency.py
++++ b/tests/contract/test_registry_consistency.py
+@@ -254,7 +254,7 @@ def test_backup_restore_from_copied_db_file(tmp_path) -> None:
+         _run(source.put(created, expected_version="0"))
+         _run(source.put(_make_resource(name="node", uid="uid-node", generation=7)))
+     finally:
+-        # 先关闭源连接再复制：确保 rollback journal 已合并、数据全量落盘
++        # 先关闭源连接再复制：最后一个连接关闭时 WAL 合并回主库文件，数据全量落盘
+         _run(source.close())
+ 
+     # 模拟备份：复制 DB 文件（文件级备份恢复路径）
+diff --git a/tests/unit/controlplane/test_sqlite.py b/tests/unit/controlplane/test_sqlite.py
+new file mode 100644
+index 0000000..28e6a36
+--- /dev/null
++++ b/tests/unit/controlplane/test_sqlite.py
+@@ -0,0 +1,88 @@
++"""控制平面 SQLite 连接设置单元测试。
++
++覆盖：
++
++* ``connect`` 启用 WAL 与外键约束，``synchronous`` 保持 ``FULL``，等锁 5 秒；
++* 控制平面的各个存储都以 WAL 模式打开数据库文件；
++* 同一文件上一个连接的读事务不阻塞另一个存储写入。
++"""
++
++from __future__ import annotations
++
++import asyncio
++import inspect
++import sqlite3
++import time
++
++import pytest
++from forgemesh.controlplane.audit import AuditLog
++from forgemesh.controlplane.outbox import Outbox
++from forgemesh.controlplane.reconciler import ProcessedKeyStore
++from forgemesh.controlplane.registry import SQLiteRegistry
++from forgemesh.controlplane.sqlite import connect
++from forgemesh.controlplane.tasks import TaskStore
++
++
++def _close(store) -> None:
++    """关闭存储（兼容同步与异步的 ``close``）。"""
++    result = store.close()
++    if inspect.isawaitable(result):
++        asyncio.run(result)
++
++
++@pytest.mark.unit
++def test_connect_enables_wal_and_foreign_keys(tmp_path) -> None:
++    conn = connect(str(tmp_path / "cp.db"))
++    try:
++        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
++        assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
++        assert conn.execute("PRAGMA synchronous").fetchone()[0] == 2  # FULL
++        assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
++    finally:
++        conn.close()
++
++
++@pytest.mark.unit
++def test_connect_accepts_memory_database() -> None:
++    conn = connect(":memory:")
++    try:
++        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "memory"
++        assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
++    finally:
++        conn.close()
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize(
++    "open_store", [SQLiteRegistry, ProcessedKeyStore, TaskStore, AuditLog, Outbox]
++)
++def test_stores_open_the_database_in_wal_mode(tmp_path, open_store) -> None:
++    path = str(tmp_path / "cp.db")
++    store = open_store(path)
++    try:
++        probe = sqlite3.connect(path)
++        try:
++            assert probe.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
++        finally:
++            probe.close()
++    finally:
++        _close(store)
++
++
++@pytest.mark.unit
++def test_open_read_does_not_block_writes_from_another_store(tmp_path) -> None:
++    """注册表与去重键共用一个文件：读事务进行中，另一个连接仍可立即提交写入。"""
++    path = str(tmp_path / "cp.db")
++    store = ProcessedKeyStore(path)
++    reader = sqlite3.connect(path)
++    try:
++        reader.execute("BEGIN")
++        reader.execute("SELECT COUNT(*) FROM processed_dedup_keys").fetchone()
++        started = time.monotonic()
++        asyncio.run(store.mark("key-a"))
++        assert time.monotonic() - started < 1
++        assert asyncio.run(store.seen("key-a")) is True
++    finally:
++        reader.rollback()
++        reader.close()
++        _close(store)
+-- 
+2.43.0
+
