@@ -1,0 +1,482 @@
+From 631d53db1633d34224c9a82ad9e1364b10c1957b Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 13 Oct 2026 02:48:38 +0000
+Subject: [PATCH 03/10] feat(registry): add update_spec for desired-state
+ updates
+
+put(expected_version=...) rewrites the whole stored object: a caller
+that only wants to change the desired state has to send back status,
+conditions, finalizers and observedGeneration it read earlier, and it
+cannot tell a spec change (which must bump generation) from a label
+change (which must not). The API needs a narrower, race-free entry
+point for PUT and PATCH.
+
+update_spec replaces spec, labels and annotations of a resource whose
+kind has a registered model, validates the result against that model
+and keeps everything the controller owns untouched. The spec is
+compared after normalisation, so only a real spec change increments
+generation; labels and annotations changes only bump the resource
+version, and an update that changes nothing is not written at all.
+Checks and write run in one BEGIN IMMEDIATE transaction. Terminating
+resources are rejected first (retrying cannot help), then optional uid
+and resource version preconditions; the uid catches a resource that
+was deleted and re-created under the same name, whose version counts
+up from 0 again. Each ConflictError carries a ConflictReason in
+details["reason"] so the API can report why it refused the write.
+---
+ .../controlplane/registry/__init__.py         |   2 +
+ .../forgemesh/controlplane/registry/store.py  | 128 +++++++++
+ tests/unit/controlplane/test_registry_spec.py | 261 ++++++++++++++++++
+ 3 files changed, 391 insertions(+)
+ create mode 100644 tests/unit/controlplane/test_registry_spec.py
+
+diff --git a/packages/control-plane/src/forgemesh/controlplane/registry/__init__.py b/packages/control-plane/src/forgemesh/controlplane/registry/__init__.py
+index 47dc80e..9da3d2b 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/registry/__init__.py
++++ b/packages/control-plane/src/forgemesh/controlplane/registry/__init__.py
+@@ -6,6 +6,7 @@ from .store import (
+     DEFAULT_RELEASE_FINALIZER,
+     SIDE_EFFECT_PHASES,
+     ChangeType,
++    ConflictReason,
+     RequestDeleteResult,
+     ResourceChange,
+     ResourceKey,
+@@ -16,6 +17,7 @@ __all__ = [
+     "DEFAULT_RELEASE_FINALIZER",
+     "SIDE_EFFECT_PHASES",
+     "ChangeType",
++    "ConflictReason",
+     "RequestDeleteResult",
+     "ResourceChange",
+     "ResourceKey",
+diff --git a/packages/control-plane/src/forgemesh/controlplane/registry/store.py b/packages/control-plane/src/forgemesh/controlplane/registry/store.py
+index bb3954d..3c493c0 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/registry/store.py
++++ b/packages/control-plane/src/forgemesh/controlplane/registry/store.py
+@@ -17,6 +17,9 @@
+ * :meth:`SQLiteRegistry.update_status` → **status 子资源**：只修改状态条件、
+   phase 与 ``observedGeneration``，不递增 ``generation``，可选 CAS；合并后
+   没有变化时不写库。
++* :meth:`SQLiteRegistry.update_spec` → **期望状态**：整体替换 ``spec`` / labels /
++  annotations，可选 uid 与版本 CAS；只有 ``spec`` 变化时递增 ``generation``，
++  ``Terminating`` 的资源拒绝更新；没有变化时不写库。
+ 
+ 受控删除（finalizer 语义，对齐 architecture.md §5.3/§12.4 与 development-plan
+ 第 7 章）
+@@ -189,6 +192,14 @@ class ChangeType(StrEnum):
+     DELETED = "deleted"
+ 
+ 
++class ConflictReason(StrEnum):
++    """:meth:`SQLiteRegistry.update_spec` 拒绝写入的原因（``ConflictError.details["reason"]``）。"""
++
++    RESOURCE_VERSION = "ResourceVersionMismatch"
++    UID = "UidMismatch"
++    TERMINATING = "Terminating"
++
++
+ @dataclass(frozen=True)
+ class ResourceKey:
+     """跨租户唯一定位一个资源。"""
+@@ -983,6 +994,122 @@ class SQLiteRegistry(ResourceRegistry):
+ 
+         return await self._run(_update_status)
+ 
++    async def update_spec(
++        self,
++        kind: str,
++        namespace: str | None,
++        name: str,
++        tenant_id: str,
++        spec: dict[str, Any],
++        *,
++        labels: dict[str, str],
++        annotations: dict[str, str],
++        expected_version: str | None = None,
++        expected_uid: str | None = None,
++    ) -> Resource:
++        """期望状态写入：整体替换 ``spec``、``metadata.labels`` 与 ``metadata.annotations``。
++
++        只适用于登记了强类型模型的 kind（:data:`_KIND_MODELS`），写入结果须满足该模型；
++        status、条件、finalizer、uid 与 ``observedGeneration`` 原样保留。规则：
++
++        * ``spec`` 按模型规范化（补齐默认值）后与当前值比较，变化时 ``generation`` 加 1；
++          只有 labels / annotations 变化时 ``generation`` 不变；
++        * 有变化时 ``resource_version`` 加 1，并追加 ``updated`` 变更记录（控制器据此
++          重新协调）；没有任何变化时不写库，返回当前资源；
++        * 资源处于 ``Terminating`` 时拒绝，先于 uid / 版本检查（重新读取后重试也不会成功）；
++        * ``expected_uid`` / ``expected_version`` 非空时须与当前 uid / 版本相同（版本按
++          字符串比较）；同名资源被删除后重建时版本会从 0 重新计数，uid 可以识别这种情况。
++
++        检查与写入在同一个 ``BEGIN IMMEDIATE`` 事务中完成。
++
++        Returns:
++            写入后的资源；没有变化时为当前资源。
++
++        Raises:
++            NotFoundError: 资源不存在（或跨租户不可见）。
++            ConflictError: 资源处于 ``Terminating``，或 uid / 版本与预期不同；
++                ``details["reason"]`` 为 :class:`ConflictReason` 的取值。
++            ValueError: kind 没有登记强类型模型。
++            pydantic.ValidationError: 替换后的资源不满足模型约束（``ValueError`` 的子类）。
++        """
++        model = _KIND_MODELS.get(kind)
++        if model is None:
++            raise ValueError(f"spec updates are not supported for kind {kind!r}")
++        target = f"kind={kind} namespace={namespace!r} name={name}"
++
++        def _update_spec() -> Resource:
++            with self._immediate_transaction() as cur:
++                row = cur.execute(
++                    "SELECT body, phase, uid, generation, resource_version FROM resources "
++                    "WHERE tenant_id=? AND kind=? AND namespace IS ? AND name=?",
++                    (tenant_id, kind, namespace, name),
++                ).fetchone()
++                if row is None:
++                    raise NotFoundError(f"resource not found: {target} tenant_id={tenant_id}")
++                if row["phase"] == "Terminating":
++                    raise ConflictError(
++                        f"resource is terminating and no longer accepts updates: {target}",
++                        details={"reason": ConflictReason.TERMINATING.value},
++                    )
++                if expected_uid is not None and expected_uid != row["uid"]:
++                    raise ConflictError(
++                        f"uid {expected_uid!r} does not match the current resource: {target}",
++                        details={"reason": ConflictReason.UID.value},
++                    )
++                read_version = row["resource_version"]
++                if expected_version is not None and expected_version != str(read_version):
++                    raise ConflictError(
++                        f"resourceVersion {expected_version!r} does not match the current "
++                        f"version {read_version}: {target}",
++                        details={"reason": ConflictReason.RESOURCE_VERSION.value},
++                    )
++                body = json.loads(row["body"])
++                metadata = body["metadata"]
++                replaced = model.model_validate(
++                    {
++                        **body,
++                        "spec": spec,
++                        "metadata": {**metadata, "labels": labels, "annotations": annotations},
++                    }
++                )
++                new_spec = replaced.model_dump(mode="json", by_alias=True)["spec"]
++                new_labels = dict(replaced.metadata.labels)
++                new_annotations = dict(replaced.metadata.annotations)
++                spec_changed = new_spec != self._normalised_spec(model, body)
++                if (
++                    not spec_changed
++                    and new_labels == metadata.get("labels", {})
++                    and new_annotations == metadata.get("annotations", {})
++                ):
++                    return self._body_to_resource(row["body"])
++
++                generation = row["generation"] + 1 if spec_changed else row["generation"]
++                new_version = read_version + 1
++                body["spec"] = new_spec
++                metadata["labels"] = new_labels
++                metadata["annotations"] = new_annotations
++                metadata["generation"] = generation
++                metadata["resourceVersion"] = str(new_version)
++                new_body = json.dumps(body, ensure_ascii=False)
++                cur.execute(
++                    "UPDATE resources SET body=?, generation=?, resource_version=?, "
++                    " updated_at=datetime('now') "
++                    "WHERE tenant_id=? AND kind=? AND namespace IS ? AND name=?",
++                    (new_body, generation, new_version, tenant_id, kind, namespace, name),
++                )
++                self._record_change(cur, tenant_id, kind, namespace, name, ChangeType.UPDATED)
++                return self._body_to_resource(new_body)
++
++        return await self._run(_update_spec)
++
++    @staticmethod
++    def _normalised_spec(model: type[Resource], body: dict[str, Any]) -> Any:
++        """payload 中 ``spec`` 按模型规范化后的 JSON；payload 不满足模型时取原值。"""
++        try:
++            return model.model_validate(body).model_dump(mode="json", by_alias=True).get("spec")
++        except ValidationError:
++            return body.get("spec")
++
+     # ------------------------------------------------------------------ #
+     # 控制器读取（跨租户，仅供控制平面内部使用）
+     # ------------------------------------------------------------------ #
+@@ -1445,6 +1572,7 @@ __all__ = [
+     "DEFAULT_RELEASE_FINALIZER",
+     "SIDE_EFFECT_PHASES",
+     "ChangeType",
++    "ConflictReason",
+     "RequestDeleteResult",
+     "ResourceChange",
+     "ResourceKey",
+diff --git a/tests/unit/controlplane/test_registry_spec.py b/tests/unit/controlplane/test_registry_spec.py
+new file mode 100644
+index 0000000..fc5b108
+--- /dev/null
++++ b/tests/unit/controlplane/test_registry_spec.py
+@@ -0,0 +1,261 @@
++"""注册中心期望状态写入（``update_spec``）单元测试。"""
++
++from __future__ import annotations
++
++import asyncio
++import json
++from typing import Any
++
++import pytest
++from forgemesh.controlplane.registry import ChangeType, ConflictReason, SQLiteRegistry
++from forgemesh.core.errors import ConflictError, NotFoundError
++from forgemesh.core.objects import ObjectMeta, Resource
++from forgemesh.resource.inference import (
++    AcceleratorSpec,
++    InferencePhase,
++    InferenceService,
++    InferenceServiceSpec,
++    InferenceServiceStatus,
++    ModelRef,
++    ResourcesSpec,
++    RuntimeRef,
++)
++from pydantic import ValidationError
++
++KIND = "InferenceService"
++TENANT = "tenant-a"
++NAMESPACE = "team-a"
++SPEC: dict[str, Any] = {
++    "model": {"reference": "models/llama"},
++    "runtime": {"provider": "vllm"},
++    "resources": {"accelerator": {"type": "nvidia-gpu", "minMemoryGiB": 16}},
++}
++NEW_SPEC: dict[str, Any] = {**SPEC, "model": {"reference": "models/mistral"}}
++
++
++def _run(coro):
++    """在同步测试中驱动协程（不依赖 pytest-asyncio）。"""
++    return asyncio.run(coro)
++
++
++def _service(
++    *,
++    generation: int = 1,
++    labels: dict[str, str] | None = None,
++    phase: InferencePhase = InferencePhase.PENDING,
++) -> InferenceService:
++    return InferenceService(
++        metadata=ObjectMeta(
++            name="svc",
++            namespace=NAMESPACE,
++            tenant_id=TENANT,
++            uid="uid-1",
++            generation=generation,
++            labels=labels or {},
++            annotations={"team": "search"},
++        ),
++        spec=InferenceServiceSpec(
++            model=ModelRef(reference="models/llama"),
++            runtime=RuntimeRef(provider="vllm"),
++            resources=ResourcesSpec(
++                accelerator=AcceleratorSpec(type="nvidia-gpu", minMemoryGiB=16)
++            ),
++        ),
++        status=InferenceServiceStatus(phase=phase),
++    )
++
++
++def _update(reg: SQLiteRegistry, spec: dict[str, Any] = NEW_SPEC, **kwargs: Any) -> Resource:
++    kwargs.setdefault("labels", {})
++    kwargs.setdefault("annotations", {"team": "search"})
++    return _run(reg.update_spec(KIND, NAMESPACE, "svc", TENANT, spec, **kwargs))
++
++
++def _stored_row(reg: SQLiteRegistry):
++    return reg._conn.execute(
++        "SELECT body, generation, observed_generation, resource_version FROM resources "
++        "WHERE name='svc'"
++    ).fetchone()
++
++
++def _changes(reg: SQLiteRegistry) -> list[ChangeType]:
++    return [change.change for change in _run(reg.changes_since(0))]
++
++
++@pytest.mark.unit
++def test_spec_change_bumps_generation_and_version() -> None:
++    reg = SQLiteRegistry()
++    _run(reg.put(_service()))
++    _run(
++        reg.update_status(
++            KIND,
++            NAMESPACE,
++            "svc",
++            TENANT,
++            {
++                "phase": "Scheduling",
++                "conditions": [{"type": "Ready", "status": "False", "reason": "Scheduling"}],
++            },
++            observed_generation=1,
++        )
++    )
++    before = _run(reg.get(KIND, NAMESPACE, "svc", TENANT))
++
++    updated = _update(reg, expected_version="1", expected_uid="uid-1")
++
++    assert isinstance(updated, InferenceService)
++    assert updated.spec.model.reference == "models/mistral"
++    assert (updated.metadata.generation, updated.metadata.observed_generation) == (2, 1)
++    assert updated.metadata.resourceVersion == "2"
++    assert updated.metadata.uid == "uid-1"
++    assert updated.status == before.status
++    assert updated.finalizers == before.finalizers
++    assert _run(reg.get(KIND, NAMESPACE, "svc", TENANT)) == updated
++    row = _stored_row(reg)
++    assert (row["generation"], row["observed_generation"], row["resource_version"]) == (2, 1, 2)
++    assert _changes(reg) == [ChangeType.CREATED, ChangeType.STATUS, ChangeType.UPDATED]
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize(
++    ("labels", "annotations"),
++    [
++        pytest.param({"tier": "gold"}, {"team": "search"}, id="labels"),
++        pytest.param({}, {"team": "ads"}, id="annotations"),
++    ],
++)
++def test_metadata_changes_keep_the_generation(
++    labels: dict[str, str], annotations: dict[str, str]
++) -> None:
++    reg = SQLiteRegistry()
++    _run(reg.put(_service()))
++
++    updated = _update(reg, SPEC, labels=labels, annotations=annotations)
++
++    assert (updated.metadata.labels, updated.metadata.annotations) == (labels, annotations)
++    assert updated.metadata.generation == 1
++    assert updated.metadata.resourceVersion == "1"
++    assert _changes(reg) == [ChangeType.CREATED, ChangeType.UPDATED]
++
++
++@pytest.mark.unit
++def test_labels_and_annotations_are_replaced_as_a_whole() -> None:
++    reg = SQLiteRegistry()
++    _run(reg.put(_service(labels={"tier": "gold", "zone": "a"})))
++
++    updated = _update(reg, SPEC, labels={"tier": "gold"}, annotations={})
++
++    assert updated.metadata.labels == {"tier": "gold"}
++    assert updated.metadata.annotations == {}
++    body = json.loads(_stored_row(reg)["body"])
++    assert (body["metadata"]["labels"], body["metadata"]["annotations"]) == ({"tier": "gold"}, {})
++
++
++@pytest.mark.unit
++def test_unchanged_update_is_not_written() -> None:
++    """spec 规范化后比较：省略的字段取默认值，与已存储的完整 spec 相同时不写库。"""
++    reg = SQLiteRegistry()
++    created = _run(reg.put(_service()))
++
++    unchanged = _update(reg, SPEC, labels={}, expected_version="0")
++
++    assert unchanged == created
++    assert _stored_row(reg)["resource_version"] == 0
++    assert _changes(reg) == [ChangeType.CREATED]
++
++
++@pytest.mark.unit
++def test_stale_resource_version_is_a_conflict() -> None:
++    """两个写入方读到同一版本：先写的成功，后写的冲突，不会覆盖前者。"""
++    reg = SQLiteRegistry()
++    _run(reg.put(_service()))
++    _update(reg, expected_version="0")
++
++    with pytest.raises(ConflictError) as excinfo:
++        _update(reg, {**SPEC, "model": {"reference": "models/qwen"}}, expected_version="0")
++
++    assert excinfo.value.details == {"reason": ConflictReason.RESOURCE_VERSION}
++    stored = _run(reg.get(KIND, NAMESPACE, "svc", TENANT))
++    assert stored.spec.model.reference == "models/mistral"
++    assert stored.metadata.resourceVersion == "1"
++
++
++@pytest.mark.unit
++def test_uid_mismatch_is_a_conflict() -> None:
++    """同名资源被删除后重建：版本从 0 重新计数，uid 不同仍然冲突。"""
++    reg = SQLiteRegistry()
++    _run(reg.put(_service()))
++
++    with pytest.raises(ConflictError) as excinfo:
++        _update(reg, expected_version="0", expected_uid="uid-of-a-deleted-service")
++
++    assert excinfo.value.details == {"reason": ConflictReason.UID}
++    assert _stored_row(reg)["resource_version"] == 0
++
++
++@pytest.mark.unit
++def test_terminating_resource_rejects_updates() -> None:
++    """Terminating 先于版本检查：即使版本过期也报告 Terminating（重试无意义）。"""
++    reg = SQLiteRegistry()
++    _run(reg.put(_service(phase=InferencePhase.READY)))
++    assert not _run(reg.request_delete(KIND, NAMESPACE, "svc", TENANT)).deleted
++
++    for expected_version in (None, "0"):
++        with pytest.raises(ConflictError) as excinfo:
++            _update(reg, expected_version=expected_version)
++        assert excinfo.value.details == {"reason": ConflictReason.TERMINATING}
++    assert _stored_row(reg)["resource_version"] == 1
++
++
++@pytest.mark.unit
++def test_legacy_rows_with_generation_zero_count_up_from_zero() -> None:
++    """1.1.0 之前创建的资源 generation 为 0：不迁移，第一次 spec 变化后为 1。"""
++    reg = SQLiteRegistry()
++    _run(reg.put(_service(generation=0)))
++
++    updated = _update(reg)
++
++    assert (updated.metadata.generation, updated.metadata.observed_generation) == (1, 0)
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize(
++    "spec",
++    [
++        pytest.param({**SPEC, "replicas": 3}, id="unknown-field"),
++        pytest.param({key: SPEC[key] for key in ("model", "runtime")}, id="missing-resources"),
++    ],
++)
++def test_invalid_spec_is_rejected(spec: dict[str, Any]) -> None:
++    reg = SQLiteRegistry()
++    _run(reg.put(_service()))
++
++    with pytest.raises(ValidationError):
++        _update(reg, spec)
++
++    assert _stored_row(reg)["resource_version"] == 0
++
++
++@pytest.mark.unit
++def test_invalid_labels_are_rejected() -> None:
++    reg = SQLiteRegistry()
++    _run(reg.put(_service()))
++
++    with pytest.raises(ValidationError):
++        _update(reg, labels={"tier": 1})
++
++
++@pytest.mark.unit
++def test_missing_resource_is_not_found() -> None:
++    with pytest.raises(NotFoundError):
++        _update(SQLiteRegistry())
++
++
++@pytest.mark.unit
++def test_kinds_without_a_model_are_not_supported() -> None:
++    reg = SQLiteRegistry()
++    widget = Resource(kind="Widget", metadata=ObjectMeta(name="w", tenant_id=TENANT))
++    _run(reg.put(widget))
++
++    with pytest.raises(ValueError, match="not supported"):
++        _run(reg.update_spec("Widget", None, "w", TENANT, {}, labels={}, annotations={}))
+-- 
+2.43.0
+

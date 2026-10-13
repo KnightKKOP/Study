@@ -1,0 +1,151 @@
+From 71765a8c7cf1156bbf07e7ceb0972f09e4c0e7ed Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 13 Oct 2026 04:01:05 +0000
+Subject: [PATCH 10/10] docs: describe resource updates, pagination and the API
+ contract
+
+The CHANGELOG, README and module mapping did not mention the new PUT
+and PATCH endpoints, list pagination, the server-owned generation, the
+derived decision risk level or the contract drift test, and the README
+had no section describing the REST API.
+
+The 1.1.0 CHANGELOG lists the additions, marks the breaking changes
+(server-owned generation, strict create, signed registry page tokens,
+derived risk level) and records the fixes. The README gains a REST API
+section with the endpoint table, the update and pagination rules, an
+example, and what an update does not do yet: the controller does not
+redeploy on a spec change, and a change submitted after the deployment
+workflow started does not take effect although observedGeneration
+catches up. The module mapping lists the new modules, the new tests and
+the registry_meta table.
+---
+ CHANGELOG.md                        | 13 +++++++++++
+ README.md                           | 34 +++++++++++++++++++++++++++++
+ docs/architecture/module-mapping.md | 10 ++++-----
+ 3 files changed, 52 insertions(+), 5 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 6b2fc00..04262ed 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -45,6 +45,11 @@
+ - 插件策略文件（JSON，由管理员维护）：`trustedKeys` 列出受信任的 Ed25519 签名公钥（PEM），`grants` 按插件的 `metadata.id` 授予权限，对该插件的所有版本生效。`load_plugin_policy` 严格校验：文件不可读、未知字段、非法或重复的公钥、带版本号的 `pluginId`、同一插件的多条授予、词表之外或重复的权限都抛出 `PluginPolicyError`；`PluginManager.from_policy_file` 按策略文件构造插件管理器，`PluginManager.effective_permissions` 返回插件实际拥有的权限。控制平面应用目前不构造插件管理器，因此没有对应的环境变量。
+ - 插件权限词表 `forgemesh.plugin.permissions.Permission`（15 项，形如 `<域>.<动作>`，如 `resource.read`、`network.egress`、`platform.admin`）：清单的 `spec.permissions`、JSON Schema 的权限枚举、管理员的授予与 `forgemesh.plugin.isolation` 共用这一份词表，契约测试保证 Schema 枚举与词表逐项一致。
+ - `forgemesh.plugin.loader.load_entrypoint(plugin_dir, entrypoint)`：按清单 `spec.entrypoint`（`<模块>:<类>`）把插件目录作为 Python 包加载并返回入口类；插件目录必须含 `__init__.py`，入口类必须定义在插件包内。加载在当前进程内执行插件代码，不提供任何隔离。
++- 推理服务更新接口：`PUT /api/v1/inference-services/{name}` 整体替换 `spec`、`metadata.labels` 与 `metadata.annotations`，请求体是完整的资源文档（`GET` 的响应修改后可以直接提交，省略 labels / annotations 即清空）；`PATCH` 同一路径接受 JSON Merge Patch（RFC 7386，`Content-Type: application/merge-patch+json`，其他媒体类型返回 `415 UNSUPPORTED_MEDIA_TYPE` 并带 `Accept-Patch`），补丁合并到当前资源的 JSON 表示之后按与 `PUT` 相同的规则处理。两者要求 `write` scope，与 `GET` / `DELETE` 一样以 `namespace` 查询参数指定命名空间。`kind`、`apiVersion`、`metadata.name`、`metadata.namespace` 与租户不可修改（给出时必须与当前资源一致，否则 `400`），`status`、`conditions`、`finalizers`、`generation`、`observedGeneration` 被忽略；只有 `spec` 变化时 `generation` 递增，没有任何变化的更新不写入。乐观并发：`metadata.resourceVersion`、`metadata.uid` 与 `If-Match` 是前置条件，不满足时返回 `409 CONFLICT`，`details.reason` 为 `ResourceVersionMismatch` 或 `UidMismatch`（`If-Match` 不匹配同样是 `409`，而不是 `412`）；处于 `Terminating` 的资源拒绝更新（`409`，`details.reason` 为 `Terminating`）。读取与写入之间资源被并发修改（如控制器写入 `status`）时，服务端重新读取、重新检查前置条件后再写，最多尝试 5 次，不会覆盖并发写入的 `status`。单个资源的响应（`GET` / `POST` / `PUT` / `PATCH`）带强 `ETag`，随 `resourceVersion` 变化，同名资源删除后重建也不会得到旧值。
++- Registry 期望状态写入 `SQLiteRegistry.update_spec(kind, namespace, name, tenant_id, spec, *, labels, annotations, expected_version=None, expected_uid=None)`：整体替换 `spec`、labels 与 annotations，只支持登记了强类型模型的 kind（目前只有 `InferenceService`），结果须满足该模型；status、条件、finalizer、uid 与 `observedGeneration` 原样保留。`spec` 按模型规范化后比较，变化时 `generation` 加 1；有变化时 `resource_version` 加 1 并追加 `updated` 变更记录（控制器据此重新协调），没有变化时不写库。检查与写入在同一个 `BEGIN IMMEDIATE` 事务中：资源处于 `Terminating`（先于其他检查）、uid 或版本与预期不同时抛出 `ConflictError`，`details["reason"]` 为 `ConflictReason` 的取值（`Terminating` / `UidMismatch` / `ResourceVersionMismatch`）。
++- 列表分页：`GET /api/v1/inference-services` 与 `GET /api/v1/resources` 接受 `pageToken`，还有更多结果时响应带 `nextPageToken`（最后一页不带），`count` 为本页条数；结果按 `(namespace, name)` 升序，不带命名空间的资源在最前。游标不透明，绑定签发它的租户与过滤条件（`namespace`，`/resources` 还有 `kind`），`limit` 可以逐页变化；格式不对、被修改或用于其他租户 / 过滤条件的游标返回 `400`，空的 `pageToken` 等同于省略。Registry 新增 `list_page(kind, tenant_id, namespace=None, labels=None, page_token=None, limit=100)`，返回 `ResourcePage`（`items` / `next_page_token`），无效的游标抛出 `InvalidPageTokenError`（`ValueError` 的子类）。游标形如 `<载荷>.<签名>`，签名是覆盖载荷与租户、kind、`namespace`、标签选择器的 HMAC-SHA256，密钥在首次打开数据库时随机生成、保存在新表 `registry_meta` 中，控制平面重启后游标仍然有效。游标记录位置而不是快照：翻页期间新建或删除的资源可能出现也可能缺席，全程存在的资源恰好出现一次。
++- 决策风险等级（改进计划 5.10）：`POST /api/v1/decisions` 的风险等级由服务端按 `question` 推导（`forgemesh.controlplane.api.risk`）。`question` 是形如 `<域>.<动作>` 的操作标识，只看第一个 `.` 之前的域（忽略大小写与首尾空白）：`driver`、`node`、`mig`、`gpu`、`device`、`plugin`、`model`、`quota`、`tenant`、`policy`、`system`、`platform` 为 `high`（architecture.md 14.2 节列出的高风险操作所在的域），`inference` 为 `low`，其他（含自由文本）为 `medium`；请求中的 `riskLevel` 只能调高，低于推导值时被忽略。实际采用的等级在响应的 `riskLevel` 中返回（`503 DECISION_NO_CANDIDATE` / `DECISION_FALLBACK_REQUIRED` 的错误信封在 `details.riskLevel` 中）。高风险请求的候选来自备用 Provider 时返回 `503 DECISION_FALLBACK_REQUIRED`，候选在 `details.candidates` 中供人工审批，不自动采用。
++- 新增 `tests/contract/test_openapi_contract.py`（随 pytest 在 CI 中运行）：双向核对应用提供的路由与 `api/openapi/openapi.yaml`（探针除外），路径与方法、每个操作的参数（位置、名称、是否必填、是否弃用，查询与路径参数还有类型）与请求体的媒体类型都必须一致；再逐一调用每个操作，响应的状态码必须列在契约中，响应体与响应头符合契约，错误信封回显关联 ID，契约列出的每个状态码都至少被调用到一次。只使用已有的开发依赖 `jsonschema` 与 PyYAML。
+ 
+ ### Changed
+ 
+@@ -89,6 +94,10 @@
+ - `scripts/plugin_entrypoint_smoke.py` 按清单 `spec.entrypoint` 经 `load_entrypoint` 加载入口类，缺少 `entrypoint` 即失败（此前跳过），并做基本健康检查：构造器没有必填参数时实例化一次（目前 6 个插件）；需要宿主注入依赖的只报告所需参数（`decision-typesafe-jev` 的客户端、`metering-basic` 的存储、`qos-basic` 的配置、`workflow-reference` 的存储与执行器等）。
+ - `PluginSdk.validate_manifest` 的告警与实际行为一致：未设置 `isolation` 时说明插件在进程内运行（此前称安装器默认使用 `restricted-rpc`），未设置 `entrypoint` 时说明插件无法加载；清单仍写 `artifactDigest` / `signature` 时给出弃用告警（见 Deprecated）。
+ - [docs/plugin-development/guide.md](docs/plugin-development/guide.md) 按当前实现更新运行方式与隔离、权限词表、入口点、签名与注册流程；`SECURITY.md` 3.2 / 3.3 节、README 与 [ADR-006](docs/design-decisions/adr-006.md)（新增实施现状）同步更新；[docs/architecture/module-mapping.md](docs/architecture/module-mapping.md) 更新插件的加载方式与运行形态，更正 `runtime-vllm` 的文件列表（没有 `provider.py`），新增偏差 D3（受限 RPC 宿主未实现）。
++- **破坏性**：`metadata.generation` 由服务端维护：创建时一律为 `1`，`observedGeneration` 为 `0`，请求中的 `generation` / `observedGeneration` 被忽略（此前原样保存请求中的值，未给出时为 `0`）；之后只有 `spec` 变化时递增，labels / annotations 变化不递增。1.1.0 之前创建的资源不做迁移：保留已保存的 `generation`（通常为 `0`），下一次 `spec` 变化时从原值递增。OpenAPI 新增 `ObjectMeta` schema，服务端维护的字段标为 `readOnly`；JSON Schema 的说明同步更新。
++- **破坏性**：`POST /api/v1/inference-services` 拒绝未知的顶层字段（`400`，此前静默忽略）；顶层字段与 `PUT` 相同：`apiVersion`、`kind`、`metadata`、`spec`，以及被忽略的 `status`、`conditions`、`finalizers`。
++- **破坏性**：`SQLiteRegistry.list()` 的 `continue_token` 必须是 `list_page` 以同一租户、kind 与过滤条件返回的 `next_page_token`（见 Added），此前格式（未签名的 base64 JSON，任何人都能构造，也不绑定租户与过滤条件）的游标抛出 `InvalidPageTokenError`；私有方法 `_encode_token` / `_decode_token` 移除。
++- **破坏性**：`POST /api/v1/decisions` 的风险等级改由服务端推导（见 Added）。此前请求一律以 `low` 交给决策路由器（请求中的 `riskLevel` 被忽略），默认配置下高风险保护经 API 从不生效；现在推导为 `high` 的操作在路由器没有备用 Provider 时返回 `503 DECISION_NO_CANDIDATE`，候选来自备用 Provider 时返回 `503 DECISION_FALLBACK_REQUIRED`（此前自动采用该候选并返回 `200`），`FALLBACK_REQUIRED` 也不再与全部失败一样返回 `DECISION_NO_CANDIDATE`。控制平面应用目前不注入决策路由器，经 `forgemesh-control-plane` 访问时这个端点仍返回 `503 DECISION_ROUTER_UNAVAILABLE`。
+ 
+ ### Deprecated
+ 
+@@ -135,6 +144,10 @@
+ - 全部 10 个插件清单与示例清单的 `entrypoint` 写成 `python -m forgemesh_<名称>`，而这些模块并不存在，没有一个插件能按清单加载；入口冒烟只用 `entrypoint` 判断是否跳过，随后绕开它按文件路径加载 `provider.py`（或包的 `__init__.py`），只断言其中有公有类。现改为真实的 `<模块>:<类>` 入口，冒烟按入口加载（见 Changed）。
+ - 全部 10 个插件与示例清单声明 `isolation: restricted-rpc`，而受限 RPC 宿主并不存在，插件实际都在宿主进程内运行；其中 `decision-typesafe-jev` 在进程内经 `urllib` 直接请求 TypeSafe API。现全部改为 `in-process`（`decision-typesafe-jev` 已申请 `network.egress`）。
+ - `plugin-sdk` 包补齐 `pyyaml` 依赖声明：`forgemesh.plugin.sdk` 与签名工具都用它读取清单，此前独立安装（如控制平面镜像）后导入 `forgemesh.plugin.sdk` 即失败。
++- `get_registry()` 在 `init_registry()` 之前被调用时新建一个内存数据库（改进计划 4.6 遗留问题）：组装出错或请求与关闭竞争时，资源只写进进程内存、重启即丢失，API 却报告成功，`/readyz` 也返回 `200`。现在抛出 `ComponentNotReadyError`，资源端点返回 `503 REGISTRY_UNAVAILABLE`（仍先校验凭证），`/readyz` 返回 `503`；应用关闭时清空全局 Registry，关闭之后的请求不再拿到已关闭的连接。
++- 列表接口最多返回 `limit` 条，没有办法取得其余的资源，OpenAPI 声明的 `nextPageToken` 从未返回：现以 `pageToken` / `nextPageToken` 分页（见 Added）。
++- 两个列表接口的 `limit` 越界（`400`）与删除时的并发冲突（`409`）在错误信封中放的是新生成的关联 ID，与请求的 `X-Correlation-Id`（经网关访问时总会带上）对不上：现与其他错误一样回显请求头。OpenAPI 在全部业务端点上声明 `X-Correlation-Id` 请求头。
++- OpenAPI 与实现不一致：网关一直转发的 `GET /api/v1/resources` 没有描述；`POST /api/v1/workflows` 的 `404` / `500` / `503` 与 `POST /api/v1/decisions` 的 `500` 没有列出；列表响应的 `count` 没有描述；`DecisionRequest.context` 标为必填（服务端默认为空对象）。现已补齐，`info.description` 说明任何端点遇到未预期的内部错误都返回 `500 INTERNAL_ERROR`，契约测试 `tests/contract/test_openapi_contract.py` 防止两者再次偏离（见 Added）。
+ 
+ ### Security
+ 
+diff --git a/README.md b/README.md
+index 9cd2d69..d881e02 100644
+--- a/README.md
++++ b/README.md
+@@ -184,6 +184,40 @@ curl -s -H "Authorization: Bearer fmk_…" http://127.0.0.1:8080/api/v1/inferenc
+ 
+ 控制平面启动后会自动协调 `InferenceService`：新建、修改或请求删除的资源在 0.5 秒内被处理，协调结果写入 `status.conditions`（例如 `Ready=False` 及其原因）。未设置 `FORGEMESH_INVENTORY_FILE` 时，新建的服务会停在 `Pending`，并带有 `Ready=False`（`SchedulerUnavailable`）条件；只设置清单、未设置 `FORGEMESH_RUNTIME_LAUNCHER` 时，条件为 `Ready=False`（`WorkflowRuntimeUnavailable`），协调器在分配之前停下，不占用设备。两者都设置后，资源每轮推进一个 phase（`Pending` → `Scheduling` → `Preparing` → `Deploying` → `Verifying` → `Ready`）：分配设备，运行部署工作流（准备模型 → 启动实例 → 验证实例），成功后写入 `status.endpoints` 与 `Ready=True`，网关随即可以转发对话；部署失败时资源进入 `Failed`，不自动重试，删除后重新创建即可再次部署；删除时先取消部署、停止实例，再释放分配。每个服务只部署一个实例（`spec.availability.replicas` 不生效），已部署服务的 `spec` 变化不会重新部署。控制器与 API 运行在同一个进程中，是权威存储的唯一写者（ADR-013）：请以单进程运行，不要使用 `uvicorn --workers` 或多副本。设置了启动器时 `POST /api/v1/workflows` 同样返回 `503`（`WORKFLOW_RUNTIME_UNAVAILABLE`）：部署工作流的运行时只供协调器使用，不对外开放。
+ 
++### REST API
++
++控制平面的 REST API 以 `/api/v1` 为前缀，契约是 [api/openapi/openapi.yaml](api/openapi/openapi.yaml)。契约测试 `tests/contract/test_openapi_contract.py` 双向核对应用提供的路由、参数、请求体与状态码（探针除外），并逐一调用每个操作、校验响应符合契约：修改路由时须同步修改契约。网关把 `/api/v1/inference-services`、`/api/v1/resources`、`/api/v1/workflows`、`/api/v1/decisions` 及其子路径的请求（任意方法，连同查询串、请求头与请求体）转发给控制平面。错误响应都是错误信封 `{"error": {"code", "message", "correlationId", "details"}}`，`correlationId` 回显请求头 `X-Correlation-Id`（经网关访问时由网关补上）。
++
++| 端点 | 说明 |
++| --- | --- |
++| `POST /api/v1/inference-services` | 创建（`201`）：`uid`、租户与 `resourceVersion` 由服务端设置，`generation` 为 `1`、`observedGeneration` 为 `0`，`status` 被忽略；未知的顶层字段返回 `400`，同名资源已存在返回 `409` |
++| `GET /api/v1/inference-services` | 列出推理服务，可按 `namespace` 过滤，分页见下 |
++| `GET /api/v1/inference-services/{name}` | 读取一个推理服务，响应带 `ETag` |
++| `PUT /api/v1/inference-services/{name}` | 整体替换 `spec`、labels 与 annotations，规则见下 |
++| `PATCH /api/v1/inference-services/{name}` | JSON Merge Patch（RFC 7386，`Content-Type: application/merge-patch+json`），规则同 `PUT` |
++| `DELETE /api/v1/inference-services/{name}` | 受控删除：直接删除返回 `204`；持有 finalizer 或加速器分配时返回 `202`，资源进入 `Terminating`，由协调器释放后删除 |
++| `GET /api/v1/resources?kind=…` | 按 kind 列出资源，分页同上；省略 `kind` 时返回空列表 |
++| `POST /api/v1/workflows`、`POST /api/v1/decisions` | 控制平面应用不注入工作流运行时与决策路由器，合法的请求返回 `503`（`WORKFLOW_RUNTIME_UNAVAILABLE` / `DECISION_ROUTER_UNAVAILABLE`）；决策的风险等级由服务端按 `question` 推导，请求中的 `riskLevel` 只能调高 |
++
++单个资源的端点以 `namespace` 查询参数指定命名空间，省略时指不带命名空间的资源。读接口要求 `read` scope，写接口（含 `PUT` / `PATCH`、启动工作流与请求决策）要求 `write` scope。
++
++**分页**：列表按 `(namespace, name)` 升序返回（不带命名空间的资源在最前），每页最多 `limit` 条（`1`–`1000`，默认 `100`），`count` 是本页的条数。还有更多结果时响应带 `nextPageToken`：以相同的过滤条件把它作为 `pageToken` 传回即得下一页，`limit` 可以变化。游标不透明，只对签发它的租户与同一组过滤条件有效，格式不对、被修改或用于其他租户 / 过滤条件时返回 `400`；控制平面重启后仍然有效。
++
++**更新**：`PUT` 的请求体是完整的资源文档（`GET` 的响应修改后可以直接提交），`spec`、`metadata.labels` 与 `metadata.annotations` 整体替换，省略 labels / annotations 即清空；`PATCH` 的补丁合并到当前资源之后按同样的规则处理（`null` 删除字段，对象逐字段合并，数组整体替换）。`kind`、`apiVersion`、`metadata.name`、`metadata.namespace` 与租户不可修改（`400`），`status`、`conditions`、`finalizers`、`generation`、`observedGeneration` 被忽略。只有 `spec` 变化时 `generation` 递增，没有任何变化的更新不写入。乐观并发：把读到的 `metadata.resourceVersion`（及 `metadata.uid`）留在请求体中，或在 `If-Match` 中携带响应的 `ETag`；资源在此期间被修改过（包括控制器写入 `status`）就返回 `409`（`details.reason` 为 `ResourceVersionMismatch`），重新读取后再试。同名资源删除后重建时 `resourceVersion` 从 `0` 重新计数，`uid` 不符（`UidMismatch`）或 `ETag` 不符可以识别这种情况；资源正在删除时返回 `409`（`Terminating`）。
++
++```bash
++KEY="Authorization: Bearer fmk_…"
++URL="http://127.0.0.1:8081/api/v1/inference-services/llama?namespace=default"
++# 带上读到的版本修改模型引用；期间资源被修改过时返回 409
++RV=$(curl -s -H "$KEY" "$URL" | jq -r .metadata.resourceVersion)
++curl -s -X PATCH -H "$KEY" -H "Content-Type: application/merge-patch+json" \
++  -d "{\"metadata\": {\"resourceVersion\": \"$RV\"}, \"spec\": {\"model\": {\"reference\": \"models/llama-3\"}}}" "$URL"
++# 翻页：把响应中的 nextPageToken 作为 pageToken 传回，直到响应不再带它
++curl -s -H "$KEY" "http://127.0.0.1:8081/api/v1/inference-services?limit=50&pageToken=<nextPageToken>"
++```
++
++更新只修改期望状态，控制器目前不按新的 `spec` 重新部署（见上文）：已经 `Ready` 的服务保持 `generation` 大于 `observedGeneration`；部署工作流启动之后（`Deploying` / `Verifying`）提交的变化同样不会生效，但服务进入 `Ready` 时 `observedGeneration` 会记为最新的 `generation`。
++
+ ### Go 网关
+ 
+ ```bash
+diff --git a/docs/architecture/module-mapping.md b/docs/architecture/module-mapping.md
+index 0fce571..e0ae3da 100644
+--- a/docs/architecture/module-mapping.md
++++ b/docs/architecture/module-mapping.md
+@@ -66,7 +66,7 @@
+ | 数据所有权 | 无（仅定义协议，不持有数据） |
+ | 允许依赖 | 无（纯声明文件，可引用彼此的语义） |
+ | 禁止依赖 | 任何实现代码、任何第三方运行时 |
+-| 测试路径 | `tests/contract/test_schema_validation.py`、`tests/contract/test_cross_representation.py` |
++| 测试路径 | `tests/contract/test_schema_validation.py`、`tests/contract/test_cross_representation.py`、`tests/contract/test_openapi_contract.py`（控制平面路由与 `openapi.yaml` 双向核对，逐一调用每个操作，响应按契约中的 schema 校验） |
+ | 状态 | 已实现且有测试覆盖 |
+ | 演进动作 | 保留；WP-A2.3 将加强 OpenAPI 语义校验（operationId 唯一、引用完整性） |
+ 
+@@ -120,13 +120,13 @@
+ | 字段 | 内容 |
+ |---|---|
+ | 架构模块 | L2 Core Control Plane（权威状态、协调、插件管理、审计） |
+-| 当前代码路径 | `packages/control-plane/src/forgemesh/controlplane/`：`registry/{models,store}.py`、`reconciler/{core,dedup}.py`、`controller/{manager,queue}.py`、`scheduler/{inventory,first_fit}.py`、`deployment/{launcher,workflow,release,recovery,config,network,fake,vllm_process,memory}.py`、`api/{routes,dependencies,errors}.py`、`plugin_manager.py`、`outbox.py`、`audit.py`、`tasks.py`、`heartbeat.py`、`observability.py`、`diagnostics.py`、`app.py`、`auth.py`、`keygen.py`、`sqlite.py`（共 38 个 `.py`；其中 `auth.py` / `keygen.py` / `api/errors.py` 为 API 认证与错误信封，见 ADR-014；`controller/` 驱动协调器并回写 status；`scheduler/` 按静态加速器清单首次适配分配；`deployment/` 为部署工作流（准备模型 → 启动实例 → 验证实例）、启动器契约 `RuntimeLauncher` 与两个启动器（`fake.py`：控制平面进程内的 OpenAI 兼容桩服务 `FakeLauncher`；`vllm_process.py`：本机 vLLM 子进程 `VLLMProcessLauncher`；由 `config.py` 按 `FORGEMESH_RUNTIME_LAUNCHER` 选择，`network.py` 为两者共用的地址校验与健康检查）、删除时的清理 `DeploymentReleaser`、重启之后把实例已不在运行的 `Ready` 服务转为 `Degraded` 的 `mark_lost_instances`（`recovery.py`）与测试替身 `InMemoryLauncher`；`sqlite.py` 统一 SQLite 连接设置（WAL、外键），并由 `workflow_db_path` 给出工作流存储文件；其余与任务书的 9 个子模块一一对应） |
+-| 核心契约 | 实现 `core-contracts` 的 `ResourceRegistry` / `Reconciler` / `Scheduler`（`FirstFitScheduler`：清单来自 `FORGEMESH_INVENTORY_FILE`，设置时才注入控制器；分配与设备占用经 `SQLiteRegistry.create_allocation` 在同一事务中写入，设备独占由 `allocation_devices` 部分唯一索引保证）；协调器按 phase 逐轮推进 `InferenceService`（`Pending` → `Scheduling` → `Preparing` → `Deploying` → `Verifying` → `Ready`），以 `deployment:{uid}` 为幂等键启动并查询部署工作流，成功后写入 `status.endpoints`，删除时经 `DeploymentReleaser` 取消部署、停止实例（部署包只依赖工作流契约，运行时与启动器由组装方注入：`app.py` 在设置了 `FORGEMESH_RUNTIME_LAUNCHER` 时以 `workflow-runtime` 的 `LocalWorkflowRuntime` 与所选启动器组装，未设置时不注入，协调器在分配之前报告 `WorkflowRuntimeUnavailable`）；`app.py` 提供 HTTP 服务（FastAPI，未安装时回退纯标准库占位——生产必须 FastAPI/ASGI），并在 lifespan 中运行控制器（设置了启动器时，先恢复未结束的部署运行、把实例已不在运行的 `Ready` 服务转为 `Degraded`，再启动控制器）；控制器按序号增量读取 `resource_changes` 变更记录，经 `update_status`（status 子资源，CAS）回写协调结果；Outbox 事务性事件（architecture.md 3.3 规则 7）；`ProcessedKeyStore` 去重（reconciler/dedup.py）；`PluginManager`（plugin_manager.py）注册时校验插件清单与 Ed25519 签名（受信任公钥来自插件策略文件），插件实际权限为清单申请与管理员授予的交集，控制平面应用尚未接入 |
++| 当前代码路径 | `packages/control-plane/src/forgemesh/controlplane/`：`registry/{models,store}.py`、`reconciler/{core,dedup}.py`、`controller/{manager,queue}.py`、`scheduler/{inventory,first_fit}.py`、`deployment/{launcher,workflow,release,recovery,config,network,fake,vllm_process,memory}.py`、`api/{routes,dependencies,errors,updates,risk}.py`、`plugin_manager.py`、`outbox.py`、`audit.py`、`tasks.py`、`heartbeat.py`、`observability.py`、`diagnostics.py`、`app.py`、`auth.py`、`keygen.py`、`sqlite.py`（共 40 个 `.py`；其中 `auth.py` / `keygen.py` / `api/errors.py` 为 API 认证与错误信封，见 ADR-014；`api/updates.py` 为 `PUT` / `PATCH` 的更新规则（JSON Merge Patch、ETag / `If-Match`），`api/risk.py` 按操作推导决策请求的风险等级；`controller/` 驱动协调器并回写 status；`scheduler/` 按静态加速器清单首次适配分配；`deployment/` 为部署工作流（准备模型 → 启动实例 → 验证实例）、启动器契约 `RuntimeLauncher` 与两个启动器（`fake.py`：控制平面进程内的 OpenAI 兼容桩服务 `FakeLauncher`；`vllm_process.py`：本机 vLLM 子进程 `VLLMProcessLauncher`；由 `config.py` 按 `FORGEMESH_RUNTIME_LAUNCHER` 选择，`network.py` 为两者共用的地址校验与健康检查）、删除时的清理 `DeploymentReleaser`、重启之后把实例已不在运行的 `Ready` 服务转为 `Degraded` 的 `mark_lost_instances`（`recovery.py`）与测试替身 `InMemoryLauncher`；`sqlite.py` 统一 SQLite 连接设置（WAL、外键），并由 `workflow_db_path` 给出工作流存储文件；其余与任务书的 9 个子模块一一对应） |
++| 核心契约 | 实现 `core-contracts` 的 `ResourceRegistry` / `Reconciler` / `Scheduler`（`FirstFitScheduler`：清单来自 `FORGEMESH_INVENTORY_FILE`，设置时才注入控制器；分配与设备占用经 `SQLiteRegistry.create_allocation` 在同一事务中写入，设备独占由 `allocation_devices` 部分唯一索引保证）；协调器按 phase 逐轮推进 `InferenceService`（`Pending` → `Scheduling` → `Preparing` → `Deploying` → `Verifying` → `Ready`），以 `deployment:{uid}` 为幂等键启动并查询部署工作流，成功后写入 `status.endpoints`，删除时经 `DeploymentReleaser` 取消部署、停止实例（部署包只依赖工作流契约，运行时与启动器由组装方注入：`app.py` 在设置了 `FORGEMESH_RUNTIME_LAUNCHER` 时以 `workflow-runtime` 的 `LocalWorkflowRuntime` 与所选启动器组装，未设置时不注入，协调器在分配之前报告 `WorkflowRuntimeUnavailable`）；`app.py` 提供 HTTP 服务（FastAPI，未安装时回退纯标准库占位——生产必须 FastAPI/ASGI），并在 lifespan 中运行控制器（设置了启动器时，先恢复未结束的部署运行、把实例已不在运行的 `Ready` 服务转为 `Degraded`，再启动控制器）；控制器按序号增量读取 `resource_changes` 变更记录，经 `update_status`（status 子资源，CAS）回写协调结果；API 的 `PUT` / `PATCH` 经 `update_spec`（期望状态，CAS，只有 `spec` 变化时递增 `generation`）写入，列表经 `list_page` 分页（游标绑定租户与过滤条件并签名）；Outbox 事务性事件（architecture.md 3.3 规则 7）；`ProcessedKeyStore` 去重（reconciler/dedup.py）；`PluginManager`（plugin_manager.py）注册时校验插件清单与 Ed25519 签名（受信任公钥来自插件策略文件），插件实际权限为清单申请与管理员授予的交集，控制平面应用尚未接入 |
+ | 运行形态 | 单实例控制平面进程（模块化单体，architecture.md 3.3 规则 8）；ADR-013 约束：仅允许单写方写同一 SQLite 权威库；控制器与 API 同进程运行，不得以多个 worker 进程启动 |
+ | 数据所有权 | **全部业务资源权威状态**（registry/store.py）、审计事件（audit.py，默认内存库，控制平面应用尚未接入）、Outbox 事件、任务与心跳状态 |
+ | 允许依赖 | `forgemesh.core` / `forgemesh.resource` / `forgemesh.policy` / `forgemesh.decision` / `forgemesh.workflow*` / `forgemesh.plugin`（plugin-sdk）、标准库 `sqlite3`、FastAPI |
+ | 禁止依赖 | 任何插件私有模块（`decision_rules` / `gpu_nvidia` 等，扫描二验证 ✅，见 3.2） |
+-| 测试路径 | `tests/unit/controlplane/`：`test_api.py`、`test_routes.py`、`test_registry.py`、`test_reconciler.py`、`test_dedup_store.py`、`test_plugin_manager.py`、`test_outbox.py`、`test_audit.py`、`test_tasks.py`、`test_heartbeat.py`、`test_observability.py`、`test_diagnostics.py`、`test_app.py`、`test_auth.py`、`test_controller_manager.py`、`test_controller_queue.py`、`test_registry_changes.py`、`test_registry_status.py`、`test_registry_allocations.py`、`test_sqlite.py`、`test_scheduler.py`、`test_scheduler_inventory.py`、`test_allocation_lifecycle.py`、`test_deployment.py`、`test_deployment_lifecycle.py`、`test_fake_launcher.py`、`test_vllm_launcher.py`、`test_launcher_config.py`、`test_launcher_network.py`（29 个文件，glob 核对；`test_deployment_lifecycle.py` 以控制器、调度器、本地工作流运行时与内存启动器覆盖部署、重启、失败与删除闭环；`test_vllm_launcher.py` 以同目录的替身 `vllm_standin.py` 代替 vLLM 运行，不需要 GPU）；端到端 `tests/e2e/test_closed_loop.py`（应用 + 假启动器：创建 → `Ready` → 对话 → 删除 → 重新创建 → 重启后 `Degraded`） |
++| 测试路径 | `tests/unit/controlplane/`：`test_api.py`、`test_routes.py`、`test_registry.py`、`test_reconciler.py`、`test_dedup_store.py`、`test_plugin_manager.py`、`test_outbox.py`、`test_audit.py`、`test_tasks.py`、`test_heartbeat.py`、`test_observability.py`、`test_diagnostics.py`、`test_app.py`、`test_auth.py`、`test_controller_manager.py`、`test_controller_queue.py`、`test_registry_changes.py`、`test_registry_status.py`、`test_registry_allocations.py`、`test_sqlite.py`、`test_scheduler.py`、`test_scheduler_inventory.py`、`test_allocation_lifecycle.py`、`test_deployment.py`、`test_deployment_lifecycle.py`、`test_fake_launcher.py`、`test_vllm_launcher.py`、`test_launcher_config.py`、`test_launcher_network.py`、`test_registry_spec.py`、`test_api_updates.py`、`test_api_pagination.py`（32 个文件，glob 核对；`test_deployment_lifecycle.py` 以控制器、调度器、本地工作流运行时与内存启动器覆盖部署、重启、失败与删除闭环；`test_vllm_launcher.py` 以同目录的替身 `vllm_standin.py` 代替 vLLM 运行，不需要 GPU）；端到端 `tests/e2e/test_closed_loop.py`（应用 + 假启动器：创建 → `Ready` → 对话 → 删除 → 重新创建 → 重启后 `Degraded`） |
+ | 状态 | 已实现且有测试覆盖 |
+ | 演进动作 | 保留；WP-C1 补故障路径（CAS 并发、重启恢复、finalizer 闭环、Allocation 唯一性） |
+ 
+@@ -285,7 +285,7 @@
+ | 字段 | 内容 |
+ |---|---|
+ | 架构模块 | L6 权威存储（过渡态：SQLite；目标态：PostgreSQL） |
+-| 当前代码路径 | `packages/control-plane/src/forgemesh/controlplane/registry/store.py`（`SQLiteRegistry`，权威资源状态，CAS 乐观并发 `resource_version`；分配 `allocations` 与设备占用 `allocation_devices`，部分唯一索引保证每个资源 uid 在其租户内至多一个 Active 分配、每个设备（跨租户）至多属于一个 Active 分配）；`packages/decision-api/src/forgemesh/decision/records.py`（`DecisionRecordStore`）；`packages/workflow-runtime/src/forgemesh/workflowruntime/store.py`（工作流运行存储）；审计 `audit.py` |
++| 当前代码路径 | `packages/control-plane/src/forgemesh/controlplane/registry/store.py`（`SQLiteRegistry`，权威资源状态，CAS 乐观并发 `resource_version`；分配 `allocations` 与设备占用 `allocation_devices`，部分唯一索引保证每个资源 uid 在其租户内至多一个 Active 分配、每个设备（跨租户）至多属于一个 Active 分配；`registry_meta` 保存列表分页游标的签名密钥，随库备份与恢复）；`packages/decision-api/src/forgemesh/decision/records.py`（`DecisionRecordStore`）；`packages/workflow-runtime/src/forgemesh/workflowruntime/store.py`（工作流运行存储）；审计 `audit.py` |
+ | 核心契约 | ADR-013：**SQLite 为权威存储、单控制平面实例写、禁止扩展 replicas；PostgreSQL 为目标态**（迁移由真实 SLO/基准触发）；Registry 对齐 `core-contracts.ResourceRegistry` 契约 |
+ | 运行形态 | 进程内嵌入式：控制平面应用打开 `FORGEMESH_DB_PATH`（Registry 与去重键，WAL 模式）；设置了 `FORGEMESH_RUNTIME_LAUNCHER` 时另以 `workflow_db_path(FORGEMESH_DB_PATH)` 给出的同目录独立文件（`*.workflows.db`，WAL 模式，步骤写入不必等待 Registry 的写锁）作为部署工作流的存储；审计、决策记录、工作流存储未指定文件时使用内存库。两个文件之间没有跨文件事务：备份时先注册表、后工作流存储，同一组恢复，见 docs/operations/backup-restore.md |
+ | 数据所有权 | 权威写方：控制平面**唯一实例**（registry/audit/outbox）；决策记录写方为 Decision 链路（D1 关联） |
+-- 
+2.43.0
+

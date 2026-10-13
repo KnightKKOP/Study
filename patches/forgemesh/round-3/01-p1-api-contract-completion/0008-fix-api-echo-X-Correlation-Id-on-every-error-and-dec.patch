@@ -1,0 +1,326 @@
+From 5ea7ac52602a854a433489a1aa57e323d55342f2 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 13 Oct 2026 03:35:09 +0000
+Subject: [PATCH 08/10] fix(api): echo X-Correlation-Id on every error and
+ declare the header
+
+The limit check on both list endpoints and the delete conflict path built
+their error envelopes with a fresh random id, so a caller (or the gateway,
+which always forwards X-Correlation-ID) could not match those errors to its
+request, unlike every other error response.
+
+A router-level get_correlation_id dependency now provides the id to the
+routes that build envelopes themselves, and makes every endpoint declare the
+header, which the OpenAPI contract now documents as a shared parameter on all
+business paths.
+---
+ api/openapi/openapi.yaml                      | 18 ++++++++++
+ .../controlplane/api/dependencies.py          | 12 +++++--
+ .../src/forgemesh/controlplane/api/routes.py  | 26 +++++++-------
+ tests/unit/controlplane/test_api.py           | 34 ++++++++++++++++---
+ 4 files changed, 71 insertions(+), 19 deletions(-)
+
+diff --git a/api/openapi/openapi.yaml b/api/openapi/openapi.yaml
+index 3a447b1..001529a 100644
+--- a/api/openapi/openapi.yaml
++++ b/api/openapi/openapi.yaml
+@@ -68,6 +68,8 @@ paths:
+                 $ref: "#/components/schemas/Error"
+ 
+   /api/v1/inference-services:
++    parameters:
++      - $ref: "#/components/parameters/CorrelationId"
+     get:
+       tags: [inference-services]
+       summary: 列出推理服务
+@@ -147,6 +149,7 @@ paths:
+         description: 资源所在的命名空间；省略时指不带命名空间的资源。
+         schema:
+           type: string
++      - $ref: "#/components/parameters/CorrelationId"
+     get:
+       tags: [inference-services]
+       summary: 获取推理服务
+@@ -282,6 +285,8 @@ paths:
+ 
+ 
+   /api/v1/workflows:
++    parameters:
++      - $ref: "#/components/parameters/CorrelationId"
+     post:
+       tags: [workflows]
+       summary: 启动工作流运行
+@@ -308,6 +313,8 @@ paths:
+ 
+ 
+   /api/v1/decisions:
++    parameters:
++      - $ref: "#/components/parameters/CorrelationId"
+     post:
+       tags: [decisions]
+       summary: 请求一次结构化决策（决策≠授权；授权由 Scheduler/Policy 完成）
+@@ -344,6 +351,8 @@ paths:
+ 
+ 
+   /api/v1/resources:
++    parameters:
++      - $ref: "#/components/parameters/CorrelationId"
+     get:
+       tags: [resources]
+       summary: 按 kind 列出资源
+@@ -379,6 +388,15 @@ paths:
+ 
+ components:
+   parameters:
++    CorrelationId:
++      name: X-Correlation-Id
++      in: header
++      required: false
++      description: >-
++        全链路关联 ID（大小写不敏感，与网关的 X-Correlation-ID 相同）：错误响应在
++        error.correlationId 中回显该值；省略时由服务端生成。经网关访问时网关总会补上它。
++      schema:
++        type: string
+     NamespaceFilter:
+       name: namespace
+       in: query
+diff --git a/packages/control-plane/src/forgemesh/controlplane/api/dependencies.py b/packages/control-plane/src/forgemesh/controlplane/api/dependencies.py
+index 6ae7346..097bb0a 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/api/dependencies.py
++++ b/packages/control-plane/src/forgemesh/controlplane/api/dependencies.py
+@@ -18,8 +18,9 @@ from __future__ import annotations
+ 
+ from collections.abc import Awaitable, Callable
+ from typing import TYPE_CHECKING
++from uuid import uuid4
+ 
+-from fastapi import Depends, Request
++from fastapi import Depends, Header, Request
+ from forgemesh.controlplane.auth import (
+     SCOPE_READ,
+     SCOPE_WRITE,
+@@ -30,7 +31,7 @@ from forgemesh.controlplane.auth import (
+ )
+ from forgemesh.controlplane.registry import SQLiteRegistry
+ 
+-from .errors import ApiError
++from .errors import CORRELATION_HEADER, ApiError
+ 
+ if TYPE_CHECKING:  # pragma: no cover - 仅静态类型检查使用，运行时不导入
+     from forgemesh.decision.router import DecisionRouter
+@@ -192,6 +193,13 @@ async def get_principal(request: Request) -> Principal:
+         raise ApiError(403, "FORBIDDEN", str(exc)) from exc
+ 
+ 
++async def get_correlation_id(
++    correlation_id: str | None = Header(default=None, alias=CORRELATION_HEADER),
++) -> str:
++    """本次请求的关联 ID：取 ``X-Correlation-Id`` 请求头，缺失时生成；错误信封回显该值。"""
++    return correlation_id or uuid4().hex
++
++
+ async def get_tenant_id(principal: Principal = Depends(get_principal)) -> str:
+     """当前请求的租户：取自已验证的凭证，覆盖请求体中可能携带的租户字段。"""
+     return principal.tenant_id
+diff --git a/packages/control-plane/src/forgemesh/controlplane/api/routes.py b/packages/control-plane/src/forgemesh/controlplane/api/routes.py
+index 54b8dc4..bceb94c 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/api/routes.py
++++ b/packages/control-plane/src/forgemesh/controlplane/api/routes.py
+@@ -45,6 +45,7 @@ from ..app import error_envelope
+ from ..registry import ConflictReason, InvalidPageTokenError, SQLiteRegistry
+ from .dependencies import (
+     ComponentNotReadyError,
++    get_correlation_id,
+     get_decision_router,
+     get_tenant_id,
+     get_workflow_runtime,
+@@ -65,7 +66,8 @@ from .updates import (
+     unknown_fields,
+ )
+ 
+-router = APIRouter(prefix="/api/v1")
++#: 所有端点都在错误信封中回显 ``X-Correlation-Id``，路由器级依赖让每个端点都声明这个请求头。
++router = APIRouter(prefix="/api/v1", dependencies=[Depends(get_correlation_id)])
+ 
+ _KIND = "InferenceService"
+ 
+@@ -114,14 +116,14 @@ def _build_inference_service(body: dict[str, Any], tenant_id: str) -> InferenceS
+     )
+ 
+ 
+-def _invalid_limit(limit: int) -> JSONResponse | None:
++def _invalid_limit(limit: int, correlation_id: str) -> JSONResponse | None:
+     if 1 <= limit <= MAX_LIST_LIMIT:
+         return None
+     return _error_response(
+         400,
+         "BAD_REQUEST",
+         f"limit must be between 1 and {MAX_LIST_LIMIT}, got {limit}",
+-        uuid4().hex,
++        correlation_id,
+     )
+ 
+ 
+@@ -179,14 +181,13 @@ async def create_inference_service(
+     body: dict[str, Any],
+     tenant_id: str = Depends(get_tenant_id),
+     registry: SQLiteRegistry = Depends(require_registry),
+-    x_correlation_id: str | None = Header(default=None, alias="X-Correlation-Id"),
++    correlation_id: str = Depends(get_correlation_id),
+ ) -> Any:
+     """创建推理服务（201，附 ``ETag``）。
+ 
+     请求体不合法（缺少 ``spec``、kind 不匹配、未知的顶层字段等）返回 400；同名资源已存在
+     返回 409。
+     """
+-    correlation_id = x_correlation_id or uuid4().hex
+     try:
+         resource = _build_inference_service(body, tenant_id)
+     except ValidationError as exc:
+@@ -213,6 +214,7 @@ async def list_inference_services(
+     namespace: str | None = None,
+     limit: int = 100,
+     page_token: str | None = Query(default=None, alias="pageToken"),
++    correlation_id: str = Depends(get_correlation_id),
+ ) -> Any:
+     """列出推理服务（可选按 namespace 过滤），按 ``(namespace, name)`` 升序分页。
+ 
+@@ -220,7 +222,7 @@ async def list_inference_services(
+     传回（``limit`` 可以不同）；无效、被篡改或签发给另一租户 / 另一组过滤条件的
+     ``pageToken`` 返回 400。
+     """
+-    if (invalid := _invalid_limit(limit)) is not None:
++    if (invalid := _invalid_limit(limit, correlation_id)) is not None:
+         return invalid
+     return await _list_response(registry, _KIND, tenant_id, namespace, page_token, limit)
+ 
+@@ -357,6 +359,7 @@ async def delete_inference_service(
+     tenant_id: str = Depends(get_tenant_id),
+     registry: SQLiteRegistry = Depends(require_registry),
+     namespace: str | None = None,
++    correlation_id: str = Depends(get_correlation_id),
+ ) -> Any:
+     """删除推理服务（受控删除语义，对齐 development-plan 第 7 章除闭环）。
+ 
+@@ -374,7 +377,7 @@ async def delete_inference_service(
+     except NotFoundError as exc:
+         raise HTTPException(status_code=404, detail=f"InferenceService '{name}' not found") from exc
+     except ConflictError as exc:
+-        return _error_response(409, "CONFLICT", str(exc), uuid4().hex)
++        return _error_response(409, "CONFLICT", str(exc), correlation_id)
+     if result.deleted:
+         return Response(status_code=204)
+     return JSONResponse(status_code=202, content={"name": name, "phase": "Terminating"})
+@@ -393,13 +396,14 @@ async def list_resources(
+     namespace: str | None = None,
+     limit: int = 100,
+     page_token: str | None = Query(default=None, alias="pageToken"),
++    correlation_id: str = Depends(get_correlation_id),
+ ) -> Any:
+     """列出某个 kind 的资源（可选按 namespace 过滤），分页规则同推理服务列表。
+ 
+     未指定 ``kind`` 时返回空列表（P1 简化：避免全表扫描）；这时不会签发 ``nextPageToken``，
+     带 ``pageToken`` 返回 400。
+     """
+-    if (invalid := _invalid_limit(limit)) is not None:
++    if (invalid := _invalid_limit(limit, correlation_id)) is not None:
+         return invalid
+     if not kind:
+         if page_token:
+@@ -464,7 +468,7 @@ def _error_response(
+ async def start_workflow(
+     body: dict[str, Any],
+     tenant_id: str = Depends(get_tenant_id),
+-    x_correlation_id: str | None = Header(default=None, alias="X-Correlation-Id"),
++    correlation_id: str = Depends(get_correlation_id),
+ ) -> Any:
+     """启动工作流运行（202 已受理）。
+ 
+@@ -480,7 +484,6 @@ async def start_workflow(
+     错误映射：校验失败 400；定义不存在 404（``NotFoundError``）；
+     ``WorkflowRuntime`` 未注入 503；其余内部错误 500（统一错误信封）。
+     """
+-    correlation_id = x_correlation_id or uuid4().hex
+     try:
+         req = WorkflowStartRequest.model_validate(body)
+     except ValidationError as exc:
+@@ -548,7 +551,7 @@ class DecisionCallRequest(BaseModel):
+ async def request_decision(
+     body: dict[str, Any],
+     tenant_id: str = Depends(get_tenant_id),
+-    x_correlation_id: str | None = Header(default=None, alias="X-Correlation-Id"),
++    correlation_id: str = Depends(get_correlation_id),
+ ) -> Any:
+     """请求一次结构化决策（决策≠授权；授权由 Scheduler/Policy 完成）。
+ 
+@@ -569,7 +572,6 @@ async def request_decision(
+     ``DECISION_FALLBACK_REQUIRED``（候选在 ``details.candidates`` 中供人工审批，不自动
+     采用）。两种 503 都**绝不默认放行**。其余内部错误 500（统一错误信封）。
+     """
+-    correlation_id = x_correlation_id or uuid4().hex
+     try:
+         req = DecisionCallRequest.model_validate(body)
+     except ValidationError as exc:
+diff --git a/tests/unit/controlplane/test_api.py b/tests/unit/controlplane/test_api.py
+index d908062..bea9b2f 100644
+--- a/tests/unit/controlplane/test_api.py
++++ b/tests/unit/controlplane/test_api.py
+@@ -6,9 +6,10 @@
+ * 重复创建返回 409；
+ * 查询不存在返回 404；
+ * 删除：无副作用且没有分配的资源 204 直接物理删除；有副作用态（Ready）或持有
+-  加速器分配的资源 202 Terminating；
++  加速器分配的资源 202 Terminating；与并发写入冲突 409；
+ * 列表返回多个资源；
+-* 缺失 ``X-Tenant-Id`` 头返回 401（dev 认证模式）。
++* 缺失 ``X-Tenant-Id`` 头返回 401（dev 认证模式）；
++* 错误信封回显请求的 ``X-Correlation-Id``。
+ 
+ 使用 FastAPI ``TestClient``（同步驱动），不依赖 pytest-asyncio。
+ """
+@@ -28,6 +29,7 @@ from forgemesh.controlplane.api.dependencies import (
+     reset_registry,
+ )
+ from forgemesh.controlplane.api.errors import install_exception_handlers
++from forgemesh.core.errors import ConflictError
+ from forgemesh.core.objects import ObjectMeta
+ from forgemesh.core.scheduler import AllocatedDevice, ResourceRef
+ from forgemesh.resource.inference import (
+@@ -301,9 +303,31 @@ def test_routes_report_an_uninitialised_registry(method: str, path: str) -> None
+ @pytest.mark.parametrize("path", ["/api/v1/inference-services", "/api/v1/resources"])
+ @pytest.mark.parametrize("limit", [-1, 0, 1001])
+ def test_list_rejects_out_of_range_limit(client: TestClient, path: str, limit: int) -> None:
+-    """limit 超出 [1, 1000] 返回 400（SQLite 中 LIMIT -1 表示不限条数）。"""
++    """limit 超出 [1, 1000] 返回 400（SQLite 中 LIMIT -1 表示不限条数），回显关联 ID。"""
+     resp = client.get(
+-        path, headers=TENANT_HEADERS, params={"limit": limit, "kind": "InferenceService"}
++        path,
++        headers={**TENANT_HEADERS, "X-Correlation-Id": "corr-1"},
++        params={"limit": limit, "kind": "InferenceService"},
+     )
+     assert resp.status_code == 400, resp.text
+-    assert resp.json()["error"]["code"] == "BAD_REQUEST"
++    error = resp.json()["error"]
++    assert (error["code"], error["correlationId"]) == ("BAD_REQUEST", "corr-1")
++
++
++def test_delete_race_returns_409_with_the_correlation_id(client: TestClient, monkeypatch) -> None:
++    """受控删除与并发写入冲突返回 409 错误信封，回显请求的关联 ID。"""
++    client.post("/api/v1/inference-services", json=_payload(), headers=TENANT_HEADERS)
++
++    async def racing_delete(*args, **kwargs):
++        raise ConflictError("request_delete raced with concurrent write")
++
++    monkeypatch.setattr(get_registry(), "request_delete", racing_delete)
++    resp = client.delete(
++        "/api/v1/inference-services/svc-1",
++        headers={**TENANT_HEADERS, "X-Correlation-Id": "corr-1"},
++        params={"namespace": "default"},
++    )
++
++    assert resp.status_code == 409, resp.text
++    error = resp.json()["error"]
++    assert (error["code"], error["correlationId"]) == ("CONFLICT", "corr-1")
+-- 
+2.43.0
+

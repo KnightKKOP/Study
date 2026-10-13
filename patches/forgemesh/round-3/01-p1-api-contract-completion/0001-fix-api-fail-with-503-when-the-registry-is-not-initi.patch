@@ -1,0 +1,368 @@
+From dd74aee87a6bce91aace3448c5558acfeb2fe5aa Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 13 Oct 2026 02:39:55 +0000
+Subject: [PATCH 01/10] fix(api): fail with 503 when the registry is not
+ initialised
+
+get_registry() used to open a fresh in-memory SQLite registry when
+init_registry() had not run. A wiring mistake (or a request racing the
+shutdown) then wrote resources into process memory that vanished on
+restart while the API reported success.
+
+get_registry() now raises ComponentNotReadyError like the other
+runtime components. The resource routes take the registry through a
+require_registry dependency that maps it to a 503 error envelope with
+code REGISTRY_UNAVAILABLE (authentication is still checked first), and
+the application lifespan clears the global registry on shutdown so a
+stopped app no longer hands out a closed connection. The OpenAPI
+document gains a shared ServiceUnavailable response for these routes.
+---
+ api/openapi/openapi.yaml                      | 16 ++++++++
+ .../controlplane/api/dependencies.py          | 22 ++++++++--
+ .../src/forgemesh/controlplane/api/routes.py  | 14 ++++---
+ .../src/forgemesh/controlplane/app.py         |  2 +
+ tests/unit/controlplane/test_api.py           | 40 ++++++++++++++++++-
+ tests/unit/controlplane/test_app.py           | 36 ++++++++++++++++-
+ 6 files changed, 119 insertions(+), 11 deletions(-)
+
+diff --git a/api/openapi/openapi.yaml b/api/openapi/openapi.yaml
+index 622e552..7ad747f 100644
+--- a/api/openapi/openapi.yaml
++++ b/api/openapi/openapi.yaml
+@@ -106,6 +106,8 @@ paths:
+           $ref: "#/components/responses/Unauthorized"
+         "403":
+           $ref: "#/components/responses/Forbidden"
++        "503":
++          $ref: "#/components/responses/ServiceUnavailable"
+     post:
+       tags: [inference-services]
+       summary: 创建推理服务（声明式）
+@@ -131,6 +133,8 @@ paths:
+           $ref: "#/components/responses/Forbidden"
+         "409":
+           $ref: "#/components/responses/Conflict"
++        "503":
++          $ref: "#/components/responses/ServiceUnavailable"
+ 
+ 
+   /api/v1/inference-services/{name}:
+@@ -162,6 +166,8 @@ paths:
+           $ref: "#/components/responses/Forbidden"
+         "404":
+           $ref: "#/components/responses/NotFound"
++        "503":
++          $ref: "#/components/responses/ServiceUnavailable"
+     delete:
+       tags: [inference-services]
+       summary: 删除推理服务（受控删除：finalizer 驱动受控释放）
+@@ -186,6 +192,8 @@ paths:
+           $ref: "#/components/responses/NotFound"
+         "409":
+           $ref: "#/components/responses/Conflict"
++        "503":
++          $ref: "#/components/responses/ServiceUnavailable"
+ 
+ 
+   /api/v1/workflows:
+@@ -453,4 +461,12 @@ components:
+         application/json:
+           schema:
+             $ref: "#/components/schemas/Error"
++    ServiceUnavailable:
++      description: >-
++        所依赖的组件未就绪（错误码 AUTHENTICATOR_UNAVAILABLE、REGISTRY_UNAVAILABLE 等）：
++        控制平面未完成组装或正在关闭，不会以临时内存库或放行兜底。
++      content:
++        application/json:
++          schema:
++            $ref: "#/components/schemas/Error"
+ 
+diff --git a/packages/control-plane/src/forgemesh/controlplane/api/dependencies.py b/packages/control-plane/src/forgemesh/controlplane/api/dependencies.py
+index 1224e14..6ae7346 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/api/dependencies.py
++++ b/packages/control-plane/src/forgemesh/controlplane/api/dependencies.py
+@@ -2,7 +2,9 @@
+ 
+ 组件组装模式（对齐 development-plan 8.2「组装与依赖注入」）：
+ 
+-* ``Registry`` —— 由 :func:`init_registry` 初始化，未初始化时以内存库兜底；
++* ``Registry`` —— 由 :func:`init_registry` 初始化；未初始化时 :func:`get_registry` 抛出
++  :class:`ComponentNotReadyError`，依赖它的端点经 :func:`require_registry` 返回 503
++  （``REGISTRY_UNAVAILABLE``），不以内存库兜底（否则配置错误时数据只写进进程内存）；
+ * ``WorkflowRuntime`` / ``DecisionRouter`` —— 由组装方（部署入口/测试）通过
+   :func:`init_workflow_runtime` / :func:`init_decision_router` 显式注入；
+   未注入时 :func:`get_workflow_runtime` / :func:`get_decision_router` 抛出
+@@ -69,12 +71,26 @@ def init_registry(db_path: str = ":memory:") -> SQLiteRegistry:
+ 
+ 
+ def get_registry() -> SQLiteRegistry:
+-    """获取当前 Registry 实例；未初始化时以内存库兜底。"""
++    """获取已初始化的 Registry；未初始化时抛 :class:`ComponentNotReadyError`。"""
+     if _registry is None:
+-        return init_registry()
++        raise ComponentNotReadyError("Registry 未初始化：请先调用 init_registry(...) 完成组装。")
+     return _registry
+ 
+ 
++def reset_registry() -> None:
++    """清空已初始化的 Registry（应用关闭与测试用）；连接由持有方关闭。"""
++    global _registry
++    _registry = None
++
++
++async def require_registry() -> SQLiteRegistry:
++    """端点依赖：返回已初始化的 Registry；未初始化时返回 503 错误信封。"""
++    try:
++        return get_registry()
++    except ComponentNotReadyError as exc:
++        raise ApiError(503, "REGISTRY_UNAVAILABLE", str(exc)) from exc
++
++
+ def init_workflow_runtime(runtime: WorkflowRuntime) -> WorkflowRuntime:
+     """注入全局 WorkflowRuntime 实例（``POST /api/v1/workflows`` 使用）。
+ 
+diff --git a/packages/control-plane/src/forgemesh/controlplane/api/routes.py b/packages/control-plane/src/forgemesh/controlplane/api/routes.py
+index 3b5a0b4..f4fd3de 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/api/routes.py
++++ b/packages/control-plane/src/forgemesh/controlplane/api/routes.py
+@@ -36,13 +36,14 @@ from forgemesh.workflow.runtime import WorkflowDefinition
+ from pydantic import BaseModel, ConfigDict, Field, ValidationError
+ 
+ from ..app import error_envelope
++from ..registry import SQLiteRegistry
+ from .dependencies import (
+     ComponentNotReadyError,
+     get_decision_router,
+-    get_registry,
+     get_tenant_id,
+     get_workflow_runtime,
+     require_read,
++    require_registry,
+     require_write,
+ )
+ from .errors import validation_details
+@@ -114,6 +115,7 @@ def _invalid_limit(limit: int) -> JSONResponse | None:
+ async def create_inference_service(
+     body: dict[str, Any],
+     tenant_id: str = Depends(get_tenant_id),
++    registry: SQLiteRegistry = Depends(require_registry),
+     x_correlation_id: str | None = Header(default=None, alias="X-Correlation-Id"),
+ ) -> Any:
+     """创建推理服务（201）。
+@@ -134,7 +136,7 @@ async def create_inference_service(
+     except ValueError as exc:
+         return _error_response(400, "BAD_REQUEST", str(exc), correlation_id)
+     try:
+-        created = await get_registry().put(resource)
++        created = await registry.put(resource)
+     except ConflictError as exc:
+         return _error_response(409, "CONFLICT", str(exc), correlation_id)
+     return JSONResponse(status_code=201, content=created.model_dump(by_alias=True, mode="json"))
+@@ -143,13 +145,13 @@ async def create_inference_service(
+ @router.get("/inference-services", dependencies=[Depends(require_read)])
+ async def list_inference_services(
+     tenant_id: str = Depends(get_tenant_id),
++    registry: SQLiteRegistry = Depends(require_registry),
+     namespace: str | None = None,
+     limit: int = 100,
+ ) -> Any:
+     """列出推理服务（可选按 namespace 过滤、limit 分页）。"""
+     if (invalid := _invalid_limit(limit)) is not None:
+         return invalid
+-    registry = get_registry()
+     items = await registry.list("InferenceService", tenant_id, namespace=namespace, limit=limit)
+     return {"items": [r.model_dump(by_alias=True) for r in items], "count": len(items)}
+ 
+@@ -158,10 +160,10 @@ async def list_inference_services(
+ async def get_inference_service(
+     name: str,
+     tenant_id: str = Depends(get_tenant_id),
++    registry: SQLiteRegistry = Depends(require_registry),
+     namespace: str | None = None,
+ ) -> dict[str, Any]:
+     """获取单个推理服务；不存在时返回 HTTP 404。"""
+-    registry = get_registry()
+     try:
+         resource = await registry.get("InferenceService", namespace, name, tenant_id)
+     except NotFoundError as exc:
+@@ -173,6 +175,7 @@ async def get_inference_service(
+ async def delete_inference_service(
+     name: str,
+     tenant_id: str = Depends(get_tenant_id),
++    registry: SQLiteRegistry = Depends(require_registry),
+     namespace: str | None = None,
+ ) -> Any:
+     """删除推理服务（受控删除语义，对齐 development-plan 第 7 章除闭环）。
+@@ -186,7 +189,6 @@ async def delete_inference_service(
+ 
+     不存在时返回 HTTP 404（不变）。
+     """
+-    registry = get_registry()
+     try:
+         result = await registry.request_delete("InferenceService", namespace, name, tenant_id)
+     except NotFoundError as exc:
+@@ -206,6 +208,7 @@ async def delete_inference_service(
+ @router.get("/resources", dependencies=[Depends(require_read)])
+ async def list_resources(
+     tenant_id: str = Depends(get_tenant_id),
++    registry: SQLiteRegistry = Depends(require_registry),
+     kind: str | None = None,
+     namespace: str | None = None,
+     limit: int = 100,
+@@ -216,7 +219,6 @@ async def list_resources(
+     """
+     if (invalid := _invalid_limit(limit)) is not None:
+         return invalid
+-    registry = get_registry()
+     if kind:
+         items = await registry.list(kind, tenant_id, namespace=namespace, limit=limit)
+     else:
+diff --git a/packages/control-plane/src/forgemesh/controlplane/app.py b/packages/control-plane/src/forgemesh/controlplane/app.py
+index e735f6a..1526424 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/app.py
++++ b/packages/control-plane/src/forgemesh/controlplane/app.py
+@@ -222,6 +222,7 @@ if _FASTAPI_AVAILABLE:
+             init_authenticator,
+             init_registry,
+             reset_authenticator,
++            reset_registry,
+         )
+         from .api.errors import install_exception_handlers
+ 
+@@ -248,6 +249,7 @@ if _FASTAPI_AVAILABLE:
+             async with AsyncExitStack() as cleanup:
+                 registry = init_registry(path)
+                 cleanup.push_async_callback(registry.close)
++                cleanup.callback(reset_registry)
+                 logger.info("control plane registry opened: %s", path)
+                 init_authenticator(auth)
+                 cleanup.callback(reset_authenticator)
+diff --git a/tests/unit/controlplane/test_api.py b/tests/unit/controlplane/test_api.py
+index fc29736..7d818a1 100644
+--- a/tests/unit/controlplane/test_api.py
++++ b/tests/unit/controlplane/test_api.py
+@@ -21,7 +21,13 @@ import pytest
+ from fastapi import FastAPI
+ from fastapi.testclient import TestClient
+ from forgemesh.controlplane.api import create_api_router
+-from forgemesh.controlplane.api.dependencies import get_registry, init_registry
++from forgemesh.controlplane.api.dependencies import (
++    ComponentNotReadyError,
++    get_registry,
++    init_registry,
++    reset_registry,
++)
++from forgemesh.controlplane.api.errors import install_exception_handlers
+ from forgemesh.core.objects import ObjectMeta
+ from forgemesh.core.scheduler import AllocatedDevice, ResourceRef
+ from forgemesh.resource.inference import (
+@@ -233,6 +239,38 @@ def test_create_rejects_invalid_body(client: TestClient, mutate) -> None:
+     assert listed["count"] == 0
+ 
+ 
++@pytest.mark.parametrize(
++    ("method", "path"),
++    [
++        ("GET", "/api/v1/inference-services"),
++        ("POST", "/api/v1/inference-services"),
++        ("GET", "/api/v1/inference-services/svc-1"),
++        ("DELETE", "/api/v1/inference-services/svc-1"),
++        ("GET", "/api/v1/resources?kind=InferenceService"),
++    ],
++)
++def test_routes_report_an_uninitialised_registry(method: str, path: str) -> None:
++    """Registry 未初始化：返回 503 错误信封，不以内存库兜底；认证仍先于它检查。"""
++    reset_registry()
++    app = FastAPI()
++    install_exception_handlers(app)
++    app.include_router(create_api_router())
++    client = TestClient(app)
++    body = _payload() if method == "POST" else None
++
++    resp = client.request(
++        method, path, json=body, headers={**TENANT_HEADERS, "X-Correlation-Id": "corr-1"}
++    )
++    unauthenticated = client.request(method, path, json=body)
++
++    assert resp.status_code == 503, resp.text
++    error = resp.json()["error"]
++    assert (error["code"], error["correlationId"]) == ("REGISTRY_UNAVAILABLE", "corr-1")
++    assert unauthenticated.status_code == 401
++    with pytest.raises(ComponentNotReadyError):
++        get_registry()
++
++
+ @pytest.mark.parametrize("path", ["/api/v1/inference-services", "/api/v1/resources"])
+ @pytest.mark.parametrize("limit", [-1, 0, 1001])
+ def test_list_rejects_out_of_range_limit(client: TestClient, path: str, limit: int) -> None:
+diff --git a/tests/unit/controlplane/test_app.py b/tests/unit/controlplane/test_app.py
+index 5e86fce..640089f 100644
+--- a/tests/unit/controlplane/test_app.py
++++ b/tests/unit/controlplane/test_app.py
+@@ -17,6 +17,7 @@ from forgemesh.controlplane.api.dependencies import (
+     ComponentNotReadyError,
+     get_authenticator,
+     get_registry,
++    reset_registry,
+     reset_runtime_components,
+ )
+ from forgemesh.controlplane.app import DB_PATH_ENV, create_app
+@@ -146,6 +147,28 @@ def test_readyz_reports_unavailable_registry(tmp_path) -> None:
+         assert not_ready.json()["error"]["code"] == "NOT_READY"
+ 
+ 
++@pytest.mark.unit
++def test_readyz_reports_an_uninitialised_registry(tmp_path) -> None:
++    """lifespan 没有运行时 Registry 未初始化：就绪探针报告 503，而不是悄悄打开一个内存库。"""
++    reset_registry()
++    client = TestClient(create_app(db_path=str(tmp_path / "cp.db")))
++
++    response = client.get("/readyz")
++
++    assert response.status_code == 503
++    assert response.json()["error"]["code"] == "NOT_READY"
++    assert not (tmp_path / "cp.db").exists()
++
++
++@pytest.mark.unit
++def test_stopping_the_app_releases_the_registry(tmp_path) -> None:
++    with TestClient(create_app(db_path=str(tmp_path / "cp.db"))) as client:
++        assert client.get("/readyz").status_code == 200
++
++    with pytest.raises(ComponentNotReadyError):
++        get_registry()
++
++
+ @pytest.mark.unit
+ def test_framework_errors_use_the_error_envelope(tmp_path) -> None:
+     with TestClient(create_app(db_path=str(tmp_path / "cp.db"))) as client:
+@@ -361,7 +384,15 @@ def test_failed_controller_start_releases_the_registry_and_authenticator(
+     async def failing_start(self: ControllerManager) -> None:
+         raise RuntimeError("controller failed to start")
+ 
++    closed: list[SQLiteRegistry] = []
++    close = SQLiteRegistry.close
++
++    async def recording_close(self: SQLiteRegistry) -> None:
++        closed.append(self)
++        await close(self)
++
+     monkeypatch.setattr(ControllerManager, "start", failing_start)
++    monkeypatch.setattr(SQLiteRegistry, "close", recording_close)
+ 
+     with (
+         pytest.raises(RuntimeError, match="controller failed to start"),
+@@ -371,5 +402,8 @@ def test_failed_controller_start_releases_the_registry_and_authenticator(
+ 
+     with pytest.raises(ComponentNotReadyError):
+         get_authenticator()
++    with pytest.raises(ComponentNotReadyError):
++        get_registry()
++    [registry] = closed
+     with pytest.raises(sqlite3.ProgrammingError):
+-        asyncio.run(get_registry().ping())
++        asyncio.run(registry.ping())
+-- 
+2.43.0
+

@@ -1,0 +1,1542 @@
+From 1fb4d68a59a4c7a05d4ff75ad1fbe0aa6e49d317 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 13 Oct 2026 03:00:09 +0000
+Subject: [PATCH 04/10] feat(api): add PUT and PATCH for inference services
+
+A deployed service could not be changed through the API at all: the
+only way to alter its desired state was to delete and re-create it.
+
+PUT /api/v1/inference-services/{name} replaces spec, labels and
+annotations; PATCH on the same path applies an RFC 7386 JSON merge
+patch (application/merge-patch+json, otherwise 415) to the current
+representation and then follows the same rules. Both need the write
+scope and take the namespace query parameter like GET and DELETE.
+The update goes through SQLiteRegistry.update_spec, so only a spec
+change increments generation, a no-op update is not written, and the
+status written by the controller is never overwritten.
+
+kind, apiVersion, metadata.name, metadata.namespace and the tenant are
+immutable (400 when a document tries to change them); status,
+conditions, finalizers, generation and observedGeneration are ignored
+on input. metadata.uid, metadata.resourceVersion and If-Match are
+optimistic concurrency preconditions: a mismatch, as well as an update
+of a Terminating resource, is a 409 error envelope whose
+details.reason says why. A failed If-Match also returns 409 rather
+than 412, so clients handle every concurrency failure the same way.
+
+Single-resource responses (GET, POST, PUT, PATCH) carry a strong ETag
+built from the uid and the resource version, so a resource deleted
+and re-created under the same name, whose version restarts at 0,
+never matches an old ETag. Without client preconditions the server
+retries a few times when the controller writes in between read and
+write.
+
+Create now rejects unknown top-level fields with 400 instead of
+silently ignoring them, so the same document is accepted or rejected
+the same way by POST and PUT, and a GET response can be posted back.
+---
+ api/openapi/openapi.yaml                      | 152 +++-
+ .../src/forgemesh/controlplane/api/routes.py  | 185 ++++-
+ .../src/forgemesh/controlplane/api/updates.py | 264 +++++++
+ tests/unit/controlplane/test_api.py           |   4 +-
+ tests/unit/controlplane/test_api_updates.py   | 668 ++++++++++++++++++
+ tests/unit/controlplane/test_auth.py          |  13 +
+ 6 files changed, 1254 insertions(+), 32 deletions(-)
+ create mode 100644 packages/control-plane/src/forgemesh/controlplane/api/updates.py
+ create mode 100644 tests/unit/controlplane/test_api_updates.py
+
+diff --git a/api/openapi/openapi.yaml b/api/openapi/openapi.yaml
+index 029ac75..a0a6eb3 100644
+--- a/api/openapi/openapi.yaml
++++ b/api/openapi/openapi.yaml
+@@ -23,7 +23,7 @@ security:
+   - apiKey: []
+ tags:
+   - name: inference-services
+-    description: 推理服务声明式生命周期管理（创建/查询/删除）
++    description: 推理服务声明式生命周期管理（创建/查询/更新/删除）
+   - name: workflows
+     description: 工作流运行启动与状态查询
+   - name: decisions
+@@ -120,7 +120,10 @@ paths:
+               $ref: "#/components/schemas/InferenceService"
+       responses:
+         "201":
+-          description: 已创建
++          description: 已创建（generation 为 1，observedGeneration 为 0）
++          headers:
++            ETag:
++              $ref: "#/components/headers/ETag"
+           content:
+             application/json:
+               schema:
+@@ -156,6 +159,9 @@ paths:
+       responses:
+         "200":
+           description: 资源
++          headers:
++            ETag:
++              $ref: "#/components/headers/ETag"
+           content:
+             application/json:
+               schema:
+@@ -168,6 +174,90 @@ paths:
+           $ref: "#/components/responses/NotFound"
+         "503":
+           $ref: "#/components/responses/ServiceUnavailable"
++    put:
++      tags: [inference-services]
++      summary: 整体替换推理服务的 spec / labels / annotations
++      operationId: replaceInferenceService
++      description: >-
++        请求体是完整的资源文档（GET 的响应修改后可直接提交）。spec、metadata.labels 与
++        metadata.annotations 整体替换（省略 labels / annotations 即清空）；只有 spec 变化时
++        generation 递增，labels / annotations 变化不递增，没有任何变化时不写入、版本不变。
++        kind、apiVersion、metadata.name、metadata.namespace 与租户不可修改：给出时必须与当前
++        资源一致，否则 400。status、conditions、finalizers、generation、observedGeneration
++        被忽略。metadata.uid / metadata.resourceVersion 给出时是前置条件，与 If-Match 一样，
++        不满足时返回 409；处于 Terminating 的资源拒绝更新（409）。
++        已经 Ready 的服务在 spec 变化后保持 generation 大于 observedGeneration，直到控制器
++        处理新的 spec。
++      parameters:
++        - $ref: "#/components/parameters/IfMatch"
++      requestBody:
++        required: true
++        content:
++          application/json:
++            schema:
++              $ref: "#/components/schemas/InferenceService"
++      responses:
++        "200":
++          description: 更新后的资源（没有变化时为当前资源）
++          headers:
++            ETag:
++              $ref: "#/components/headers/ETag"
++          content:
++            application/json:
++              schema:
++                $ref: "#/components/schemas/InferenceService"
++        "400":
++          $ref: "#/components/responses/BadRequest"
++        "401":
++          $ref: "#/components/responses/Unauthorized"
++        "403":
++          $ref: "#/components/responses/Forbidden"
++        "404":
++          $ref: "#/components/responses/NotFound"
++        "409":
++          $ref: "#/components/responses/Conflict"
++        "503":
++          $ref: "#/components/responses/ServiceUnavailable"
++    patch:
++      tags: [inference-services]
++      summary: 以 JSON Merge Patch（RFC 7386）更新推理服务
++      operationId: patchInferenceService
++      description: >-
++        补丁合并到当前资源的 JSON 表示（与 GET 的响应相同）之后，按与 PUT 相同的规则检查并
++        写入：null 删除字段，对象逐字段合并，数组整体替换。补丁中没有给出的字段沿用当前值，
++        所以只有补丁里给出的 metadata.resourceVersion / metadata.uid 才构成前置条件。
++      parameters:
++        - $ref: "#/components/parameters/IfMatch"
++      requestBody:
++        required: true
++        content:
++          application/merge-patch+json:
++            schema:
++              $ref: "#/components/schemas/InferenceServicePatch"
++      responses:
++        "200":
++          description: 更新后的资源（没有变化时为当前资源）
++          headers:
++            ETag:
++              $ref: "#/components/headers/ETag"
++          content:
++            application/json:
++              schema:
++                $ref: "#/components/schemas/InferenceService"
++        "400":
++          $ref: "#/components/responses/BadRequest"
++        "401":
++          $ref: "#/components/responses/Unauthorized"
++        "403":
++          $ref: "#/components/responses/Forbidden"
++        "404":
++          $ref: "#/components/responses/NotFound"
++        "409":
++          $ref: "#/components/responses/Conflict"
++        "415":
++          $ref: "#/components/responses/UnsupportedMediaType"
++        "503":
++          $ref: "#/components/responses/ServiceUnavailable"
+     delete:
+       tags: [inference-services]
+       summary: 删除推理服务（受控删除：finalizer 驱动受控释放）
+@@ -249,6 +339,23 @@ paths:
+ 
+ 
+ components:
++  parameters:
++    IfMatch:
++      name: If-Match
++      in: header
++      required: false
++      description: >-
++        乐观并发前置条件：取自资源响应的 ETag（强比较，弱标签永不匹配；* 表示资源存在即可）。
++        与当前 ETag 不匹配返回 409（details.reason 为 ResourceVersionMismatch）。
++      schema:
++        type: string
++  headers:
++    ETag:
++      description: >-
++        资源当前版本的强实体标签（不透明字符串，可原样用于 If-Match）：resourceVersion 变化时
++        随之变化，同名资源删除后重建也不会得到旧的 ETag。
++      schema:
++        type: string
+   securitySchemes:
+     apiKey:
+       type: http
+@@ -288,8 +395,10 @@ components:
+               type: string
+     InferenceService:
+       type: object
+-      description: "权威 Schema: api/schemas/inference-service.schema.json（此处为骨架摘要）。"
+-      additionalProperties: true
++      description: >-
++        权威 Schema: api/schemas/inference-service.schema.json（此处为 API 表示的摘要）。
++        status、conditions、finalizers 由控制平面维护，请求中的值被忽略；未知的顶层字段返回 400。
++      additionalProperties: false
+       required: [apiVersion, kind, metadata, spec]
+       properties:
+         apiVersion:
+@@ -303,6 +412,24 @@ components:
+           additionalProperties: true
+         status:
+           $ref: "#/components/schemas/InferenceServiceStatus"
++        conditions:
++          type: array
++          readOnly: true
++          items:
++            type: object
++            additionalProperties: true
++        finalizers:
++          type: array
++          readOnly: true
++          description: 受控删除的阻塞器，由控制平面维护。
++          items:
++            type: string
++    InferenceServicePatch:
++      type: object
++      description: >-
++        JSON Merge Patch 文档（RFC 7386）：合并到当前资源的 JSON 表示之后，结果须满足
++        InferenceService 与 PUT 的规则。
++      additionalProperties: true
+     ObjectMeta:
+       type: object
+       description: >-
+@@ -500,7 +627,22 @@ components:
+           schema:
+             $ref: "#/components/schemas/Error"
+     Conflict:
+-      description: 并发冲突/已存在
++      description: >-
++        冲突（错误码 CONFLICT）：同名资源已存在，或写入被拒绝。更新被拒绝时 details.reason
++        说明原因：ResourceVersionMismatch（resourceVersion 或 If-Match 与当前版本不符，重新
++        读取后重试）、UidMismatch（同名资源已被删除并重建）、Terminating（资源正在删除，不再
++        接受更新）。
++      content:
++        application/json:
++          schema:
++            $ref: "#/components/schemas/Error"
++    UnsupportedMediaType:
++      description: 请求体的媒体类型不受支持（错误码 UNSUPPORTED_MEDIA_TYPE）。
++      headers:
++        Accept-Patch:
++          description: PATCH 接受的媒体类型，固定为 application/merge-patch+json。
++          schema:
++            type: string
+       content:
+         application/json:
+           schema:
+diff --git a/packages/control-plane/src/forgemesh/controlplane/api/routes.py b/packages/control-plane/src/forgemesh/controlplane/api/routes.py
+index 65d8249..4b47c24 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/api/routes.py
++++ b/packages/control-plane/src/forgemesh/controlplane/api/routes.py
+@@ -5,6 +5,9 @@
+ * ``POST   /inference-services``          —— 创建推理服务
+ * ``GET    /inference-services``          —— 列出推理服务
+ * ``GET    /inference-services/{name}``   —— 获取单个推理服务
++* ``PUT    /inference-services/{name}``   —— 整体替换 spec / labels / annotations
++* ``PATCH  /inference-services/{name}``   —— JSON Merge Patch（RFC 7386）更新，规则同 PUT
++  （见 :mod:`.updates`；单个资源的响应带 ``ETag``，``If-Match`` 不匹配返回 409）
+ * ``DELETE /inference-services/{name}``   —— 删除推理服务（受控删除：无
+   finalizer 且没有加速器分配 → 204 物理删除；有 finalizer 或分配 → 202
+   ``Terminating``，协调器驱动受控释放后物理删除，见 development-plan 第 7 章）
+@@ -24,19 +27,22 @@
+ 
+ from __future__ import annotations
+ 
++import json
++from collections.abc import Callable
+ from typing import Any
+ from uuid import uuid4
+ 
+-from fastapi import APIRouter, Depends, Header, HTTPException
++from fastapi import APIRouter, Depends, Header, HTTPException, Request
+ from fastapi.responses import JSONResponse, Response
+ from forgemesh.core.errors import ConflictError, NotFoundError
++from forgemesh.core.objects import Resource
+ from forgemesh.decision.provider import DecisionRequest as InternalDecisionRequest
+ from forgemesh.resource.inference import InferenceService
+ from forgemesh.workflow.runtime import WorkflowDefinition
+ from pydantic import BaseModel, ConfigDict, Field, ValidationError
+ 
+ from ..app import error_envelope
+-from ..registry import SQLiteRegistry
++from ..registry import ConflictReason, SQLiteRegistry
+ from .dependencies import (
+     ComponentNotReadyError,
+     get_decision_router,
+@@ -46,10 +52,22 @@ from .dependencies import (
+     require_registry,
+     require_write,
+ )
+-from .errors import validation_details
++from .errors import ApiError, validation_details
++from .updates import (
++    MERGE_PATCH_MEDIA_TYPE,
++    SERVER_OWNED_METADATA,
++    apply_merge_patch,
++    check_update,
++    conflict,
++    etag_of,
++    parse_if_match,
++    unknown_fields,
++)
+ 
+ router = APIRouter(prefix="/api/v1")
+ 
++_KIND = "InferenceService"
++
+ 
+ class ResourceListResponse(BaseModel):
+     """资源列表响应。"""
+@@ -58,44 +76,38 @@ class ResourceListResponse(BaseModel):
+     count: int
+ 
+ 
+-#: 由服务端维护、创建请求中一律忽略的元数据字段。已验证凭证中的租户是权威来源，
+-#: 覆盖请求体中的租户字段，防止跨租户伪造；generation 只由服务端在 spec 变化时递增，
+-#: observedGeneration 只由控制器写入。
+-_SERVER_OWNED_METADATA = (
+-    "tenant_id",
+-    "tenantId",
+-    "uid",
+-    "resourceVersion",
+-    "generation",
+-    "observedGeneration",
+-    "observed_generation",
+-)
+-
+ #: 新建资源的 ``metadata.generation``（``observedGeneration`` 为 0：控制器尚未处理）。
+ INITIAL_GENERATION = 1
+ 
+ #: 列表接口单页条数上限。
+ MAX_LIST_LIMIT = 1000
+ 
++#: PUT / PATCH 在读取与写入之间遇到并发写入（如控制器写 status）时重新读取并重试，
++#: 这是总尝试次数。
++_UPDATE_ATTEMPTS = 5
++
+ 
+ def _build_inference_service(body: dict[str, Any], tenant_id: str) -> InferenceService:
+     """从请求体构造强类型 :class:`InferenceService`（OpenAPI 要求必须携带 ``spec``）。
+ 
+     租户取自已验证的凭证，``uid`` 由服务端分配，``generation`` 从
+-    :data:`INITIAL_GENERATION` 开始；``status`` 属于观测状态，只能由控制器写入，
+-    创建请求中的 ``status`` 与 generation 字段被忽略。
++    :data:`INITIAL_GENERATION` 开始；``status`` / ``conditions`` / ``finalizers`` 由控制
++    平面维护，创建请求中的这些字段与 generation 字段被忽略。
+ 
+     Raises:
+-        ValueError: ``kind`` 不是 ``InferenceService``，或 ``metadata`` 不是对象。
++        ValueError: 含未知的顶层字段，``kind`` 不是 ``InferenceService``，或 ``metadata``
++            不是对象。
+         pydantic.ValidationError: ``metadata`` / ``spec`` 不满足模型约束。
+     """
++    if unknown := unknown_fields(body):
++        raise ValueError(f"unknown top-level fields: {unknown}")
+     kind = body.get("kind", "InferenceService")
+     if kind != "InferenceService":
+         raise ValueError(f"kind must be 'InferenceService' on this endpoint, got {kind!r}")
+     metadata = body.get("metadata")
+     if not isinstance(metadata, dict):
+         raise ValueError("metadata must be an object")
+-    metadata = {k: v for k, v in metadata.items() if k not in _SERVER_OWNED_METADATA}
++    metadata = {k: v for k, v in metadata.items() if k not in SERVER_OWNED_METADATA}
+     metadata["tenantId"] = tenant_id
+     metadata["uid"] = uuid4().hex
+     metadata["generation"] = INITIAL_GENERATION
+@@ -120,6 +132,15 @@ def _invalid_limit(limit: int) -> JSONResponse | None:
+     )
+ 
+ 
++def _resource_response(resource: Resource, status_code: int = 200) -> JSONResponse:
++    """单个资源的 JSON 表示，附带当前版本的 ``ETag``。"""
++    return JSONResponse(
++        status_code=status_code,
++        content=resource.model_dump(by_alias=True, mode="json"),
++        headers={"ETag": etag_of(resource)},
++    )
++
++
+ # ------------------------------------------------------------------ #
+ # 推理服务 CRUD
+ # ------------------------------------------------------------------ #
+@@ -132,9 +153,10 @@ async def create_inference_service(
+     registry: SQLiteRegistry = Depends(require_registry),
+     x_correlation_id: str | None = Header(default=None, alias="X-Correlation-Id"),
+ ) -> Any:
+-    """创建推理服务（201）。
++    """创建推理服务（201，附 ``ETag``）。
+ 
+-    请求体不合法（缺少 ``spec``、kind 不匹配等）返回 400；同名资源已存在返回 409。
++    请求体不合法（缺少 ``spec``、kind 不匹配、未知的顶层字段等）返回 400；同名资源已存在
++    返回 409。
+     """
+     correlation_id = x_correlation_id or uuid4().hex
+     try:
+@@ -153,7 +175,7 @@ async def create_inference_service(
+         created = await registry.put(resource)
+     except ConflictError as exc:
+         return _error_response(409, "CONFLICT", str(exc), correlation_id)
+-    return JSONResponse(status_code=201, content=created.model_dump(by_alias=True, mode="json"))
++    return _resource_response(created, status_code=201)
+ 
+ 
+ @router.get("/inference-services", dependencies=[Depends(require_read)])
+@@ -176,13 +198,124 @@ async def get_inference_service(
+     tenant_id: str = Depends(get_tenant_id),
+     registry: SQLiteRegistry = Depends(require_registry),
+     namespace: str | None = None,
+-) -> dict[str, Any]:
+-    """获取单个推理服务；不存在时返回 HTTP 404。"""
++) -> JSONResponse:
++    """获取单个推理服务（附 ``ETag``）；不存在时返回 HTTP 404。"""
+     try:
+         resource = await registry.get("InferenceService", namespace, name, tenant_id)
+     except NotFoundError as exc:
+         raise HTTPException(status_code=404, detail=f"InferenceService '{name}' not found") from exc
+-    return resource.model_dump(by_alias=True)
++    return _resource_response(resource)
++
++
++async def _update_inference_service(
++    registry: SQLiteRegistry,
++    tenant_id: str,
++    name: str,
++    namespace: str | None,
++    if_match: list[str] | None,
++    document_for: Callable[[dict[str, Any]], Any],
++) -> JSONResponse:
++    """PUT / PATCH 的共同流程：读取当前资源 → 生成更新文档 → 检查 → CAS 写入。
++
++    ``document_for`` 由当前资源的 JSON 表示得到更新文档。客户端的前置条件每一轮都对照
++    这一轮读到的资源检查，写入以读到的 uid 与版本为条件；读取之后资源被并发修改（如
++    控制器写入 status）时重新读取再来一轮，不会覆盖并发写入，也不会绕过前置条件。
++    """
++    condition = parse_if_match(if_match)
++    for _ in range(_UPDATE_ATTEMPTS):
++        try:
++            current, phase = await registry.get_with_phase(_KIND, namespace, name, tenant_id)
++        except NotFoundError as exc:
++            raise ApiError(404, "NOT_FOUND", f"InferenceService '{name}' not found") from exc
++        if phase == "Terminating":
++            raise conflict(
++                f"InferenceService '{name}' is terminating and no longer accepts updates",
++                ConflictReason.TERMINATING,
++            )
++        document = document_for(current.model_dump(by_alias=True, mode="json"))
++        desired = check_update(document, current, tenant_id=tenant_id, if_match=condition)
++        try:
++            updated = await registry.update_spec(
++                _KIND,
++                namespace,
++                name,
++                tenant_id,
++                desired.spec,
++                labels=desired.labels,
++                annotations=desired.annotations,
++                expected_version=current.metadata.resourceVersion,
++                expected_uid=current.metadata.uid,
++            )
++        except NotFoundError as exc:
++            raise ApiError(404, "NOT_FOUND", f"InferenceService '{name}' not found") from exc
++        except ConflictError as exc:
++            if (exc.details or {}).get("reason") == ConflictReason.TERMINATING:
++                raise conflict(exc.message, ConflictReason.TERMINATING) from exc
++            continue
++        return _resource_response(updated)
++    raise conflict(
++        f"InferenceService '{name}' kept changing while the update was applied; retry",
++        ConflictReason.RESOURCE_VERSION,
++    )
++
++
++@router.put("/inference-services/{name}", dependencies=[Depends(require_write)])
++async def replace_inference_service(
++    name: str,
++    body: dict[str, Any],
++    tenant_id: str = Depends(get_tenant_id),
++    registry: SQLiteRegistry = Depends(require_registry),
++    namespace: str | None = None,
++    if_match: list[str] | None = Header(default=None, alias="If-Match"),
++) -> JSONResponse:
++    """整体替换推理服务的 ``spec``、labels 与 annotations（200，附 ``ETag``）。
++
++    文档规则见 :mod:`.updates`：只有 ``spec`` 变化时 ``generation`` 递增，没有变化的请求
++    不写库。错误：文档不合法或试图修改不可变字段 400；不存在 404；资源处于 Terminating，
++    或 uid / resourceVersion / If-Match 前置条件不满足 409（``details.reason``）。
++    """
++    return await _update_inference_service(
++        registry, tenant_id, name, namespace, if_match, lambda _current: body
++    )
++
++
++@router.patch("/inference-services/{name}", dependencies=[Depends(require_write)])
++async def patch_inference_service(
++    name: str,
++    request: Request,
++    tenant_id: str = Depends(get_tenant_id),
++    registry: SQLiteRegistry = Depends(require_registry),
++    namespace: str | None = None,
++    if_match: list[str] | None = Header(default=None, alias="If-Match"),
++) -> JSONResponse:
++    """以 JSON Merge Patch（RFC 7386）更新推理服务（200，附 ``ETag``）。
++
++    补丁合并到当前资源的 JSON 表示（与 GET 的响应相同）之后，按与 PUT 相同的规则检查
++    并写入。错误：媒体类型不是 ``application/merge-patch+json`` 415；补丁不是 JSON 对象
++    400；其余同 PUT。
++    """
++    media_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
++    if media_type != MERGE_PATCH_MEDIA_TYPE:
++        raise ApiError(
++            415,
++            "UNSUPPORTED_MEDIA_TYPE",
++            f"PATCH requires Content-Type: {MERGE_PATCH_MEDIA_TYPE}",
++            headers={"Accept-Patch": MERGE_PATCH_MEDIA_TYPE},
++        )
++    try:
++        patch = json.loads(await request.body())
++    except ValueError as exc:
++        raise ApiError(400, "BAD_REQUEST", "the merge patch is not valid JSON") from exc
++    if not isinstance(patch, dict):
++        raise ApiError(400, "BAD_REQUEST", "the merge patch must be a JSON object")
++    return await _update_inference_service(
++        registry,
++        tenant_id,
++        name,
++        namespace,
++        if_match,
++        lambda current: apply_merge_patch(current, patch),
++    )
+ 
+ 
+ @router.delete("/inference-services/{name}", dependencies=[Depends(require_write)])
+diff --git a/packages/control-plane/src/forgemesh/controlplane/api/updates.py b/packages/control-plane/src/forgemesh/controlplane/api/updates.py
+new file mode 100644
+index 0000000..97127d0
+--- /dev/null
++++ b/packages/control-plane/src/forgemesh/controlplane/api/updates.py
+@@ -0,0 +1,264 @@
++"""资源更新（``PUT`` / ``PATCH``）：JSON Merge Patch、ETag / If-Match 与更新文档校验。
++
++更新文档是 ``PUT`` 的请求体，或把 ``PATCH`` 的补丁（RFC 7386）合并到当前资源的 JSON
++表示（与 ``GET`` 的响应相同）之后的结果，两者按同一规则解释：
++
++* 顶层只允许 :data:`RESOURCE_FIELDS`；``status`` / ``conditions`` / ``finalizers`` 由控制
++  平面维护，请求中的值被忽略；
++* ``kind``、``apiVersion``、``metadata.name``、``metadata.namespace`` 与租户不可修改：
++  给出时必须与当前资源一致（名称与命名空间即路径与查询参数），否则 400；
++* ``metadata.uid`` / ``metadata.resourceVersion`` 给出时是前置条件，与当前值不同返回
++  409；``If-Match`` 与当前 ETag 不匹配同样返回 409；
++* ``generation`` / ``observedGeneration`` 由服务端维护，请求中的值被忽略；
++* ``spec``、``metadata.labels`` 与 ``metadata.annotations`` 整体替换：文档中没有 labels /
++  annotations 即清空。
++
++PATCH 合并的基础是当前资源，没有改动的字段沿用当前值，因此只有补丁里给出的
++``resourceVersion`` / ``uid`` 才构成前置条件。
++"""
++
++from __future__ import annotations
++
++import copy
++import re
++from collections.abc import Sequence
++from dataclasses import dataclass
++from typing import Any
++
++from forgemesh.core.objects import Resource
++from forgemesh.resource.inference import InferenceService
++from pydantic import ValidationError
++
++from ..registry import ConflictReason
++from .errors import ApiError, validation_details
++
++#: 资源文档允许的顶层字段。
++RESOURCE_FIELDS = frozenset(
++    {"apiVersion", "kind", "metadata", "spec", "status", "conditions", "finalizers"}
++)
++
++#: 由服务端维护的元数据字段：创建时一律忽略；更新时 uid / resourceVersion 作为前置条件，
++#: 租户须与凭证一致，其余忽略。已验证凭证中的租户是权威来源，防止跨租户伪造。
++SERVER_OWNED_METADATA = (
++    "tenant_id",
++    "tenantId",
++    "uid",
++    "resourceVersion",
++    "generation",
++    "observedGeneration",
++    "observed_generation",
++)
++
++#: ``PATCH`` 接受的请求体媒体类型（RFC 7386）。
++MERGE_PATCH_MEDIA_TYPE = "application/merge-patch+json"
++
++#: ``If-Match`` 列表中的一个元素：``*`` 或（可带 ``W/`` 前缀的）实体标签（RFC 9110 8.8.3）；
++#: 列表语法允许空元素（RFC 9110 5.6.1）。
++_IF_MATCH_ELEMENT = re.compile(r'[ \t]*(?:(\*)|(W/)?("[\x21\x23-\x7e\x80-\xff]*"))?[ \t]*(?:,|$)')
++
++
++def unknown_fields(document: dict[str, Any]) -> list[str]:
++    """文档中 :data:`RESOURCE_FIELDS` 以外的顶层字段（排序后返回）。"""
++    return sorted(set(document) - RESOURCE_FIELDS)
++
++
++def apply_merge_patch(target: Any, patch: Any) -> Any:
++    """按 RFC 7386 把 ``patch`` 合并到 ``target``，返回新值（不修改入参）。
++
++    补丁中的 ``null`` 删除对应字段；对象逐字段递归合并；其余值（含数组）整体替换。
++    """
++    if not isinstance(patch, dict):
++        return copy.deepcopy(patch)
++    merged = copy.deepcopy(target) if isinstance(target, dict) else {}
++    for key, value in patch.items():
++        if value is None:
++            merged.pop(key, None)
++        else:
++            merged[key] = apply_merge_patch(merged.get(key), value)
++    return merged
++
++
++def etag_of(resource: Resource) -> str:
++    """资源当前版本的强 ETag（带引号的不透明字符串）。
++
++    同名资源删除后重建时 ``resourceVersion`` 从 0 重新计数，所以 ETag 同时包含 uid：
++    不同的资源实例不会得到同一个 ETag。
++    """
++    meta = resource.metadata
++    if meta.uid is None:
++        return f'"{meta.resourceVersion}"'
++    return f'"{meta.uid}.{meta.resourceVersion}"'
++
++
++@dataclass(frozen=True)
++class IfMatch:
++    """解析后的 ``If-Match`` 请求头。
++
++    Attributes:
++        any: 请求头为 ``*``：资源存在即满足。
++        tags: 强实体标签（含引号）；弱标签按强比较永不匹配，不收录。
++    """
++
++    any: bool
++    tags: frozenset[str]
++
++    def matches(self, etag: str) -> bool:
++        """``etag`` 是否满足该前置条件（强比较）。"""
++        return self.any or etag in self.tags
++
++
++def parse_if_match(values: Sequence[str] | None) -> IfMatch | None:
++    """解析 ``If-Match``（可出现多次，各行等价于逗号连接）；没有该请求头时返回 ``None``。
++
++    Raises:
++        ApiError: 请求头格式错误（400）。
++    """
++    if not values:
++        return None
++    any_tag = False
++    tags: set[str] = set()
++    elements = 0
++    for value in values:
++        position = 0
++        while position < len(value):
++            match = _IF_MATCH_ELEMENT.match(value, position)
++            if match is None or match.end() == position:
++                raise ApiError(400, "BAD_REQUEST", f"malformed If-Match header: {value!r}")
++            star, weak, tag = match.groups()
++            if star or tag:
++                elements += 1
++            if star:
++                any_tag = True
++            elif tag and not weak:
++                tags.add(tag)
++            position = match.end()
++    if not elements:
++        raise ApiError(400, "BAD_REQUEST", "If-Match must list an entity tag or '*'")
++    return IfMatch(any=any_tag, tags=frozenset(tags))
++
++
++@dataclass(frozen=True)
++class DesiredState:
++    """更新文档中可写的部分（已按模型校验并规范化）。"""
++
++    spec: dict[str, Any]
++    labels: dict[str, str]
++    annotations: dict[str, str]
++
++
++def _bad_request(message: str) -> ApiError:
++    return ApiError(400, "BAD_REQUEST", message)
++
++
++def conflict(message: str, reason: ConflictReason) -> ApiError:
++    """409 错误：``details.reason`` 说明拒绝写入的原因。"""
++    return ApiError(409, "CONFLICT", message, details={"reason": reason.value})
++
++
++def check_update(
++    document: Any,
++    current: Resource,
++    *,
++    tenant_id: str,
++    if_match: IfMatch | None,
++) -> DesiredState:
++    """按模块说明的规则检查更新文档，返回要写入的期望状态。
++
++    Args:
++        document: 更新文档（PUT 请求体或 PATCH 合并结果）。
++        current: 当前资源（本次请求读到的版本）。
++        tenant_id: 已验证凭证绑定的租户。
++        if_match: 解析后的 ``If-Match``；没有该请求头时为 ``None``。
++
++    Raises:
++        ApiError: 文档不合法或试图修改不可变字段（400）；前置条件不满足（409）。
++    """
++    if not isinstance(document, dict):
++        raise _bad_request("the resource document must be a JSON object")
++    if unknown := unknown_fields(document):
++        raise ApiError(
++            400, "BAD_REQUEST", f"unknown top-level fields: {unknown}", details={"fields": unknown}
++        )
++    if "kind" in document and document["kind"] != current.kind:
++        raise _bad_request(f"kind is immutable: expected {current.kind!r}")
++    if "apiVersion" in document and document["apiVersion"] != current.apiVersion:
++        raise _bad_request(f"apiVersion is immutable: expected {current.apiVersion!r}")
++    metadata = document.get("metadata")
++    if not isinstance(metadata, dict):
++        raise _bad_request("metadata must be an object")
++    meta = current.metadata
++    if "name" in metadata and metadata["name"] != meta.name:
++        raise _bad_request(f"metadata.name must match the name in the path ({meta.name!r})")
++    if "namespace" in metadata and metadata["namespace"] != meta.namespace:
++        raise _bad_request(
++            f"metadata.namespace must match the namespace query parameter ({meta.namespace!r})"
++        )
++    for key in ("tenantId", "tenant_id"):
++        if metadata.get(key) is not None and metadata[key] != tenant_id:
++            raise _bad_request("the tenant of a resource is immutable")
++    for key in ("uid", "resourceVersion"):
++        if metadata.get(key) is not None and not isinstance(metadata[key], str):
++            raise _bad_request(f"metadata.{key} must be a string")
++    uid = metadata.get("uid")
++    if uid is not None and uid != meta.uid:
++        raise conflict(
++            f"metadata.uid {uid!r} does not match the current resource {meta.uid!r}",
++            ConflictReason.UID,
++        )
++    resource_version = metadata.get("resourceVersion")
++    if resource_version is not None and resource_version != meta.resourceVersion:
++        raise conflict(
++            f"metadata.resourceVersion {resource_version!r} does not match the current "
++            f"version {meta.resourceVersion!r}",
++            ConflictReason.RESOURCE_VERSION,
++        )
++    if if_match is not None and not if_match.matches(etag_of(current)):
++        raise conflict(
++            f"If-Match does not match the current ETag {etag_of(current)}",
++            ConflictReason.RESOURCE_VERSION,
++        )
++
++    labels = metadata.get("labels")
++    annotations = metadata.get("annotations")
++    candidate: dict[str, Any] = {
++        "apiVersion": current.apiVersion,
++        "kind": current.kind,
++        "metadata": {
++            **{k: v for k, v in metadata.items() if k not in SERVER_OWNED_METADATA},
++            "name": meta.name,
++            "namespace": meta.namespace,
++            "labels": {} if labels is None else labels,
++            "annotations": {} if annotations is None else annotations,
++        },
++    }
++    if "spec" in document:
++        candidate["spec"] = document["spec"]
++    try:
++        validated = InferenceService.model_validate(candidate)
++    except ValidationError as exc:
++        raise ApiError(
++            400,
++            "BAD_REQUEST",
++            "inference service update failed validation",
++            details={"errors": validation_details(exc)},
++        ) from exc
++    return DesiredState(
++        spec=validated.spec.model_dump(mode="json"),
++        labels=dict(validated.metadata.labels),
++        annotations=dict(validated.metadata.annotations),
++    )
++
++
++__all__ = [
++    "MERGE_PATCH_MEDIA_TYPE",
++    "RESOURCE_FIELDS",
++    "SERVER_OWNED_METADATA",
++    "DesiredState",
++    "IfMatch",
++    "apply_merge_patch",
++    "check_update",
++    "conflict",
++    "etag_of",
++    "parse_if_match",
++    "unknown_fields",
++]
+diff --git a/tests/unit/controlplane/test_api.py b/tests/unit/controlplane/test_api.py
+index 3e04da2..d908062 100644
+--- a/tests/unit/controlplane/test_api.py
++++ b/tests/unit/controlplane/test_api.py
+@@ -270,6 +270,8 @@ def test_create_rejects_invalid_body(client: TestClient, mutate) -> None:
+         ("GET", "/api/v1/inference-services"),
+         ("POST", "/api/v1/inference-services"),
+         ("GET", "/api/v1/inference-services/svc-1"),
++        ("PUT", "/api/v1/inference-services/svc-1"),
++        ("PATCH", "/api/v1/inference-services/svc-1"),
+         ("DELETE", "/api/v1/inference-services/svc-1"),
+         ("GET", "/api/v1/resources?kind=InferenceService"),
+     ],
+@@ -281,7 +283,7 @@ def test_routes_report_an_uninitialised_registry(method: str, path: str) -> None
+     install_exception_handlers(app)
+     app.include_router(create_api_router())
+     client = TestClient(app)
+-    body = _payload() if method == "POST" else None
++    body = _payload() if method in {"POST", "PUT", "PATCH"} else None
+ 
+     resp = client.request(
+         method, path, json=body, headers={**TENANT_HEADERS, "X-Correlation-Id": "corr-1"}
+diff --git a/tests/unit/controlplane/test_api_updates.py b/tests/unit/controlplane/test_api_updates.py
+new file mode 100644
+index 0000000..f15d104
+--- /dev/null
++++ b/tests/unit/controlplane/test_api_updates.py
+@@ -0,0 +1,668 @@
++"""推理服务更新端点（``PUT`` / ``PATCH``）与 ``ETag`` / ``If-Match`` 单元测试。
++
++覆盖：整体替换与 JSON Merge Patch 的写入结果、generation 只随 spec 递增、服务端维护的
++字段被忽略、不可变字段、uid / resourceVersion / If-Match 前置条件与并发冲突、Terminating
++拒绝更新、媒体类型，以及合并补丁与 If-Match 解析本身。
++"""
++
++from __future__ import annotations
++
++import asyncio
++import copy
++import json
++from typing import Any
++
++import pytest
++from fastapi import FastAPI
++from fastapi.testclient import TestClient
++from forgemesh.controlplane.api import create_api_router
++from forgemesh.controlplane.api.dependencies import get_registry, init_registry
++from forgemesh.controlplane.api.errors import ApiError, install_exception_handlers
++from forgemesh.controlplane.api.updates import IfMatch, apply_merge_patch, parse_if_match
++from forgemesh.controlplane.registry import ConflictReason, SQLiteRegistry
++from forgemesh.core.errors import ConflictError
++from forgemesh.core.objects import ObjectMeta
++from forgemesh.resource.inference import (
++    AcceleratorSpec,
++    InferencePhase,
++    InferenceService,
++    InferenceServiceSpec,
++    InferenceServiceStatus,
++    ModelRef,
++    ResourcesSpec,
++    RuntimeRef,
++)
++
++TENANT_HEADERS = {"X-Tenant-Id": "tenant-a"}
++PATH = "/api/v1/inference-services/svc-1"
++PARAMS = {"namespace": "default"}
++MERGE_PATCH = "application/merge-patch+json"
++SPEC: dict[str, Any] = {
++    "model": {"reference": "models/llama"},
++    "runtime": {"provider": "vllm", "version": "0.6.3"},
++    "resources": {"accelerator": {"type": "nvidia-gpu", "count": 1, "minMemoryGiB": 16}},
++}
++
++
++@pytest.fixture()
++def client() -> TestClient:
++    """带错误信封处理器的测试客户端（全新内存库），已创建资源 ``default/svc-1``。"""
++    init_registry(":memory:")
++    app = FastAPI()
++    install_exception_handlers(app)
++    app.include_router(create_api_router())
++    test_client = TestClient(app)
++    created = test_client.post(
++        "/api/v1/inference-services",
++        json={
++            "apiVersion": "forgemesh.io/v1alpha1",
++            "kind": "InferenceService",
++            "metadata": {
++                "name": "svc-1",
++                "namespace": "default",
++                "labels": {"tier": "gold", "zone": "a"},
++                "annotations": {"team": "search"},
++            },
++            "spec": SPEC,
++        },
++        headers=TENANT_HEADERS,
++    )
++    assert created.status_code == 201, created.text
++    return test_client
++
++
++def _get(client: TestClient) -> dict[str, Any]:
++    response = client.get(PATH, params=PARAMS, headers=TENANT_HEADERS)
++    assert response.status_code == 200, response.text
++    return response.json()
++
++
++def _put(client: TestClient, document: Any, **headers: str):
++    return client.put(PATH, params=PARAMS, json=document, headers={**TENANT_HEADERS, **headers})
++
++
++def _patch(client: TestClient, patch: Any, content_type: str = MERGE_PATCH, **headers: str):
++    return client.patch(
++        PATH,
++        params=PARAMS,
++        content=json.dumps(patch).encode(),
++        headers={**TENANT_HEADERS, "Content-Type": content_type, **headers},
++    )
++
++
++def _error(response) -> tuple[str, Any]:
++    error = response.json()["error"]
++    return error["code"], (error.get("details") or {}).get("reason")
++
++
++def _with_model(document: dict[str, Any], reference: str) -> dict[str, Any]:
++    changed = copy.deepcopy(document)
++    changed["spec"]["model"]["reference"] = reference
++    return changed
++
++
++def _set_status() -> None:
++    """模拟控制器写入 status（递增 resourceVersion，不改 generation）。"""
++    asyncio.run(
++        get_registry().update_status(
++            "InferenceService",
++            "default",
++            "svc-1",
++            "tenant-a",
++            {"conditions": [{"type": "Ready", "status": "False", "reason": "Scheduling"}]},
++            observed_generation=1,
++        )
++    )
++
++
++# ------------------------------------------------------------------ #
++# PUT
++# ------------------------------------------------------------------ #
++
++
++def test_put_replaces_spec_labels_and_annotations(client: TestClient) -> None:
++    document = _with_model(_get(client), "models/mistral")
++    document["metadata"]["labels"] = {"zone": "b"}
++    del document["metadata"]["annotations"]
++
++    response = _put(client, document)
++
++    assert response.status_code == 200, response.text
++    updated = response.json()
++    assert updated["spec"]["model"]["reference"] == "models/mistral"
++    assert (updated["metadata"]["labels"], updated["metadata"]["annotations"]) == (
++        {"zone": "b"},
++        {},
++    )
++    assert (updated["metadata"]["generation"], updated["metadata"]["observedGeneration"]) == (2, 0)
++    assert updated["metadata"]["resourceVersion"] == "1"
++    uid = updated["metadata"]["uid"]
++    assert response.headers["ETag"] == f'"{uid}.1"'
++    assert _get(client) == updated
++
++
++def test_label_and_annotation_changes_keep_the_generation(client: TestClient) -> None:
++    document = _get(client)
++    document["metadata"]["labels"]["zone"] = "b"
++    document["metadata"]["annotations"] = {"team": "ads"}
++
++    updated = _put(client, document).json()
++
++    assert updated["metadata"]["generation"] == 1
++    assert updated["metadata"]["resourceVersion"] == "1"
++    assert updated["metadata"]["labels"] == {"tier": "gold", "zone": "b"}
++
++
++def test_put_without_changes_is_not_written(client: TestClient) -> None:
++    before = client.get(PATH, params=PARAMS, headers=TENANT_HEADERS)
++    document = before.json()
++    document["spec"] = {key: SPEC[key] for key in ("model", "runtime", "resources")}
++
++    response = _put(client, document)
++
++    assert response.status_code == 200, response.text
++    assert response.json() == before.json()
++    assert response.headers["ETag"] == before.headers["ETag"]
++
++
++def test_put_ignores_status_and_server_owned_fields(client: TestClient) -> None:
++    document = _with_model(_get(client), "models/mistral")
++    document["status"] = {"phase": "Ready", "observedGeneration": 9}
++    document["conditions"] = [{"type": "Ready", "status": "True"}]
++    document["finalizers"] = ["example.com/keep"]
++    document["metadata"].update(generation=9, observedGeneration=9)
++
++    updated = _put(client, document).json()
++
++    assert (updated["metadata"]["generation"], updated["metadata"]["observedGeneration"]) == (2, 0)
++    assert updated["status"]["phase"] == "Pending"
++    assert (updated["conditions"], updated["finalizers"]) == ([], [])
++
++
++def test_put_of_a_legacy_generation_zero_resource_counts_up_from_zero(client: TestClient) -> None:
++    """1.1.0 之前创建的资源 generation 为 0：不迁移，第一次 spec 变化后为 1。"""
++    registry = get_registry()
++    legacy = InferenceService(
++        metadata=ObjectMeta(name="legacy", namespace="default", tenant_id="tenant-a", uid="u-0"),
++        spec=InferenceServiceSpec.model_validate(SPEC),
++    )
++    asyncio.run(registry.put(legacy))
++    path = "/api/v1/inference-services/legacy"
++    document = client.get(path, params=PARAMS, headers=TENANT_HEADERS).json()
++    assert document["metadata"]["generation"] == 0
++
++    updated = client.put(
++        path, params=PARAMS, json=_with_model(document, "models/mistral"), headers=TENANT_HEADERS
++    ).json()
++
++    assert (updated["metadata"]["generation"], updated["metadata"]["observedGeneration"]) == (1, 0)
++
++
++@pytest.mark.parametrize(
++    "mutate",
++    [
++        pytest.param(lambda d: d.pop("spec"), id="missing-spec"),
++        pytest.param(lambda d: d["spec"].update(replicas=3), id="unknown-spec-field"),
++        pytest.param(lambda d: d["metadata"].update(owner="me"), id="unknown-metadata-field"),
++        pytest.param(lambda d: d["metadata"]["labels"].update(tier=1), id="non-string-label"),
++        pytest.param(lambda d: d.update(description="x"), id="unknown-top-level-field"),
++        pytest.param(lambda d: d.update(metadata="svc-1"), id="metadata-not-object"),
++        pytest.param(lambda d: d.update(kind="Gadget"), id="kind"),
++        pytest.param(lambda d: d.update(apiVersion="forgemesh.io/v2"), id="api-version"),
++        pytest.param(lambda d: d["metadata"].update(name="svc-2"), id="name"),
++        pytest.param(lambda d: d["metadata"].update(namespace="other"), id="namespace"),
++        pytest.param(lambda d: d["metadata"].update(namespace=None), id="namespace-null"),
++        pytest.param(lambda d: d["metadata"].update(tenantId="tenant-b"), id="tenant"),
++        pytest.param(lambda d: d["metadata"].update(resourceVersion=0), id="numeric-version"),
++    ],
++)
++def test_put_rejects_invalid_documents(client: TestClient, mutate) -> None:
++    document = _with_model(_get(client), "models/mistral")
++    mutate(document)
++
++    response = _put(client, document)
++
++    assert response.status_code == 400, response.text
++    assert _error(response)[0] == "BAD_REQUEST"
++    assert _get(client)["metadata"]["resourceVersion"] == "0"
++
++
++def test_put_validation_errors_point_at_the_field(client: TestClient) -> None:
++    document = _get(client)
++    document["spec"]["replicas"] = 3
++
++    error = _put(client, document).json()["error"]
++
++    assert [item["loc"] for item in error["details"]["errors"]] == [["spec", "replicas"]]
++
++
++def test_put_without_the_namespace_query_addresses_another_resource(client: TestClient) -> None:
++    """资源在 default 命名空间：省略 namespace 查询参数指的是另一个（不存在的）资源。"""
++    response = client.put(
++        "/api/v1/inference-services/svc-1", json=_get(client), headers=TENANT_HEADERS
++    )
++
++    assert response.status_code == 404, response.text
++
++
++def test_put_with_another_uid_is_a_conflict(client: TestClient) -> None:
++    document = _with_model(_get(client), "models/mistral")
++    document["metadata"]["uid"] = "uid-of-a-deleted-service"
++
++    response = _put(client, document)
++
++    assert response.status_code == 409, response.text
++    assert _error(response) == ("CONFLICT", ConflictReason.UID)
++
++
++def test_concurrent_puts_with_the_same_resource_version_conflict(client: TestClient) -> None:
++    """两个客户端读到同一版本：先写的成功，后写的 409，不会覆盖前者。"""
++    first = _get(client)
++    second = copy.deepcopy(first)
++
++    winner = _put(client, _with_model(first, "models/mistral"))
++    loser = _put(client, _with_model(second, "models/qwen"))
++
++    assert winner.status_code == 200, winner.text
++    assert loser.status_code == 409, loser.text
++    assert _error(loser) == ("CONFLICT", ConflictReason.RESOURCE_VERSION)
++    assert _get(client)["spec"]["model"]["reference"] == "models/mistral"
++
++
++def test_status_writes_also_invalidate_a_resource_version(client: TestClient) -> None:
++    """status 与 spec 共用 resourceVersion：读取之后控制器写过 status，带旧版本的写入冲突。"""
++    document = _get(client)
++    _set_status()
++
++    response = _put(client, _with_model(document, "models/mistral"))
++
++    assert response.status_code == 409, response.text
++    del document["metadata"]["resourceVersion"]
++    assert _put(client, _with_model(document, "models/mistral")).status_code == 200
++
++
++def test_if_match_must_match_the_current_etag(client: TestClient) -> None:
++    current = client.get(PATH, params=PARAMS, headers=TENANT_HEADERS)
++    etag = current.headers["ETag"]
++    document = current.json()
++    del document["metadata"]["resourceVersion"]
++
++    stale = _put(client, _with_model(document, "models/a"), **{"If-Match": '"stale.0"'})
++    weak = _put(client, _with_model(document, "models/b"), **{"If-Match": f"W/{etag}"})
++    listed = _put(client, _with_model(document, "models/c"), **{"If-Match": f'"x", {etag}'})
++    star = _put(client, _with_model(document, "models/d"), **{"If-Match": "*"})
++    outdated = _put(client, _with_model(document, "models/e"), **{"If-Match": etag})
++
++    assert (stale.status_code, weak.status_code) == (409, 409)
++    assert _error(stale) == ("CONFLICT", ConflictReason.RESOURCE_VERSION)
++    assert listed.status_code == 200, listed.text
++    assert listed.headers["ETag"] != etag
++    assert star.status_code == 200, star.text
++    assert outdated.status_code == 409
++    assert _get(client)["spec"]["model"]["reference"] == "models/d"
++
++
++def test_if_match_of_a_re_created_resource_does_not_match(client: TestClient) -> None:
++    """同名资源删除后重建：resourceVersion 从 0 重新计数，但 ETag 含 uid，旧 ETag 不匹配。"""
++    old_etag = client.get(PATH, params=PARAMS, headers=TENANT_HEADERS).headers["ETag"]
++    old = _get(client)
++    assert client.delete(PATH, params=PARAMS, headers=TENANT_HEADERS).status_code == 204
++    recreated = {key: old[key] for key in ("apiVersion", "kind", "spec")}
++    recreated["metadata"] = {"name": "svc-1", "namespace": "default"}
++    assert (
++        client.post("/api/v1/inference-services", json=recreated, headers=TENANT_HEADERS)
++    ).status_code == 201
++
++    response = _patch(client, {"spec": {"availability": {"replicas": 2}}}, **{"If-Match": old_etag})
++
++    assert response.status_code == 409, response.text
++    assert _get(client)["metadata"]["resourceVersion"] == "0"
++
++
++@pytest.mark.parametrize("value", ["abc", '"unterminated', '"a" "b"', "", ", ,"])
++def test_malformed_if_match_is_rejected(client: TestClient, value: str) -> None:
++    response = _put(client, _get(client), **{"If-Match": value})
++
++    assert response.status_code == 400, response.text
++    assert _error(response)[0] == "BAD_REQUEST"
++
++
++def test_concurrent_status_writes_are_kept_and_the_update_is_retried(
++    client: TestClient, monkeypatch
++) -> None:
++    """读取之后、写入之前控制器写了 status：重新读取再写，status 不被覆盖，更新仍然成功。"""
++    registry = get_registry()
++    reads: list[str] = []
++    get_with_phase = SQLiteRegistry.get_with_phase
++
++    async def racing_get_with_phase(self, *args):
++        result = await get_with_phase(self, *args)
++        reads.append(result[0].metadata.resourceVersion)
++        if len(reads) == 1:
++            await self.update_status(
++                "InferenceService",
++                "default",
++                "svc-1",
++                "tenant-a",
++                {"conditions": [{"type": "Ready", "status": "False", "reason": "Scheduling"}]},
++                observed_generation=1,
++            )
++        return result
++
++    monkeypatch.setattr(SQLiteRegistry, "get_with_phase", racing_get_with_phase)
++
++    response = _patch(client, {"spec": {"availability": {"replicas": 2}}})
++
++    assert response.status_code == 200, response.text
++    assert reads == ["0", "1"]
++    stored = asyncio.run(registry.get("InferenceService", "default", "svc-1", "tenant-a"))
++    assert stored.spec.availability.replicas == 2
++    assert [condition.reason for condition in stored.status.conditions] == ["Scheduling"]
++    assert stored.metadata.resourceVersion == "2"
++
++
++def test_update_gives_up_when_the_resource_keeps_changing(client: TestClient, monkeypatch) -> None:
++    calls: list[str | None] = []
++
++    async def always_conflicting(self, *args, expected_version=None, **kwargs):
++        calls.append(expected_version)
++        raise ConflictError("changed", details={"reason": ConflictReason.RESOURCE_VERSION.value})
++
++    monkeypatch.setattr(SQLiteRegistry, "update_spec", always_conflicting)
++
++    response = _put(client, _with_model(_get(client), "models/mistral"))
++
++    assert response.status_code == 409, response.text
++    assert _error(response) == ("CONFLICT", ConflictReason.RESOURCE_VERSION)
++    assert len(calls) == 5
++
++
++@pytest.mark.parametrize("method", ["PUT", "PATCH"])
++def test_terminating_resources_reject_updates(client: TestClient, method: str) -> None:
++    registry = get_registry()
++    ready = InferenceService(
++        metadata=ObjectMeta(name="ready", namespace="default", tenant_id="tenant-a", uid="u-1"),
++        spec=InferenceServiceSpec(
++            model=ModelRef(reference="models/llama"),
++            runtime=RuntimeRef(provider="vllm"),
++            resources=ResourcesSpec(
++                accelerator=AcceleratorSpec(type="nvidia-gpu", minMemoryGiB=16)
++            ),
++        ),
++        status=InferenceServiceStatus(phase=InferencePhase.READY),
++    )
++    asyncio.run(registry.put(ready))
++    path = "/api/v1/inference-services/ready"
++    document = client.get(path, params=PARAMS, headers=TENANT_HEADERS).json()
++    assert client.delete(path, params=PARAMS, headers=TENANT_HEADERS).status_code == 202
++
++    if method == "PUT":
++        response = client.put(
++            path,
++            params=PARAMS,
++            json=_with_model(document, "models/mistral"),
++            headers=TENANT_HEADERS,
++        )
++    else:
++        response = client.patch(
++            path,
++            params=PARAMS,
++            content=b'{"metadata": {"labels": {"tier": "gold"}}}',
++            headers={**TENANT_HEADERS, "Content-Type": MERGE_PATCH},
++        )
++
++    assert response.status_code == 409, response.text
++    assert _error(response) == ("CONFLICT", ConflictReason.TERMINATING)
++
++
++@pytest.mark.parametrize("method", ["PUT", "PATCH"])
++def test_updates_of_missing_or_foreign_resources_are_not_found(
++    client: TestClient, method: str
++) -> None:
++    document = _get(client)
++    requests = [
++        ("/api/v1/inference-services/nope", TENANT_HEADERS),
++        (PATH, {"X-Tenant-Id": "tenant-b"}),
++    ]
++    for path, headers in requests:
++        if method == "PUT":
++            response = client.put(path, params=PARAMS, json=document, headers=headers)
++        else:
++            response = client.patch(
++                path,
++                params=PARAMS,
++                content=b"{}",
++                headers={**headers, "Content-Type": MERGE_PATCH},
++            )
++        assert response.status_code == 404, response.text
++        assert _error(response)[0] == "NOT_FOUND"
++    assert _get(client)["metadata"]["resourceVersion"] == "0"
++
++
++# ------------------------------------------------------------------ #
++# PATCH
++# ------------------------------------------------------------------ #
++
++
++def test_patch_merges_into_the_current_resource(client: TestClient) -> None:
++    response = _patch(
++        client,
++        {
++            "metadata": {"labels": {"zone": None, "team": "ads"}},
++            "spec": {"availability": {"replicas": 2}},
++        },
++    )
++
++    assert response.status_code == 200, response.text
++    updated = response.json()
++    assert updated["metadata"]["labels"] == {"tier": "gold", "team": "ads"}
++    assert updated["metadata"]["annotations"] == {"team": "search"}
++    assert updated["spec"]["availability"] == {"replicas": 2}
++    assert updated["spec"]["model"] == {"reference": "models/llama", "digest": None}
++    assert updated["metadata"]["generation"] == 2
++    assert response.headers["ETag"] == f'"{updated["metadata"]["uid"]}.1"'
++
++
++def test_patch_of_labels_only_keeps_the_generation(client: TestClient) -> None:
++    updated = _patch(client, {"metadata": {"annotations": None}}).json()
++
++    assert updated["metadata"]["annotations"] == {}
++    assert (updated["metadata"]["generation"], updated["metadata"]["resourceVersion"]) == (1, "1")
++
++
++@pytest.mark.parametrize(
++    "patch",
++    [
++        pytest.param({}, id="empty"),
++        pytest.param({"status": {"phase": "Ready"}}, id="status"),
++        pytest.param({"metadata": {"generation": 5, "observedGeneration": 5}}, id="generation"),
++        pytest.param({"spec": {"availability": {"replicas": 1}}}, id="default-value"),
++    ],
++)
++def test_patch_without_effective_changes_is_not_written(client: TestClient, patch) -> None:
++    before = _get(client)
++
++    response = _patch(client, patch)
++
++    assert response.status_code == 200, response.text
++    assert response.json() == before
++
++
++def test_patch_resource_version_is_a_precondition(client: TestClient) -> None:
++    """补丁中给出的 resourceVersion 是前置条件；不给时合并到最新的资源上。"""
++    _set_status()
++
++    stale = _patch(client, {"metadata": {"resourceVersion": "0"}, "spec": {"model": None}})
++    pinned = _patch(
++        client, {"metadata": {"resourceVersion": "1"}, "spec": {"availability": {"replicas": 2}}}
++    )
++    unpinned = _patch(client, {"spec": {"availability": {"replicas": 3}}})
++
++    assert stale.status_code == 409, stale.text
++    assert _error(stale) == ("CONFLICT", ConflictReason.RESOURCE_VERSION)
++    assert pinned.status_code == 200, pinned.text
++    assert unpinned.status_code == 200, unpinned.text
++    assert unpinned.json()["metadata"]["resourceVersion"] == "3"
++    assert unpinned.json()["spec"]["availability"] == {"replicas": 3}
++
++
++@pytest.mark.parametrize(
++    ("patch", "status", "code"),
++    [
++        pytest.param({"kind": "Gadget"}, 400, "BAD_REQUEST", id="kind"),
++        pytest.param({"metadata": {"name": "svc-2"}}, 400, "BAD_REQUEST", id="name"),
++        pytest.param({"metadata": {"namespace": "other"}}, 400, "BAD_REQUEST", id="namespace"),
++        pytest.param({"metadata": {"tenantId": "tenant-b"}}, 400, "BAD_REQUEST", id="tenant"),
++        pytest.param({"spec": None}, 400, "BAD_REQUEST", id="remove-spec"),
++        pytest.param({"spec": {"resources": None}}, 400, "BAD_REQUEST", id="remove-resources"),
++        pytest.param({"lables": {"tier": "x"}}, 400, "BAD_REQUEST", id="unknown-field"),
++        pytest.param({"metadata": {"uid": "other"}}, 409, "CONFLICT", id="uid"),
++    ],
++)
++def test_patch_rejects_invalid_results(client: TestClient, patch, status: int, code: str) -> None:
++    response = _patch(client, patch)
++
++    assert response.status_code == status, response.text
++    assert _error(response)[0] == code
++    assert _get(client)["metadata"]["resourceVersion"] == "0"
++
++
++@pytest.mark.parametrize("content_type", ["application/json", "text/plain", ""])
++def test_patch_requires_the_merge_patch_media_type(client: TestClient, content_type: str) -> None:
++    response = _patch(client, {"metadata": {"labels": None}}, content_type=content_type)
++
++    assert response.status_code == 415, response.text
++    assert _error(response)[0] == "UNSUPPORTED_MEDIA_TYPE"
++    assert response.headers["Accept-Patch"] == MERGE_PATCH
++
++
++def test_patch_media_type_may_carry_parameters(client: TestClient) -> None:
++    response = _patch(
++        client, {"metadata": {"labels": None}}, content_type="Application/Merge-Patch+JSON; q=1"
++    )
++
++    assert response.status_code == 200, response.text
++    assert response.json()["metadata"]["labels"] == {}
++
++
++@pytest.mark.parametrize("content", [b"[]", b'"labels"', b"null", b"{", b""])
++def test_patch_must_be_a_json_object(client: TestClient, content: bytes) -> None:
++    response = client.patch(
++        PATH,
++        params=PARAMS,
++        content=content,
++        headers={**TENANT_HEADERS, "Content-Type": MERGE_PATCH},
++    )
++
++    assert response.status_code == 400, response.text
++    assert _error(response)[0] == "BAD_REQUEST"
++
++
++# ------------------------------------------------------------------ #
++# 创建与读取
++# ------------------------------------------------------------------ #
++
++
++def test_create_and_get_return_the_etag(client: TestClient) -> None:
++    created = client.post(
++        "/api/v1/inference-services",
++        json={"kind": "InferenceService", "metadata": {"name": "svc-2"}, "spec": SPEC},
++        headers=TENANT_HEADERS,
++    )
++    fetched = client.get("/api/v1/inference-services/svc-2", headers=TENANT_HEADERS)
++
++    uid = created.json()["metadata"]["uid"]
++    assert created.headers["ETag"] == fetched.headers["ETag"] == f'"{uid}.0"'
++
++
++def test_create_rejects_unknown_top_level_fields(client: TestClient) -> None:
++    response = client.post(
++        "/api/v1/inference-services",
++        json={
++            "kind": "InferenceService",
++            "metadata": {"name": "svc-2"},
++            "spec": SPEC,
++            "lables": {"tier": "gold"},
++        },
++        headers=TENANT_HEADERS,
++    )
++
++    assert response.status_code == 400, response.text
++    assert "lables" in response.json()["error"]["message"]
++
++
++def test_create_ignores_controller_owned_top_level_fields(client: TestClient) -> None:
++    """GET 的响应可以原样用于创建：status / conditions / finalizers 被忽略。"""
++    document = _get(client)
++    document["metadata"]["name"] = "copy"
++
++    response = client.post("/api/v1/inference-services", json=document, headers=TENANT_HEADERS)
++
++    assert response.status_code == 201, response.text
++    assert response.json()["finalizers"] == []
++
++
++# ------------------------------------------------------------------ #
++# 合并补丁与 If-Match 解析
++# ------------------------------------------------------------------ #
++
++
++@pytest.mark.parametrize(
++    ("target", "patch", "expected"),
++    [
++        ({"a": "b"}, {"a": "c"}, {"a": "c"}),
++        ({"a": "b"}, {"b": "c"}, {"a": "b", "b": "c"}),
++        ({"a": "b"}, {"a": None}, {}),
++        ({"a": "b", "b": "c"}, {"a": None}, {"b": "c"}),
++        ({"a": ["b"]}, {"a": "c"}, {"a": "c"}),
++        ({"a": "c"}, {"a": ["b"]}, {"a": ["b"]}),
++        ({"a": {"b": "c"}}, {"a": {"b": "d", "c": None}}, {"a": {"b": "d"}}),
++        ({"a": [{"b": "c"}]}, {"a": [1]}, {"a": [1]}),
++        (["a", "b"], ["c", "d"], ["c", "d"]),
++        ({"a": "b"}, ["c"], ["c"]),
++        ({"a": "foo"}, None, None),
++        ({"a": "foo"}, "bar", "bar"),
++        ({"e": None}, {"a": 1}, {"e": None, "a": 1}),
++        ([1, 2], {"a": "b", "c": None}, {"a": "b"}),
++        ({}, {"a": {"bb": {"ccc": None}}}, {"a": {"bb": {}}}),
++    ],
++)
++def test_merge_patch_follows_rfc_7386(target: Any, patch: Any, expected: Any) -> None:
++    """RFC 7386 附录 A 的全部示例；入参不被修改。"""
++    original = copy.deepcopy((target, patch))
++
++    assert apply_merge_patch(target, patch) == expected
++    assert (target, patch) == original
++
++
++@pytest.mark.parametrize(
++    ("values", "expected"),
++    [
++        (None, None),
++        ([], None),
++        (["*"], IfMatch(any=True, tags=frozenset())),
++        (['"a"'], IfMatch(any=False, tags=frozenset({'"a"'}))),
++        (['"a", W/"b" ,"c"'], IfMatch(any=False, tags=frozenset({'"a"', '"c"'}))),
++        (['"a"', '"b"'], IfMatch(any=False, tags=frozenset({'"a"', '"b"'}))),
++        ([', "a",'], IfMatch(any=False, tags=frozenset({'"a"'}))),
++        (['W/"a"'], IfMatch(any=False, tags=frozenset())),
++        (['""'], IfMatch(any=False, tags=frozenset({'""'}))),
++    ],
++)
++def test_if_match_parsing(values: list[str] | None, expected: IfMatch | None) -> None:
++    assert parse_if_match(values) == expected
++
++
++@pytest.mark.parametrize("value", ["a", '"a', '"a" "b"', "", " ", ",", 'W/ "a"', '"a"b'])
++def test_malformed_if_match_values(value: str) -> None:
++    with pytest.raises(ApiError) as excinfo:
++        parse_if_match([value])
++
++    assert excinfo.value.status_code == 400
++
++
++def test_weak_tags_never_match() -> None:
++    condition = parse_if_match(['W/"u.1"'])
++
++    assert condition is not None
++    assert not condition.matches('"u.1"')
+diff --git a/tests/unit/controlplane/test_auth.py b/tests/unit/controlplane/test_auth.py
+index 31a8200..e2c33b4 100644
+--- a/tests/unit/controlplane/test_auth.py
++++ b/tests/unit/controlplane/test_auth.py
+@@ -279,11 +279,24 @@ def test_read_only_credentials_cannot_write(api_client) -> None:
+         params={"namespace": "default"},
+         headers=_bearer(KEY_READ_ONLY),
+     )
++    replaced = api_client.put(
++        "/api/v1/inference-services/llama",
++        params={"namespace": "default"},
++        json=BODY,
++        headers=_bearer(KEY_READ_ONLY),
++    )
++    patched = api_client.patch(
++        "/api/v1/inference-services/llama",
++        params={"namespace": "default"},
++        content=b'{"metadata": {"labels": {"tier": "gold"}}}',
++        headers=_bearer(KEY_READ_ONLY, **{"Content-Type": "application/merge-patch+json"}),
++    )
+ 
+     assert listed.status_code == 200
+     assert listed.json()["count"] == 1
+     assert created.status_code == 403
+     assert deleted.status_code == 403
++    assert (replaced.status_code, patched.status_code) == (403, 403)
+     assert api_client.get("/api/v1/inference-services", headers=_bearer(KEY_A)).json()["count"] == 1
+ 
+ 
+-- 
+2.43.0
+

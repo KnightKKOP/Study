@@ -1,0 +1,500 @@
+From 9fc21a43604b6a7cac3ccb6cb2b95d064f38e062 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 13 Oct 2026 03:21:53 +0000
+Subject: [PATCH 07/10] feat(api): derive the decision risk level on the server
+
+The decisions endpoint never passed a risk level, so every request ran
+with the internal default "low" and the router's high-risk protection
+(refuse without a fallback provider, never adopt a fallback candidate
+automatically) could not trigger through the API.
+
+The server now derives the level from the operation domain, the part of
+`question` before the first dot: the domains of the high-risk operations
+listed in architecture 14.2 (driver, node, mig, gpu, device, plugin,
+model, quota, tenant, policy, system, platform) are high, inference is
+low, anything else is medium. A client may raise the level with
+riskLevel but never lower it. The effective level is returned in the
+response and in the error details.
+
+A FALLBACK_REQUIRED result used to fall into DECISION_NO_CANDIDATE with
+a misleading "no provider returned a valid candidate" message; it now
+returns 503 DECISION_FALLBACK_REQUIRED with the candidates in the
+details for manual approval, still without adopting any of them. The
+OpenAPI document gains riskLevel, the derivation rule and the 503
+outcomes, and no longer marks context as required, since the server
+defaults it.
+---
+ api/openapi/openapi.yaml                      |  37 +++-
+ .../src/forgemesh/controlplane/api/risk.py    |  74 ++++++++
+ .../src/forgemesh/controlplane/api/routes.py  |  39 ++++-
+ tests/unit/controlplane/test_routes.py        | 160 +++++++++++++++++-
+ 4 files changed, 298 insertions(+), 12 deletions(-)
+ create mode 100644 packages/control-plane/src/forgemesh/controlplane/api/risk.py
+
+diff --git a/api/openapi/openapi.yaml b/api/openapi/openapi.yaml
+index ff2fc14..3a447b1 100644
+--- a/api/openapi/openapi.yaml
++++ b/api/openapi/openapi.yaml
+@@ -312,6 +312,14 @@ paths:
+       tags: [decisions]
+       summary: 请求一次结构化决策（决策≠授权；授权由 Scheduler/Policy 完成）
+       operationId: requestDecision
++      description: >-
++        风险等级由服务端按 question 推导：question 是形如 <域>.<动作> 的操作标识（如
++        inference.schedule），只看第一个 "." 之前的域（忽略大小写与首尾空白）。driver、node、mig、
++        gpu、device、plugin、model、quota、tenant、policy、system、platform 为 high（architecture
++        14.2 列出的高风险操作），inference 为 low，其他（含自由文本）为 medium。请求中的
++        riskLevel 只能调高，低于推导值时被忽略。高风险请求没有备用 Provider 时返回 503
++        DECISION_NO_CANDIDATE；候选来自备用 Provider 时不自动采用，返回 503
++        DECISION_FALLBACK_REQUIRED，候选在 details.candidates 中供人工审批。
+       requestBody:
+         required: true
+         content:
+@@ -331,6 +339,8 @@ paths:
+           $ref: "#/components/responses/Unauthorized"
+         "403":
+           $ref: "#/components/responses/Forbidden"
++        "503":
++          $ref: "#/components/responses/DecisionUnavailable"
+ 
+ 
+   /api/v1/resources:
+@@ -665,20 +675,30 @@ components:
+           type: integer
+     DecisionRequest:
+       type: object
+-      required: [question, context]
++      required: [question]
+       properties:
+         question:
+           type: string
++          minLength: 1
++          description: 操作标识，形如 <域>.<动作>（如 inference.schedule），决定推导的风险等级。
+         context:
+           type: object
+           additionalProperties: true
++          default: {}
+         requiredCapabilities:
+           type: array
+           items:
+             type: string
++        riskLevel:
++          $ref: "#/components/schemas/RiskLevel"
++    RiskLevel:
++      type: string
++      enum: [low, medium, high]
++      description: >-
++        风险等级。请求中的值只能调高服务端按 question 推导的等级；响应中是实际采用的等级。
+     DecisionResponse:
+       type: object
+-      required: [decisionId, outcome, rationale]
++      required: [decisionId, outcome, rationale, riskLevel]
+       properties:
+         decisionId:
+           type: string
+@@ -693,6 +713,8 @@ components:
+         degraded:
+           type: boolean
+           description: 是否走了 Provider 降级路径。
++        riskLevel:
++          $ref: "#/components/schemas/RiskLevel"
+   responses:
+     BadRequest:
+       description: 请求不合法
+@@ -754,4 +776,15 @@ components:
+         application/json:
+           schema:
+             $ref: "#/components/schemas/Error"
++    DecisionUnavailable:
++      description: >-
++        没有可以自动采用的决策，绝不默认放行。错误码：DECISION_ROUTER_UNAVAILABLE（决策路由器
++        未注入）；DECISION_NO_CANDIDATE（全部 Provider 失败，或高风险请求没有备用 Provider；
++        details.attempts、details.riskLevel）；DECISION_FALLBACK_REQUIRED（高风险请求的候选
++        来自备用 Provider，不自动采用；details.candidates 供人工审批，另有 details.attempts、
++        details.riskLevel）。所依赖的组件未就绪时同 ServiceUnavailable。
++      content:
++        application/json:
++          schema:
++            $ref: "#/components/schemas/Error"
+ 
+diff --git a/packages/control-plane/src/forgemesh/controlplane/api/risk.py b/packages/control-plane/src/forgemesh/controlplane/api/risk.py
+new file mode 100644
+index 0000000..cba7279
+--- /dev/null
++++ b/packages/control-plane/src/forgemesh/controlplane/api/risk.py
+@@ -0,0 +1,74 @@
++"""决策请求的风险等级：由服务端按操作推导，客户端只能调高、不能调低。
++
++操作标识即请求的 ``question``，形如 ``<域>.<动作>``（如 ``inference.schedule``）。推导只看
++域，即第一个 ``.`` 之前的部分（忽略大小写与首尾空白；不含 ``.`` 时是整个字符串）：
++
++==========================================================  ========
++域                                                           等级
++==========================================================  ========
++``driver`` ``node`` ``mig`` ``gpu`` ``device`` ``plugin``     ``high``
++``model`` ``quota`` ``tenant`` ``policy`` ``system``
++``platform``（architecture 14.2 列出的高风险操作所在的域）
++``inference``                                                ``low``
++其他（含自由文本的问题）                                       ``medium``
++==========================================================  ========
++
++请求中的 ``riskLevel`` 高于推导值时采用请求值，否则采用推导值。决策路由器的高风险保护以
++最终等级为准：高风险请求没有备用 Provider 时直接失败，候选来自备用 Provider 时不自动采用。
++"""
++
++from __future__ import annotations
++
++from typing import Literal
++
++RiskLevel = Literal["low", "medium", "high"]
++
++_ORDER: tuple[RiskLevel, ...] = ("low", "medium", "high")
++
++#: 推导为 ``high`` 的域。
++HIGH_RISK_DOMAINS = frozenset(
++    {
++        "driver",
++        "node",
++        "mig",
++        "gpu",
++        "device",
++        "plugin",
++        "model",
++        "quota",
++        "tenant",
++        "policy",
++        "system",
++        "platform",
++    }
++)
++
++#: 推导为 ``low`` 的域；不在两个集合中的域为 ``medium``。
++LOW_RISK_DOMAINS = frozenset({"inference"})
++
++
++def derive_risk_level(operation: str) -> RiskLevel:
++    """按操作所在的域推导风险等级（规则见模块文档）。"""
++    domain = operation.strip().lower().partition(".")[0]
++    if domain in HIGH_RISK_DOMAINS:
++        return "high"
++    if domain in LOW_RISK_DOMAINS:
++        return "low"
++    return "medium"
++
++
++def effective_risk_level(operation: str, requested: RiskLevel | None = None) -> RiskLevel:
++    """推导值与请求值中较高的一个；没有请求值时就是推导值。"""
++    derived = derive_risk_level(operation)
++    if requested is None:
++        return derived
++    return max(derived, requested, key=_ORDER.index)
++
++
++__all__ = [
++    "HIGH_RISK_DOMAINS",
++    "LOW_RISK_DOMAINS",
++    "RiskLevel",
++    "derive_risk_level",
++    "effective_risk_level",
++]
+diff --git a/packages/control-plane/src/forgemesh/controlplane/api/routes.py b/packages/control-plane/src/forgemesh/controlplane/api/routes.py
+index 631514c..54b8dc4 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/api/routes.py
++++ b/packages/control-plane/src/forgemesh/controlplane/api/routes.py
+@@ -53,6 +53,7 @@ from .dependencies import (
+     require_write,
+ )
+ from .errors import ApiError, validation_details
++from .risk import RiskLevel, effective_risk_level
+ from .updates import (
+     MERGE_PATCH_MEDIA_TYPE,
+     SERVER_OWNED_METADATA,
+@@ -532,6 +533,7 @@ class DecisionCallRequest(BaseModel):
+         context: 决策上下文。
+         required_capabilities: 期望的 Provider 能力列表；并入内部 ``context``
+             传递（内部模型 ``extra="forbid"``，无对应字段）。
++        risk_level: 客户端期望的风险等级；只能调高服务端推导的等级（见 :mod:`.risk`）。
+     """
+ 
+     model_config = ConfigDict(populate_by_name=True)
+@@ -539,6 +541,7 @@ class DecisionCallRequest(BaseModel):
+     question: str = Field(min_length=1)
+     context: dict[str, Any] = Field(default_factory=dict)
+     required_capabilities: list[str] | None = Field(default=None, alias="requiredCapabilities")
++    risk_level: RiskLevel | None = Field(default=None, alias="riskLevel")
+ 
+ 
+ @router.post("/decisions", dependencies=[Depends(require_write)])
+@@ -553,14 +556,18 @@ async def request_decision(
+ 
+     * 请求体以 OpenAPI ``DecisionRequest`` 为 API 层形状，内部转换为
+       ``forgemesh.decision.DecisionRequest``（租户取自请求头）；
++    * 风险等级由服务端按 ``question`` 推导，请求中的 ``riskLevel`` 只能调高（见
++      :mod:`.risk`）；
+     * 调用注入的 ``DecisionRouter.route``，按序降级直至产出有效候选；
+     * 响应体为 OpenAPI ``DecisionResponse``（``decisionId`` / ``outcome`` /
+-      ``rationale`` / ``trace`` / ``degraded``），``trace.attempts`` 提供降级
+-      路径摘要（可解释性）。
+-
+-    错误映射：校验失败 400；全部 Provider 失败 503（**绝不默认放行**，
+-    ``DecisionResult.success=False`` 交人工处理）；``DecisionRouter`` 未注入
+-    503；其余内部错误 500（统一错误信封）。
++      ``rationale`` / ``trace`` / ``degraded`` / ``riskLevel``），``trace.attempts``
++      提供降级路径摘要（可解释性）。
++
++    错误映射：校验失败 400；``DecisionRouter`` 未注入 503
++    ``DECISION_ROUTER_UNAVAILABLE``；全部 Provider 失败，或高风险请求没有备用 Provider
++    503 ``DECISION_NO_CANDIDATE``；高风险请求的候选来自备用 Provider 503
++    ``DECISION_FALLBACK_REQUIRED``（候选在 ``details.candidates`` 中供人工审批，不自动
++    采用）。两种 503 都**绝不默认放行**。其余内部错误 500（统一错误信封）。
+     """
+     correlation_id = x_correlation_id or uuid4().hex
+     try:
+@@ -584,11 +591,13 @@ async def request_decision(
+     context = dict(req.context)
+     if req.required_capabilities is not None:
+         context["requiredCapabilities"] = list(req.required_capabilities)
++    risk_level = effective_risk_level(req.question, req.risk_level)
+     internal = InternalDecisionRequest(
+         request_id=request_id,
+         tenant_id=tenant_id,
+         operation=req.question,
+         context=context,
++        risk_level=risk_level,
+     )
+ 
+     try:
+@@ -596,6 +605,19 @@ async def request_decision(
+     except Exception as exc:  # noqa: BLE001 - Router 任意故障统一转错误信封
+         return _error_response(500, "INTERNAL_ERROR", f"决策路由失败: {exc}", correlation_id)
+ 
++    attempts = [a.model_dump() for a in result.attempts]
++    if result.status == "FALLBACK_REQUIRED":
++        return _error_response(
++            503,
++            "DECISION_FALLBACK_REQUIRED",
++            "高风险决策的候选来自备用 Provider，不自动采用，需人工审批",
++            correlation_id,
++            {
++                "riskLevel": risk_level,
++                "attempts": attempts,
++                "candidates": [c.model_dump() for c in result.candidates],
++            },
++        )
+     if not result.success or result.chosen is None:
+         # 全部 Provider 失败：绝不默认放行，503 交人工处理（5.5 降级决策表）。
+         return _error_response(
+@@ -603,7 +625,7 @@ async def request_decision(
+             "DECISION_NO_CANDIDATE",
+             result.error or "所有决策 Provider 均未返回有效候选（禁止默认放行）",
+             correlation_id,
+-            {"attempts": [a.model_dump() for a in result.attempts]},
++            {"riskLevel": risk_level, "attempts": attempts},
+         )
+ 
+     chosen = result.chosen
+@@ -614,10 +636,11 @@ async def request_decision(
+         "rationale": rationale,
+         "trace": {
+             "requestId": request_id,
+-            "attempts": [a.model_dump() for a in result.attempts],
++            "attempts": attempts,
+             "candidates": [c.model_dump() for c in result.candidates],
+         },
+         "degraded": any(not a.ok for a in result.attempts),
++        "riskLevel": risk_level,
+     }
+ 
+ 
+diff --git a/tests/unit/controlplane/test_routes.py b/tests/unit/controlplane/test_routes.py
+index 364dfd1..94f0b7b 100644
+--- a/tests/unit/controlplane/test_routes.py
++++ b/tests/unit/controlplane/test_routes.py
+@@ -7,7 +7,8 @@
+   请求校验失败 400 错误信封、缺租户头 400、组件未注入 503、定义不存在 404；
+ * decisions：成功候选（200 + DecisionResponse 形状）、降级标记 degraded、
+   全部 Provider 失败 503 错误信封（绝不默认放行）、Router 异常 500、
+-  租户头注入内部模型、缺租户头 400、校验失败 400。
++  租户头注入内部模型、缺租户头 400、校验失败 400；风险等级由服务端按操作推导、
++  客户端只能调高，高风险请求的备用候选不自动采用（503 DECISION_FALLBACK_REQUIRED）。
+ 
+ ``WorkflowRuntime`` / ``DecisionRouter`` 以 stub 注入（不依赖真实 Provider），
+ 沿用 ``test_api.py`` 的 TestClient 模式。
+@@ -28,7 +29,7 @@ from forgemesh.controlplane.api.dependencies import (
+     reset_runtime_components,
+ )
+ from forgemesh.core.errors import NotFoundError
+-from forgemesh.decision import Attempt, DecisionCandidate, DecisionResult
++from forgemesh.decision import Attempt, DecisionCandidate, DecisionResult, DecisionRouter
+ from forgemesh.workflow.runtime import RunRef, WorkflowDefinition
+ 
+ TENANT_HEADERS = {"X-Tenant-Id": "tenant-a"}
+@@ -277,6 +278,7 @@ def test_decision_no_candidate(client: TestClient) -> None:
+     assert error["code"] == "DECISION_NO_CANDIDATE"
+     assert error["correlationId"]
+     assert "attempts" in error["details"]
++    assert error["details"]["riskLevel"] == "low"
+ 
+ 
+ def test_decision_router_exception(client: TestClient) -> None:
+@@ -306,3 +308,157 @@ def test_decision_validation_error(client: TestClient) -> None:
+     error = resp.json()["error"]
+     assert error["code"] == "BAD_REQUEST"
+     assert error["details"]["errors"]
++
++
++# ------------------------------------------------------------------ #
++# 决策风险等级（服务端推导，客户端只能调高）
++# ------------------------------------------------------------------ #
++
++
++@pytest.mark.parametrize(
++    ("question", "expected"),
++    [
++        ("inference.schedule", "low"),
++        ("gpu.force-release", "high"),
++        ("Node.Restart", "high"),
++        ("  driver.upgrade  ", "high"),
++        ("mig.reconfigure", "high"),
++        ("plugin.install", "high"),
++        ("model.change-source", "high"),
++        ("tenant.quota.update", "high"),
++        ("system", "high"),
++        ("workflow.compensate", "medium"),
++        ("inferences.schedule", "medium"),
++        ("Which node should host svc-1?", "medium"),
++    ],
++)
++def test_decision_risk_level_is_derived_from_the_operation(
++    client: TestClient, question: str, expected: str
++) -> None:
++    router = StubDecisionRouter(result=_ok_result())
++    init_decision_router(router)
++
++    resp = client.post("/api/v1/decisions", json={"question": question}, headers=TENANT_HEADERS)
++
++    assert resp.status_code == 200, resp.text
++    assert router.calls[0].risk_level == expected
++    assert resp.json()["riskLevel"] == expected
++
++
++@pytest.mark.parametrize(
++    ("question", "requested", "expected"),
++    [
++        ("inference.schedule", "medium", "medium"),
++        ("inference.schedule", "high", "high"),
++        ("workflow.compensate", "low", "medium"),
++        ("gpu.force-release", "low", "high"),
++        ("gpu.force-release", "medium", "high"),
++    ],
++)
++def test_clients_may_raise_but_never_lower_the_risk_level(
++    client: TestClient, question: str, requested: str, expected: str
++) -> None:
++    router = StubDecisionRouter(result=_ok_result())
++    init_decision_router(router)
++
++    resp = client.post(
++        "/api/v1/decisions",
++        json={"question": question, "riskLevel": requested},
++        headers=TENANT_HEADERS,
++    )
++
++    assert resp.status_code == 200, resp.text
++    assert router.calls[0].risk_level == expected
++    assert resp.json()["riskLevel"] == expected
++
++
++def test_decision_rejects_an_unknown_risk_level(client: TestClient) -> None:
++    router = StubDecisionRouter(result=_ok_result())
++    init_decision_router(router)
++
++    resp = client.post(
++        "/api/v1/decisions",
++        json={"question": "inference.schedule", "riskLevel": "critical"},
++        headers=TENANT_HEADERS,
++    )
++
++    assert resp.status_code == 400, resp.text
++    error = resp.json()["error"]
++    assert error["code"] == "BAD_REQUEST"
++    assert error["details"]["errors"]
++    assert router.calls == []
++
++
++def test_decision_fallback_required_is_not_adopted(client: TestClient) -> None:
++    """高风险请求的候选来自备用 Provider：503 交人工审批，候选只出现在 details 中。"""
++    candidate = DecisionCandidate(candidate_id="c1", action="gpu.release")
++    result = DecisionResult(
++        candidates=[candidate],
++        success=False,
++        status="FALLBACK_REQUIRED",
++        attempts=[
++            Attempt(provider="p1", ok=False, error="TimeoutError"),
++            Attempt(provider="p2", ok=True),
++        ],
++    )
++    init_decision_router(StubDecisionRouter(result=result))
++
++    resp = client.post(
++        "/api/v1/decisions", json={"question": "gpu.force-release"}, headers=TENANT_HEADERS
++    )
++
++    assert resp.status_code == 503, resp.text
++    error = resp.json()["error"]
++    assert error["code"] == "DECISION_FALLBACK_REQUIRED"
++    assert error["details"]["riskLevel"] == "high"
++    assert [c["candidate_id"] for c in error["details"]["candidates"]] == ["c1"]
++    assert [a["provider"] for a in error["details"]["attempts"]] == ["p1", "p2"]
++
++
++class _Provider:
++    """最小 DecisionProvider：返回预置候选或抛出预置异常。"""
++
++    provider_version = "1"
++
++    def __init__(self, provider_id: str, *, fails: bool = False) -> None:
++        self.provider_id = provider_id
++        self._fails = fails
++
++    async def decide(self, req: Any) -> list[DecisionCandidate]:
++        if self._fails:
++            raise RuntimeError(f"{self.provider_id} is down")
++        return [DecisionCandidate(candidate_id=f"{self.provider_id}-1", action="act")]
++
++
++@pytest.mark.parametrize(
++    ("question", "status", "code"),
++    [
++        ("inference.schedule", 200, None),
++        ("gpu.force-release", 503, "DECISION_FALLBACK_REQUIRED"),
++    ],
++)
++def test_the_router_high_risk_protection_applies_to_api_requests(
++    client: TestClient, question: str, status: int, code: str | None
++) -> None:
++    """真实 DecisionRouter：首选失败、备用成功时，低风险请求降级采用，高风险请求不自动采用。"""
++    init_decision_router(DecisionRouter([_Provider("primary", fails=True), _Provider("fallback")]))
++
++    resp = client.post("/api/v1/decisions", json={"question": question}, headers=TENANT_HEADERS)
++
++    assert resp.status_code == status, resp.text
++    if code is None:
++        assert resp.json()["degraded"] is True
++    else:
++        assert resp.json()["error"]["code"] == code
++
++
++def test_high_risk_requests_need_a_fallback_provider(client: TestClient) -> None:
++    init_decision_router(DecisionRouter([_Provider("only")]))
++
++    resp = client.post(
++        "/api/v1/decisions", json={"question": "node.restart"}, headers=TENANT_HEADERS
++    )
++
++    assert resp.status_code == 503, resp.text
++    error = resp.json()["error"]
++    assert (error["code"], error["details"]["riskLevel"]) == ("DECISION_NO_CANDIDATE", "high")
+-- 
+2.43.0
+

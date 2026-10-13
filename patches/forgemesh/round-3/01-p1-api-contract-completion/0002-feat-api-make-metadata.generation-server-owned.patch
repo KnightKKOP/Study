@@ -1,0 +1,198 @@
+From 4f48f19d11a1984d1dee778a81f9ce3eb7ea3025 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 13 Oct 2026 02:43:48 +0000
+Subject: [PATCH 02/10] feat(api): make metadata.generation server-owned
+
+The create endpoint copied metadata.generation and observedGeneration
+from the request body, so a client could create a resource that
+already looked observed (generation == observedGeneration) or start
+at an arbitrary generation. The generation is the controller's signal
+that the desired state changed, so it must belong to the server.
+
+Create now drops generation, observedGeneration (both spellings) and
+the status subtree from the request and starts every resource at
+generation 1 with observedGeneration 0, like Kubernetes. Rows written
+before this change are not migrated: they keep their stored
+generation (normally 0, the old default), which still compares
+consistently with the observedGeneration the controller wrote, and
+the next spec change increments it from there.
+
+OpenAPI gains an ObjectMeta schema that marks the server-owned fields
+read-only and states the generation rule; the JSON Schema
+descriptions follow.
+---
+ api/openapi/openapi.yaml                      | 48 ++++++++++++++++++-
+ api/schemas/inference-service.schema.json     |  5 +-
+ .../src/forgemesh/controlplane/api/routes.py  | 22 +++++++--
+ tests/unit/controlplane/test_api.py           | 25 ++++++++++
+ 4 files changed, 92 insertions(+), 8 deletions(-)
+
+diff --git a/api/openapi/openapi.yaml b/api/openapi/openapi.yaml
+index 7ad747f..029ac75 100644
+--- a/api/openapi/openapi.yaml
++++ b/api/openapi/openapi.yaml
+@@ -297,13 +297,57 @@ components:
+         kind:
+           type: string
+         metadata:
+-          type: object
+-          additionalProperties: true
++          $ref: "#/components/schemas/ObjectMeta"
+         spec:
+           type: object
+           additionalProperties: true
+         status:
+           $ref: "#/components/schemas/InferenceServiceStatus"
++    ObjectMeta:
++      type: object
++      description: >-
++        公共元数据。uid、tenantId、resourceVersion、generation、observedGeneration
++        由服务端维护（readOnly），创建请求中的值被忽略。
++      required: [name]
++      additionalProperties: false
++      properties:
++        name:
++          type: string
++        namespace:
++          type: [string, "null"]
++          description: 租户内的逻辑命名空间；null 表示不带命名空间的资源。
++        labels:
++          type: object
++          additionalProperties:
++            type: string
++        annotations:
++          type: object
++          additionalProperties:
++            type: string
++        uid:
++          type: [string, "null"]
++          readOnly: true
++          description: 服务端分配的稳定标识，资源生命周期内不变。
++        tenantId:
++          type: [string, "null"]
++          readOnly: true
++          description: 凭证绑定的租户。
++        resourceVersion:
++          type: [string, "null"]
++          readOnly: true
++          description: 乐观并发版本（不透明字符串），每次成功写入（含控制器写 status）都会变化。
++        generation:
++          type: integer
++          minimum: 0
++          readOnly: true
++          description: >-
++            期望状态（spec）版本：创建时为 1，只有 spec 变化时递增，labels / annotations
++            变化不递增。1.1.0 之前创建的资源保留原值（通常为 0），下一次 spec 变化时从原值递增。
++        observedGeneration:
++          type: integer
++          minimum: 0
++          readOnly: true
++          description: 控制器已处理到的 generation；小于 generation 表示最新的 spec 尚未被处理。
+     InferenceServiceStatus:
+       type: object
+       description: 实际状态，只由控制器写入；创建请求中的 status 会被忽略。
+diff --git a/api/schemas/inference-service.schema.json b/api/schemas/inference-service.schema.json
+index dba019e..5fe583c 100644
+--- a/api/schemas/inference-service.schema.json
++++ b/api/schemas/inference-service.schema.json
+@@ -67,11 +67,12 @@
+         "generation": {
+           "type": "integer",
+           "minimum": 0,
+-          "description": "期望状态版本，spec 变更时递增（系统维护）。"
++          "description": "期望状态版本：创建时为 1，只有 spec 变化时递增（系统维护，请求中的值被忽略）。"
+         },
+         "observedGeneration": {
+           "type": "integer",
+-          "minimum": 0
++          "minimum": 0,
++          "description": "控制器已处理到的 generation（系统维护）。"
+         }
+       }
+     },
+diff --git a/packages/control-plane/src/forgemesh/controlplane/api/routes.py b/packages/control-plane/src/forgemesh/controlplane/api/routes.py
+index f4fd3de..65d8249 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/api/routes.py
++++ b/packages/control-plane/src/forgemesh/controlplane/api/routes.py
+@@ -59,8 +59,20 @@ class ResourceListResponse(BaseModel):
+ 
+ 
+ #: 由服务端维护、创建请求中一律忽略的元数据字段。已验证凭证中的租户是权威来源，
+-#: 覆盖请求体中的租户字段，防止跨租户伪造。
+-_SERVER_OWNED_METADATA = ("tenant_id", "tenantId", "uid", "resourceVersion")
++#: 覆盖请求体中的租户字段，防止跨租户伪造；generation 只由服务端在 spec 变化时递增，
++#: observedGeneration 只由控制器写入。
++_SERVER_OWNED_METADATA = (
++    "tenant_id",
++    "tenantId",
++    "uid",
++    "resourceVersion",
++    "generation",
++    "observedGeneration",
++    "observed_generation",
++)
++
++#: 新建资源的 ``metadata.generation``（``observedGeneration`` 为 0：控制器尚未处理）。
++INITIAL_GENERATION = 1
+ 
+ #: 列表接口单页条数上限。
+ MAX_LIST_LIMIT = 1000
+@@ -69,8 +81,9 @@ MAX_LIST_LIMIT = 1000
+ def _build_inference_service(body: dict[str, Any], tenant_id: str) -> InferenceService:
+     """从请求体构造强类型 :class:`InferenceService`（OpenAPI 要求必须携带 ``spec``）。
+ 
+-    租户取自请求头，``uid`` 由服务端分配；``status`` 属于观测状态，只能由控制器
+-    写入，创建请求中的 ``status`` 被忽略。
++    租户取自已验证的凭证，``uid`` 由服务端分配，``generation`` 从
++    :data:`INITIAL_GENERATION` 开始；``status`` 属于观测状态，只能由控制器写入，
++    创建请求中的 ``status`` 与 generation 字段被忽略。
+ 
+     Raises:
+         ValueError: ``kind`` 不是 ``InferenceService``，或 ``metadata`` 不是对象。
+@@ -85,6 +98,7 @@ def _build_inference_service(body: dict[str, Any], tenant_id: str) -> InferenceS
+     metadata = {k: v for k, v in metadata.items() if k not in _SERVER_OWNED_METADATA}
+     metadata["tenantId"] = tenant_id
+     metadata["uid"] = uuid4().hex
++    metadata["generation"] = INITIAL_GENERATION
+     return InferenceService.model_validate(
+         {
+             "apiVersion": body.get("apiVersion", "forgemesh.io/v1alpha1"),
+diff --git a/tests/unit/controlplane/test_api.py b/tests/unit/controlplane/test_api.py
+index 7d818a1..3e04da2 100644
+--- a/tests/unit/controlplane/test_api.py
++++ b/tests/unit/controlplane/test_api.py
+@@ -218,6 +218,31 @@ def test_create_preserves_spec_and_assigns_server_fields(client: TestClient) ->
+     assert fetched["metadata"]["uid"] == created["metadata"]["uid"]
+ 
+ 
++@pytest.mark.parametrize(
++    "client_metadata",
++    [
++        pytest.param({"generation": 7, "observedGeneration": 3}, id="camel-case"),
++        pytest.param({"generation": 0, "observed_generation": 9}, id="snake-case"),
++    ],
++)
++def test_create_starts_at_generation_one(client: TestClient, client_metadata: dict) -> None:
++    """generation 由服务端维护：新建资源为 1、observedGeneration 为 0，请求中的值被忽略。"""
++    body = _payload()
++    body["metadata"].update(client_metadata)
++    body["status"] = {"observedGeneration": 5}
++
++    created = client.post("/api/v1/inference-services", json=body, headers=TENANT_HEADERS)
++
++    assert created.status_code == 201, created.text
++    fetched = client.get(
++        "/api/v1/inference-services/svc-1", headers=TENANT_HEADERS, params={"namespace": "default"}
++    ).json()
++    for resource in (created.json(), fetched):
++        metadata = resource["metadata"]
++        assert (metadata["generation"], metadata["observedGeneration"]) == (1, 0)
++        assert resource["status"]["observedGeneration"] == 0
++
++
+ @pytest.mark.parametrize(
+     "mutate",
+     [
+-- 
+2.43.0
+

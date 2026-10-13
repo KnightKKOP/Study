@@ -1,0 +1,635 @@
+From 6bc2c22f9772d0c470eeb28df09c3b3e239afd5f Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 13 Oct 2026 03:10:30 +0000
+Subject: [PATCH 05/10] feat(registry): sign list page tokens and expose them
+ through list_page
+
+The registry could only continue a listing from a token built with the
+private _encode_token, and that token was plain base64 JSON: any caller
+could forge a position, and nothing tied it to the tenant or the filters
+it was issued for. API pagination needs an opaque token it can safely
+hand to clients.
+
+list_page() returns the items together with next_page_token, which is
+set only when more items match. A token is <payload>.<signature>; the
+signature is an HMAC-SHA256 over the payload plus tenant, kind,
+namespace and label selector, keyed by a random secret persisted in a
+new registry_meta table so tokens survive restarts. The limit is
+deliberately not bound, so clients may change the page size between
+pages. Malformed, modified or foreign tokens raise
+InvalidPageTokenError (a ValueError). list() delegates to list_page(),
+so its continue_token must now come from list_page().
+---
+ .../controlplane/registry/__init__.py         |   4 +
+ .../forgemesh/controlplane/registry/store.py  | 196 +++++++++++++--
+ tests/contract/test_registry_hardening.py     |   9 +-
+ tests/unit/controlplane/test_registry.py      | 226 +++++++++++++++++-
+ 4 files changed, 394 insertions(+), 41 deletions(-)
+
+diff --git a/packages/control-plane/src/forgemesh/controlplane/registry/__init__.py b/packages/control-plane/src/forgemesh/controlplane/registry/__init__.py
+index 9da3d2b..89aa8a2 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/registry/__init__.py
++++ b/packages/control-plane/src/forgemesh/controlplane/registry/__init__.py
+@@ -7,9 +7,11 @@ from .store import (
+     SIDE_EFFECT_PHASES,
+     ChangeType,
+     ConflictReason,
++    InvalidPageTokenError,
+     RequestDeleteResult,
+     ResourceChange,
+     ResourceKey,
++    ResourcePage,
+     SQLiteRegistry,
+ )
+ 
+@@ -18,8 +20,10 @@ __all__ = [
+     "SIDE_EFFECT_PHASES",
+     "ChangeType",
+     "ConflictReason",
++    "InvalidPageTokenError",
+     "RequestDeleteResult",
+     "ResourceChange",
+     "ResourceKey",
++    "ResourcePage",
+     "SQLiteRegistry",
+ ]
+diff --git a/packages/control-plane/src/forgemesh/controlplane/registry/store.py b/packages/control-plane/src/forgemesh/controlplane/registry/store.py
+index 3c493c0..3f62c23 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/registry/store.py
++++ b/packages/control-plane/src/forgemesh/controlplane/registry/store.py
+@@ -54,6 +54,17 @@ Allocation 持久化
+ :meth:`SQLiteRegistry.create_allocation` 在同一个 ``BEGIN IMMEDIATE`` 事务中写入
+ 分配行与设备行；``release_allocation`` 走 ``ALLOCATION_STATE_MACHINE`` 校验。
+ 
++分页
++----
++:meth:`SQLiteRegistry.list_page` 按 ``(namespace, name)`` 升序（``namespace`` 为空视为
++``""``）返回一页资源与下一页的不透明游标 ``next_page_token``，格式为 ``<载荷>.<签名>``：
++载荷是 ``{"v": 1, "ns": ..., "name": ...}``（本页最后一个资源的位置）的 base64url 编码
++（无填充），签名是以 ``registry_meta`` 表中持久化的随机密钥对「载荷 + 租户、kind 与过滤
++条件」计算的 HMAC-SHA256（同样 base64url 编码）。游标因此绑定租户、kind 与过滤条件
++（``limit`` 每页可以不同），被篡改或用于另一租户 / kind / 另一组过滤条件时抛
++:class:`InvalidPageTokenError`；密钥随数据库保存，控制平面重启后游标仍然有效。游标记录
++位置而不是快照：翻页期间新建或删除的资源可能出现也可能缺席，全程存在的资源恰好出现一次。
++
+ 变更记录
+ --------
+ 每次写入 ``resources`` 都在**同一事务**中向 ``resource_changes`` 追加一条
+@@ -77,8 +88,11 @@ import asyncio
+ import base64
+ import builtins
+ import contextlib
++import hashlib
++import hmac
+ import json
+ import logging
++import secrets
+ import sqlite3
+ import threading
+ from collections.abc import Callable, Collection, Iterator, Sequence
+@@ -179,8 +193,35 @@ CREATE TABLE IF NOT EXISTS resource_changes (
+     change TEXT NOT NULL,
+     created_at TEXT NOT NULL DEFAULT (datetime('now'))
+ );
++CREATE TABLE IF NOT EXISTS registry_meta (
++    name TEXT PRIMARY KEY,
++    value TEXT NOT NULL
++);
+ """
+ 
++#: ``registry_meta`` 中保存分页游标签名密钥（hex）的行。
++_PAGE_TOKEN_KEY_NAME = "page_token_key"
++
++#: 分页游标载荷的格式版本。
++_PAGE_TOKEN_VERSION = 1
++
++_INVALID_PAGE_TOKEN = (
++    "invalid page token: it is malformed, was modified, or was issued for "
++    "a different tenant, kind or filter set"
++)
++
++
++def _b64encode(data: bytes) -> str:
++    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
++
++
++def _b64decode(text: str) -> bytes:
++    return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
++
++
++class InvalidPageTokenError(ValueError):
++    """分页游标无效：无法解析、被篡改，或签发给了另一个租户、kind 或另一组过滤条件。"""
++
+ 
+ class ChangeType(StrEnum):
+     """``resource_changes.change`` 的取值。"""
+@@ -226,6 +267,19 @@ class ResourceChange:
+     change: ChangeType
+ 
+ 
++@dataclass(frozen=True)
++class ResourcePage:
++    """:meth:`SQLiteRegistry.list_page` 返回的一页资源。
++
++    Attributes:
++        items: 本页资源，按 ``(namespace, name)`` 升序（``namespace`` 为空视为 ``""``）。
++        next_page_token: 继续列出下一页的游标；没有更多资源时为 ``None``。
++    """
++
++    items: builtins.list[Resource]
++    next_page_token: str | None = None
++
++
+ @dataclass(frozen=True)
+ class RequestDeleteResult:
+     """:meth:`SQLiteRegistry.request_delete` 的结果。
+@@ -277,6 +331,7 @@ class SQLiteRegistry(ResourceRegistry):
+         self._conn.row_factory = sqlite3.Row
+         self._lock = threading.RLock()
+         self._init_schema()
++        self._page_token_key = self._load_page_token_key()
+ 
+     # ------------------------------------------------------------------ #
+     # 内部辅助
+@@ -341,6 +396,23 @@ class SQLiteRegistry(ResourceRegistry):
+         self._ensure_identity_index()
+         self._conn.commit()
+ 
++    def _load_page_token_key(self) -> bytes:
++        """读取分页游标的签名密钥；库中还没有时生成并持久化。
++
++        多个进程同时打开同一个新库时，``INSERT OR IGNORE`` 保证只有先写入的密钥生效，
++        各方随后读到的都是同一个值。
++        """
++        query = "SELECT value FROM registry_meta WHERE name=?"
++        row = self._conn.execute(query, (_PAGE_TOKEN_KEY_NAME,)).fetchone()
++        if row is None:
++            self._conn.execute(
++                "INSERT OR IGNORE INTO registry_meta (name, value) VALUES (?, ?)",
++                (_PAGE_TOKEN_KEY_NAME, secrets.token_hex(32)),
++            )
++            self._conn.commit()
++            row = self._conn.execute(query, (_PAGE_TOKEN_KEY_NAME,)).fetchone()
++        return bytes.fromhex(row["value"])
++
+     def _migrate_legacy_allocations(self) -> None:
+         """删除存量库中不分租户的旧索引 ``idx_allocations_one_active_per_resource``。
+ 
+@@ -452,20 +524,58 @@ class SQLiteRegistry(ResourceRegistry):
+         return f'$.metadata.labels."{key}"'
+ 
+     @staticmethod
+-    def _encode_token(namespace: str | None, name: str) -> str:
+-        """将分页游标 ``(namespace, name)`` 编码为 opaque base64 字符串。"""
+-        payload = json.dumps({"ns": namespace, "name": name}, ensure_ascii=False)
+-        return base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii")
++    def _page_scope(
++        tenant_id: str, kind: str, namespace: str | None, labels: dict[str, str] | None
++    ) -> str:
++        """分页游标绑定的上下文：租户、kind 与过滤条件（不含 ``limit``）。"""
++        return json.dumps(
++            {
++                "tenant": tenant_id,
++                "kind": kind,
++                "namespace": namespace,
++                "labels": sorted((labels or {}).items()),
++            },
++            sort_keys=True,
++            separators=(",", ":"),
++            ensure_ascii=False,
++        )
+ 
+-    @staticmethod
+-    def _decode_token(token: str) -> tuple[str | None, str]:
+-        """解码分页游标，返回 ``(namespace, name)``。"""
++    def _sign_page_token(self, payload: str, scope: str) -> str:
++        message = f"{payload}.{scope}".encode()
++        return _b64encode(hmac.new(self._page_token_key, message, hashlib.sha256).digest())
++
++    def _encode_page_token(self, scope: str, namespace_key: str, name: str) -> str:
++        """把本页最后一个资源的位置编码为签名游标。"""
++        position = {"v": _PAGE_TOKEN_VERSION, "ns": namespace_key, "name": name}
++        payload = _b64encode(
++            json.dumps(position, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
++        )
++        return f"{payload}.{self._sign_page_token(payload, scope)}"
++
++    def _decode_page_token(self, token: str, scope: str) -> tuple[str, str]:
++        """校验签名并解码游标，返回 ``(namespace 排序键, name)``。
++
++        Raises:
++            InvalidPageTokenError: 游标无法解析、被篡改，或属于另一个上下文 ``scope``。
++        """
++        # 签发的游标只含 base64url 字符与 "."；先排除非 ASCII 输入，compare_digest 才能比较 str
++        if not token.isascii():
++            raise InvalidPageTokenError(_INVALID_PAGE_TOKEN)
++        payload, _, signature = token.partition(".")
++        if not hmac.compare_digest(signature, self._sign_page_token(payload, scope)):
++            raise InvalidPageTokenError(_INVALID_PAGE_TOKEN)
+         try:
+-            raw = base64.urlsafe_b64decode(token.encode("ascii")).decode("utf-8")
+-            payload = json.loads(raw)
+-            return payload["ns"], payload["name"]
+-        except (ValueError, KeyError, UnicodeDecodeError) as exc:
+-            raise ValueError(f"invalid continue_token: {token!r}") from exc
++            position = json.loads(_b64decode(payload))
++        except ValueError as exc:
++            raise InvalidPageTokenError(_INVALID_PAGE_TOKEN) from exc
++        if not (
++            isinstance(position, dict)
++            and position.get("v") == _PAGE_TOKEN_VERSION
++            and isinstance(position.get("ns"), str)
++            and isinstance(position.get("name"), str)
++        ):
++            raise InvalidPageTokenError(_INVALID_PAGE_TOKEN)
++        return position["ns"], position["name"]
+ 
+     @staticmethod
+     def _row_to_resource(row: sqlite3.Row) -> Resource:
+@@ -648,24 +758,57 @@ class SQLiteRegistry(ResourceRegistry):
+         continue_token: str | None = None,
+         limit: int = 100,
+     ) -> builtins.list[Resource]:
+-        """按 ``kind`` + 可选 ``namespace`` / ``labels`` 过滤列出资源（分页）。
++        """按 ``kind`` + 可选 ``namespace`` / ``labels`` 过滤列出一页资源。
+ 
+-        标签过滤在 SQL 中先于 ``LIMIT`` 执行，保证每页返回的都是匹配项。
++        与 :meth:`list_page` 相同，只是不返回下一页游标；``continue_token`` 必须是
++        :meth:`list_page` 以相同租户、kind 与过滤条件返回的 ``next_page_token``。
+         ``watch=True`` 在阶段 P1 暂未实现，抛 :class:`NotImplementedError`。
+ 
+         Raises:
+             ValueError: ``limit`` 小于 1，或标签键包含双引号 / 反斜杠。
++            InvalidPageTokenError: ``continue_token`` 无效。
+         """
+         if watch:
+             raise NotImplementedError("watch stream is not implemented in phase P1")
++        page = await self.list_page(
++            kind, tenant_id, namespace, labels, page_token=continue_token, limit=limit
++        )
++        return page.items
++
++    async def list_page(
++        self,
++        kind: str,
++        tenant_id: str,
++        namespace: str | None = None,
++        labels: dict[str, str] | None = None,
++        page_token: str | None = None,
++        limit: int = 100,
++    ) -> ResourcePage:
++        """按 ``kind`` + 可选 ``namespace`` / ``labels`` 过滤列出一页资源与下一页游标。
++
++        结果按 ``(namespace, name)`` 升序（``namespace`` 为空视为 ``""``），标签过滤在 SQL
++        中先于 ``LIMIT`` 执行，保证每页返回的都是匹配项。还有更多匹配项时
++        ``next_page_token`` 非空：以相同的租户、kind 与过滤条件把它作为 ``page_token``
++        传回即得下一页（``limit`` 可以不同），游标格式见模块文档「分页」。
++
++        Raises:
++            ValueError: ``limit`` 小于 1，或标签键包含双引号 / 反斜杠。
++            InvalidPageTokenError: ``page_token`` 无法解析、被篡改，或签发给了另一个租户、
++                kind 或另一组过滤条件。
++        """
+         if limit < 1:
+             raise ValueError(f"limit must be >= 1, got {limit}")
+         label_paths = [
+             (self._label_path(key), value) for key, value in sorted((labels or {}).items())
+         ]
++        scope = self._page_scope(tenant_id, kind, namespace, labels)
++        after = self._decode_page_token(page_token, scope) if page_token is not None else None
+ 
+-        def _list() -> list[Resource]:
+-            sql = "SELECT body FROM resources WHERE tenant_id=? AND kind=?"
++        def _list_page() -> ResourcePage:
++            sql = (
++                "SELECT body, COALESCE(namespace, '') AS ns_key, name FROM resources "
++                "WHERE tenant_id=? AND kind=?"
++            )
+             params: list[Any] = [tenant_id, kind]
+             if namespace is not None:
+                 sql += " AND namespace IS ?"
+@@ -673,21 +816,24 @@ class SQLiteRegistry(ResourceRegistry):
+             for path, value in label_paths:
+                 sql += " AND json_extract(body, ?) = ?"
+                 params.extend([path, value])
+-            if continue_token is not None:
+-                cursor_ns, cursor_name = self._decode_token(continue_token)
+-                cursor_ns_key = cursor_ns if cursor_ns is not None else ""
+-                # 按 (COALESCE(namespace,''), name) 升序游标推进
++            if after is not None:
++                after_ns_key, after_name = after
+                 sql += (
+                     " AND (COALESCE(namespace, '') > ?"
+                     " OR (COALESCE(namespace, '') = ? AND name > ?))"
+                 )
+-                params.extend([cursor_ns_key, cursor_ns_key, cursor_name])
++                params.extend([after_ns_key, after_ns_key, after_name])
++            # 多取一行，用来判断是否还有下一页
+             sql += " ORDER BY COALESCE(namespace, ''), name LIMIT ?"
+-            params.append(limit)
++            params.append(limit + 1)
+             rows = self._conn.execute(sql, tuple(params)).fetchall()
+-            return [self._row_to_resource(r) for r in rows]
++            items = [self._row_to_resource(row) for row in rows[:limit]]
++            if len(rows) <= limit:
++                return ResourcePage(items)
++            last = rows[limit - 1]
++            return ResourcePage(items, self._encode_page_token(scope, last["ns_key"], last["name"]))
+ 
+-        return await self._run(_list)
++        return await self._run(_list_page)
+ 
+     async def delete(
+         self,
+@@ -1573,8 +1719,10 @@ __all__ = [
+     "SIDE_EFFECT_PHASES",
+     "ChangeType",
+     "ConflictReason",
++    "InvalidPageTokenError",
+     "RequestDeleteResult",
+     "ResourceChange",
+     "ResourceKey",
++    "ResourcePage",
+     "SQLiteRegistry",
+ ]
+diff --git a/tests/contract/test_registry_hardening.py b/tests/contract/test_registry_hardening.py
+index 3d80a6c..c33f509 100644
+--- a/tests/contract/test_registry_hardening.py
++++ b/tests/contract/test_registry_hardening.py
+@@ -290,12 +290,11 @@ def test_label_selector_is_applied_before_limit() -> None:
+             seen: list[str] = []
+             token = None
+             while True:
+-                page = await reg.list(KIND, TENANT, labels=selector, limit=4, continue_token=token)
+-                if not page:
++                page = await reg.list_page(KIND, TENANT, labels=selector, page_token=token, limit=4)
++                seen.extend(r.metadata.name for r in page.items)
++                token = page.next_page_token
++                if token is None:
+                     break
+-                seen.extend(r.metadata.name for r in page)
+-                last = page[-1].metadata
+-                token = SQLiteRegistry._encode_token(last.namespace, last.name)
+             assert seen == [f"res-{i:03d}" for i in range(140, 150)]
+         finally:
+             await reg.close()
+diff --git a/tests/unit/controlplane/test_registry.py b/tests/unit/controlplane/test_registry.py
+index c89dcfe..f37a7ef 100644
+--- a/tests/unit/controlplane/test_registry.py
++++ b/tests/unit/controlplane/test_registry.py
+@@ -7,7 +7,7 @@
+ * 重复 Create 抛 ConflictError；
+ * Delete（成功 / NotFound）；
+ * 租户隔离（跨租户 Get 抛 NotFoundError）；
+-* 分页游标（5 条分 3 页取完）；
++* 分页游标（5 条分 3 页取完；签名游标绑定租户 / kind / 过滤条件、防篡改、重启后有效）；
+ * namespace 过滤；
+ * generation 自增；
+ * resource_version 递增；
+@@ -23,10 +23,16 @@
+ from __future__ import annotations
+ 
+ import asyncio
++import base64
+ import sqlite3
++from collections.abc import Callable
+ 
+ import pytest
+-from forgemesh.controlplane.registry import DEFAULT_RELEASE_FINALIZER, SQLiteRegistry
++from forgemesh.controlplane.registry import (
++    DEFAULT_RELEASE_FINALIZER,
++    InvalidPageTokenError,
++    SQLiteRegistry,
++)
+ from forgemesh.controlplane.registry.models import bump_generation, validate_resource
+ from forgemesh.core.errors import ConflictError, InvalidStateTransition, NotFoundError
+ from forgemesh.core.objects import ObjectMeta, Resource
+@@ -197,19 +203,215 @@ def test_list_with_pagination() -> None:
+     for i in range(5):
+         _run(reg.put(_make_resource(name=f"res-{i}", namespace="ns")))
+ 
+-    page1 = _run(reg.list(KIND, TENANT_A, namespace="ns", limit=2))
+-    assert len(page1) == 2
++    page1 = _run(reg.list_page(KIND, TENANT_A, namespace="ns", limit=2))
++    page2 = _run(
++        reg.list_page(KIND, TENANT_A, namespace="ns", page_token=page1.next_page_token, limit=2)
++    )
++    page3 = _run(
++        reg.list_page(KIND, TENANT_A, namespace="ns", page_token=page2.next_page_token, limit=2)
++    )
+ 
+-    token = SQLiteRegistry._encode_token(page1[-1].metadata.namespace, page1[-1].metadata.name)
+-    page2 = _run(reg.list(KIND, TENANT_A, namespace="ns", limit=2, continue_token=token))
+-    assert len(page2) == 2
++    assert [len(page.items) for page in (page1, page2, page3)] == [2, 2, 1]
++    assert page3.next_page_token is None
++    all_names = [r.metadata.name for page in (page1, page2, page3) for r in page.items]
++    assert all_names == ["res-0", "res-1", "res-2", "res-3", "res-4"]
+ 
+-    token = SQLiteRegistry._encode_token(page2[-1].metadata.namespace, page2[-1].metadata.name)
+-    page3 = _run(reg.list(KIND, TENANT_A, namespace="ns", limit=2, continue_token=token))
+-    assert len(page3) == 1
+ 
+-    all_names = [r.metadata.name for r in page1 + page2 + page3]
+-    assert all_names == ["res-0", "res-1", "res-2", "res-3", "res-4"]
++@pytest.mark.unit
++@pytest.mark.parametrize(
++    ("count", "limit", "has_more"),
++    [(0, 1, False), (2, 2, False), (2, 3, False), (3, 2, True)],
++)
++def test_list_page_returns_a_token_only_when_more_items_match(
++    count: int, limit: int, has_more: bool
++) -> None:
++    reg = SQLiteRegistry()
++    for i in range(count):
++        _run(reg.put(_make_resource(name=f"res-{i}")))
++
++    page = _run(reg.list_page(KIND, TENANT_A, limit=limit))
++
++    assert len(page.items) == min(count, limit)
++    assert (page.next_page_token is not None) is has_more
++
++
++@pytest.mark.unit
++def test_list_continues_from_a_list_page_token() -> None:
++    reg = SQLiteRegistry()
++    for i in range(3):
++        _run(reg.put(_make_resource(name=f"res-{i}")))
++    first = _run(reg.list_page(KIND, TENANT_A, limit=1))
++
++    rest = _run(reg.list(KIND, TENANT_A, continue_token=first.next_page_token))
++
++    assert [r.metadata.name for r in rest] == ["res-1", "res-2"]
++
++
++@pytest.mark.unit
++def test_list_rejects_an_invalid_continue_token() -> None:
++    reg = SQLiteRegistry()
++    _run(reg.put(_make_resource()))
++
++    with pytest.raises(InvalidPageTokenError):
++        _run(reg.list(KIND, TENANT_A, continue_token="not-a-token"))
++
++
++@pytest.mark.unit
++def test_page_token_does_not_bind_the_page_size() -> None:
++    reg = SQLiteRegistry()
++    for i in range(4):
++        _run(reg.put(_make_resource(name=f"res-{i}")))
++    first = _run(reg.list_page(KIND, TENANT_A, limit=1))
++
++    second = _run(reg.list_page(KIND, TENANT_A, page_token=first.next_page_token, limit=10))
++
++    assert [r.metadata.name for r in second.items] == ["res-1", "res-2", "res-3"]
++    assert second.next_page_token is None
++
++
++@pytest.mark.unit
++def test_list_page_orders_cluster_scoped_resources_first() -> None:
++    reg = SQLiteRegistry()
++    _run(reg.put(_make_resource(name="b", namespace="ns")))
++    _run(reg.put(_make_resource(name="z", namespace=None)))
++    _run(reg.put(_make_resource(name="a", namespace="ns")))
++
++    seen: list[tuple[str | None, str]] = []
++    token = None
++    while True:
++        page = _run(reg.list_page(KIND, TENANT_A, page_token=token, limit=1))
++        seen.extend((r.metadata.namespace, r.metadata.name) for r in page.items)
++        token = page.next_page_token
++        if token is None:
++            break
++
++    assert seen == [(None, "z"), ("ns", "a"), ("ns", "b")]
++
++
++_BOUND_QUERY = {"kind": KIND, "tenant_id": TENANT_A, "namespace": "ns", "labels": {"env": "prod"}}
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize(
++    "change",
++    [
++        pytest.param({"tenant_id": TENANT_B}, id="other-tenant"),
++        pytest.param({"kind": "Node"}, id="other-kind"),
++        pytest.param({"namespace": "other"}, id="other-namespace"),
++        pytest.param({"namespace": None}, id="all-namespaces"),
++        pytest.param({"labels": None}, id="no-label-selector"),
++        pytest.param({"labels": {"env": "dev"}}, id="other-label-value"),
++        pytest.param({"labels": {"env": "prod", "tier": "web"}}, id="extra-label"),
++    ],
++)
++def test_page_token_is_bound_to_tenant_kind_and_filters(change: dict) -> None:
++    reg = SQLiteRegistry()
++    for tenant_id in (TENANT_A, TENANT_B):
++        for kind in (KIND, "Node"):
++            for i in range(2):
++                resource = _make_resource(
++                    name=f"res-{i}", namespace="ns", tenant_id=tenant_id, kind=kind
++                )
++                resource.metadata.labels = {"env": "prod"}
++                _run(reg.put(resource))
++    token = _run(reg.list_page(**_BOUND_QUERY, limit=1)).next_page_token
++    assert token is not None
++
++    with pytest.raises(InvalidPageTokenError):
++        _run(reg.list_page(**{**_BOUND_QUERY, **change}, page_token=token, limit=1))
++
++
++@pytest.mark.unit
++def test_page_token_ignores_the_order_of_label_selectors() -> None:
++    reg = SQLiteRegistry()
++    for i in range(2):
++        resource = _make_resource(name=f"res-{i}")
++        resource.metadata.labels = {"app": "web", "env": "prod"}
++        _run(reg.put(resource))
++    first = _run(reg.list_page(KIND, TENANT_A, labels={"app": "web", "env": "prod"}, limit=1))
++
++    second = _run(
++        reg.list_page(
++            KIND,
++            TENANT_A,
++            labels={"env": "prod", "app": "web"},
++            page_token=first.next_page_token,
++            limit=1,
++        )
++    )
++
++    assert [r.metadata.name for r in second.items] == ["res-1"]
++
++
++def _b64(data: bytes) -> str:
++    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
++
++
++def _swap_payload(token: str) -> str:
++    """把载荷换成跳过一个资源的合法载荷，保留原签名。"""
++    payload = _b64(b'{"v":1,"ns":"","name":"res-1"}')
++    return f"{payload}.{token.partition('.')[2]}"
++
++
++def _alter_signature(token: str) -> str:
++    return token[:-1] + ("B" if token.endswith("A") else "A")
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize(
++    "tamper",
++    [
++        pytest.param(_swap_payload, id="swapped-payload"),
++        pytest.param(_alter_signature, id="altered-signature"),
++        pytest.param(lambda token: token.partition(".")[0], id="missing-signature"),
++        pytest.param(lambda token: f"{token}.extra", id="trailing-data"),
++        pytest.param(lambda token: f"{token}é", id="non-ascii"),
++        pytest.param(lambda token: "", id="empty"),
++        pytest.param(lambda token: "not-a-token", id="garbage"),
++        pytest.param(
++            lambda token: base64.urlsafe_b64encode(b'{"ns": "", "name": "res-0"}').decode(),
++            id="legacy-unsigned-token",
++        ),
++    ],
++)
++def test_tampered_page_tokens_are_rejected(tamper: Callable[[str], str]) -> None:
++    reg = SQLiteRegistry()
++    for i in range(3):
++        _run(reg.put(_make_resource(name=f"res-{i}")))
++    token = _run(reg.list_page(KIND, TENANT_A, limit=1)).next_page_token
++
++    with pytest.raises(InvalidPageTokenError):
++        _run(reg.list_page(KIND, TENANT_A, page_token=tamper(token), limit=1))
++
++
++@pytest.mark.unit
++def test_page_tokens_survive_a_restart(tmp_path) -> None:
++    db_file = str(tmp_path / "registry.db")
++    reg = SQLiteRegistry(db_file)
++    for i in range(3):
++        _run(reg.put(_make_resource(name=f"res-{i}")))
++    token = _run(reg.list_page(KIND, TENANT_A, limit=1)).next_page_token
++    _run(reg.close())
++
++    reopened = SQLiteRegistry(db_file)
++    try:
++        page = _run(reopened.list_page(KIND, TENANT_A, page_token=token, limit=5))
++    finally:
++        _run(reopened.close())
++
++    assert [r.metadata.name for r in page.items] == ["res-1", "res-2"]
++
++
++@pytest.mark.unit
++def test_page_tokens_from_another_database_are_rejected() -> None:
++    issuer, other = SQLiteRegistry(), SQLiteRegistry()
++    for reg in (issuer, other):
++        for i in range(2):
++            _run(reg.put(_make_resource(name=f"res-{i}")))
++    token = _run(issuer.list_page(KIND, TENANT_A, limit=1)).next_page_token
++
++    with pytest.raises(InvalidPageTokenError):
++        _run(other.list_page(KIND, TENANT_A, page_token=token, limit=1))
+ 
+ 
+ @pytest.mark.unit
+-- 
+2.43.0
+

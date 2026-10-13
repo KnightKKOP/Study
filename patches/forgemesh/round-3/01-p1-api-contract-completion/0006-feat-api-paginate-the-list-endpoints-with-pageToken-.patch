@@ -1,0 +1,593 @@
+From 5a27721cbafcad7578b5640a6b4931e35347b83f Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 13 Oct 2026 03:17:29 +0000
+Subject: [PATCH 06/10] feat(api): paginate the list endpoints with pageToken
+ and nextPageToken
+
+The list endpoints returned at most `limit` items with no way to fetch
+the rest, although the OpenAPI document already promised a
+nextPageToken. GET /api/v1/inference-services and GET /api/v1/resources
+now accept pageToken and return nextPageToken when more items match,
+backed by the signed registry tokens: a token only works for the tenant
+and the filters it was issued for (namespace, plus kind on /resources),
+the limit may change between pages, and malformed, modified or foreign
+tokens are rejected with a 400 error envelope. An empty pageToken starts
+at the first page. /resources without kind still returns an empty list,
+so a pageToken there is rejected too.
+
+The OpenAPI document gains the pageToken parameter, the count field, the
+ordering rule, and the GET /api/v1/resources operation, which the
+gateway already proxies but which was never documented.
+---
+ api/openapi/openapi.yaml                      | 129 +++++++++--
+ .../src/forgemesh/controlplane/api/routes.py  |  80 +++++--
+ .../unit/controlplane/test_api_pagination.py  | 216 ++++++++++++++++++
+ tests/unit/controlplane/test_app.py           |   2 +-
+ 4 files changed, 389 insertions(+), 38 deletions(-)
+ create mode 100644 tests/unit/controlplane/test_api_pagination.py
+
+diff --git a/api/openapi/openapi.yaml b/api/openapi/openapi.yaml
+index a0a6eb3..ff2fc14 100644
+--- a/api/openapi/openapi.yaml
++++ b/api/openapi/openapi.yaml
+@@ -28,6 +28,8 @@ tags:
+     description: 工作流运行启动与状态查询
+   - name: decisions
+     description: 结构化决策请求（决策≠授权；授权由 Scheduler/Policy 完成）
++  - name: resources
++    description: 按 kind 列出资源（只读）
+   - name: probes
+     description: 存活与就绪探针
+ 
+@@ -70,6 +72,9 @@ paths:
+       tags: [inference-services]
+       summary: 列出推理服务
+       operationId: listInferenceServices
++      description: >-
++        按 (namespace, name) 升序分页，不带命名空间的资源排在最前。响应带 nextPageToken 时
++        还有下一页：以相同的过滤条件把它作为 pageToken 传回。
+       parameters:
+         - name: tenantId
+           in: query
+@@ -80,22 +85,12 @@ paths:
+           description: 从未生效，服务端忽略；租户取自凭证（ADR-014）。
+           schema:
+             type: string
+-        - name: namespace
+-          in: query
+-          description: 只列出该命名空间中的资源；省略时不按命名空间过滤。
+-          schema:
+-            type: string
+-        - name: limit
+-          in: query
+-          description: 单页最多返回的条数；超出 1–1000 返回 400。
+-          schema:
+-            type: integer
+-            minimum: 1
+-            maximum: 1000
+-            default: 100
++        - $ref: "#/components/parameters/NamespaceFilter"
++        - $ref: "#/components/parameters/Limit"
++        - $ref: "#/components/parameters/PageToken"
+       responses:
+         "200":
+-          description: 列表
++          description: 一页推理服务
+           content:
+             application/json:
+               schema:
+@@ -338,8 +333,66 @@ paths:
+           $ref: "#/components/responses/Forbidden"
+ 
+ 
++  /api/v1/resources:
++    get:
++      tags: [resources]
++      summary: 按 kind 列出资源
++      operationId: listResources
++      description: >-
++        与推理服务列表相同的排序与分页规则；省略 kind 时返回空列表（不做全表扫描），这时不会
++        签发 nextPageToken，带 pageToken 返回 400。
++      parameters:
++        - name: kind
++          in: query
++          description: 资源类型，如 InferenceService。
++          schema:
++            type: string
++        - $ref: "#/components/parameters/NamespaceFilter"
++        - $ref: "#/components/parameters/Limit"
++        - $ref: "#/components/parameters/PageToken"
++      responses:
++        "200":
++          description: 一页资源
++          content:
++            application/json:
++              schema:
++                $ref: "#/components/schemas/ResourceList"
++        "400":
++          $ref: "#/components/responses/BadRequest"
++        "401":
++          $ref: "#/components/responses/Unauthorized"
++        "403":
++          $ref: "#/components/responses/Forbidden"
++        "503":
++          $ref: "#/components/responses/ServiceUnavailable"
++
++
+ components:
+   parameters:
++    NamespaceFilter:
++      name: namespace
++      in: query
++      description: 只列出该命名空间中的资源；省略时不按命名空间过滤。
++      schema:
++        type: string
++    Limit:
++      name: limit
++      in: query
++      description: 单页最多返回的条数；超出 1–1000 返回 400。
++      schema:
++        type: integer
++        minimum: 1
++        maximum: 1000
++        default: 100
++    PageToken:
++      name: pageToken
++      in: query
++      description: >-
++        上一页响应中的 nextPageToken（不透明字符串），空字符串等同于省略。只对签发它的租户与
++        同一组过滤条件（namespace；资源列表还有 kind）有效，limit 可以逐页变化；格式不对、
++        被修改或用于其他租户 / 过滤条件时返回 400。控制平面重启后仍然有效。
++      schema:
++        type: string
+     IfMatch:
+       name: If-Match
+       in: header
+@@ -517,14 +570,60 @@ components:
+             tgi-generate 为 POST /generate_stream。
+     InferenceServiceList:
+       type: object
+-      required: [items]
++      required: [items, count]
+       properties:
+         items:
+           type: array
+           items:
+             $ref: "#/components/schemas/InferenceService"
++        count:
++          $ref: "#/components/schemas/PageCount"
+         nextPageToken:
++          $ref: "#/components/schemas/NextPageToken"
++    Resource:
++      type: object
++      description: >-
++        通用资源表示：apiVersion、kind、metadata，加上该 kind 特有的字段（如 InferenceService
++        的 spec / status，见 InferenceService）。
++      required: [apiVersion, kind, metadata]
++      additionalProperties: true
++      properties:
++        apiVersion:
++          type: string
++        kind:
+           type: string
++        metadata:
++          $ref: "#/components/schemas/ObjectMeta"
++        conditions:
++          type: array
++          items:
++            type: object
++            additionalProperties: true
++        finalizers:
++          type: array
++          items:
++            type: string
++    ResourceList:
++      type: object
++      required: [items, count]
++      properties:
++        items:
++          type: array
++          items:
++            $ref: "#/components/schemas/Resource"
++        count:
++          $ref: "#/components/schemas/PageCount"
++        nextPageToken:
++          $ref: "#/components/schemas/NextPageToken"
++    PageCount:
++      type: integer
++      minimum: 0
++      description: 本页的条数（不是总数）。
++    NextPageToken:
++      type: string
++      description: >-
++        还有更多结果时出现，最后一页不带此字段：作为 pageToken 传回即得下一页。游标记录位置而
++        不是快照，翻页期间新建或删除的资源可能出现也可能缺席，全程存在的资源恰好出现一次。
+     TerminatingResponse:
+       type: object
+       description: >
+diff --git a/packages/control-plane/src/forgemesh/controlplane/api/routes.py b/packages/control-plane/src/forgemesh/controlplane/api/routes.py
+index 4b47c24..631514c 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/api/routes.py
++++ b/packages/control-plane/src/forgemesh/controlplane/api/routes.py
+@@ -3,7 +3,7 @@
+ 对齐 ``api/openapi/openapi.yaml`` 契约，以 ``/api/v1`` 为前缀：
+ 
+ * ``POST   /inference-services``          —— 创建推理服务
+-* ``GET    /inference-services``          —— 列出推理服务
++* ``GET    /inference-services``          —— 列出推理服务（``limit`` 条一页，``pageToken`` 翻页）
+ * ``GET    /inference-services/{name}``   —— 获取单个推理服务
+ * ``PUT    /inference-services/{name}``   —— 整体替换 spec / labels / annotations
+ * ``PATCH  /inference-services/{name}``   —— JSON Merge Patch（RFC 7386）更新，规则同 PUT
+@@ -13,7 +13,7 @@
+   ``Terminating``，协调器驱动受控释放后物理删除，见 development-plan 第 7 章）
+ * ``POST   /workflows``                   —— 启动工作流运行（development-plan 5.4）
+ * ``POST   /decisions``                   —— 结构化决策（决策≠授权，development-plan 5.5）
+-* ``GET    /resources``                   —— 通用资源列表（可选 kind 过滤）
++* ``GET    /resources``                   —— 通用资源列表（按 kind 过滤，分页同上）
+ 
+ 租户取自已验证的凭证（见 :func:`.dependencies.get_principal` 与
+ :mod:`forgemesh.controlplane.auth`），作为多租户隔离的权威来源，覆盖请求体中的
+@@ -32,7 +32,7 @@ from collections.abc import Callable
+ from typing import Any
+ from uuid import uuid4
+ 
+-from fastapi import APIRouter, Depends, Header, HTTPException, Request
++from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
+ from fastapi.responses import JSONResponse, Response
+ from forgemesh.core.errors import ConflictError, NotFoundError
+ from forgemesh.core.objects import Resource
+@@ -42,7 +42,7 @@ from forgemesh.workflow.runtime import WorkflowDefinition
+ from pydantic import BaseModel, ConfigDict, Field, ValidationError
+ 
+ from ..app import error_envelope
+-from ..registry import ConflictReason, SQLiteRegistry
++from ..registry import ConflictReason, InvalidPageTokenError, SQLiteRegistry
+ from .dependencies import (
+     ComponentNotReadyError,
+     get_decision_router,
+@@ -68,14 +68,6 @@ router = APIRouter(prefix="/api/v1")
+ 
+ _KIND = "InferenceService"
+ 
+-
+-class ResourceListResponse(BaseModel):
+-    """资源列表响应。"""
+-
+-    items: list[dict[str, Any]]
+-    count: int
+-
+-
+ #: 新建资源的 ``metadata.generation``（``observedGeneration`` 为 0：控制器尚未处理）。
+ INITIAL_GENERATION = 1
+ 
+@@ -132,6 +124,41 @@ def _invalid_limit(limit: int) -> JSONResponse | None:
+     )
+ 
+ 
++async def _list_response(
++    registry: SQLiteRegistry,
++    kind: str,
++    tenant_id: str,
++    namespace: str | None,
++    page_token: str | None,
++    limit: int,
++) -> dict[str, Any]:
++    """列表响应 ``{"items", "count", "nextPageToken"}``；还有更多结果时才带 ``nextPageToken``。
++
++    空的 ``pageToken`` 等同于省略（第一页）。
++
++    Raises:
++        ApiError: ``pageToken`` 无效，或签发给了另一个租户或另一组过滤条件（400）。
++    """
++    try:
++        page = await registry.list_page(
++            kind, tenant_id, namespace=namespace, page_token=page_token or None, limit=limit
++        )
++    except InvalidPageTokenError as exc:
++        raise ApiError(
++            400,
++            "BAD_REQUEST",
++            "invalid pageToken: it is malformed, was modified, or was issued for "
++            "a different tenant or filter set",
++        ) from exc
++    body: dict[str, Any] = {
++        "items": [resource.model_dump(by_alias=True, mode="json") for resource in page.items],
++        "count": len(page.items),
++    }
++    if page.next_page_token is not None:
++        body["nextPageToken"] = page.next_page_token
++    return body
++
++
+ def _resource_response(resource: Resource, status_code: int = 200) -> JSONResponse:
+     """单个资源的 JSON 表示，附带当前版本的 ``ETag``。"""
+     return JSONResponse(
+@@ -184,12 +211,17 @@ async def list_inference_services(
+     registry: SQLiteRegistry = Depends(require_registry),
+     namespace: str | None = None,
+     limit: int = 100,
++    page_token: str | None = Query(default=None, alias="pageToken"),
+ ) -> Any:
+-    """列出推理服务（可选按 namespace 过滤、limit 分页）。"""
++    """列出推理服务（可选按 namespace 过滤），按 ``(namespace, name)`` 升序分页。
++
++    响应带 ``nextPageToken`` 时还有下一页：以相同的 ``namespace`` 把它作为 ``pageToken``
++    传回（``limit`` 可以不同）；无效、被篡改或签发给另一租户 / 另一组过滤条件的
++    ``pageToken`` 返回 400。
++    """
+     if (invalid := _invalid_limit(limit)) is not None:
+         return invalid
+-    items = await registry.list("InferenceService", tenant_id, namespace=namespace, limit=limit)
+-    return {"items": [r.model_dump(by_alias=True) for r in items], "count": len(items)}
++    return await _list_response(registry, _KIND, tenant_id, namespace, page_token, limit)
+ 
+ 
+ @router.get("/inference-services/{name}", dependencies=[Depends(require_read)])
+@@ -359,18 +391,22 @@ async def list_resources(
+     kind: str | None = None,
+     namespace: str | None = None,
+     limit: int = 100,
++    page_token: str | None = Query(default=None, alias="pageToken"),
+ ) -> Any:
+-    """列出资源（可选按 kind / namespace 过滤）。
++    """列出某个 kind 的资源（可选按 namespace 过滤），分页规则同推理服务列表。
+ 
+-    未指定 ``kind`` 时返回空列表（P1 简化：避免全表扫描）。
++    未指定 ``kind`` 时返回空列表（P1 简化：避免全表扫描）；这时不会签发 ``nextPageToken``，
++    带 ``pageToken`` 返回 400。
+     """
+     if (invalid := _invalid_limit(limit)) is not None:
+         return invalid
+-    if kind:
+-        items = await registry.list(kind, tenant_id, namespace=namespace, limit=limit)
+-    else:
+-        items = []
+-    return {"items": [r.model_dump(by_alias=True) for r in items], "count": len(items)}
++    if not kind:
++        if page_token:
++            raise ApiError(
++                400, "BAD_REQUEST", "invalid pageToken: a listing without kind has no further pages"
++            )
++        return {"items": [], "count": 0}
++    return await _list_response(registry, kind, tenant_id, namespace, page_token, limit)
+ 
+ 
+ # ------------------------------------------------------------------ #
+diff --git a/tests/unit/controlplane/test_api_pagination.py b/tests/unit/controlplane/test_api_pagination.py
+new file mode 100644
+index 0000000..514c490
+--- /dev/null
++++ b/tests/unit/controlplane/test_api_pagination.py
+@@ -0,0 +1,216 @@
++"""列表接口分页（``limit`` / ``pageToken`` / ``nextPageToken``）单元测试。
++
++覆盖 ``GET /api/v1/inference-services`` 与 ``GET /api/v1/resources``：按 ``(namespace, name)``
++顺序翻页、最后一页不带 ``nextPageToken``、``limit`` 可以逐页变化、空 ``pageToken`` 等同于
++省略，以及游标绑定租户与过滤条件、被篡改时返回 400 错误信封。
++"""
++
++from __future__ import annotations
++
++import asyncio
++from typing import Any
++
++import pytest
++from fastapi import FastAPI
++from fastapi.testclient import TestClient
++from forgemesh.controlplane.api import create_api_router
++from forgemesh.controlplane.api.dependencies import get_registry, init_registry
++from forgemesh.controlplane.api.errors import install_exception_handlers
++
++SERVICES = "/api/v1/inference-services"
++RESOURCES = "/api/v1/resources"
++SPEC: dict[str, Any] = {
++    "model": {"reference": "models/llama"},
++    "runtime": {"provider": "vllm", "version": "0.6.3"},
++    "resources": {"accelerator": {"type": "nvidia-gpu", "count": 1, "minMemoryGiB": 16}},
++}
++
++
++@pytest.fixture()
++def client() -> TestClient:
++    """带错误信封处理器的测试客户端（全新内存库）。"""
++    init_registry(":memory:")
++    app = FastAPI()
++    install_exception_handlers(app)
++    app.include_router(create_api_router())
++    return TestClient(app)
++
++
++def _create(client: TestClient, name: str, namespace: str = "default", tenant: str = "tenant-a"):
++    response = client.post(
++        SERVICES,
++        json={
++            "apiVersion": "forgemesh.io/v1alpha1",
++            "kind": "InferenceService",
++            "metadata": {"name": name, "namespace": namespace},
++            "spec": SPEC,
++        },
++        headers={"X-Tenant-Id": tenant},
++    )
++    assert response.status_code == 201, response.text
++
++
++def _list(client: TestClient, path: str = SERVICES, tenant: str = "tenant-a", **params: Any):
++    return client.get(
++        path, params=params, headers={"X-Tenant-Id": tenant, "X-Correlation-Id": "corr-1"}
++    )
++
++
++def _page(client: TestClient, path: str = SERVICES, **params: Any) -> dict[str, Any]:
++    response = _list(client, path, **params)
++    assert response.status_code == 200, response.text
++    return response.json()
++
++
++def _names(page: dict[str, Any]) -> list[str]:
++    return [item["metadata"]["name"] for item in page["items"]]
++
++
++def _assert_rejected(response) -> None:
++    assert response.status_code == 400, response.text
++    error = response.json()["error"]
++    assert (error["code"], error["correlationId"]) == ("BAD_REQUEST", "corr-1")
++    assert "pageToken" in error["message"]
++
++
++@pytest.mark.parametrize("path", [SERVICES, RESOURCES])
++def test_lists_page_through_all_services_in_order(client: TestClient, path: str) -> None:
++    for namespace, name in [("b", "svc-1"), ("a", "svc-2"), ("a", "svc-1"), ("b", "svc-0")]:
++        _create(client, name, namespace=namespace)
++    _create(client, "svc-3", namespace=None)
++
++    seen: list[tuple[str | None, str]] = []
++    counts: list[int] = []
++    params: dict[str, Any] = {"limit": 2}
++    if path == RESOURCES:
++        params["kind"] = "InferenceService"
++    while True:
++        page = _page(client, path, **params)
++        seen.extend(
++            (item["metadata"]["namespace"], item["metadata"]["name"]) for item in page["items"]
++        )
++        counts.append(page["count"])
++        if "nextPageToken" not in page:
++            break
++        params["pageToken"] = page["nextPageToken"]
++
++    assert seen == [(None, "svc-3"), ("a", "svc-1"), ("a", "svc-2"), ("b", "svc-0"), ("b", "svc-1")]
++    assert counts == [2, 2, 1]
++
++
++def test_a_full_last_page_has_no_next_page_token(client: TestClient) -> None:
++    for i in range(3):
++        _create(client, f"svc-{i}")
++
++    first = _page(client, limit=2)
++    last = _page(client, limit=1, pageToken=first["nextPageToken"])
++
++    assert _names(last) == ["svc-2"]
++    assert "nextPageToken" not in last
++    assert "nextPageToken" not in _page(client, limit=3)
++
++
++def test_the_limit_may_change_between_pages(client: TestClient) -> None:
++    for i in range(4):
++        _create(client, f"svc-{i}")
++    first = _page(client, limit=1)
++
++    rest = _page(client, limit=10, pageToken=first["nextPageToken"])
++
++    assert _names(rest) == ["svc-1", "svc-2", "svc-3"]
++
++
++def test_an_empty_page_token_starts_at_the_first_page(client: TestClient) -> None:
++    for i in range(2):
++        _create(client, f"svc-{i}")
++
++    assert _names(_page(client, limit=1, pageToken="")) == ["svc-0"]
++
++
++def test_list_items_match_the_single_resource_representation(client: TestClient) -> None:
++    _create(client, "svc-0")
++    asyncio.run(
++        get_registry().update_status(
++            "InferenceService",
++            "default",
++            "svc-0",
++            "tenant-a",
++            {"conditions": [{"type": "Ready", "status": "False", "reason": "Scheduling"}]},
++            observed_generation=1,
++        )
++    )
++
++    [item] = _page(client)["items"]
++    fetched = client.get(
++        f"{SERVICES}/svc-0", params={"namespace": "default"}, headers={"X-Tenant-Id": "tenant-a"}
++    )
++
++    assert item == fetched.json()
++
++
++@pytest.mark.parametrize(
++    ("tenant", "params"),
++    [
++        pytest.param("tenant-b", {"namespace": "default"}, id="other-tenant"),
++        pytest.param("tenant-a", {"namespace": "other"}, id="other-namespace"),
++        pytest.param("tenant-a", {}, id="all-namespaces"),
++    ],
++)
++def test_service_page_tokens_are_bound_to_the_tenant_and_filters(
++    client: TestClient, tenant: str, params: dict[str, Any]
++) -> None:
++    for owner in ("tenant-a", "tenant-b"):
++        for namespace in ("default", "other"):
++            for i in range(2):
++                _create(client, f"svc-{i}", namespace=namespace, tenant=owner)
++    token = _page(client, namespace="default", limit=1)["nextPageToken"]
++
++    _assert_rejected(_list(client, tenant=tenant, limit=1, pageToken=token, **params))
++
++
++@pytest.mark.parametrize(
++    "params",
++    [
++        pytest.param({"kind": "Node"}, id="other-kind"),
++        pytest.param({}, id="without-kind"),
++    ],
++)
++def test_resource_page_tokens_are_bound_to_the_kind(
++    client: TestClient, params: dict[str, Any]
++) -> None:
++    for i in range(2):
++        _create(client, f"svc-{i}")
++    token = _page(client, RESOURCES, kind="InferenceService", limit=1)["nextPageToken"]
++
++    _assert_rejected(_list(client, RESOURCES, limit=1, pageToken=token, **params))
++
++
++def test_listing_resources_without_kind_stays_empty(client: TestClient) -> None:
++    _create(client, "svc-0")
++
++    assert _page(client, RESOURCES) == {"items": [], "count": 0}
++
++
++def _replace_last_character(token: str) -> str:
++    return token[:-1] + ("B" if token.endswith("A") else "A")
++
++
++def _replace_first_character(token: str) -> str:
++    return ("B" if token.startswith("A") else "A") + token[1:]
++
++
++@pytest.mark.parametrize(
++    "tamper",
++    [
++        pytest.param(_replace_first_character, id="modified-payload"),
++        pytest.param(_replace_last_character, id="modified-signature"),
++        pytest.param(lambda token: token.partition(".")[0], id="unsigned"),
++        pytest.param(lambda token: "not-a-token", id="garbage"),
++    ],
++)
++def test_tampered_page_tokens_are_rejected(client: TestClient, tamper) -> None:
++    for i in range(3):
++        _create(client, f"svc-{i}")
++    token = _page(client, limit=1)["nextPageToken"]
++
++    _assert_rejected(_list(client, limit=1, pageToken=tamper(token)))
+diff --git a/tests/unit/controlplane/test_app.py b/tests/unit/controlplane/test_app.py
+index 640089f..e989098 100644
+--- a/tests/unit/controlplane/test_app.py
++++ b/tests/unit/controlplane/test_app.py
+@@ -201,7 +201,7 @@ def test_unhandled_errors_return_an_opaque_500_envelope(tmp_path, monkeypatch) -
+ 
+     app = create_app(db_path=str(tmp_path / "cp.db"))
+     with TestClient(app, raise_server_exceptions=False) as client:
+-        monkeypatch.setattr(get_registry(), "list", failing_list)
++        monkeypatch.setattr(get_registry(), "list_page", failing_list)
+         response = client.get("/api/v1/inference-services", headers=HEADERS)
+ 
+     assert response.status_code == 500
+-- 
+2.43.0
+
