@@ -1,0 +1,354 @@
+From ec7763f7e6285383c3438c3a5ba553acec2749a5 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 13 Oct 2026 05:55:40 +0000
+Subject: [PATCH 04/18] feat(reconciler): deploy a failed service again when
+ its spec changes
+
+The R3-1 API accepts updates of a Failed service and bumps its
+generation, but the state machine only let Failed move to Terminating,
+so the update was stored and never acted on: the only way out of
+Failed was to delete and re-create the service.
+
+Failed gains one transition, Failed -> Pending. A Failed service whose
+generation is ahead of its observedGeneration moves to Pending in a
+pass without side effects, and is then deployed like a new service:
+Pending -> Scheduling evaluates the policy, the held allocation is
+reused when it still fits and replaced otherwise, and an instance that
+compensation could not stop is stopped before the new deployment run
+starts. Pending rather than Scheduling was picked so that redeploying
+a failed service never skips the policy check or any later step.
+
+There is still no automatic retry: a Failed service whose spec did not
+change is left alone.
+---
+ .../forgemesh/controlplane/reconciler/core.py | 38 +++++++--
+ .../src/forgemesh/resource/states.py          |  5 +-
+ .../controlplane/test_deployment_lifecycle.py | 78 ++++++++++++++++++-
+ tests/unit/controlplane/test_reconciler.py    | 37 ++++++++-
+ tests/unit/resource/test_states.py            | 16 ++++
+ 5 files changed, 162 insertions(+), 12 deletions(-)
+
+diff --git a/packages/control-plane/src/forgemesh/controlplane/reconciler/core.py b/packages/control-plane/src/forgemesh/controlplane/reconciler/core.py
+index f093a23..f65c81f 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/reconciler/core.py
++++ b/packages/control-plane/src/forgemesh/controlplane/reconciler/core.py
+@@ -68,13 +68,15 @@ generation 的运行（spec 在部署过程中变化，或运行来自 1.1.0 之
+   不返回步骤输出）时同样进入 ``Failed`` 并保留分配。
+ * 运行成功、实例却已不在运行（如控制平面在运行成功之后、写入 ``Ready`` 之前重启，
+   实例随进程结束）：``phase=Failed``、``Ready=False``（``InstanceLost``），释放分配。
+-* ``Failed`` 是终态：资源状态机只允许它转入 ``Terminating``，协调器不自动重试，删除后
+-  重新创建资源即可再次部署。
++* ``Failed`` 不自动重试。spec 变化（``generation`` 大于 ``observedGeneration``）时回到
++  ``Pending``（``Ready=False``，原因 ``Pending``，这一轮没有副作用），之后与新建的资源一样
++  经过策略校验、分配与部署：补偿没能停止的实例在启动新的部署运行之前停止，仍持有的分配
++  满足新的申请时复用。spec 没有变化时删除后重新创建资源即可再次部署。
+ 
+ 需要分配或执行工作流、却未注入对应组件时，在任何副作用之前返回 ``Ready=False``
+ （``SchedulerUnavailable`` / ``WorkflowRuntimeUnavailable``）。没有 ``metadata.uid`` 的
+ 资源报告 ``MissingUid``，不是 ``InferenceService`` 的资源报告 ``NotDeployable``。spec 没有
+-变化的 ``Ready`` / ``Degraded``，以及 ``Failed`` / ``Unknown`` 的资源没有可做的事。
++变化的 ``Ready`` / ``Degraded`` / ``Failed``，以及 ``Unknown`` 的资源没有可做的事。
+ 
+ 终止协调（Terminating，对齐 architecture.md §5.3/§12.4 与 development-plan
+ 第 7 章删除闭环）
+@@ -333,6 +335,8 @@ class ReconciliationController(Reconciler):
+         # 注意：失败路径不登记 dedup_key，保证 requeue 重试。
+         if phase == InferencePhase.TERMINATING:
+             return await self._reconcile_terminating(ctx)
++        if phase == InferencePhase.FAILED:
++            return await self._reconcile_failed(ctx)
+ 
+         diff = self._compute_diff(resource, ctx.observed)
+         if not diff["needs_reconcile"]:
+@@ -710,7 +714,7 @@ class ReconciliationController(Reconciler):
+                     ctx,
+                     "InstanceLost",
+                     f"instance {instance.instance_id} at {instance.url} is not running any "
+-                    "more; delete and re-create the service to deploy it again",
++                    "more; change the spec or re-create the service to deploy it again",
+                     release_allocation=True,
+                 )
+             return await self._ready(ctx, instance)
+@@ -842,6 +846,29 @@ class ReconciliationController(Reconciler):
+             },
+         )
+ 
++    async def _reconcile_failed(self, ctx: ReconcileContext) -> ReconcileResult:
++        """``Failed`` 一轮：spec 变化时回到 ``Pending`` 重新部署，否则没有可做的事。
++
++        这一轮没有副作用，也不评估策略：``Pending`` 一轮像对新建的资源一样授权这次部署，
++        之前的实例与分配由之后的部署轮次停止、复用或替换。
++        """
++        meta = ctx.resource.metadata
++        if meta.generation <= meta.observed_generation:
++            await self._mark_processed(ctx.dedup_key)
++            return ReconcileResult(done=True)
++        if meta.uid:
++            self._retry_counts.pop(meta.uid, None)
++        message = f"the spec changed (generation {meta.generation}); deploying it again"
++        return ReconcileResult(
++            done=False,
++            requeue_after=0.0,
++            status_patch={
++                "phase": InferencePhase.PENDING.value,
++                "endpoints": [],
++                "conditions": [_ready_condition("False", InferencePhase.PENDING.value, message)],
++            },
++        )
++
+     def _next_retry_delay(self, uid: str) -> float:
+         failures = self._retry_counts.get(uid, 0) + 1
+         self._retry_counts[uid] = failures
+@@ -1011,7 +1038,8 @@ class ReconciliationController(Reconciler):
+         * phase 尚未观测到（``None``）或处于部署 / 更新过程中（``Pending`` 到 ``Verifying``、
+           ``Updating``）时需要协调；
+         * ``Ready`` / ``Degraded`` 只在 spec 变化（``generation`` 大于 ``observedGeneration``）
+-          时需要协调（开始更新）；其余 phase（``Failed`` / ``Unknown``）没有可做的事。
++          时需要协调（开始更新）；其余 phase 没有可做的事（:meth:`reconcile` 在此之前处理
++          ``Terminating`` 与 ``Failed``）。
+         * ``needs_allocation``：本轮或之后的轮次要调用调度器（``Preparing`` 及之前，以及开始
+           更新的一轮）；``needs_workflow``：每一轮都要用到工作流运行时；``requirements``
+           为传给调度器的需求（见 :func:`_scheduling_requirements`）。
+diff --git a/packages/resource-model/src/forgemesh/resource/states.py b/packages/resource-model/src/forgemesh/resource/states.py
+index 8346fac..b718d08 100644
+--- a/packages/resource-model/src/forgemesh/resource/states.py
++++ b/packages/resource-model/src/forgemesh/resource/states.py
+@@ -15,6 +15,7 @@
+     Pending → Scheduling → Preparing → Deploying → Verifying → Ready
+     Ready ↔ Degraded / Updating
+     Degraded → Updating（降级的服务 spec 变化时同样经 Updating 重新部署）
++    Failed → Pending（spec 变化时重新部署；没有自动重试）
+     任意非终态（含 Failed / Unknown）→ Terminating（删除入口，受控释放）
+     任意非终态 → Failed / Unknown
+     Terminating → ∅（唯一终态，无出边；finalizer 清空后由注册表物理删除）
+@@ -22,7 +23,8 @@
+ 其中 ``Terminating`` 是**唯一终态**：进入后无任何出边，由协调器驱动
+ 「受控释放 → 清空 finalizer → 物理删除」闭环（对齐 development-plan 第 7 章）。
+ ``Failed`` / ``Unknown`` 不再是吸收态——允许 ``Failed / Unknown → Terminating``
+-以便人工清理失败资源（删除入口必须对所有现实状态可达）。
++以便人工清理失败资源（删除入口必须对所有现实状态可达）。``Failed`` 只经
++``Pending`` 重新部署：与新建的资源一样从策略校验开始，不跳过部署流程中的任何一步。
+ 
+ **分配转移语义**（``ALLOCATION_TRANSITIONS``）::
+ 
+@@ -170,6 +172,7 @@ INFERENCE_TRANSITIONS: dict[str, set[str]] = {
+     },
+     InferencePhase.TERMINATING.value: set(),
+     InferencePhase.FAILED.value: {
++        InferencePhase.PENDING.value,
+         InferencePhase.TERMINATING.value,
+     },
+     InferencePhase.UNKNOWN.value: {
+diff --git a/tests/unit/controlplane/test_deployment_lifecycle.py b/tests/unit/controlplane/test_deployment_lifecycle.py
+index a64543e..8522794 100644
+--- a/tests/unit/controlplane/test_deployment_lifecycle.py
++++ b/tests/unit/controlplane/test_deployment_lifecycle.py
+@@ -7,7 +7,8 @@
+   不会再分配；实例没有活过重启时，``Ready`` 的服务转为 ``Degraded``（endpoint 标记为未
+   就绪），运行成功却还没写入 ``Ready`` 的服务进入 ``Failed``；
+ * 部署工作流没能启动时保留分配并重试；部署失败时实例被停止、分配释放，资源停在
+-  ``Failed``；补偿没能停止的实例在删除资源时停止；
++  ``Failed``，修改 spec 之后从 ``Pending`` 重新部署；补偿没能停止的实例在删除资源或重新
++  部署时停止；
+ * 部署过程中 spec 变化：上一代 spec 的运行被取消，服务以新的 spec 进入 ``Ready``；加速器
+   申请变化、持有的设备不再满足时释放分配、重新分配；
+ * ``Ready`` 的服务 spec 变化：经 ``Updating`` 停止旧实例、部署新的 spec 后回到 ``Ready``；
+@@ -388,7 +389,7 @@ def test_a_workflow_that_fails_to_start_is_retried_with_the_same_allocation(monk
+ @pytest.mark.unit
+ def test_a_failed_deployment_stops_its_instance_releases_its_allocation_and_stays_failed():
+     """验证用尽重试：工作流补偿停止实例，资源进入 Failed（``Ready=False``，消息是失败的
+-    步骤），分配释放；Failed 是终态，之后的协调不再部署，删除时直接物理删除。"""
++    步骤），分配释放；没有自动重试，spec 不变时之后的协调不再部署，删除时直接物理删除。"""
+     launcher = _ScriptedLauncher()
+     launcher.fail.add("verify")
+ 
+@@ -747,6 +748,77 @@ def test_an_update_the_policy_denies_leaves_the_service_serving_until_it_is_allo
+     asyncio.run(scenario())
+ 
+ 
++# ---------------------------------------------------------------------- #
++# 失败之后修改 spec
++# ---------------------------------------------------------------------- #
++
++
++@pytest.mark.unit
++def test_a_failed_service_is_deployed_again_once_its_spec_changes():
++    """部署失败（分配已释放）之后修改 spec：服务回到 Pending，与新建的资源一样逐轮部署，
++    以新的 spec 进入 Ready（``observedGeneration`` 即新的 generation）。"""
++    launcher = _ScriptedLauncher()
++    launcher.fail.add("verify")
++    new_spec = _spec(model="models/mistral")
++
++    async def scenario() -> None:
++        async with _ControlPlane(":memory:", launcher) as plane:
++            await plane.registry.put(_service())
++            assert (await plane.deploy())[-1] == "Failed"
++            launcher.fail.clear()
++
++            assert await plane.update(new_spec) == 2
++            assert await plane.deploy() == [
++                "Pending",
++                "Scheduling",
++                "Preparing",
++                "Deploying",
++                "Verifying",
++                "Ready",
++            ]
++            service = await plane.service()
++            [instance] = launcher.running.values()
++            assert (launcher.launches[-1].instance_key, launcher.launches[-1].spec) == (
++                deployment_run_key(UID, 2),
++                new_spec,
++            )
++            assert service.status.endpoints == [instance.endpoint()]
++            assert (service.metadata.generation, service.metadata.observed_generation) == (2, 2)
++            assert {
++                record["idempotency_key"]: record["status"]
++                for record in await plane.registry.list_allocations(TENANT)
++            } == {f"{UID}:1": "Released", f"{UID}:2": "Active"}
++
++    asyncio.run(scenario())
++
++
++@pytest.mark.unit
++def test_an_instance_left_behind_by_a_failed_deployment_is_stopped_before_the_redeployment():
++    """补偿没能停止实例（服务 Failed、保留分配）之后修改 spec：新的部署复用这份分配，启动
++    新的部署运行之前停止遗留的实例，最后只有新的实例在运行。"""
++    launcher = _ScriptedLauncher()
++    launcher.fail.add("verify")
++    launcher.stop_failures = 1
++
++    async def scenario() -> None:
++        async with _ControlPlane(":memory:", launcher) as plane:
++            await plane.registry.put(_service())
++            assert (await plane.deploy())[-1] == "Failed"
++            [left_behind] = launcher.running.values()
++            [allocation] = await plane.registry.list_allocations(TENANT)
++            launcher.fail.clear()
++
++            await plane.update(_spec(model="models/mistral"))
++            assert (await plane.deploy())[-1] == "Ready"
++            [instance] = launcher.running.values()
++            assert launcher.stops == [left_behind.instance_id]
++            assert instance.instance_id != left_behind.instance_id
++            assert launcher.launches[-1].allocation_id == allocation["id"]
++            assert await plane.registry.list_allocations(TENANT) == [allocation]
++
++    asyncio.run(scenario())
++
++
+ # ---------------------------------------------------------------------- #
+ # 重放与重启
+ # ---------------------------------------------------------------------- #
+@@ -868,7 +940,7 @@ def test_an_instance_lost_between_a_successful_run_and_ready_fails_the_service(t
+                 "False",
+                 "InstanceLost",
+                 f"instance {instance.instance_id} at {instance.url} is not running any more; "
+-                "delete and re-create the service to deploy it again",
++                "change the spec or re-create the service to deploy it again",
+             )
+             assert await plane.registry.get_active_allocation(UID, TENANT) is None
+             assert await plane.registry.allocated_devices() == frozenset()
+diff --git a/tests/unit/controlplane/test_reconciler.py b/tests/unit/controlplane/test_reconciler.py
+index 608d3ef..7816b38 100644
+--- a/tests/unit/controlplane/test_reconciler.py
++++ b/tests/unit/controlplane/test_reconciler.py
+@@ -1135,13 +1135,13 @@ def test_a_failed_run_lookup_keeps_the_phase_and_backs_off():
+     [
+         (InferencePhase.READY, 2),
+         (InferencePhase.DEGRADED, 2),
+-        (InferencePhase.FAILED, 1),
++        (InferencePhase.FAILED, 2),
+         (InferencePhase.UNKNOWN, 1),
+     ],
+ )
+ def test_services_outside_a_deployment_are_left_alone(phase, observed_generation):
+-    """部署之外没有可做的事：spec 没有变化的服务中的资源，以及 Failed（不自动重试）与
+-    Unknown。"""
++    """部署之外没有可做的事：spec 没有变化的 Ready / Degraded / Failed（不自动重试），以及
++    Unknown（spec 变化也一样）。"""
+     scheduler = MockScheduler()
+     workflow = StubWorkflowRuntime()
+     controller = _controller(scheduler=scheduler, workflow=workflow)
+@@ -1156,6 +1156,37 @@ def test_services_outside_a_deployment_are_left_alone(phase, observed_generation
+     assert (workflow.started, workflow.lookups) == ([], [])
+ 
+ 
++@pytest.mark.unit
++def test_a_failed_service_whose_spec_changed_goes_back_to_pending():
++    """Failed 且 spec 变化：回到 Pending、清空 endpoint，立即重新排队；这一轮没有副作用，
++    不评估策略（Pending 一轮像对新建的资源一样授权），不登记去重键。"""
++    policy = SequencePolicyEngine("deny")
++    scheduler = MockScheduler()
++    workflow = StubWorkflowRuntime(run=make_run(WorkflowStatus.FAILED))
++    release = StubReleaseProvider()
++    controller = _controller(policy=policy, scheduler=scheduler, workflow=workflow, release=release)
++    service = make_inference_service(
++        phase=InferencePhase.FAILED, generation=2, observed_generation=1
++    )
++    ctx = make_service_context(service)
++
++    result = asyncio.run(controller.reconcile(ctx))
++
++    assert (result.done, result.requeue_after) == (False, 0.0)
++    assert result.status_patch == {
++        "phase": "Pending",
++        "endpoints": [],
++        **_not_ready("Pending", "the spec changed (generation 2); deploying it again"),
++    }
++    assert (policy.calls, scheduler.requests, workflow.lookups, release.released) == (
++        0,
++        [],
++        [],
++        [],
++    )
++    assert ctx.dedup_key not in controller._processed_keys
++
++
+ # ---------------------------------------------------------------------- #
+ # 部署过程中 spec 变化
+ # ---------------------------------------------------------------------- #
+diff --git a/tests/unit/resource/test_states.py b/tests/unit/resource/test_states.py
+index 19c1786..b9e50be 100644
+--- a/tests/unit/resource/test_states.py
++++ b/tests/unit/resource/test_states.py
+@@ -6,6 +6,7 @@
+ * **非法转移被拒**（如 Ready→Scheduling 抛 ``InvalidStateTransition``）；
+ * ``Ready`` 到 ``Degraded`` / ``Updating`` / ``Terminating`` 的双向/单向语义，
+   ``Degraded`` → ``Updating``（spec 变化）；
++* ``Failed`` 只经 ``Pending`` 重新部署（spec 变化），``Unknown`` 只能删除；
+ * 所有非终态（含 ``Failed`` / ``Unknown``，人工清理入口）→ ``Terminating``；
+ * ``Terminating`` 唯一终态无出边（finalizer 清空后由注册表物理删除）；
+ * ``Allocation`` 的 ``Active → {Released, Expired}`` 单向语义；
+@@ -48,6 +49,7 @@ pytestmark = pytest.mark.unit
+         (InferencePhase.DEGRADED, InferencePhase.UPDATING),
+         (InferencePhase.UPDATING, InferencePhase.READY),
+         (InferencePhase.READY, InferencePhase.TERMINATING),
++        (InferencePhase.FAILED, InferencePhase.PENDING),
+     ],
+ )
+ def test_inference_legal_transitions_pass(current: InferencePhase, target: InferencePhase) -> None:
+@@ -117,6 +119,20 @@ def test_any_state_can_terminate(source: InferencePhase) -> None:
+     INFERENCE_STATE_MACHINE.validate(source.value, InferencePhase.TERMINATING.value)
+ 
+ 
++def test_failed_is_deployed_again_only_through_pending() -> None:
++    """Failed 只能回到 Pending（spec 变化后重新部署）或进入 Terminating，不能跳过部署流程
++    直接进入后面的 phase；Unknown 只能删除。"""
++    assert INFERENCE_TRANSITIONS[InferencePhase.FAILED.value] == {
++        InferencePhase.PENDING.value,
++        InferencePhase.TERMINATING.value,
++    }
++    assert INFERENCE_TRANSITIONS[InferencePhase.UNKNOWN.value] == {InferencePhase.TERMINATING.value}
++    with pytest.raises(InvalidStateTransition):
++        INFERENCE_STATE_MACHINE.validate(
++            InferencePhase.FAILED.value, InferencePhase.SCHEDULING.value
++        )
++
++
+ def test_terminating_has_no_outgoing() -> None:
+     """Terminating 为唯一终态：无出边（finalizer 清空后由注册表物理删除）。"""
+     assert INFERENCE_TRANSITIONS[InferencePhase.TERMINATING.value] == set()
+-- 
+2.43.0
+

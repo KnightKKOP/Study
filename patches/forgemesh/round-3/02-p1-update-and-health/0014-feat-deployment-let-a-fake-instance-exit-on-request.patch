@@ -1,0 +1,211 @@
+From 2b3dee52df0147033217d80384fbe926912d115b Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 13 Oct 2026 08:36:29 +0000
+Subject: [PATCH 14/18] feat(deployment): let a fake instance exit on request
+
+The controller now finds instances that stopped running and redeploys
+their services, but a fake instance only ends with the control plane
+process, so nothing outside the unit tests can make one disappear
+while the control plane keeps running. The compose smoke needs that to
+check the lost-instance path end to end.
+
+POST /fake/exit on a fake instance makes it end like an exited
+process: the launcher forgets it before answering 202, so is_running
+is false from then on, and it then stops listening and interrupts its
+other requests. The request itself is left out of the interruption so
+the caller gets its answer. aclose waits for instances that are still
+exiting, so closing the launcher leaves no task behind.
+
+Only fake instances have the route, and the gateway forwards to the
+fixed path of an endpoint's protocol, so it cannot be reached through
+the gateway.
+---
+ .../forgemesh/controlplane/deployment/fake.py | 29 ++++++++-
+ tests/unit/controlplane/test_fake_launcher.py | 64 ++++++++++++++++++-
+ 2 files changed, 89 insertions(+), 4 deletions(-)
+
+diff --git a/packages/control-plane/src/forgemesh/controlplane/deployment/fake.py b/packages/control-plane/src/forgemesh/controlplane/deployment/fake.py
+index e364e42..1910884 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/deployment/fake.py
++++ b/packages/control-plane/src/forgemesh/controlplane/deployment/fake.py
+@@ -8,7 +8,10 @@
+ * ``POST /v1/chat/completions`` → 请求体须是带非空 ``messages`` 数组的 JSON 对象；
+   ``"stream": true`` 时以 SSE 返回若干 ``chat.completion.chunk`` 事件（每个一行
+   ``data: {...}``），以 ``data: [DONE]`` 结束，否则返回一个 ``chat.completion`` 对象。
+-  回复内容固定，含实例 id。
++  回复内容固定，含实例 id；
++* ``POST /fake/exit`` → ``202``，实例随之像进程退出一样结束：启动器立即不再认为它在运行，
++  随后停止监听、中断其余请求。用来测试控制平面发现并替换丢失的实例（见
++  ``scripts/compose_smoke.sh``）；网关只转发到推理协议的路径，经网关调用不到它。
+ 
+ 每个连接只处理一个请求（``Connection: close``）；请求体须以 ``Content-Length`` 给出长度，
+ 至多 1 MiB。
+@@ -46,6 +49,7 @@ MAX_BODY_BYTES = 1024 * 1024
+ 
+ _HEALTH_PATH = "/health"
+ _CHAT_PATH = "/v1/chat/completions"
++_EXIT_PATH = "/fake/exit"
+ 
+ 
+ class _HttpError(Exception):
+@@ -148,6 +152,7 @@ class FakeLauncher(RuntimeLauncher):
+         self._probe_host = local_address(self._bind_host)
+         self._by_key: dict[str, _Instance] = {}
+         self._by_id: dict[str, _Instance] = {}
++        self._exits: set[asyncio.Task[None]] = set()
+         self._closed = False
+ 
+     @property
+@@ -230,12 +235,13 @@ class FakeLauncher(RuntimeLauncher):
+         return instance_id in self._by_id
+ 
+     async def aclose(self) -> None:
+-        """停止全部实例；之后 :meth:`launch` 抛出 :class:`RuntimeError`。"""
++        """停止全部实例，等正在退出的实例停止监听；之后 :meth:`launch` 抛出
++        :class:`RuntimeError`。"""
+         self._closed = True
+         states = list(self._by_id.values())
+         for state in states:
+             self._forget(state)
+-        await asyncio.gather(*(self._shutdown(state) for state in states))
++        await asyncio.gather(*(self._shutdown(state) for state in states), *self._exits)
+ 
+     def _forget(self, state: _Instance) -> None:
+         self._by_id.pop(state.instance.instance_id, None)
+@@ -251,6 +257,18 @@ class FakeLauncher(RuntimeLauncher):
+         await state.server.wait_closed()
+         logger.info("fake instance stopped: instance_id=%s", state.instance.instance_id)
+ 
++    def _exit(self, state: _Instance) -> None:
++        """``POST /fake/exit``：实例立即不再算作在运行，随后停止监听、中断其余请求；这个请求
++        不在中断之列，照常得到响应。"""
++        logger.info("fake instance exits on request: instance_id=%s", state.instance.instance_id)
++        self._forget(state)
++        connection = asyncio.current_task()
++        if connection is not None:
++            state.connections.discard(connection)
++        task = asyncio.create_task(self._shutdown(state))
++        self._exits.add(task)
++        task.add_done_callback(self._exits.discard)
++
+     async def _serve(
+         self, instance_id: str, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+     ) -> None:
+@@ -297,6 +315,11 @@ class FakeLauncher(RuntimeLauncher):
+             if method != "POST":
+                 raise _HttpError(HTTPStatus.METHOD_NOT_ALLOWED, "use POST", allow="POST")
+             return self._chat(state, body)
++        if path == _EXIT_PATH:
++            if method != "POST":
++                raise _HttpError(HTTPStatus.METHOD_NOT_ALLOWED, "use POST", allow="POST")
++            self._exit(state)
++            return [_response(HTTPStatus.ACCEPTED, b"", "text/plain")]
+         raise _HttpError(HTTPStatus.NOT_FOUND, f"no route for {path}")
+ 
+     def _chat(self, state: _Instance, body: bytes) -> list[bytes]:
+diff --git a/tests/unit/controlplane/test_fake_launcher.py b/tests/unit/controlplane/test_fake_launcher.py
+index 1c9fd03..e72ec00 100644
+--- a/tests/unit/controlplane/test_fake_launcher.py
++++ b/tests/unit/controlplane/test_fake_launcher.py
+@@ -4,7 +4,8 @@
+   响应），非法请求得到 OpenAI 风格的错误；
+ * 同一实例幂等键返回同一实例；监听地址与写进实例地址的主机分开配置；
+ * ``stop`` 释放端口并中断进行中的请求，``aclose`` 停止全部实例；不开线程，关闭后不留下
+-  任务；不认识的实例立即验证失败。
++  任务；不认识的实例立即验证失败；
++* ``POST /fake/exit`` 让实例像进程退出一样结束，``aclose`` 等正在退出的实例停止监听。
+ """
+ 
+ from __future__ import annotations
+@@ -35,6 +36,7 @@ from forgemesh.resource.inference import (
+ )
+ 
+ CHAT_PATH = "/v1/chat/completions"
++EXIT_PATH = "/fake/exit"
+ CHAT = {"model": "smoke", "messages": [{"role": "user", "content": "hi"}], "stream": True}
+ 
+ 
+@@ -172,6 +174,7 @@ def test_a_request_without_stream_gets_one_chat_completion() -> None:
+         (_post(CHAT_PATH, {**CHAT, "stream": "yes"}), 400, None),
+         (b"GET /v1/chat/completions HTTP/1.1\r\nHost: instance\r\n\r\n", 405, "POST"),
+         (b"POST /health HTTP/1.1\r\nHost: instance\r\nContent-Length: 0\r\n\r\n", 405, "GET"),
++        (b"GET /fake/exit HTTP/1.1\r\nHost: instance\r\n\r\n", 405, "POST"),
+         (b"GET /v1/models HTTP/1.1\r\nHost: instance\r\n\r\n", 404, None),
+         (
+             b"POST /v1/chat/completions HTTP/1.1\r\nHost: instance\r\n"
+@@ -196,6 +199,7 @@ def test_a_request_without_stream_gets_one_chat_completion() -> None:
+         "stream-not-a-boolean",
+         "get-chat",
+         "post-health",
++        "get-exit",
+         "unknown-path",
+         "chunked-body",
+         "body-too-large",
+@@ -361,6 +365,64 @@ def test_aclose_stops_every_instance_without_threads_or_leftover_tasks() -> None
+     assert set(threading.enumerate()) == threads
+ 
+ 
++@pytest.mark.unit
++def test_an_instance_exits_on_request_like_a_process_that_ended() -> None:
++    """回复 202 时实例已不在运行；随后停止监听、中断其余请求，同一实例键再启动的是新实例。"""
++    launcher = FakeLauncher()
++
++    async def scenario() -> None:
++        instance = await launcher.launch(_request())
++        other = await launcher.launch(_request("uid-2"))
++        reader, writer = await asyncio.open_connection("127.0.0.1", _port(instance))
++        writer.write(f"POST {CHAT_PATH} HTTP/1.1\r\n".encode())
++        await writer.drain()
++        await launcher.verify(instance)
++
++        status, headers, body = await _http(_port(instance), _post(EXIT_PATH, b""))
++
++        assert (status, headers["content-length"], body) == (202, "0", b"")
++        assert not await launcher.is_running(instance.instance_id)
++        with pytest.raises(RuntimeError, match=f"instance {instance.instance_id} is not running"):
++            await launcher.verify(instance)
++        with contextlib.suppress(ConnectionResetError):
++            assert await reader.read() == b""
++        writer.close()
++        with contextlib.suppress(ConnectionResetError):
++            await writer.wait_closed()
++        await _assert_refused(_port(instance))
++        await launcher.verify(other)
++        relaunched = await launcher.launch(_request())
++        assert relaunched.instance_id not in {instance.instance_id, other.instance_id}
++        await launcher.aclose()
++        assert asyncio.all_tasks() == {asyncio.current_task()}
++
++    asyncio.run(scenario())
++
++
++@pytest.mark.unit
++def test_aclose_waits_for_an_instance_that_is_exiting() -> None:
++    launcher = FakeLauncher()
++
++    async def scenario() -> None:
++        instance = await launcher.launch(_request())
++        reader, writer = await asyncio.open_connection("127.0.0.1", _port(instance))
++        writer.write(_post(EXIT_PATH, b""))
++        await writer.drain()
++        async with asyncio.timeout(5):
++            while await launcher.is_running(instance.instance_id):
++                await asyncio.sleep(0)
++
++        await launcher.aclose()
++
++        assert asyncio.all_tasks() == {asyncio.current_task()}
++        await _assert_refused(_port(instance))
++        assert (await reader.read()).startswith(b"HTTP/1.1 202 Accepted\r\n")
++        writer.close()
++        await writer.wait_closed()
++
++    asyncio.run(scenario())
++
++
+ @pytest.mark.unit
+ def test_verify_fails_for_unknown_instances_and_unhealthy_ones(monkeypatch) -> None:
+     """重启之前的实例（启动器不认识）立即失败；``/health`` 不应答时同样失败。"""
+-- 
+2.43.0
+
