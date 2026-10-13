@@ -1,7 +1,7 @@
-From 7baa099746b1347fc5e5ff2b40136ffd2eae2178 Mon Sep 17 00:00:00 2001
+From 53185cf7cb4262f8a696fc7f5a9780faf9cf60e6 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Tue, 13 Oct 2026 03:46:04 +0000
-Subject: [PATCH 06/11] feat(gateway): propagate W3C trace context and log it
+Subject: [PATCH 06/17] feat(gateway): propagate W3C trace context and log it
  with the ids
 
 Requests crossing the gateway could only be correlated through the
@@ -583,10 +583,10 @@ index 0000000..69c66b0
 +	}
 +}
 diff --git a/gateway/internal/router/router.go b/gateway/internal/router/router.go
-index ea08f9c..1a4a854 100644
+index fc527de..cdede2c 100644
 --- a/gateway/internal/router/router.go
 +++ b/gateway/internal/router/router.go
-@@ -16,10 +16,10 @@
+@@ -17,10 +17,10 @@
  //	                                          路径；要求 read 作用域）
  //	ANY  /api/v1/inference/{svc}/chat          同上，用于不带命名空间的服务
  //
@@ -600,7 +600,7 @@ index ea08f9c..1a4a854 100644
  // 认证模式见 config.AuthModeAPIKey / config.AuthModeDev 与 ADR-014。
  package router
  
-@@ -118,10 +118,13 @@ func New(cfg config.Config, logger *log.Logger) (*Router, error) {
+@@ -120,10 +120,13 @@ func New(cfg config.Config, logger *log.Logger) (*Router, error) {
  		maxBody = config.DefaultMaxRequestBodyBytes
  	}
  

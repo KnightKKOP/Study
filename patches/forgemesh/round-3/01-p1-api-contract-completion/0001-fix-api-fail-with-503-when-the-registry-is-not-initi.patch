@@ -1,7 +1,7 @@
 From dd74aee87a6bce91aace3448c5558acfeb2fe5aa Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Tue, 13 Oct 2026 02:39:55 +0000
-Subject: [PATCH 01/10] fix(api): fail with 503 when the registry is not
+Subject: [PATCH 01/11] fix(api): fail with 503 when the registry is not
  initialised
 
 get_registry() used to open a fresh in-memory SQLite registry when

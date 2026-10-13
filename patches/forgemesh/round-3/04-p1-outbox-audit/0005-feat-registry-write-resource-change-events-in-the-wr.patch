@@ -1,14 +1,14 @@
-From 71a5ddd5c1b01de12386e4fe59f7eef965761e43 Mon Sep 17 00:00:00 2001
+From 7429de19a1b5a3d683cc366c924b4d9db6a278e0 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Tue, 13 Oct 2026 03:11:59 +0000
-Subject: [PATCH 05/12] feat(registry): write resource change events in the
+Subject: [PATCH 05/14] feat(registry): write resource change events in the
  write transaction
 
-Every resource write of SQLiteRegistry (create, update, status write,
-delete request, delete) now also writes a DomainEvent into the outbox
-that shares the registry's connection, inside the same transaction as
-the resource row and its change record: a failed write leaves no event,
-and a failed event write rolls the resource write back.
+Every resource write of SQLiteRegistry (create, update, spec update,
+status write, delete request, delete) now also writes a DomainEvent
+into the outbox that shares the registry's connection, inside the same
+transaction as the resource row and its change record: a failed write
+leaves no event, and a failed event write rolls the resource write back.
 
 The envelope follows api/schemas/event.schema.json. eventType is
 "<kind as dotted words>.<change>" (inference.service.created, .updated,
@@ -17,9 +17,20 @@ resource identity, the phase and the resource representation after the
 write (deleted: the last state before the delete). Writes without a
 correlation id get a generated one.
 
+update_spec, the desired-state write behind PUT and PATCH, takes a
+correlation_id like the other writes and emits .updated inside its
+BEGIN IMMEDIATE transaction; an update that changes nothing writes
+neither a change record nor an event.
+
 The controller passes the correlation id of a reconcile to its status
 writes, and the reconciler passes it (and actor "reconciler") when it
 removes the release finalizer, so all events of one reconcile share it.
+The instance check that turns a Ready service whose instance is gone
+into Degraded writes its status through update_status as well, so it
+emits a .status_updated event in that transaction, with a generated
+correlation id since it belongs to no reconcile. Allocation writes,
+including the reclaim of orphaned allocations, change no resource and
+write no event.
 
 delete() now reads the row under BEGIN IMMEDIATE before deleting it to
 capture the last state. CONTROL_PLANE_VERSION moves to a dependency-free
@@ -28,22 +39,22 @@ producer.version without an import cycle.
 ---
  .../src/forgemesh/controlplane/app.py         |   4 +-
  .../controlplane/controller/manager.py        |  12 +-
- .../src/forgemesh/controlplane/events.py      | 179 ++++++++
+ .../src/forgemesh/controlplane/events.py      | 180 ++++++
  .../forgemesh/controlplane/reconciler/core.py |   7 +-
- .../forgemesh/controlplane/registry/store.py  | 104 ++++-
+ .../forgemesh/controlplane/registry/store.py  | 115 +++-
  .../src/forgemesh/controlplane/version.py     |  11 +
  .../controlplane/test_controller_manager.py   |  65 ++-
- .../unit/controlplane/test_registry_events.py | 392 ++++++++++++++++++
- 8 files changed, 757 insertions(+), 17 deletions(-)
+ .../unit/controlplane/test_registry_events.py | 528 ++++++++++++++++++
+ 8 files changed, 903 insertions(+), 19 deletions(-)
  create mode 100644 packages/control-plane/src/forgemesh/controlplane/events.py
  create mode 100644 packages/control-plane/src/forgemesh/controlplane/version.py
  create mode 100644 tests/unit/controlplane/test_registry_events.py
 
 diff --git a/packages/control-plane/src/forgemesh/controlplane/app.py b/packages/control-plane/src/forgemesh/controlplane/app.py
-index e735f6a..f233dca 100644
+index 591037c..8907ae0 100644
 --- a/packages/control-plane/src/forgemesh/controlplane/app.py
 +++ b/packages/control-plane/src/forgemesh/controlplane/app.py
-@@ -77,6 +77,7 @@ from .deployment import (
+@@ -87,6 +87,7 @@ from .deployment import (
  from .reconciler import ProcessedKeyStore, ReconciliationController
  from .scheduler import INVENTORY_FILE_ENV, FirstFitScheduler, inventory_from_env
  from .sqlite import workflow_db_path
@@ -51,7 +62,7 @@ index e735f6a..f233dca 100644
  
  if TYPE_CHECKING:  # pragma: no cover - 仅静态类型检查使用
      from .auth import Authenticator
-@@ -100,9 +101,6 @@ API_PREFIX = "/api/v1"
+@@ -110,9 +111,6 @@ API_PREFIX = "/api/v1"
  #: 兜底服务（无 FastAPI）的占位错误码。
  NOT_IMPLEMENTED_CODE = "NOT_IMPLEMENTED"
  
@@ -62,10 +73,10 @@ index e735f6a..f233dca 100644
  DEFAULT_DB_PATH = "forgemesh.db"
  HOST_ENV = "FORGEMESH_HOST"
 diff --git a/packages/control-plane/src/forgemesh/controlplane/controller/manager.py b/packages/control-plane/src/forgemesh/controlplane/controller/manager.py
-index f37f0bf..d7af3e1 100644
+index 637fa23..8afdd51 100644
 --- a/packages/control-plane/src/forgemesh/controlplane/controller/manager.py
 +++ b/packages/control-plane/src/forgemesh/controlplane/controller/manager.py
-@@ -172,17 +172,18 @@ class ControllerManager:
+@@ -235,17 +235,18 @@ class ControllerManager:
          dedup_key = compute_dedup_key(
              key.kind, key.namespace, key.name, meta.uid, meta.generation, operation
          ).key
@@ -86,7 +97,7 @@ index f37f0bf..d7af3e1 100644
          ):
              self._queue.add(key)
              return
-@@ -198,8 +199,12 @@ class ControllerManager:
+@@ -261,8 +262,12 @@ class ControllerManager:
          resource: Resource,
          operation: str,
          patch: dict[str, Any],
@@ -100,7 +111,7 @@ index f37f0bf..d7af3e1 100644
          target = (resource.metadata.uid, resource.metadata.generation, operation)
          expected_version = resource.metadata.resourceVersion
          for _ in range(self._status_write_attempts):
-@@ -212,6 +217,7 @@ class ControllerManager:
+@@ -275,6 +280,7 @@ class ControllerManager:
                      patch,
                      observed_generation=resource.metadata.generation,
                      expected_version=expected_version,
@@ -110,10 +121,10 @@ index f37f0bf..d7af3e1 100644
              except NotFoundError:
 diff --git a/packages/control-plane/src/forgemesh/controlplane/events.py b/packages/control-plane/src/forgemesh/controlplane/events.py
 new file mode 100644
-index 0000000..8021009
+index 0000000..b098a7a
 --- /dev/null
 +++ b/packages/control-plane/src/forgemesh/controlplane/events.py
-@@ -0,0 +1,179 @@
+@@ -0,0 +1,180 @@
 +"""领域事件信封与资源变更事件。
 +
 +信封字段与 ``api/schemas/event.schema.json``（DomainEvent）一致。资源注册表在写入资源的
@@ -166,7 +177,8 @@ index 0000000..8021009
 +    CREATED = "created"
 +    """创建资源。"""
 +    UPDATED = "updated"
-+    """更新资源（含协调器移除 finalizer）。"""
++    """更新资源：``update_spec`` 的期望状态写入（API 的 PUT / PATCH），或 ``put`` 的
++    Update-CAS（含协调器移除 finalizer）。"""
 +    STATUS_UPDATED = "status_updated"
 +    """status 子资源写入：控制器回写状态条件、phase 与实例地址。"""
 +    TERMINATING = "terminating"
@@ -294,10 +306,10 @@ index 0000000..8021009
 +    "resource_event",
 +]
 diff --git a/packages/control-plane/src/forgemesh/controlplane/reconciler/core.py b/packages/control-plane/src/forgemesh/controlplane/reconciler/core.py
-index b8b170c..1720ba6 100644
+index 43eb0a6..eafb3ee 100644
 --- a/packages/control-plane/src/forgemesh/controlplane/reconciler/core.py
 +++ b/packages/control-plane/src/forgemesh/controlplane/reconciler/core.py
-@@ -698,7 +698,12 @@ class ReconciliationController(Reconciler):
+@@ -1211,7 +1211,12 @@ class ReconciliationController(Reconciler):
          if current.finalizers:
              # 仍有其他 finalizer 持有方未完成清理：写回并等待。
              try:
@@ -312,10 +324,20 @@ index b8b170c..1720ba6 100644
                  # 版本漂移：下轮重读重试。
                  return ReconcileResult(done=False, requeue_after=5.0)
 diff --git a/packages/control-plane/src/forgemesh/controlplane/registry/store.py b/packages/control-plane/src/forgemesh/controlplane/registry/store.py
-index 4b101f3..c8e2517 100644
+index 4de9c01..46f51e0 100644
 --- a/packages/control-plane/src/forgemesh/controlplane/registry/store.py
 +++ b/packages/control-plane/src/forgemesh/controlplane/registry/store.py
-@@ -58,6 +58,10 @@ Allocation 持久化
+@@ -55,7 +55,8 @@ Allocation 持久化
+ 分配行与设备行；``release_allocation`` 走 ``ALLOCATION_STATE_MACHINE`` 校验。归属资源已不
+ 存在的 Active 分配由 :meth:`SQLiteRegistry.list_orphaned_allocations` 列出、
+ :meth:`SQLiteRegistry.expire_orphaned_allocation` 标记为 ``Expired``（控制器回收孤立的分配）；
+-没有组件按 ``lease_until`` 让分配过期。
++没有组件按 ``lease_until`` 让分配过期。分配的写入（含回收孤立的分配）不修改 ``resources``，
++既不追加变更记录，也不写资源变更事件。
+ 
+ 分页
+ ----
+@@ -75,6 +76,10 @@ Allocation 持久化
  （不依赖 PostgreSQL ``LISTEN/NOTIFY``，见 ADR-013），处理完后调用
  :meth:`SQLiteRegistry.prune_changes` 清理。
  
@@ -326,7 +348,7 @@ index 4b101f3..c8e2517 100644
  租户隔离
  --------
  面向租户的查询均以 ``tenant_id`` 作为首要过滤条件；跨租户访问一律视为
-@@ -93,6 +97,8 @@ from forgemesh.resource.inference import Endpoint, InferenceService
+@@ -113,6 +118,8 @@ from forgemesh.resource.inference import Endpoint, InferenceService
  from forgemesh.resource.states import ALLOCATION_STATE_MACHINE, INFERENCE_STATE_MACHINE
  from pydantic import ValidationError
  
@@ -335,7 +357,7 @@ index 4b101f3..c8e2517 100644
  from ..sqlite import Database
  
  logger = logging.getLogger(__name__)
-@@ -188,6 +194,16 @@ class ChangeType(StrEnum):
+@@ -235,6 +242,16 @@ class ChangeType(StrEnum):
      DELETED = "deleted"
  
  
@@ -349,13 +371,13 @@ index 4b101f3..c8e2517 100644
 +}
 +
 +
- @dataclass(frozen=True)
- class ResourceKey:
-     """跨租户唯一定位一个资源。"""
-@@ -265,6 +281,12 @@ class SQLiteRegistry(ResourceRegistry):
-         self._conn = self._db.conn
+ class ConflictReason(StrEnum):
+     """:meth:`SQLiteRegistry.update_spec` 拒绝写入的原因（``ConflictError.details["reason"]``）。"""
+ 
+@@ -334,6 +351,12 @@ class SQLiteRegistry(ResourceRegistry):
          self._lock = self._db.lock
          self._init_schema()
+         self._page_token_key = self._load_page_token_key()
 +        self._outbox = Outbox(database=self._db)
 +
 +    @property
@@ -365,7 +387,7 @@ index 4b101f3..c8e2517 100644
  
      # ------------------------------------------------------------------ #
      # 内部辅助
-@@ -291,6 +313,35 @@ class SQLiteRegistry(ResourceRegistry):
+@@ -360,6 +383,35 @@ class SQLiteRegistry(ResourceRegistry):
              (tenant_id, kind, namespace, name, change.value),
          )
  
@@ -401,7 +423,7 @@ index 4b101f3..c8e2517 100644
      @contextlib.contextmanager
      def _immediate_transaction(self) -> Iterator[sqlite3.Cursor]:
          """``BEGIN IMMEDIATE`` 事务：开始即持有写锁，事务内的检查不会被其他连接的
-@@ -520,7 +571,8 @@ class SQLiteRegistry(ResourceRegistry):
+@@ -644,7 +696,8 @@ class SQLiteRegistry(ResourceRegistry):
          * ``expected_version`` 非 ``None`` → Update-CAS；版本不匹配或资源不存在抛
            ConflictError。成功后 ``resource_version`` 递增。
  
@@ -411,7 +433,7 @@ index 4b101f3..c8e2517 100644
          """
          meta = resource.metadata
          tenant_id = meta.tenant_id
-@@ -529,6 +581,7 @@ class SQLiteRegistry(ResourceRegistry):
+@@ -653,6 +706,7 @@ class SQLiteRegistry(ResourceRegistry):
          namespace = meta.namespace
          name = meta.name
          kind = resource.kind
@@ -419,7 +441,7 @@ index 4b101f3..c8e2517 100644
          generation = meta.generation
          observed_generation = meta.observed_generation
          phase = self._extract_phase(resource)
-@@ -565,6 +618,7 @@ class SQLiteRegistry(ResourceRegistry):
+@@ -689,6 +743,7 @@ class SQLiteRegistry(ResourceRegistry):
                          ),
                      )
                      self._record_change(cur, tenant_id, kind, namespace, name, ChangeType.CREATED)
@@ -427,7 +449,7 @@ index 4b101f3..c8e2517 100644
                      self._conn.commit()
                      return stored
                  # ---- Update-CAS ----
-@@ -611,6 +665,7 @@ class SQLiteRegistry(ResourceRegistry):
+@@ -735,6 +790,7 @@ class SQLiteRegistry(ResourceRegistry):
                          f"(kind={kind} namespace={namespace!r} name={name})",
                      )
                  self._record_change(cur, tenant_id, kind, namespace, name, ChangeType.UPDATED)
@@ -435,7 +457,7 @@ index 4b101f3..c8e2517 100644
                  self._conn.commit()
                  return stored
              except sqlite3.IntegrityError as exc:
-@@ -682,21 +737,40 @@ class SQLiteRegistry(ResourceRegistry):
+@@ -842,21 +898,40 @@ class SQLiteRegistry(ResourceRegistry):
          actor: str | None = None,
          correlation_id: str | None = None,
      ) -> None:
@@ -481,7 +503,7 @@ index 4b101f3..c8e2517 100644
              self._conn.commit()
  
          await self._run(_delete)
-@@ -735,7 +809,7 @@ class SQLiteRegistry(ResourceRegistry):
+@@ -895,7 +970,7 @@ class SQLiteRegistry(ResourceRegistry):
              name: 资源名。
              tenant_id: 租户标识（多租户边界）。
              actor: 操作发起者标识（审计用）。
@@ -490,7 +512,7 @@ index 4b101f3..c8e2517 100644
  
          Returns:
              :class:`RequestDeleteResult`：``deleted=True`` 已物理删除；
-@@ -749,6 +823,7 @@ class SQLiteRegistry(ResourceRegistry):
+@@ -909,6 +984,7 @@ class SQLiteRegistry(ResourceRegistry):
          """
          terminating = "Terminating"
          active = AllocationStatus.ACTIVE.value
@@ -498,7 +520,7 @@ index 4b101f3..c8e2517 100644
  
          def _request_delete() -> RequestDeleteResult:
              cur = self._conn.cursor()
-@@ -791,6 +866,9 @@ class SQLiteRegistry(ResourceRegistry):
+@@ -951,6 +1027,9 @@ class SQLiteRegistry(ResourceRegistry):
                          f"namespace={namespace!r} name={name} tenant_id={tenant_id}",
                      )
                  self._record_change(cur, tenant_id, kind, namespace, name, ChangeType.DELETED)
@@ -508,7 +530,7 @@ index 4b101f3..c8e2517 100644
                  self._conn.commit()
                  return RequestDeleteResult(True, [])
              # finalizer 非空（或自动追加）→ 受控删除：置 Terminating。
-@@ -807,13 +885,14 @@ class SQLiteRegistry(ResourceRegistry):
+@@ -967,13 +1046,14 @@ class SQLiteRegistry(ResourceRegistry):
              metadata = body.get("metadata")
              if isinstance(metadata, dict):
                  metadata["resourceVersion"] = str(new_version)
@@ -524,7 +546,7 @@ index 4b101f3..c8e2517 100644
                      terminating,
                      json.dumps(effective),
                      new_version,
-@@ -831,6 +910,9 @@ class SQLiteRegistry(ResourceRegistry):
+@@ -991,6 +1071,9 @@ class SQLiteRegistry(ResourceRegistry):
                      f"namespace={namespace!r} name={name} tenant_id={tenant_id}",
                  )
              self._record_change(cur, tenant_id, kind, namespace, name, ChangeType.TERMINATING)
@@ -534,7 +556,7 @@ index 4b101f3..c8e2517 100644
              self._conn.commit()
              logger.info(
                  "delete requested: kind=%s name=%s tenant_id=%s → Terminating "
-@@ -856,6 +938,7 @@ class SQLiteRegistry(ResourceRegistry):
+@@ -1016,6 +1099,7 @@ class SQLiteRegistry(ResourceRegistry):
          *,
          observed_generation: int | None = None,
          expected_version: str | None = None,
@@ -542,7 +564,7 @@ index 4b101f3..c8e2517 100644
      ) -> Resource:
          """status 子资源写入：只修改状态条件、phase、实例地址与 observedGeneration。
  
-@@ -872,7 +955,8 @@ class SQLiteRegistry(ResourceRegistry):
+@@ -1032,7 +1116,8 @@ class SQLiteRegistry(ResourceRegistry):
          * ``observed_generation`` 写入元数据列与 ``metadata.observedGeneration``，
            payload 已有 ``status.observedGeneration`` 时一并更新；
          * ``expected_version`` 非空时做 CAS，冲突语义与 :meth:`put` 相同；
@@ -552,7 +574,7 @@ index 4b101f3..c8e2517 100644
  
          Returns:
              写入后的资源；没有变化时为当前资源。
-@@ -896,6 +980,7 @@ class SQLiteRegistry(ResourceRegistry):
+@@ -1056,6 +1141,7 @@ class SQLiteRegistry(ResourceRegistry):
              if raw_endpoints is not None
              else None
          )
@@ -560,7 +582,7 @@ index 4b101f3..c8e2517 100644
  
          def _update_status() -> Resource:
              cur = self._conn.cursor()
-@@ -973,6 +1058,7 @@ class SQLiteRegistry(ResourceRegistry):
+@@ -1133,6 +1219,7 @@ class SQLiteRegistry(ResourceRegistry):
                      f"namespace={namespace!r} name={name} tenant_id={tenant_id}",
                  )
              self._record_change(cur, tenant_id, kind, namespace, name, ChangeType.STATUS)
@@ -568,6 +590,42 @@ index 4b101f3..c8e2517 100644
              self._conn.commit()
              return updated
  
+@@ -1150,6 +1237,7 @@ class SQLiteRegistry(ResourceRegistry):
+         annotations: dict[str, str],
+         expected_version: str | None = None,
+         expected_uid: str | None = None,
++        correlation_id: str | None = None,
+     ) -> Resource:
+         """期望状态写入：整体替换 ``spec``、``metadata.labels`` 与 ``metadata.annotations``。
+ 
+@@ -1159,7 +1247,8 @@ class SQLiteRegistry(ResourceRegistry):
+         * ``spec`` 按模型规范化（补齐默认值）后与当前值比较，变化时 ``generation`` 加 1；
+           只有 labels / annotations 变化时 ``generation`` 不变；
+         * 有变化时 ``resource_version`` 加 1，并追加 ``updated`` 变更记录（控制器据此
+-          重新协调）；没有任何变化时不写库，返回当前资源；
++          重新协调）与资源变更事件（``correlation_id`` 为空时生成一个新的）；没有任何变化
++          时不写库，返回当前资源；
+         * 资源处于 ``Terminating`` 时拒绝，先于 uid / 版本检查（重新读取后重试也不会成功）；
+         * ``expected_uid`` / ``expected_version`` 非空时须与当前 uid / 版本相同（版本按
+           字符串比较）；同名资源被删除后重建时版本会从 0 重新计数，uid 可以识别这种情况。
+@@ -1180,6 +1269,7 @@ class SQLiteRegistry(ResourceRegistry):
+         if model is None:
+             raise ValueError(f"spec updates are not supported for kind {kind!r}")
+         target = f"kind={kind} namespace={namespace!r} name={name}"
++        key = ResourceKey(tenant_id, kind, namespace, name)
+ 
+         def _update_spec() -> Resource:
+             with self._immediate_transaction() as cur:
+@@ -1242,6 +1332,9 @@ class SQLiteRegistry(ResourceRegistry):
+                     (new_body, generation, new_version, tenant_id, kind, namespace, name),
+                 )
+                 self._record_change(cur, tenant_id, kind, namespace, name, ChangeType.UPDATED)
++                self._emit(
++                    key, ChangeType.UPDATED, new_body, new_version, row["phase"], correlation_id
++                )
+                 return self._body_to_resource(new_body)
+ 
+         return await self._run(_update_spec)
 diff --git a/packages/control-plane/src/forgemesh/controlplane/version.py b/packages/control-plane/src/forgemesh/controlplane/version.py
 new file mode 100644
 index 0000000..145815c
@@ -586,10 +644,10 @@ index 0000000..145815c
 +
 +__all__ = ["CONTROL_PLANE_VERSION"]
 diff --git a/tests/unit/controlplane/test_controller_manager.py b/tests/unit/controlplane/test_controller_manager.py
-index 67e67e9..6cf7aba 100644
+index 9e5001f..4032024 100644
 --- a/tests/unit/controlplane/test_controller_manager.py
 +++ b/tests/unit/controlplane/test_controller_manager.py
-@@ -15,12 +15,17 @@ from typing import Any
+@@ -16,12 +16,17 @@ from typing import Any
  import pytest
  from forgemesh.controlplane.controller import ControllerManager, WorkQueue
  from forgemesh.controlplane.deployment import LAUNCH_INSTANCE, LaunchedInstance
@@ -608,7 +666,7 @@ index 67e67e9..6cf7aba 100644
  from forgemesh.core.errors import NotFoundError
  from forgemesh.core.objects import Condition, ObjectMeta, Resource
  from forgemesh.core.scheduler import AllocationRef, ScheduleRequest
-@@ -109,6 +114,17 @@ class ConcurrentWritePolicy:
+@@ -110,6 +115,17 @@ class ConcurrentWritePolicy:
          return PolicyDecision(decision="allow", reason="ok")
  
  
@@ -626,7 +684,7 @@ index 67e67e9..6cf7aba 100644
  class GatedPolicy:
      """在放行前阻塞，模拟停止时仍在进行的协调。"""
  
-@@ -404,6 +420,53 @@ def test_deleted_service_is_released_and_removed() -> None:
+@@ -424,6 +440,53 @@ def test_deleted_service_is_released_and_removed() -> None:
      assert _run(scenario()) == ["svc"]
  
  
@@ -682,10 +740,10 @@ index 67e67e9..6cf7aba 100644
      async def scenario() -> None:
 diff --git a/tests/unit/controlplane/test_registry_events.py b/tests/unit/controlplane/test_registry_events.py
 new file mode 100644
-index 0000000..b9c582c
+index 0000000..eedf202
 --- /dev/null
 +++ b/tests/unit/controlplane/test_registry_events.py
-@@ -0,0 +1,392 @@
+@@ -0,0 +1,528 @@
 +"""资源注册表的资源变更事件：与资源写入在同一事务中写入 Outbox（ADR-008）。"""
 +
 +from __future__ import annotations
@@ -699,14 +757,22 @@ index 0000000..b9c582c
 +from typing import Any
 +
 +import pytest
++from forgemesh.controlplane.deployment import (
++    INSTANCE_LOST_REASON,
++    InMemoryLauncher,
++    check_instances,
++    reclaim_orphaned_allocations,
++)
 +from forgemesh.controlplane.events import DomainEvent, EventProducer, event_type_prefix
 +from forgemesh.controlplane.outbox import Dispatcher, OutboxEvent
 +from forgemesh.controlplane.registry import DEFAULT_RELEASE_FINALIZER, ChangeType, SQLiteRegistry
 +from forgemesh.controlplane.version import CONTROL_PLANE_VERSION
 +from forgemesh.core.errors import ConflictError, InvalidStateTransition, NotFoundError
 +from forgemesh.core.objects import ObjectMeta, Resource
++from forgemesh.core.scheduler import AllocatedDevice, ResourceRef
 +from forgemesh.resource.inference import (
 +    AcceleratorSpec,
++    Endpoint,
 +    InferencePhase,
 +    InferenceService,
 +    InferenceServiceSpec,
@@ -727,6 +793,12 @@ index 0000000..b9c582c
 +KIND = "InferenceService"
 +TENANT = "tenant-a"
 +NAMESPACE = "team-a"
++#: ``_service`` 的 spec 换一个模型（``update_spec`` 的一次期望状态变更）。
++NEW_SPEC: dict[str, Any] = {
++    "model": {"reference": "models/mistral"},
++    "runtime": {"provider": "vllm"},
++    "resources": {"accelerator": {"type": "nvidia-gpu", "minMemoryGiB": 16}},
++}
 +
 +
 +def _run(coro):
@@ -746,6 +818,15 @@ index 0000000..b9c582c
 +        ),
 +        status=InferenceServiceStatus(phase=phase),
 +    )
++
++
++def _serving(name: str = "svc") -> InferenceService:
++    """``Ready`` 的服务，它的 endpoint 指向启动器不认识（即已不在运行）的实例。"""
++    service = _service(name, phase=InferencePhase.READY)
++    service.status.endpoints = [
++        Endpoint(url="http://10.0.0.1:8000", instanceId=f"gone-{name}", protocol="openai-chat")
++    ]
++    return service
 +
 +
 +def _events(reg: SQLiteRegistry) -> list[OutboxEvent]:
@@ -834,6 +915,44 @@ index 0000000..b9c582c
 +
 +
 +@pytest.mark.unit
++def test_spec_updates_emit_an_updated_event_with_the_state_after_the_write() -> None:
++    reg = SQLiteRegistry()
++    _run(reg.put(_service()))
++    updated = _run(
++        reg.update_spec(
++            KIND,
++            NAMESPACE,
++            "svc",
++            TENANT,
++            NEW_SPEC,
++            labels={"tier": "gold"},
++            annotations={},
++            expected_version="0",
++            correlation_id="corr-spec",
++        )
++    )
++
++    _, event = _events(reg)
++    assert event.event_type == "inference.service.updated"
++    assert event.payload["resourceVersion"] == 1
++    assert event.payload["correlationId"] == "corr-spec"
++    assert event.payload["data"]["change"] == "updated"
++    assert event.payload["data"]["phase"] == "Pending"
++    assert event.payload["data"]["resource"] == _dump(updated)
++    assert event.payload["data"]["resource"]["spec"]["model"]["reference"] == "models/mistral"
++
++
++@pytest.mark.unit
++def test_unchanged_spec_update_emits_no_event() -> None:
++    reg = SQLiteRegistry()
++    created = _run(reg.put(_service()))
++    spec = _dump(created)["spec"]
++    _run(reg.update_spec(KIND, NAMESPACE, "svc", TENANT, spec, labels={}, annotations={}))
++
++    assert [event.event_type for event in _events(reg)] == ["inference.service.created"]
++
++
++@pytest.mark.unit
 +def test_unchanged_status_write_emits_no_event() -> None:
 +    reg = SQLiteRegistry()
 +    _run(reg.put(_service()))
@@ -845,6 +964,29 @@ index 0000000..b9c582c
 +        "inference.service.created",
 +        "inference.service.status_updated",
 +    ]
++
++
++@pytest.mark.unit
++def test_the_instance_check_reports_a_lost_instance_with_a_status_event() -> None:
++    """实例核对把实例已不在运行的 ``Ready`` 服务转为 ``Degraded``：这次 status 写入同样写入
++    事件；核对不属于哪一次协调，关联 ID 是生成的。"""
++    reg = SQLiteRegistry()
++    _run(reg.put(_serving(), correlation_id="corr-create"))
++
++    lost = _run(check_instances(reg, InMemoryLauncher(), after_restart=True))
++
++    degraded = _run(reg.get(KIND, NAMESPACE, "svc", TENANT))
++    _, event = _events(reg)
++    assert [key.name for key in lost] == ["svc"]
++    assert event.event_type == "inference.service.status_updated"
++    assert event.payload["resourceVersion"] == 1
++    assert event.payload["correlationId"] not in ("", "corr-create")
++    assert event.payload["data"]["phase"] == "Degraded"
++    assert event.payload["data"]["resource"] == _dump(degraded)
++    [ready] = event.payload["data"]["resource"]["status"]["conditions"]
++    assert (ready["status"], ready["reason"]) == ("False", INSTANCE_LOST_REASON)
++    assert _run(check_instances(reg, InMemoryLauncher())) == []
++    assert len(_events(reg)) == 2
 +
 +
 +@pytest.mark.unit
@@ -931,22 +1073,74 @@ index 0000000..b9c582c
 +        )
 +    with pytest.raises(InvalidStateTransition):
 +        _run(reg.update_status(KIND, NAMESPACE, "svc", TENANT, {"phase": "Ready"}))
++    with pytest.raises(ConflictError):
++        _run(
++            reg.update_spec(
++                KIND,
++                NAMESPACE,
++                "svc",
++                TENANT,
++                NEW_SPEC,
++                labels={},
++                annotations={},
++                expected_uid="x",
++            )
++        )
 +    with pytest.raises(NotFoundError):
 +        _run(reg.request_delete(KIND, NAMESPACE, "missing", TENANT))
 +
 +    assert [event.event_type for event in _events(reg)] == ["inference.service.created"]
 +
 +
-+#: 每种资源写入：在已有 ``svc``（Pending）与 ``ready``（Ready）的注册表上执行。
++class _Releaser:
++    """记录被停止部署的 uid 的 :class:`~forgemesh.controlplane.deployment.DeploymentReleaser`。"""
++
++    def __init__(self) -> None:
++        self.released: list[str] = []
++
++    async def release_uid(self, uid: str) -> None:
++        self.released.append(uid)
++
++
++@pytest.mark.unit
++def test_allocation_writes_and_the_orphan_reclaim_emit_no_event() -> None:
++    """分配不是资源：建立、释放分配与回收孤立的分配都不写事件。"""
++    reg = SQLiteRegistry()
++    for index, name in enumerate(("svc", "gone")):
++        meta = _run(reg.put(_service(name))).metadata
++        owner = ResourceRef(kind=KIND, namespace=NAMESPACE, name=name, uid=meta.uid)
++        device = AllocatedDevice(node_id="node-a", device_id=f"gpu-{index}")
++        _run(reg.create_allocation(TENANT, owner, f"{meta.uid}:1", [device]))
++    assert _run(reg.release_active_allocation("uid-svc", TENANT)) is not None
++    _run(reg.delete(KIND, NAMESPACE, "gone", TENANT))
++    releaser = _Releaser()
++
++    [reclaimed] = _run(reclaim_orphaned_allocations(reg, releaser))
++
++    assert releaser.released == ["uid-gone"]
++    assert _run(reg.get_allocation(reclaimed))["status"] == "Expired"
++    assert [event.event_type for event in _events(reg)] == [
++        "inference.service.created",
++        "inference.service.created",
++        "inference.service.deleted",
++    ]
++
++
++#: 每种资源写入：在已有 ``svc``（Pending）与 ``ready``（Ready，实例已不在运行）的注册表上
++#: 执行；``instance-check`` 是实例核对把 ``ready`` 转为 ``Degraded`` 的 status 写入。
 +_WRITES: dict[str, Callable[[SQLiteRegistry], Coroutine[Any, Any, Any]]] = {
 +    "create": lambda reg: reg.put(_service("new")),
 +    "update": lambda reg: reg.put(_service(), expected_version="0"),
++    "spec-update": lambda reg: reg.update_spec(
++        KIND, NAMESPACE, "svc", TENANT, NEW_SPEC, labels={}, annotations={}
++    ),
 +    "status": lambda reg: reg.update_status(
 +        KIND, NAMESPACE, "svc", TENANT, {"phase": "Scheduling"}
 +    ),
 +    "request-delete": lambda reg: reg.request_delete(KIND, NAMESPACE, "svc", TENANT),
 +    "terminate": lambda reg: reg.request_delete(KIND, NAMESPACE, "ready", TENANT),
 +    "delete": lambda reg: reg.delete(KIND, NAMESPACE, "svc", TENANT),
++    "instance-check": lambda reg: check_instances(reg, InMemoryLauncher()),
 +}
 +
 +
@@ -970,7 +1164,7 @@ index 0000000..b9c582c
 +) -> None:
 +    reg = SQLiteRegistry()
 +    _run(reg.put(_service()))
-+    _run(reg.put(_service("ready", phase=InferencePhase.READY)))
++    _run(reg.put(_serving("ready")))
 +    before = _state(reg)
 +    original = getattr(reg, stage)
 +

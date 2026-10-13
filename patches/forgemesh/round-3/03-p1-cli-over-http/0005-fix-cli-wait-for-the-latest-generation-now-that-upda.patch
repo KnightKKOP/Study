@@ -1,0 +1,486 @@
+From d76facc6e90df6f7a1e5436c9594c6f2eb115663 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 13 Oct 2026 09:55:30 +0000
+Subject: [PATCH 5/6] fix(cli): wait for the latest generation now that updates
+ redeploy
+
+The controller now redeploys a service whose spec changes: a Ready or
+Degraded service goes through Updating, a Failed one goes back to
+Pending, and a Degraded one is redeployed after a backoff. Every
+status write records the generation read at the start of its round,
+so only phase Ready, a True Ready condition and
+metadata.observedGeneration equal to metadata.generation in the same
+response mean that the current spec is deployed.
+
+wait --for ready now requires exactly that. It compares with == and
+reads observedGeneration from metadata only, so a response that does
+not report both generations, or reports an observed generation ahead
+of the spec, no longer counts as ready. It keeps waiting through a
+stale Ready, Updating, Degraded and a Failed service whose spec has
+changed since, and still fails at once on Terminating and on Failed
+at the current generation; that error now adds that the controller
+deploys the service again only when its spec changes.
+
+An update denied by the policy, held for approval or lacking a
+scheduler or launcher writes no status: the service stays Ready (or
+Degraded) with the old observedGeneration and the reason is only in
+the control plane log. The timeout message for that state now says
+that the update has not started and where to find the reason.
+
+The README no longer claims that the controller does not redeploy a
+Ready service; the wait paragraph, the exit code table, --help, the
+CHANGELOG entry and module-mapping describe the rule above. The e2e
+test applies a changed spec after the first wait and checks that the
+second wait returns at generation and observedGeneration 2 with a new
+instance.
+---
+ CHANGELOG.md                               |   4 +-
+ README.md                                  |   4 +-
+ docs/architecture/module-mapping.md        |   4 +-
+ packages/cli/src/forgemesh/cli/commands.py |  42 +++++---
+ packages/cli/src/forgemesh/cli/errors.py   |   3 +-
+ packages/cli/src/forgemesh/cli/main.py     |   7 +-
+ tests/e2e/test_cli.py                      |  41 +++++--
+ tests/unit/cli/test_commands.py            | 118 +++++++++++++++++++--
+ 8 files changed, 179 insertions(+), 44 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index be75c58..72e241c 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -54,8 +54,8 @@
+ - 列表分页：`GET /api/v1/inference-services` 与 `GET /api/v1/resources` 接受 `pageToken`，还有更多结果时响应带 `nextPageToken`（最后一页不带），`count` 为本页条数；结果按 `(namespace, name)` 升序，不带命名空间的资源在最前。游标不透明，绑定签发它的租户与过滤条件（`namespace`，`/resources` 还有 `kind`），`limit` 可以逐页变化；格式不对、被修改或用于其他租户 / 过滤条件的游标返回 `400`，空的 `pageToken` 等同于省略。Registry 新增 `list_page(kind, tenant_id, namespace=None, labels=None, page_token=None, limit=100)`，返回 `ResourcePage`（`items` / `next_page_token`），无效的游标抛出 `InvalidPageTokenError`（`ValueError` 的子类）。游标形如 `<载荷>.<签名>`，签名是覆盖载荷与租户、kind、`namespace`、标签选择器的 HMAC-SHA256，密钥在首次打开数据库时随机生成、保存在新表 `registry_meta` 中，控制平面重启后游标仍然有效。游标记录位置而不是快照：翻页期间新建或删除的资源可能出现也可能缺席，全程存在的资源恰好出现一次。
+ - 决策风险等级（改进计划 5.10）：`POST /api/v1/decisions` 的风险等级由服务端按 `question` 推导（`forgemesh.controlplane.api.risk`）。`question` 是形如 `<域>.<动作>` 的操作标识，只看第一个 `.` 之前的域（忽略大小写与首尾空白）：`driver`、`node`、`mig`、`gpu`、`device`、`plugin`、`model`、`quota`、`tenant`、`policy`、`system`、`platform` 为 `high`（architecture.md 14.2 节列出的高风险操作所在的域），`inference` 为 `low`，其他（含自由文本）为 `medium`；请求中的 `riskLevel` 只能调高，低于推导值时被忽略。实际采用的等级在响应的 `riskLevel` 中返回（`503 DECISION_NO_CANDIDATE` / `DECISION_FALLBACK_REQUIRED` 的错误信封在 `details.riskLevel` 中）。高风险请求的候选来自备用 Provider 时返回 `503 DECISION_FALLBACK_REQUIRED`，候选在 `details.candidates` 中供人工审批，不自动采用。
+ - 新增 `tests/contract/test_openapi_contract.py`（随 pytest 在 CI 中运行）：双向核对应用提供的路由与 `api/openapi/openapi.yaml`（探针除外），路径与方法、每个操作的参数（位置、名称、是否必填、是否弃用，查询与路径参数还有类型）与请求体的媒体类型都必须一致；再逐一调用每个操作，响应的状态码必须列在契约中，响应体与响应头符合契约，错误信封回显关联 ID，契约列出的每个状态码都至少被调用到一次。只使用已有的开发依赖 `jsonschema` 与 PyYAML。
+-- 命令行工具 `forgemesh` 改为 REST API 的客户端（改进计划 5.11，用法见 README「命令行工具」）：`apply -f`（资源不存在就创建，存在就以读到的 `resourceVersion` 与 `uid` 为前置条件整体替换，遇到并发修改时重新读取再试，最多 5 次；同一份文档再次提交不产生写入，输出 `created` / `configured` / `unchanged`；接受多文档 YAML、JSON 对象或数组与标准输入 `-`，`-f` 可以重复）、`get`（`-o yaml|json`）、`describe`、`list`（跟随 `nextPageToken` 读取全部页，`-o table|yaml|json`，`--page-size`）、`delete`（受控删除，区分 `204` 已删除与 `202` 进入 `Terminating`），以及新命令 `wait`（`--for ready` 等到服务 `Ready` 且控制器已处理当前的 `spec`，服务进入 `Failed` 或正在删除时立即失败；`--for delete` 等到资源消失；`--timeout` 默认 300 秒）。默认经网关访问 `http://127.0.0.1:8081`，`--api-url` / `FORGEMESH_API_URL` 指向其他地址（如控制平面 `http://127.0.0.1:8080`）；API key 取自 `--api-key-file` 指向的文件或 `FORGEMESH_API_KEY`，只放在 `Authorization` 请求头中，不出现在任何输出中；`--tenant` 作为 `X-Tenant-Id` 发送。错误信封与网关的纯文本 `429` / `502` 都转换为带关联 ID 的错误消息，退出码按原因区分（`0`–`12` 与 `130`，`forgemesh --help` 列出）。HTTP 只用标准库 `urllib`，不跟随重定向。
+-- 新增 `tests/e2e/test_cli.py`：在后台线程中以 uvicorn 运行控制平面应用（API key 认证、一块设备的加速器清单与假启动器），CLI 经真实的 HTTP 连接走完 `apply` → `wait` 就绪 → 再次 `apply`（`unchanged` / `configured`）→ 逐页 `list` → `get` → `delete`（`204` / `202`）→ `wait --for delete`，并核对 `401` / `403` / `400` / `404` 的退出码与消息，key 不出现在任何输出中。
++- 命令行工具 `forgemesh` 改为 REST API 的客户端（改进计划 5.11，用法见 README「命令行工具」）：`apply -f`（资源不存在就创建，存在就以读到的 `resourceVersion` 与 `uid` 为前置条件整体替换，遇到并发修改时重新读取再试，最多 5 次；同一份文档再次提交不产生写入，输出 `created` / `configured` / `unchanged`；接受多文档 YAML、JSON 对象或数组与标准输入 `-`，`-f` 可以重复）、`get`（`-o yaml|json`）、`describe`、`list`（跟随 `nextPageToken` 读取全部页，`-o table|yaml|json`，`--page-size`）、`delete`（受控删除，区分 `204` 已删除与 `202` 进入 `Terminating`），以及新命令 `wait`（`--for ready` 等到服务以当前的 `spec` 就绪，即 `Ready`、`Ready=True` 且 `observedGeneration` 等于 `generation`，经过 `Updating` 与重新部署中的 `Degraded` 继续等待，资源正在删除或在当前的 `spec` 下进入 `Failed` 时立即失败，被拦下的更新在超时消息中指明更新没有开始；`--for delete` 等到资源消失；`--timeout` 默认 300 秒）。默认经网关访问 `http://127.0.0.1:8081`，`--api-url` / `FORGEMESH_API_URL` 指向其他地址（如控制平面 `http://127.0.0.1:8080`）；API key 取自 `--api-key-file` 指向的文件或 `FORGEMESH_API_KEY`，只放在 `Authorization` 请求头中，不出现在任何输出中；`--tenant` 作为 `X-Tenant-Id` 发送。错误信封与网关的纯文本 `429` / `502` 都转换为带关联 ID 的错误消息，退出码按原因区分（`0`–`12` 与 `130`，`forgemesh --help` 列出）。HTTP 只用标准库 `urllib`，不跟随重定向。
++- 新增 `tests/e2e/test_cli.py`：在后台线程中以 uvicorn 运行控制平面应用（API key 认证、一块设备的加速器清单与假启动器），CLI 经真实的 HTTP 连接走完 `apply` → `wait` 就绪 → 再次 `apply`（`unchanged` / `configured`）→ 修改 `spec` 后再次 `apply` 与 `wait`（以新的实例部署第 2 代 `spec`）→ `get` → 逐页 `list` → `delete`（`204` / `202`）→ `wait --for delete`，并核对 `401` / `403` / `400` / `404` 的退出码与消息，key 不出现在任何输出中。
+ 
+ ### Changed
+ 
+diff --git a/README.md b/README.md
+index ebc8ca2..395d73c 100644
+--- a/README.md
++++ b/README.md
+@@ -273,7 +273,7 @@ CLI 只管理 `InferenceService`（写作 `inferenceservice` 或 `inferenceservi
+ 
+ 文件是 YAML（可以有多个以 `---` 分隔的文档）或 JSON（对象或对象的数组）；省略 `kind` 时视为 `InferenceService`；文档没有 `metadata.namespace` 时使用 `-n`，两者都给出时必须相同。全部文档在发出任何请求之前读取并检查，有一个不合法就不发出请求；某个资源失败时报告错误、继续处理其余的资源，以第一个失败的退出码结束。文档中的 `metadata.tenantId` 作为 `X-Tenant-Id` 发送（与 `--tenant` 不同时报错）：与 key 绑定的租户不符时 API 返回 `403`，资源不会被写进 key 的租户。
+ 
+-**wait**：每秒读取一次资源。`--for ready` 在 `status.phase` 为 `Ready`、`Ready` 条件为 `True` 且控制器已经处理当前的 `spec`（`metadata.observedGeneration` 不小于 `generation`）时成功；控制器处理当前的 `spec` 之后进入 `Failed`，或者资源正在删除时立即失败；超时时报告最后看到的状态。控制器目前不按新的 `spec` 重新部署已经 `Ready` 的服务（见「REST API」），修改这样的服务的 `spec` 之后 `wait` 会等到超时。`--for delete` 在资源不存在时成功（退出码 `0`），输出如 `InferenceService default/llama deleted`：开始等待时资源已经不存在（例如 `delete` 之后控制器在第一次读取之前就删除了它）同样如此，结果不取决于这个先后；因此名称或命名空间写错时也报告成功。读取遇到限流（`429`，按 `Retry-After` 推迟下一次读取）或 `502`–`504` 时继续等待；连接失败只在此前收到过 HTTP 响应时视为暂时故障，第一次请求就连不上时立即失败。
++**wait**：每秒读取一次资源。`--for ready` 在同一次读取中 `status.phase` 为 `Ready`、`Ready` 条件为 `True` 且 `metadata.observedGeneration` 等于 `generation` 时成功，这时服务运行的是当前的 `spec`（见「REST API」）：`spec` 变化之后，服务先以旧的 `observedGeneration` 保持 `Ready`，再经 `Updating` 重新部署，`wait` 等到新的 `spec` 部署完成。资源正在删除，或在当前的 `spec` 下进入 `Failed`（`spec` 变化之前控制器不会再部署它）时立即失败；其他状态都继续等待，如 `Updating`、重新部署中的 `Degraded`，以及 `spec` 变化之后还没重新部署的 `Failed`。超时时报告最后看到的状态：被策略拒绝、等待审批或缺少调度器 / 启动器的更新不写 `status`，服务一直以旧的 `observedGeneration` 停在 `Ready` / `Degraded`，消息说明更新没有开始、原因见控制平面的日志。`--for delete` 在资源不存在时成功（退出码 `0`），输出如 `InferenceService default/llama deleted`：开始等待时资源已经不存在（例如 `delete` 之后控制器在第一次读取之前就删除了它）同样如此，结果不取决于这个先后；因此名称或命名空间写错时也报告成功。读取遇到限流（`429`，按 `Retry-After` 推迟下一次读取）或 `502`–`504` 时继续等待；连接失败只在此前收到过 HTTP 响应时视为暂时故障，第一次请求就连不上时立即失败。
+ 
+ **错误与退出码**：错误消息写到标准错误，以 `Error:` 开头（参数写错时是 argparse 的用法提示）。错误信封显示为 `<message> (HTTP <状态码> <code>[, reason <details.reason>], correlation id <关联 ID>)`，请求校验失败时逐行列出字段与原因；网关自己的纯文本 `429` 与 `502` 分别报告为被网关限流（附上 `Retry-After` 的秒数）与网关连不上控制平面。一次调用的全部请求带同一个随机的 `X-Correlation-Id`，可以用它在网关与控制平面的日志中找到这次调用。`forgemesh --help` 列出同一张退出码表：
+ 
+@@ -291,7 +291,7 @@ CLI 只管理 `InferenceService`（写作 `inferenceservice` 或 `inferenceservi
+ | `9` | API 暂时不可用（`502`、`503`、`504`） |
+ | `10` | 没有收到 HTTP 响应：连接被拒绝、主机名无法解析、TLS 失败或超时 |
+ | `11` | `wait` 超时 |
+-| `12` | `wait` 等待的状态不会出现：服务进入 `Failed` 或正在删除 |
++| `12` | `wait` 等待的状态不会出现：服务正在删除，或在当前的 `spec` 下进入 `Failed` |
+ | `130` | 被 Ctrl-C 中断 |
+ 
+ | 环境变量 | 默认值 | 说明 |
+diff --git a/docs/architecture/module-mapping.md b/docs/architecture/module-mapping.md
+index 6721859..d84fca7 100644
+--- a/docs/architecture/module-mapping.md
++++ b/docs/architecture/module-mapping.md
+@@ -332,12 +332,12 @@
+ |---|---|
+ | 架构模块 | L1 Access Layer 的命令行入口（architecture.md 3.1 L1） |
+ | 当前代码路径 | `packages/cli/src/forgemesh/cli/{main,commands,client,config,documents,errors,output}.py`（共 7 个 `.py`，glob 核对；发行名 `forgemesh-cli`，控制台脚本 `forgemesh`） |
+-| 核心契约 | 经 `/api/v1/inference-services` 管理 `InferenceService`：`apply`（`GET` 之后 `POST`，或以读到的 `resourceVersion` / `uid` 为前置条件 `PUT`，`409` 时重新读取再试）、`get`、`describe`、`list`（跟随 `nextPageToken`）、`delete`（受控删除，区分 `204` / `202`）、`wait`（`Ready` 且 `observedGeneration` 不小于 `generation`，或资源消失）；地址取自 `--api-url` / `FORGEMESH_API_URL`（默认网关 `http://127.0.0.1:8081`），key 取自 `--api-key-file` / `FORGEMESH_API_KEY`；错误信封与网关的纯文本 `429` / `502` 映射为按原因区分的退出码（`errors.py` 的 `ExitCode`） |
++| 核心契约 | 经 `/api/v1/inference-services` 管理 `InferenceService`：`apply`（`GET` 之后 `POST`，或以读到的 `resourceVersion` / `uid` 为前置条件 `PUT`，`409` 时重新读取再试）、`get`、`describe`、`list`（跟随 `nextPageToken`）、`delete`（受控删除，区分 `204` / `202`）、`wait`（`Ready`、`Ready=True` 且 `observedGeneration` 等于 `generation`，或资源消失）；地址取自 `--api-url` / `FORGEMESH_API_URL`（默认网关 `http://127.0.0.1:8081`），key 取自 `--api-key-file` / `FORGEMESH_API_KEY`；错误信封与网关的纯文本 `429` / `502` 映射为按原因区分的退出码（`errors.py` 的 `ExitCode`） |
+ | 运行形态 | 命令行进程，HTTP 客户端（标准库 `urllib`，不跟随重定向） |
+ | 数据所有权 | 无（资源权威状态归控制平面 Registry，CLI 不在本地保存状态） |
+ | 允许依赖 | 标准库、PyYAML（`pyproject.toml` 只声明 `pyyaml>=6.0.1`）；与控制平面仅经 HTTP API 交互 |
+ | 禁止依赖 | `forgemesh.controlplane` 及其他 ForgeMesh 包、直接打开 SQLite（扫描七验证 ✅，见 3.7） |
+-| 测试路径 | `tests/unit/cli/`：`test_commands.py`、`test_client.py`、`test_config.py`、`test_documents.py`、`test_packaging.py`（5 个测试文件，glob 核对；`fakes.py` 以本地 HTTP 服务器模拟 API，`conftest.py` 提供夹具）；端到端 `tests/e2e/test_cli.py`（uvicorn 运行的控制平面应用 + API key + 假启动器：`apply` → `wait` → `list` → `get` → `delete` → `wait --for delete`，以及 API 错误的退出码） |
++| 测试路径 | `tests/unit/cli/`：`test_commands.py`、`test_client.py`、`test_config.py`、`test_documents.py`、`test_packaging.py`（5 个测试文件，glob 核对；`fakes.py` 以本地 HTTP 服务器模拟 API，`conftest.py` 提供夹具）；端到端 `tests/e2e/test_cli.py`（uvicorn 运行的控制平面应用 + API key + 假启动器：`apply` → `wait` → 修改 `spec` 后 `apply` → `wait`（第 2 代 `spec`）→ `get` → `list` → `delete` → `wait --for delete`，以及 API 错误的退出码） |
+ | 状态 | 已实现且有测试覆盖 |
+ | 演进动作 | 保留；只管理 `InferenceService`，其他 kind 待 API 提供写接口后再加 |
+ 
+diff --git a/packages/cli/src/forgemesh/cli/commands.py b/packages/cli/src/forgemesh/cli/commands.py
+index aa619a8..602d738 100644
+--- a/packages/cli/src/forgemesh/cli/commands.py
++++ b/packages/cli/src/forgemesh/cli/commands.py
+@@ -36,6 +36,9 @@ POLL_INTERVAL_SECONDS = 1.0
+ _READY = "Ready"
+ _FAILED = "Failed"
+ _TERMINATING = "Terminating"
++#: 服务中的 phase：``spec`` 变化之后，被策略拦下或缺少调度器 / 启动器的更新不写 ``status``，
++#: 服务以旧的 ``observedGeneration`` 停在这些 phase。
++_SERVING_PHASES = frozenset({_READY, "Degraded"})
+ 
+ 
+ def cmd_apply(args: argparse.Namespace, client: ApiClient) -> int:
+@@ -162,10 +165,14 @@ def cmd_delete(args: argparse.Namespace, client: ApiClient) -> int:
+ def cmd_wait(args: argparse.Namespace, client: ApiClient) -> int:
+     """``wait KIND NAME``：等资源就绪（``--for ready``）或被删除（``--for delete``）。
+ 
+-    就绪指 ``status.phase`` 为 ``Ready``、``Ready`` 条件为 ``True``，且控制器已处理当前的
+-    ``spec``（``observedGeneration`` 不小于 ``generation``）。资源正在删除，或控制器处理当前的
+-    ``spec`` 之后进入 ``Failed`` 时立即失败。API 应答过一次之后，限流、``502`` - ``504`` 与连接
+-    失败视为暂时故障，继续等待。
++    就绪指同一次读取中 ``status.phase`` 为 ``Ready``、``Ready`` 条件为 ``True``，且
++    ``metadata.observedGeneration`` 等于 ``generation``：``spec`` 变化之后服务先以旧的
++    ``observedGeneration`` 保持 ``Ready``，控制器开始更新的一轮即记下新的 generation、进入
++    ``Updating``，两者同时满足时服务运行的才是当前的 ``spec``。被策略拦下或缺少调度器 / 启动器
++    的更新不写 ``status``，服务一直以旧的 ``observedGeneration`` 停在 ``Ready`` / ``Degraded``，
++    超时的消息说明更新没有开始。资源正在删除，或在当前的 ``spec`` 下进入 ``Failed`` 时立即失败
++    （``spec`` 变化之前控制器不会再部署它）；其余状态继续等待，包括重新部署中的 ``Degraded``。
++    API 应答过一次之后，限流、``502`` - ``504`` 与连接失败视为暂时故障，继续等待。
+ 
+     ``--for delete`` 在资源不存在时成功。开始等待时资源已经不存在，输出与等到它被删除时相同：
+     ``delete`` 之后控制器可能在第一次读取之前就删除了资源，结果不能取决于这个先后。
+@@ -214,15 +221,12 @@ def cmd_wait(args: argparse.Namespace, client: ApiClient) -> int:
+ 
+ 
+ def _readiness(service: dict[str, Any]) -> tuple[bool | None, str]:
+-    """``(结论, 说明)``：``True`` 已就绪，``False`` 不会再就绪，``None`` 继续等待。"""
++    """``(结论, 说明)``：``True`` 已就绪，``False`` 不会就绪，``None`` 继续等待。"""
+     metadata = service["metadata"]
+-    status = _status(service)
+-    phase = status.get("phase")
++    phase = _status(service).get("phase")
+     generation = metadata.get("generation")
+-    observed = metadata.get("observedGeneration", status.get("observedGeneration"))
+-    current = not isinstance(generation, int) or (
+-        isinstance(observed, int) and observed >= generation
+-    )
++    observed = metadata.get("observedGeneration")
++    current = isinstance(generation, int) and observed == generation
+     condition = ready_condition(service)
+     description = f"phase {phase or NONE}"
+     if condition is not None:
+@@ -231,11 +235,23 @@ def _readiness(service: dict[str, Any]) -> tuple[bool | None, str]:
+         detail = ": ".join(str(part) for part in parts if part)
+         if detail:
+             description += f" ({detail})"
+-    if not current:
++    hint = ""
++    if current:
++        if phase == _FAILED:
++            hint = "the controller deploys it again only when its spec changes"
++    elif phase in _SERVING_PHASES:
++        description += (
++            f"; the update to generation {generation} has not started (observed {observed})"
++        )
++        hint = (
++            "an update that the policy denies or holds for approval, or that has no scheduler "
++            "or launcher, does not start; the reason is in the control plane log"
++        )
++    else:
+         description += (
+             f"; the controller has not processed generation {generation} yet (observed {observed})"
+         )
+-    description = printable(description)
++    description = printable(description) + (f"\n{hint}" if hint else "")
+     if phase == _TERMINATING or (phase == _FAILED and current):
+         return False, description
+     ready = condition is not None and condition.get("status") == "True"
+diff --git a/packages/cli/src/forgemesh/cli/errors.py b/packages/cli/src/forgemesh/cli/errors.py
+index a0f8337..78806c3 100644
+--- a/packages/cli/src/forgemesh/cli/errors.py
++++ b/packages/cli/src/forgemesh/cli/errors.py
+@@ -33,7 +33,8 @@ class ExitCode(IntEnum):
+     """没有收到 HTTP 响应：连接被拒绝、主机名无法解析、TLS 失败或超时。"""
+     WAIT_TIMEOUT = 11
+     WAIT_FAILED = 12
+-    """等待的条件不会再满足：服务进入 ``Failed`` 或正在删除。"""
++    """等待的条件不会满足：服务正在删除，或在当前的 ``spec`` 下进入 ``Failed``（``spec`` 变化之前
++    控制器不会再部署它）。"""
+     INTERRUPTED = 130
+     """被 Ctrl-C 中断（128 + SIGINT，与 shell 的约定相同）。"""
+ 
+diff --git a/packages/cli/src/forgemesh/cli/main.py b/packages/cli/src/forgemesh/cli/main.py
+index d74ce67..d10c10f 100644
+--- a/packages/cli/src/forgemesh/cli/main.py
++++ b/packages/cli/src/forgemesh/cli/main.py
+@@ -63,7 +63,7 @@ exit codes:
+   9    API unavailable (HTTP 502, 503, 504)
+   10   no HTTP response: connection refused, unknown host, TLS error, timeout
+   11   wait timed out
+-  12   wait failed: the service became Failed or is being deleted
++  12   wait failed: the service is being deleted or Failed with its current spec
+   130  interrupted
+ """
+ 
+@@ -130,7 +130,10 @@ def build_parser() -> argparse.ArgumentParser:
+         dest="condition",
+         choices=("ready", "delete"),
+         default="ready",
+-        help="default: ready; fails at once if the service becomes Failed or is being deleted",
++        help=(
++            "default: ready, i.e. phase Ready with its current spec deployed; fails at once if "
++            "the service is being deleted or Failed with its current spec"
++        ),
+     )
+     wait.add_argument(
+         "--timeout",
+diff --git a/tests/e2e/test_cli.py b/tests/e2e/test_cli.py
+index e8363c1..be39afc 100644
+--- a/tests/e2e/test_cli.py
++++ b/tests/e2e/test_cli.py
+@@ -1,7 +1,8 @@
+ """CLI 端到端测试：``forgemesh`` 经真实的 HTTP 连接调用控制平面应用（uvicorn，API key 认证，
+ 一块设备的加速器清单与假启动器），不需要 GPU。
+ 
+-* ``apply`` 创建 → ``wait`` 就绪 → 再次 ``apply`` 不变 → 修改 labels 后 ``configured``；
++* ``apply`` 创建 → ``wait`` 就绪 → 再次 ``apply`` 不变 → 修改 labels 后 ``configured`` → 修改
++  ``spec`` 后 ``configured``，``wait`` 等到控制器以新的实例部署第 2 代 ``spec``；
+ * 无法调度的第二个服务；``list`` 逐页读取；``get``；
+ * ``delete``：无法调度的服务直接删除（``204``），就绪的服务先进入 ``Terminating``（``202``），
+   ``wait --for delete`` 等它消失；
+@@ -53,13 +54,15 @@ class Result:
+ Cli = Callable[..., Result]
+ 
+ 
+-def service(name: str, *, count: int = 1, **metadata: Any) -> dict[str, Any]:
++def service(
++    name: str, *, count: int = 1, model: str = "models/llama", **metadata: Any
++) -> dict[str, Any]:
+     return {
+         "apiVersion": "forgemesh.io/v1alpha1",
+         "kind": "InferenceService",
+         "metadata": {"name": name, "namespace": "default", **metadata},
+         "spec": {
+-            "model": {"reference": "models/llama"},
++            "model": {"reference": model},
+             "runtime": {"provider": "vllm"},
+             "resources": {
+                 "accelerator": {"type": "nvidia-gpu", "count": count, "minMemoryGiB": 16}
+@@ -140,14 +143,20 @@ def test_a_service_is_applied_deployed_listed_and_deleted_with_the_cli(
+ ) -> None:
+     llama = tmp_path / "llama.yaml"
+     timeout = ("--timeout", str(TIMEOUT_SECONDS))
++    get_llama = ("get", "inferenceservice", "llama", "-n", "default", "-o", "json")
++    labels = {"zone": "b"}
+ 
+     created = cli("apply", "-f", _write(llama, service("llama")))
+     ready = cli("wait", "inferenceservice", "llama", "-n", "default", *timeout)
++    deployed = cli(*get_llama)
+     unchanged = cli("apply", "-f", str(llama))
+-    configured = cli("apply", "-f", _write(llama, service("llama", labels={"zone": "b"})))
++    configured = cli("apply", "-f", _write(llama, service("llama", labels=labels)))
++    changed = service("llama", model="models/llama-3", labels=labels)
++    updated = cli("apply", "-f", _write(llama, changed))
++    redeployed = cli("wait", "inferenceservice", "llama", "-n", "default", *timeout)
++    shown = cli(*get_llama)
+     unschedulable = cli("apply", "-f", _write(tmp_path / "big.yaml", service("big", count=2)))
+     listed = cli("list", "inferenceservices", "--page-size", "1", "-o", "json")
+-    shown = cli("get", "inferenceservice", "llama", "-n", "default", "-o", "json")
+     deleted = cli("delete", "inferenceservice", "big", "-n", "default")
+     terminating = cli("delete", "inferenceservice", "llama", "-n", "default")
+     gone = cli("wait", "inferenceservice", "llama", "-n", "default", "--for", "delete", *timeout)
+@@ -155,14 +164,23 @@ def test_a_service_is_applied_deployed_listed_and_deleted_with_the_cli(
+ 
+     assert created.out == "InferenceService default/llama created\n"
+     assert ready.out == "InferenceService default/llama is Ready\n"
++    first = json.loads(deployed.out)
++    assert (first["metadata"]["generation"], first["metadata"]["observedGeneration"]) == (1, 1)
+     assert unchanged.out == "InferenceService default/llama unchanged\n"
+     assert configured.out == "InferenceService default/llama configured\n"
++    assert updated.out == "InferenceService default/llama configured\n"
++    assert redeployed.out == "InferenceService default/llama is Ready\n"
++    llama_service = json.loads(shown.out)
++    metadata, status = llama_service["metadata"], llama_service["status"]
++    assert (metadata["generation"], metadata["observedGeneration"]) == (2, 2)
++    assert (metadata["labels"], metadata["tenantId"]) == (labels, TENANT)
++    assert llama_service["spec"]["model"]["reference"] == "models/llama-3"
++    assert status["phase"] == "Ready"
++    [endpoint] = status["endpoints"]
++    assert endpoint["ready"] is True
++    assert endpoint["instanceId"] != first["status"]["endpoints"][0]["instanceId"]
+     assert unschedulable.out == "InferenceService default/big created\n"
+     assert [item["metadata"]["name"] for item in json.loads(listed.out)] == ["big", "llama"]
+-    llama_service = json.loads(shown.out)
+-    assert llama_service["metadata"]["labels"] == {"zone": "b"}
+-    assert llama_service["metadata"]["tenantId"] == TENANT
+-    assert llama_service["status"]["phase"] == "Ready"
+     assert deleted.out == "InferenceService default/big deleted\n"
+     assert terminating.out == (
+         "InferenceService default/llama is terminating: the controller stops its instance and "
+@@ -170,8 +188,9 @@ def test_a_service_is_applied_deployed_listed_and_deleted_with_the_cli(
+     )
+     assert gone.out == "InferenceService default/llama deleted\n"
+     assert (empty.out, empty.err) == ("", "No InferenceService resources found.\n")
+-    results = (created, ready, unchanged, configured, unschedulable, listed, shown, deleted)
+-    assert [result.code for result in (*results, terminating, gone, empty)] == [0] * 11
++    results = (created, ready, deployed, unchanged, configured, updated, redeployed, shown)
++    results += (unschedulable, listed, deleted)
++    assert [result.code for result in (*results, terminating, gone, empty)] == [0] * 14
+     assert all(result.err == "" for result in results)
+     assert _errors(caplog) == []
+ 
+diff --git a/tests/unit/cli/test_commands.py b/tests/unit/cli/test_commands.py
+index 94c6f6f..bd9a4b3 100644
+--- a/tests/unit/cli/test_commands.py
++++ b/tests/unit/cli/test_commands.py
+@@ -2,8 +2,9 @@
+ 
+ 覆盖 ``apply``（创建、以读到的版本更新、不变、冲突重试与放弃、正在删除、并发创建、多文档、
+ 租户与命名空间、标准输入、``list`` 输出的再次提交）、``get`` / ``describe`` / ``list``（输出格式、
+-翻页、命名空间规则）、``delete``（``204`` / ``202``）、``wait``（就绪、``Failed`` 立即失败、
+-observedGeneration、超时、暂时故障、``--for delete``、Ctrl-C），以及 key、公共选项与参数校验。
++翻页、命名空间规则）、``delete``（``204`` / ``202``）、``wait``（就绪、``spec`` 更新与重新部署、
++``Failed`` 立即失败、observedGeneration、超时、暂时故障、``--for delete``、Ctrl-C），以及 key、
++公共选项与参数校验。
+ """
+ 
+ from __future__ import annotations
+@@ -483,6 +484,7 @@ def test_wait_fails_at_once_when_the_service_failed(
+     assert result.err == (
+         "Error: InferenceService default/llama will not become Ready: phase Failed, "
+         "Ready=False (WorkflowFailed: model download failed?[2J)\n"
++        "the controller deploys it again only when its spec changes\n"
+     )
+     assert clock.sleeps == []
+ 
+@@ -501,40 +503,134 @@ def test_wait_fails_when_the_service_is_being_deleted(
+ 
+ 
+ @pytest.mark.parametrize(
+-    ("phase", "ready"), [("Ready", ("True", "Reconciled")), ("Failed", ("False", "WorkflowFailed"))]
++    ("phase", "ready", "then"),
++    [
++        ("Ready", ("True", "Reconciled"), "Updating"),
++        ("Failed", ("False", "WorkflowFailed"), "Pending"),
++    ],
+ )
+-def test_wait_ignores_the_outcome_of_an_older_spec(
+-    api: FakeApi, cli: Cli, clock: FakeClock, phase: str, ready: tuple[str, str]
++def test_wait_follows_a_spec_change_until_the_new_spec_is_deployed(
++    api: FakeApi, cli: Cli, clock: FakeClock, phase: str, ready: tuple[str, str], then: str
+ ) -> None:
+-    """spec 更新之后（generation 2），控制器处理它之前的 Ready 或 Failed 都不是结论。"""
++    """spec 更新之后（generation 2），控制器开始处理之前的 Ready 或 Failed 都不是结论；开始处理的
++    一轮即记下新的 generation（Ready 进入 Updating，Failed 回到 Pending），之后还要等部署完成。"""
+     api.reply(
+         "GET", PATH, 200, resource(document(), phase=phase, ready=ready, generation=2, observed=1)
+     )
++    api.reply(
++        "GET",
++        PATH,
++        200,
++        resource(document(), phase=then, ready=("False", then), generation=2, observed=2),
++    )
+     api.add(document(), phase="Ready", ready=("True", "Reconciled"), generation=2, observed=2)
+ 
+     result = cli("wait", "inferenceservice", "llama", "-n", "default")
+ 
+     assert (result.code, result.out) == (0, "InferenceService default/llama is Ready\n")
+-    assert clock.sleeps == [1.0]
++    assert clock.sleeps == [1.0, 1.0]
+ 
+ 
+-def test_wait_times_out_with_the_last_state_it_saw(
++def test_wait_keeps_waiting_while_a_degraded_service_is_redeployed(
+     api: FakeApi, cli: Cli, clock: FakeClock
+ ) -> None:
+-    api.add(document(), phase="Ready", ready=("True", "Reconciled"), generation=2, observed=1)
++    """实例丢失之后控制器按退避重新部署 Degraded 的服务，重新部署失败也不是结论。"""
++    api.reply(
++        "GET",
++        PATH,
++        200,
++        resource(document(), phase="Degraded", ready=("False", "InstanceLost"), observed=1),
++    )
++    api.reply(
++        "GET",
++        PATH,
++        200,
++        resource(
++            document(),
++            phase="Degraded",
++            ready=("False", "WorkflowFailed"),
++            message="step 'verify-instance' failed; redeploying the service after a backoff",
++            observed=1,
++        ),
++    )
++    api.add(document(), **READY)
++
++    result = cli("wait", "inferenceservice", "llama", "-n", "default")
++
++    assert (result.code, result.out) == (0, "InferenceService default/llama is Ready\n")
++    assert clock.sleeps == [1.0, 1.0]
++
++
++NOT_STARTED = (
++    "the update to generation 2 has not started (observed 1)\nan update that the policy denies "
++    "or holds for approval, or that has no scheduler or launcher, does not start; the reason is "
++    "in the control plane log"
++)
++
++
++@pytest.mark.parametrize(
++    ("fields", "seen"),
++    [
++        (
++            {"phase": "Ready", "ready": ("True", "Reconciled"), "generation": 2, "observed": 1},
++            f"phase Ready, Ready=True (Reconciled); {NOT_STARTED}",
++        ),
++        (
++            {
++                "phase": "Degraded",
++                "ready": ("False", "InstanceLost"),
++                "generation": 2,
++                "observed": 1,
++            },
++            f"phase Degraded, Ready=False (InstanceLost); {NOT_STARTED}",
++        ),
++        (
++            {"phase": "Pending", "generation": 1, "observed": 0},
++            "phase Pending; the controller has not processed generation 1 yet (observed 0)",
++        ),
++    ],
++    ids=["update-not-started", "degraded-update-not-started", "not-processed"],
++)
++def test_wait_times_out_with_the_last_state_it_saw(
++    api: FakeApi, cli: Cli, clock: FakeClock, fields: dict[str, Any], seen: str
++) -> None:
++    """被拦下的更新不写 status，服务以旧的 observedGeneration 停在 Ready / Degraded，消息说明
++    更新没有开始；其他 phase 只说明控制器还没处理新的 generation。"""
++    api.add(document(), **fields)
+ 
+     result = cli("wait", "inferenceservice", "llama", "-n", "default", "--timeout", "2.5")
+ 
+     assert result.code == ExitCode.WAIT_TIMEOUT
+     assert result.err == (
+         "Error: timed out after 2.5 s waiting for InferenceService default/llama to become "
+-        "Ready; last seen: phase Ready, Ready=True (Reconciled); the controller has not "
+-        "processed generation 2 yet (observed 1)\n"
++        f"Ready; last seen: {seen}\n"
+     )
+     assert clock.sleeps == [1.0, 1.0, 0.5]
+     assert len(api.calls) == 4
+ 
+ 
++@pytest.mark.parametrize(
++    "generations",
++    [{"generation": 1, "observedGeneration": 2}, {}],
++    ids=["observed-ahead", "not-reported"],
++)
++def test_wait_needs_the_observed_generation_to_equal_the_generation(
++    api: FakeApi, cli: Cli, clock: FakeClock, generations: dict[str, int]
++) -> None:
++    service = resource(document(), **READY)
++    del service["metadata"]["generation"], service["metadata"]["observedGeneration"]
++    service["metadata"].update(generations)
++    api.reply("GET", PATH, 200, service)
++
++    result = cli("wait", "inferenceservice", "llama", "-n", "default", "--timeout", "0")
++
++    assert (result.code, result.out) == (ExitCode.WAIT_TIMEOUT, "")
++    assert result.err.startswith(
++        "Error: timed out after 0 s waiting for InferenceService default/llama to become Ready; "
++        "last seen: phase Ready, Ready=True (Reconciled); "
++    )
++
++
+ def test_wait_rides_out_rate_limiting_and_an_unreachable_control_plane(
+     api: FakeApi, cli: Cli, clock: FakeClock
+ ) -> None:
+-- 
+2.43.0
+

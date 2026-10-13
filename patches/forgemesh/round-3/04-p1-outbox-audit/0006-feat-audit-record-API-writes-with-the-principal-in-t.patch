@@ -1,7 +1,7 @@
-From a22b2f9885b3f8bd45948530426f83fb80e4d5c1 Mon Sep 17 00:00:00 2001
+From 8868a48b9622f7c0aa8f9b400c85b91995e8f6c4 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Tue, 13 Oct 2026 03:19:04 +0000
-Subject: [PATCH 06/12] feat(audit): record API writes with the principal in
+Subject: [PATCH 06/14] feat(audit): record API writes with the principal in
  the write transaction
 
 AuditLog now works on a shared Database like the outbox: put() writes a
@@ -10,90 +10,172 @@ writes and commits one record on its own. Records gain key_id (the API
 key id) and namespace; opening an existing database adds both columns.
 
 SQLiteRegistry owns an AuditLog on its connection (audit_log property).
-put, delete and request_delete take a keyword-only principal; when it
-is given, the same transaction that writes the resource and its outbox
-event also writes an audit record with the tenant, subject, key id and
-correlation id (shared with the event; generated when missing), action
-create/update/delete, outcome success and details linking the event id
-and resource version. A principal of another tenant is rejected before
-anything is written; writes without a principal (controller,
-reconciler) are not audited.
+put, update_spec, delete and request_delete take a keyword-only
+principal; when it is given, the same transaction that writes the
+resource and its outbox event also writes an audit record with the
+tenant, subject, key id and correlation id (shared with the event;
+generated when missing), action create/update/delete, outcome success
+and details linking the event id and resource version. A principal of
+another tenant is rejected before anything is written, and an
+update_spec call that changes nothing writes no record. Writes without a
+principal are not audited: the controller's status writes (update_status
+takes no principal), the instance check's among them, and the
+reconciler's finalizer write-back and delete.
 
 Principal gains key_id, set by the API key authenticator (None in dev
-mode). The create and delete routes pass the principal and the request
-correlation id (delete now reads X-Correlation-Id as well, and its 409
-envelope reuses that id).
+mode). The create, replace (PUT), patch (PATCH) and delete routes pass
+the principal and the request's X-Correlation-Id to the registry, so a
+PUT or PATCH that changes the service is recorded as action "update".
 ---
- .../src/forgemesh/controlplane/api/routes.py  |  24 ++-
- .../src/forgemesh/controlplane/audit.py       | 101 ++++++---
+ .../src/forgemesh/controlplane/api/routes.py  |  45 +++-
+ .../src/forgemesh/controlplane/audit.py       | 101 +++++--
  .../src/forgemesh/controlplane/auth.py        |   8 +-
- .../forgemesh/controlplane/registry/store.py  | 135 ++++++++++--
+ .../forgemesh/controlplane/registry/store.py  | 152 +++++++++--
  tests/unit/controlplane/test_api.py           |  22 ++
- tests/unit/controlplane/test_audit.py         |  87 +++++++-
- tests/unit/controlplane/test_auth.py          |  58 ++++-
- .../unit/controlplane/test_registry_audit.py  | 202 ++++++++++++++++++
- 8 files changed, 583 insertions(+), 54 deletions(-)
+ tests/unit/controlplane/test_api_updates.py   |  54 +++-
+ tests/unit/controlplane/test_audit.py         |  87 +++++-
+ tests/unit/controlplane/test_auth.py          |  98 ++++++-
+ .../unit/controlplane/test_registry_audit.py  | 254 ++++++++++++++++++
+ 9 files changed, 759 insertions(+), 62 deletions(-)
  create mode 100644 tests/unit/controlplane/test_registry_audit.py
 
 diff --git a/packages/control-plane/src/forgemesh/controlplane/api/routes.py b/packages/control-plane/src/forgemesh/controlplane/api/routes.py
-index 3b5a0b4..ef2f7a9 100644
+index 9879bb2..574a8a8 100644
 --- a/packages/control-plane/src/forgemesh/controlplane/api/routes.py
 +++ b/packages/control-plane/src/forgemesh/controlplane/api/routes.py
-@@ -36,9 +36,11 @@ from forgemesh.workflow.runtime import WorkflowDefinition
+@@ -42,11 +42,13 @@ from forgemesh.workflow.runtime import WorkflowDefinition
  from pydantic import BaseModel, ConfigDict, Field, ValidationError
  
  from ..app import error_envelope
 +from ..auth import Principal
+ from ..registry import ConflictReason, InvalidPageTokenError, SQLiteRegistry
  from .dependencies import (
      ComponentNotReadyError,
+     get_correlation_id,
      get_decision_router,
 +    get_principal,
-     get_registry,
      get_tenant_id,
      get_workflow_runtime,
-@@ -114,11 +116,13 @@ def _invalid_limit(limit: int) -> JSONResponse | None:
+     require_read,
+@@ -180,13 +182,14 @@ def _resource_response(resource: Resource, status_code: int = 200) -> JSONRespon
  async def create_inference_service(
      body: dict[str, Any],
      tenant_id: str = Depends(get_tenant_id),
 +    principal: Principal = Depends(get_principal),
-     x_correlation_id: str | None = Header(default=None, alias="X-Correlation-Id"),
+     registry: SQLiteRegistry = Depends(require_registry),
+     correlation_id: str = Depends(get_correlation_id),
  ) -> Any:
-     """创建推理服务（201）。
+     """创建推理服务（201，附 ``ETag``）。
  
-     请求体不合法（缺少 ``spec``、kind 不匹配等）返回 400；同名资源已存在返回 409。
-+    创建成功时在同一事务中写入资源变更事件与审计记录（调用主体与关联 ID）。
+     请求体不合法（缺少 ``spec``、kind 不匹配、未知的顶层字段等）返回 400；同名资源已存在
+-    返回 409。
++    返回 409。创建成功时在同一事务中写入资源变更事件与审计记录（调用主体与关联 ID）。
      """
-     correlation_id = x_correlation_id or uuid4().hex
      try:
-@@ -134,7 +138,9 @@ async def create_inference_service(
+         resource = _build_inference_service(body, tenant_id)
+@@ -201,7 +204,7 @@ async def create_inference_service(
      except ValueError as exc:
          return _error_response(400, "BAD_REQUEST", str(exc), correlation_id)
      try:
--        created = await get_registry().put(resource)
-+        created = await get_registry().put(
-+            resource, correlation_id=correlation_id, principal=principal
-+        )
+-        created = await registry.put(resource)
++        created = await registry.put(resource, correlation_id=correlation_id, principal=principal)
      except ConflictError as exc:
          return _error_response(409, "CONFLICT", str(exc), correlation_id)
-     return JSONResponse(status_code=201, content=created.model_dump(by_alias=True, mode="json"))
-@@ -174,6 +180,8 @@ async def delete_inference_service(
+     return _resource_response(created, status_code=201)
+@@ -251,12 +254,16 @@ async def _update_inference_service(
+     namespace: str | None,
+     if_match: list[str] | None,
+     document_for: Callable[[dict[str, Any]], Any],
++    *,
++    principal: Principal,
++    correlation_id: str,
+ ) -> JSONResponse:
+     """PUT / PATCH 的共同流程：读取当前资源 → 生成更新文档 → 检查 → CAS 写入。
+ 
+     ``document_for`` 由当前资源的 JSON 表示得到更新文档。客户端的前置条件每一轮都对照
+     这一轮读到的资源检查，写入以读到的 uid 与版本为条件；读取之后资源被并发修改（如
+     控制器写入 status）时重新读取再来一轮，不会覆盖并发写入，也不会绕过前置条件。
++    有变化的写入在同一事务中写入资源变更事件与审计记录（调用主体与关联 ID）。
+     """
+     condition = parse_if_match(if_match)
+     for _ in range(_UPDATE_ATTEMPTS):
+@@ -282,6 +289,8 @@ async def _update_inference_service(
+                 annotations=desired.annotations,
+                 expected_version=current.metadata.resourceVersion,
+                 expected_uid=current.metadata.uid,
++                correlation_id=correlation_id,
++                principal=principal,
+             )
+         except NotFoundError as exc:
+             raise ApiError(404, "NOT_FOUND", f"InferenceService '{name}' not found") from exc
+@@ -301,18 +310,28 @@ async def replace_inference_service(
+     name: str,
+     body: dict[str, Any],
+     tenant_id: str = Depends(get_tenant_id),
++    principal: Principal = Depends(get_principal),
+     registry: SQLiteRegistry = Depends(require_registry),
+     namespace: str | None = None,
+     if_match: list[str] | None = Header(default=None, alias="If-Match"),
++    correlation_id: str = Depends(get_correlation_id),
+ ) -> JSONResponse:
+     """整体替换推理服务的 ``spec``、labels 与 annotations（200，附 ``ETag``）。
+ 
+     文档规则见 :mod:`.updates`：只有 ``spec`` 变化时 ``generation`` 递增，没有变化的请求
+-    不写库。错误：文档不合法或试图修改不可变字段 400；不存在 404；资源处于 Terminating，
+-    或 uid / resourceVersion / If-Match 前置条件不满足 409（``details.reason``）。
++    不写库（也不写事件与审计记录）。错误：文档不合法或试图修改不可变字段 400；不存在 404；
++    资源处于 Terminating，或 uid / resourceVersion / If-Match 前置条件不满足 409
++    （``details.reason``）。
+     """
+     return await _update_inference_service(
+-        registry, tenant_id, name, namespace, if_match, lambda _current: body
++        registry,
++        tenant_id,
++        name,
++        namespace,
++        if_match,
++        lambda _current: body,
++        principal=principal,
++        correlation_id=correlation_id,
+     )
+ 
+ 
+@@ -331,9 +350,11 @@ async def patch_inference_service(
+     name: str,
+     request: Request,
+     tenant_id: str = Depends(get_tenant_id),
++    principal: Principal = Depends(get_principal),
+     registry: SQLiteRegistry = Depends(require_registry),
+     namespace: str | None = None,
+     if_match: list[str] | None = Header(default=None, alias="If-Match"),
++    correlation_id: str = Depends(get_correlation_id),
+ ) -> JSONResponse:
+     """以 JSON Merge Patch（RFC 7386）更新推理服务（200，附 ``ETag``）。
+ 
+@@ -362,6 +383,8 @@ async def patch_inference_service(
+         namespace,
+         if_match,
+         lambda current: apply_merge_patch(current, patch),
++        principal=principal,
++        correlation_id=correlation_id,
+     )
+ 
+ 
+@@ -369,6 +392,7 @@ async def patch_inference_service(
+ async def delete_inference_service(
      name: str,
      tenant_id: str = Depends(get_tenant_id),
-     namespace: str | None = None,
 +    principal: Principal = Depends(get_principal),
-+    x_correlation_id: str | None = Header(default=None, alias="X-Correlation-Id"),
- ) -> Any:
-     """删除推理服务（受控删除语义，对齐 development-plan 第 7 章除闭环）。
- 
-@@ -184,15 +192,23 @@ async def delete_inference_service(
+     registry: SQLiteRegistry = Depends(require_registry),
+     namespace: str | None = None,
+     correlation_id: str = Depends(get_correlation_id),
+@@ -382,10 +406,17 @@ async def delete_inference_service(
        → 清空 finalizer → 释放分配 → 物理删除」；响应体
        ``{"name": ..., "phase": "Terminating"}``。
  
 -    不存在时返回 HTTP 404（不变）。
 +    不存在时返回 HTTP 404（不变）。受理时在同一事务中写入资源变更事件与审计记录。
      """
-+    correlation_id = x_correlation_id or uuid4().hex
-     registry = get_registry()
      try:
 -        result = await registry.request_delete("InferenceService", namespace, name, tenant_id)
 +        result = await registry.request_delete(
@@ -107,11 +189,6 @@ index 3b5a0b4..ef2f7a9 100644
      except NotFoundError as exc:
          raise HTTPException(status_code=404, detail=f"InferenceService '{name}' not found") from exc
      except ConflictError as exc:
--        return _error_response(409, "CONFLICT", str(exc), uuid4().hex)
-+        return _error_response(409, "CONFLICT", str(exc), correlation_id)
-     if result.deleted:
-         return Response(status_code=204)
-     return JSONResponse(status_code=202, content={"name": name, "phase": "Terminating"})
 diff --git a/packages/control-plane/src/forgemesh/controlplane/audit.py b/packages/control-plane/src/forgemesh/controlplane/audit.py
 index 4481ac3..65a218e 100644
 --- a/packages/control-plane/src/forgemesh/controlplane/audit.py
@@ -356,23 +433,23 @@ index ebc6bdd..088cf5b 100644
  
  
 diff --git a/packages/control-plane/src/forgemesh/controlplane/registry/store.py b/packages/control-plane/src/forgemesh/controlplane/registry/store.py
-index c8e2517..fdf023e 100644
+index 46f51e0..0679bfa 100644
 --- a/packages/control-plane/src/forgemesh/controlplane/registry/store.py
 +++ b/packages/control-plane/src/forgemesh/controlplane/registry/store.py
-@@ -59,8 +59,10 @@ Allocation 持久化
+@@ -77,8 +77,10 @@ Allocation 持久化
  :meth:`SQLiteRegistry.prune_changes` 清理。
  
  同一事务中还向 :attr:`SQLiteRegistry.outbox` 写入一条资源变更事件（ADR-008 事务性
 -Outbox，信封与事件类型见 :mod:`forgemesh.controlplane.events`）：资源写入失败时不会
 -留下事件，事件写入失败时资源写入一并回滚。
 +Outbox，信封与事件类型见 :mod:`forgemesh.controlplane.events`）；API 写入（``put`` /
-+``delete`` / ``request_delete`` 给出调用主体 ``principal``）再向
++``update_spec`` / ``delete`` / ``request_delete`` 给出调用主体 ``principal``）再向
 +:attr:`SQLiteRegistry.audit_log` 写入一条审计记录。资源写入失败时不会留下事件与审计
 +记录，二者写入失败时资源写入一并回滚。
  
  租户隔离
  --------
-@@ -97,6 +99,8 @@ from forgemesh.resource.inference import Endpoint, InferenceService
+@@ -118,6 +120,8 @@ from forgemesh.resource.inference import Endpoint, InferenceService
  from forgemesh.resource.states import ALLOCATION_STATE_MACHINE, INFERENCE_STATE_MACHINE
  from pydantic import ValidationError
  
@@ -381,7 +458,7 @@ index c8e2517..fdf023e 100644
  from ..events import ResourceEventChange, resource_event
  from ..outbox import Outbox
  from ..sqlite import Database
-@@ -203,6 +207,15 @@ _EVENT_CHANGES = {
+@@ -251,6 +255,15 @@ _EVENT_CHANGES = {
      ChangeType.DELETED: ResourceEventChange.DELETED,
  }
  
@@ -395,11 +472,11 @@ index c8e2517..fdf023e 100644
 +}
 +
  
- @dataclass(frozen=True)
- class ResourceKey:
-@@ -282,12 +295,18 @@ class SQLiteRegistry(ResourceRegistry):
-         self._lock = self._db.lock
+ class ConflictReason(StrEnum):
+     """:meth:`SQLiteRegistry.update_spec` 拒绝写入的原因（``ConflictError.details["reason"]``）。"""
+@@ -352,12 +365,18 @@ class SQLiteRegistry(ResourceRegistry):
          self._init_schema()
+         self._page_token_key = self._load_page_token_key()
          self._outbox = Outbox(database=self._db)
 +        self._audit = AuditLog(database=self._db)
  
@@ -416,7 +493,7 @@ index c8e2517..fdf023e 100644
      # ------------------------------------------------------------------ #
      # 内部辅助
      # ------------------------------------------------------------------ #
-@@ -321,27 +340,60 @@ class SQLiteRegistry(ResourceRegistry):
+@@ -391,27 +410,60 @@ class SQLiteRegistry(ResourceRegistry):
          version: int,
          phase: str | None,
          correlation_id: str | None,
@@ -488,7 +565,7 @@ index c8e2517..fdf023e 100644
      @contextlib.contextmanager
      def _immediate_transaction(self) -> Iterator[sqlite3.Cursor]:
          """``BEGIN IMMEDIATE`` 事务：开始即持有写锁，事务内的检查不会被其他连接的
-@@ -564,6 +616,8 @@ class SQLiteRegistry(ResourceRegistry):
+@@ -689,6 +741,8 @@ class SQLiteRegistry(ResourceRegistry):
          expected_version: str | None = None,
          actor: str | None = None,
          correlation_id: str | None = None,
@@ -497,7 +574,7 @@ index c8e2517..fdf023e 100644
      ) -> Resource:
          """写入（Create 或 Update-CAS）资源，返回写入后的最新对象。
  
-@@ -571,13 +625,17 @@ class SQLiteRegistry(ResourceRegistry):
+@@ -696,13 +750,17 @@ class SQLiteRegistry(ResourceRegistry):
          * ``expected_version`` 非 ``None`` → Update-CAS；版本不匹配或资源不存在抛
            ConflictError。成功后 ``resource_version`` 递增。
  
@@ -517,7 +594,7 @@ index c8e2517..fdf023e 100644
          namespace = meta.namespace
          name = meta.name
          kind = resource.kind
-@@ -618,7 +676,15 @@ class SQLiteRegistry(ResourceRegistry):
+@@ -743,7 +801,15 @@ class SQLiteRegistry(ResourceRegistry):
                          ),
                      )
                      self._record_change(cur, tenant_id, kind, namespace, name, ChangeType.CREATED)
@@ -534,7 +611,7 @@ index c8e2517..fdf023e 100644
                      self._conn.commit()
                      return stored
                  # ---- Update-CAS ----
-@@ -665,7 +731,9 @@ class SQLiteRegistry(ResourceRegistry):
+@@ -790,7 +856,9 @@ class SQLiteRegistry(ResourceRegistry):
                          f"(kind={kind} namespace={namespace!r} name={name})",
                      )
                  self._record_change(cur, tenant_id, kind, namespace, name, ChangeType.UPDATED)
@@ -545,7 +622,7 @@ index c8e2517..fdf023e 100644
                  self._conn.commit()
                  return stored
              except sqlite3.IntegrityError as exc:
-@@ -736,11 +804,14 @@ class SQLiteRegistry(ResourceRegistry):
+@@ -897,11 +965,14 @@ class SQLiteRegistry(ResourceRegistry):
          tenant_id: str,
          actor: str | None = None,
          correlation_id: str | None = None,
@@ -561,7 +638,7 @@ index c8e2517..fdf023e 100644
          key = ResourceKey(tenant_id, kind, namespace, name)
  
          def _delete() -> None:
-@@ -770,6 +841,7 @@ class SQLiteRegistry(ResourceRegistry):
+@@ -931,6 +1002,7 @@ class SQLiteRegistry(ResourceRegistry):
                  row["resource_version"],
                  row["phase"],
                  correlation_id,
@@ -569,7 +646,7 @@ index c8e2517..fdf023e 100644
              )
              self._conn.commit()
  
-@@ -783,6 +855,8 @@ class SQLiteRegistry(ResourceRegistry):
+@@ -944,6 +1016,8 @@ class SQLiteRegistry(ResourceRegistry):
          tenant_id: str,
          actor: str | None = None,
          correlation_id: str | None = None,
@@ -578,7 +655,7 @@ index c8e2517..fdf023e 100644
      ) -> RequestDeleteResult:
          """受控删除入口：finalizer 非空 → ``Terminating``；为空 → 物理 DELETE。
  
-@@ -808,8 +882,11 @@ class SQLiteRegistry(ResourceRegistry):
+@@ -969,8 +1043,11 @@ class SQLiteRegistry(ResourceRegistry):
              namespace: 命名空间（可为 ``None``）。
              name: 资源名。
              tenant_id: 租户标识（多租户边界）。
@@ -592,7 +669,7 @@ index c8e2517..fdf023e 100644
  
          Returns:
              :class:`RequestDeleteResult`：``deleted=True`` 已物理删除；
-@@ -820,7 +897,9 @@ class SQLiteRegistry(ResourceRegistry):
+@@ -981,7 +1058,9 @@ class SQLiteRegistry(ResourceRegistry):
              InvalidStateTransition: 当前 phase 不允许转移到 ``Terminating``。
              ConflictError: 读取后资源被并发修改（``resource_version`` 已变化）或
                  并发获得了分配，调用方应重新读取后重试。
@@ -602,7 +679,7 @@ index c8e2517..fdf023e 100644
          terminating = "Terminating"
          active = AllocationStatus.ACTIVE.value
          key = ResourceKey(tenant_id, kind, namespace, name)
-@@ -867,7 +946,13 @@ class SQLiteRegistry(ResourceRegistry):
+@@ -1028,7 +1107,13 @@ class SQLiteRegistry(ResourceRegistry):
                      )
                  self._record_change(cur, tenant_id, kind, namespace, name, ChangeType.DELETED)
                  self._emit(
@@ -617,7 +694,7 @@ index c8e2517..fdf023e 100644
                  )
                  self._conn.commit()
                  return RequestDeleteResult(True, [])
-@@ -911,7 +996,13 @@ class SQLiteRegistry(ResourceRegistry):
+@@ -1072,7 +1157,13 @@ class SQLiteRegistry(ResourceRegistry):
                  )
              self._record_change(cur, tenant_id, kind, namespace, name, ChangeType.TERMINATING)
              self._emit(
@@ -632,11 +709,61 @@ index c8e2517..fdf023e 100644
              )
              self._conn.commit()
              logger.info(
+@@ -1238,6 +1329,7 @@ class SQLiteRegistry(ResourceRegistry):
+         expected_version: str | None = None,
+         expected_uid: str | None = None,
+         correlation_id: str | None = None,
++        principal: Principal | None = None,
+     ) -> Resource:
+         """期望状态写入：整体替换 ``spec``、``metadata.labels`` 与 ``metadata.annotations``。
+ 
+@@ -1247,8 +1339,9 @@ class SQLiteRegistry(ResourceRegistry):
+         * ``spec`` 按模型规范化（补齐默认值）后与当前值比较，变化时 ``generation`` 加 1；
+           只有 labels / annotations 变化时 ``generation`` 不变；
+         * 有变化时 ``resource_version`` 加 1，并追加 ``updated`` 变更记录（控制器据此
+-          重新协调）与资源变更事件（``correlation_id`` 为空时生成一个新的）；没有任何变化
+-          时不写库，返回当前资源；
++          重新协调）与资源变更事件（``correlation_id`` 为空时生成一个新的），给出
++          ``principal``（API 写入的调用主体）时再写入一条审计记录；没有任何变化时不写库，
++          返回当前资源；
+         * 资源处于 ``Terminating`` 时拒绝，先于 uid / 版本检查（重新读取后重试也不会成功）；
+         * ``expected_uid`` / ``expected_version`` 非空时须与当前 uid / 版本相同（版本按
+           字符串比较）；同名资源被删除后重建时版本会从 0 重新计数，uid 可以识别这种情况。
+@@ -1262,12 +1355,13 @@ class SQLiteRegistry(ResourceRegistry):
+             NotFoundError: 资源不存在（或跨租户不可见）。
+             ConflictError: 资源处于 ``Terminating``，或 uid / 版本与预期不同；
+                 ``details["reason"]`` 为 :class:`ConflictReason` 的取值。
+-            ValueError: kind 没有登记强类型模型。
++            ValueError: kind 没有登记强类型模型，或 ``principal`` 不属于资源的租户。
+             pydantic.ValidationError: 替换后的资源不满足模型约束（``ValueError`` 的子类）。
+         """
+         model = _KIND_MODELS.get(kind)
+         if model is None:
+             raise ValueError(f"spec updates are not supported for kind {kind!r}")
++        self._check_principal(principal, tenant_id)
+         target = f"kind={kind} namespace={namespace!r} name={name}"
+         key = ResourceKey(tenant_id, kind, namespace, name)
+ 
+@@ -1333,7 +1427,13 @@ class SQLiteRegistry(ResourceRegistry):
+                 )
+                 self._record_change(cur, tenant_id, kind, namespace, name, ChangeType.UPDATED)
+                 self._emit(
+-                    key, ChangeType.UPDATED, new_body, new_version, row["phase"], correlation_id
++                    key,
++                    ChangeType.UPDATED,
++                    new_body,
++                    new_version,
++                    row["phase"],
++                    correlation_id,
++                    principal,
+                 )
+                 return self._body_to_resource(new_body)
+ 
 diff --git a/tests/unit/controlplane/test_api.py b/tests/unit/controlplane/test_api.py
-index fc29736..ca493fd 100644
+index bea9b2f..44258e3 100644
 --- a/tests/unit/controlplane/test_api.py
 +++ b/tests/unit/controlplane/test_api.py
-@@ -169,6 +169,28 @@ def test_delete_pending_service_holding_an_allocation_returns_202(client: TestCl
+@@ -177,6 +177,28 @@ def test_delete_pending_service_holding_an_allocation_returns_202(client: TestCl
      assert resp.json() == {"name": "svc-1", "phase": "Terminating"}
  
  
@@ -665,6 +792,78 @@ index fc29736..ca493fd 100644
  def test_list_inference_services(client: TestClient) -> None:
      """创建多个 → LIST 返回列表。"""
      for i in range(3):
+diff --git a/tests/unit/controlplane/test_api_updates.py b/tests/unit/controlplane/test_api_updates.py
+index f15d104..3467c27 100644
+--- a/tests/unit/controlplane/test_api_updates.py
++++ b/tests/unit/controlplane/test_api_updates.py
+@@ -2,7 +2,7 @@
+ 
+ 覆盖：整体替换与 JSON Merge Patch 的写入结果、generation 只随 spec 递增、服务端维护的
+ 字段被忽略、不可变字段、uid / resourceVersion / If-Match 前置条件与并发冲突、Terminating
+-拒绝更新、媒体类型，以及合并补丁与 If-Match 解析本身。
++拒绝更新、媒体类型、更新写入的事件与审计记录，以及合并补丁与 If-Match 解析本身。
+ """
+ 
+ from __future__ import annotations
+@@ -558,6 +558,58 @@ def test_patch_must_be_a_json_object(client: TestClient, content: bytes) -> None
+     assert _error(response)[0] == "BAD_REQUEST"
+ 
+ 
++# ------------------------------------------------------------------ #
++# 事件与审计记录
++# ------------------------------------------------------------------ #
++
++
++@pytest.mark.parametrize("method", ["PUT", "PATCH"])
++def test_updates_write_the_event_and_the_audit_record_of_the_caller(
++    client: TestClient, method: str
++) -> None:
++    """与创建、删除相同：同一事务中写入资源变更事件与审计记录，带调用主体与关联 ID。"""
++    headers = {"X-Correlation-Id": "corr-update"}
++    if method == "PUT":
++        response = _put(client, _with_model(_get(client), "models/mistral"), **headers)
++    else:
++        response = _patch(client, {"spec": {"model": {"reference": "models/mistral"}}}, **headers)
++
++    assert response.status_code == 200, response.text
++    registry = get_registry()
++    records = registry.audit_log.query_by_tenant("tenant-a")
++    create, update = sorted(records, key=lambda record: record.timestamp)
++    _, event = registry.outbox.get_pending()
++    assert create.action == "create"
++    assert (update.action, update.actor, update.key_id) == ("update", "dev:tenant-a", None)
++    assert (update.resource_type, update.namespace, update.resource_id) == (
++        "InferenceService",
++        "default",
++        "svc-1",
++    )
++    assert update.correlation_id == event.payload["correlationId"] == "corr-update"
++    assert update.details == {
++        "change": "updated",
++        "resourceUid": response.json()["metadata"]["uid"],
++        "resourceVersion": 1,
++        "eventId": event.event_id,
++    }
++    assert event.payload["data"]["resource"] == response.json()
++
++
++def test_unchanged_and_rejected_updates_write_no_audit_record(client: TestClient) -> None:
++    unchanged = _put(client, _get(client))
++    stale = _patch(client, {"metadata": {"labels": None}}, **{"If-Match": '"stale"'})
++
++    assert (unchanged.status_code, stale.status_code) == (200, 409)
++    registry = get_registry()
++    assert [record.action for record in registry.audit_log.query_by_tenant("tenant-a")] == [
++        "create"
++    ]
++    assert [event.event_type for event in registry.outbox.get_pending()] == [
++        "inference.service.created"
++    ]
++
++
+ # ------------------------------------------------------------------ #
+ # 创建与读取
+ # ------------------------------------------------------------------ #
 diff --git a/tests/unit/controlplane/test_audit.py b/tests/unit/controlplane/test_audit.py
 index e5569ae..50855a7 100644
 --- a/tests/unit/controlplane/test_audit.py
@@ -775,7 +974,7 @@ index e5569ae..50855a7 100644
 +    log.close()
 +    reopened.close()
 diff --git a/tests/unit/controlplane/test_auth.py b/tests/unit/controlplane/test_auth.py
-index 31a8200..5cc8080 100644
+index e2c33b4..44997d1 100644
 --- a/tests/unit/controlplane/test_auth.py
 +++ b/tests/unit/controlplane/test_auth.py
 @@ -9,7 +9,11 @@ from fastapi import FastAPI
@@ -808,7 +1007,7 @@ index 31a8200..5cc8080 100644
      assert principal.has_scope("read") and principal.has_scope("write")
      assert read_only.has_scope("read") and not read_only.has_scope("write")
  
-@@ -287,6 +292,55 @@ def test_read_only_credentials_cannot_write(api_client) -> None:
+@@ -300,6 +305,95 @@ def test_read_only_credentials_cannot_write(api_client) -> None:
      assert api_client.get("/api/v1/inference-services", headers=_bearer(KEY_A)).json()["count"] == 1
  
  
@@ -846,6 +1045,46 @@ index 31a8200..5cc8080 100644
 +
 +
 +@pytest.mark.unit
++def test_updates_are_audited_with_the_principal(api_client) -> None:
++    path = "/api/v1/inference-services/llama"
++    namespace = {"namespace": "default"}
++    document = api_client.post(
++        "/api/v1/inference-services", json=BODY, headers=_bearer(KEY_A)
++    ).json()
++    # 不以创建时的版本为前置条件：控制器可能已写入 status。
++    del document["metadata"]["resourceVersion"]
++    document["spec"]["model"]["reference"] = "models/mistral"
++
++    replaced = api_client.put(
++        path, params=namespace, json=document, headers=_bearer(KEY_A, **{"X-Correlation-Id": "c-1"})
++    )
++    patched = api_client.patch(
++        path,
++        params=namespace,
++        content=json.dumps({"metadata": {"labels": {"team": "search"}}}),
++        headers=_bearer(
++            KEY_A, **{"Content-Type": "application/merge-patch+json", "X-Correlation-Id": "c-2"}
++        ),
++    )
++
++    assert (replaced.status_code, patched.status_code) == (200, 200)
++    create, *updates = sorted(
++        get_registry().audit_log.query_by_tenant("tenant-a"), key=lambda e: e.timestamp
++    )
++    assert create.action == "create"
++    assert [(r.action, r.correlation_id) for r in updates] == [("update", "c-1"), ("update", "c-2")]
++    for record, response in zip(updates, (replaced, patched), strict=True):
++        assert (record.actor, record.key_id, record.namespace, record.resource_id) == (
++            "alice",
++            "a",
++            "default",
++            "llama",
++        )
++        version = int(response.json()["metadata"]["resourceVersion"])
++        assert record.details["resourceVersion"] == version
++
++
++@pytest.mark.unit
 +def test_rejected_api_writes_are_not_audited(api_client) -> None:
 +    path = "/api/v1/inference-services"
 +    api_client.post(path, json=BODY, headers=_bearer(KEY_A))
@@ -866,10 +1105,10 @@ index 31a8200..5cc8080 100644
      init_registry(":memory:")
 diff --git a/tests/unit/controlplane/test_registry_audit.py b/tests/unit/controlplane/test_registry_audit.py
 new file mode 100644
-index 0000000..18807a0
+index 0000000..7e44809
 --- /dev/null
 +++ b/tests/unit/controlplane/test_registry_audit.py
-@@ -0,0 +1,202 @@
+@@ -0,0 +1,254 @@
 +"""资源注册表的审计记录：API 写入在资源写入的同一事务中记录调用主体。"""
 +
 +from __future__ import annotations
@@ -882,10 +1121,12 @@ index 0000000..18807a0
 +import pytest
 +from forgemesh.controlplane.audit import AuditEvent
 +from forgemesh.controlplane.auth import Principal
++from forgemesh.controlplane.deployment import InMemoryLauncher, check_instances
 +from forgemesh.controlplane.registry import SQLiteRegistry
 +from forgemesh.core.objects import ObjectMeta
 +from forgemesh.resource.inference import (
 +    AcceleratorSpec,
++    Endpoint,
 +    InferencePhase,
 +    InferenceService,
 +    InferenceServiceSpec,
@@ -899,6 +1140,12 @@ index 0000000..18807a0
 +TENANT = "tenant-a"
 +NAMESPACE = "team-a"
 +ALICE = Principal(subject="alice", tenant_id=TENANT, scopes=frozenset({"write"}), key_id="key-a")
++#: ``_service`` 的 spec 换一个模型（``update_spec`` 的一次期望状态变更）。
++NEW_SPEC: dict[str, Any] = {
++    "model": {"reference": "models/mistral"},
++    "runtime": {"provider": "vllm"},
++    "resources": {"accelerator": {"type": "nvidia-gpu", "minMemoryGiB": 16}},
++}
 +
 +
 +def _run(coro):
@@ -931,6 +1178,17 @@ index 0000000..18807a0
 +    "update": lambda reg, who: reg.put(
 +        _service(), expected_version="0", correlation_id="corr", principal=who
 +    ),
++    "spec-update": lambda reg, who: reg.update_spec(
++        KIND,
++        NAMESPACE,
++        "svc",
++        TENANT,
++        NEW_SPEC,
++        labels={},
++        annotations={},
++        correlation_id="corr",
++        principal=who,
++    ),
 +    "request-delete": lambda reg, who: reg.request_delete(
 +        KIND, NAMESPACE, "svc", TENANT, correlation_id="corr", principal=who
 +    ),
@@ -946,6 +1204,7 @@ index 0000000..18807a0
 +_EXPECTED = {
 +    "create": ("create", "new", "created"),
 +    "update": ("update", "svc", "updated"),
++    "spec-update": ("update", "svc", "updated"),
 +    "request-delete": ("delete", "svc", "deleted"),
 +    "terminate": ("delete", "ready", "terminating"),
 +    "delete": ("delete", "svc", "deleted"),
@@ -995,12 +1254,20 @@ index 0000000..18807a0
 +
 +@pytest.mark.unit
 +def test_internal_writes_are_not_audited() -> None:
++    """控制器的 status 写入（含实例核对）与协调器的写入（写回 finalizer、物理删除）不给出
++    调用主体：照常写入事件，不写审计记录。"""
 +    reg = _registry()
-+    _run(reg.update_status(KIND, NAMESPACE, "svc", TENANT, {"phase": "Scheduling"}))
++    gone = Endpoint(url="http://10.0.0.1:8000", instanceId="gone", protocol="openai-chat")
++    patch = {"endpoints": [gone.model_dump(mode="json")]}
++    _run(reg.update_status(KIND, NAMESPACE, "ready", TENANT, patch))
++    assert [key.name for key in _run(check_instances(reg, InMemoryLauncher()))] == ["ready"]
++    svc = _run(reg.update_status(KIND, NAMESPACE, "svc", TENANT, {"phase": "Scheduling"}))
++    svc.finalizers = ["example.com/cleanup"]
++    _run(reg.put(svc, expected_version=svc.metadata.resourceVersion, actor="reconciler"))
 +    _run(reg.delete(KIND, NAMESPACE, "svc", TENANT, actor="reconciler"))
 +
 +    assert _audit(reg) == []
-+    assert len(reg.outbox.get_pending()) == 4
++    assert len(reg.outbox.get_pending()) == 7
 +
 +
 +@pytest.mark.unit
@@ -1029,6 +1296,30 @@ index 0000000..18807a0
 +            "SELECT * FROM audit_events ORDER BY audit_id",
 +        )
 +    )
++
++
++@pytest.mark.unit
++def test_an_unchanged_spec_update_writes_no_audit_record() -> None:
++    reg = _registry()
++    current = _run(reg.get(KIND, NAMESPACE, "svc", TENANT))
++    spec = current.model_dump(mode="json", by_alias=True)["spec"]
++    before = _state(reg)
++
++    _run(
++        reg.update_spec(
++            KIND,
++            NAMESPACE,
++            "svc",
++            TENANT,
++            spec,
++            labels={},
++            annotations={},
++            correlation_id="corr",
++            principal=ALICE,
++        )
++    )
++
++    assert _state(reg) == before
 +
 +
 +@pytest.mark.unit

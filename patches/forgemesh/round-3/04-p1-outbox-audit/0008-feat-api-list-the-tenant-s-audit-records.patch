@@ -1,82 +1,97 @@
-From 1e2250618cdc74c3a1bde84a0ab80c13fb563b87 Mon Sep 17 00:00:00 2001
+From cb11e9ab7bddffaf0e55e62cc49969509f7c3253 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Tue, 13 Oct 2026 03:34:44 +0000
-Subject: [PATCH 08/12] feat(api): list the tenant's audit records
+Subject: [PATCH 08/14] feat(api): list the tenant's audit records
 
 GET /api/v1/audit-events returns the audit records of the caller's
 tenant, newest first, and needs the read scope. It accepts limit (1 to
 1000, default 100, like the list endpoints), pageToken and an optional
 correlationId filter, and returns {items, count, nextPageToken}; the
-token is only present when there is another page.
+token is only present when there is another page. Like the other
+routes it answers 503 REGISTRY_UNAVAILABLE while the registry is not
+ready and echoes X-Correlation-Id in its error responses.
 
 AuditLog.list_page pages by position (timestamp, then audit id), so
 records written while a client pages do not repeat or skip records on
-later pages. The opaque token carries that position and a digest of the
-tenant and the filter; a token issued for another tenant or filter, or
-one that cannot be parsed, is rejected with 400. The token is not a
-credential: the query is always limited to the caller's tenant. A new
-index on (tenant_id, correlation_id, timestamp) serves the filter.
+later pages. A new index on (tenant_id, correlation_id, timestamp)
+serves the filter.
+
+The page token is signed like the resource list tokens and with the
+same key. Their signing code moves from the registry into
+forgemesh.controlplane.pagetokens without changing the token format
+(the module now also creates the registry_meta table, and its single
+InvalidPageTokenError is still exported by the registry package). The
+audit log loads the page_token_key row of its database, which in the
+control plane is the registry's database. The signed scope names the
+list, the tenant and the correlationId filter: a token issued for
+another tenant or filter, a resource list token, a modified token or
+one from another database is rejected with 400, and tokens stay valid
+across restarts. The token is not a credential: the query is always
+limited to the caller's tenant.
 
 The operation and the AuditEvent / AuditEventList schemas are in the
-OpenAPI document. The Go gateway does not forward this path yet, so it
-is only reachable on the control plane itself.
+OpenAPI document, and the contract drift test covers the operation.
+The Go gateway does not forward this path yet, so it is only reachable
+on the control plane itself.
 ---
- api/openapi/openapi.yaml                      | 122 ++++++
- .../src/forgemesh/controlplane/api/routes.py  |  76 +++-
- .../src/forgemesh/controlplane/audit.py       | 106 ++++-
+ api/openapi/openapi.yaml                      | 121 +++++
+ .../src/forgemesh/controlplane/api/routes.py  |  88 +++-
+ .../src/forgemesh/controlplane/audit.py       |  79 ++-
+ .../src/forgemesh/controlplane/pagetokens.py  | 135 ++++++
+ .../forgemesh/controlplane/registry/store.py  |  90 +---
+ tests/contract/test_openapi_contract.py       |  21 +
  tests/security/test_tenant_isolation.py       |  61 ++-
- tests/unit/controlplane/test_audit_api.py     | 365 ++++++++++++++++++
- 5 files changed, 725 insertions(+), 5 deletions(-)
+ tests/unit/controlplane/test_audit_api.py     | 453 ++++++++++++++++++
+ tests/unit/controlplane/test_pagetokens.py    |  68 +++
+ 9 files changed, 1026 insertions(+), 90 deletions(-)
+ create mode 100644 packages/control-plane/src/forgemesh/controlplane/pagetokens.py
  create mode 100644 tests/unit/controlplane/test_audit_api.py
+ create mode 100644 tests/unit/controlplane/test_pagetokens.py
 
 diff --git a/api/openapi/openapi.yaml b/api/openapi/openapi.yaml
-index 622e552..fbfc671 100644
+index b354312..ac92f66 100644
 --- a/api/openapi/openapi.yaml
 +++ b/api/openapi/openapi.yaml
-@@ -28,6 +28,8 @@ tags:
-     description: 工作流运行启动与状态查询
-   - name: decisions
+@@ -32,6 +32,8 @@ tags:
      description: 结构化决策请求（决策≠授权；授权由 Scheduler/Policy 完成）
+   - name: resources
+     description: 按 kind 列出资源（只读）
 +  - name: audit
 +    description: 审计记录查询（只读，限定在凭证绑定的租户内）
    - name: probes
      description: 存活与就绪探针
  
-@@ -240,6 +242,54 @@ paths:
-           $ref: "#/components/responses/Forbidden"
+@@ -408,6 +410,52 @@ paths:
+           $ref: "#/components/responses/ServiceUnavailable"
  
  
 +  /api/v1/audit-events:
++    parameters:
++      - $ref: "#/components/parameters/CorrelationId"
 +    get:
 +      tags: [audit]
 +      summary: 列出审计记录
 +      operationId: listAuditEvents
 +      description: >-
-+        列出凭证所属租户的审计记录，最新的在前。API 创建资源与受理删除时，在写入资源的同一个
-+        事务中写入一条审计记录，记录调用主体与关联 ID；被拒绝的请求、对已在 Terminating 的资源
-+        重复的删除请求以及控制器的内部写入不产生审计记录。分页：nextPageToken 只在还有下一页时
-+        出现，原样作为 pageToken 传入即取下一页；翻页期间写入的新记录不会让后面的页重复或遗漏
-+        记录。Go 网关尚未转发此路径（返回 404），需直接访问控制平面（使用同一个 API key）。
++        列出凭证所属租户的审计记录，最新的在前。API 创建、更新（PUT / PATCH）与受理删除资源时，
++        在写入资源的同一个事务中写入一条审计记录，记录调用主体与关联 ID；被拒绝的请求、没有任何
++        变化的更新、对已在 Terminating 的资源重复的删除请求以及控制器的内部写入不产生审计记录。
++        分页：nextPageToken 只在还有下一页时出现，原样作为 pageToken 传入即取下一页；翻页期间
++        写入的新记录不会让后面的页重复或遗漏记录。Go 网关尚未转发此路径（返回 404），需直接访问
++        控制平面（使用同一个 API key）。
 +      parameters:
 +        - name: correlationId
 +          in: query
 +          description: 只列出该关联 ID 的记录；省略或为空时不过滤。
 +          schema:
 +            type: string
-+        - name: limit
-+          in: query
-+          description: 单页最多返回的条数；超出 1–1000 返回 400。
-+          schema:
-+            type: integer
-+            minimum: 1
-+            maximum: 1000
-+            default: 100
++        - $ref: "#/components/parameters/Limit"
 +        - name: pageToken
 +          in: query
 +          description: >-
-+            上一页响应中的 nextPageToken；省略或为空时从最新的记录开始。令牌与租户和
-+            correlationId 绑定：无法解析、或是为另一个租户或另一个 correlationId 签发的令牌
-+            返回 400。limit 可以逐页改变。
++            上一页响应中的 nextPageToken（不透明字符串），空字符串等同于省略（从最新的记录开始）。
++            只对签发它的租户与同一个 correlationId 有效，limit 可以逐页变化；格式不对、被修改、
++            用于其他租户 / correlationId 或取自资源列表时返回 400。控制平面重启后仍然有效。
 +          schema:
 +            type: string
 +      responses:
@@ -92,15 +107,17 @@ index 622e552..fbfc671 100644
 +          $ref: "#/components/responses/Unauthorized"
 +        "403":
 +          $ref: "#/components/responses/Forbidden"
++        "503":
++          $ref: "#/components/responses/ServiceUnavailable"
 +
 +
  components:
-   securitySchemes:
-     apiKey:
-@@ -415,6 +465,78 @@ components:
-         degraded:
-           type: boolean
+   parameters:
+     CorrelationId:
+@@ -758,6 +806,79 @@ components:
            description: 是否走了 Provider 降级路径。
+         riskLevel:
+           $ref: "#/components/schemas/RiskLevel"
 +    AuditEvent:
 +      type: object
 +      description: 一条审计记录：调用主体在什么时间对哪个资源执行了什么操作。
@@ -140,7 +157,9 @@ index 622e552..fbfc671 100644
 +            correlationId 相同。
 +        action:
 +          type: string
-+          description: 操作：create（创建资源）或 delete（受理删除，含置为 Terminating）。
++          description: >-
++            操作：create（创建资源）、update（PUT / PATCH 更新资源）或 delete（受理删除，含置为
++            Terminating）。
 +        resourceType:
 +          type: string
 +          description: 资源的 kind，如 InferenceService。
@@ -156,7 +175,7 @@ index 622e552..fbfc671 100644
 +          type: [object, "null"]
 +          additionalProperties: true
 +          description: >-
-+            资源写入的记录含 change（created / terminating / deleted）、resourceUid、
++            资源写入的记录含 change（created / updated / terminating / deleted）、resourceUid、
 +            resourceVersion 与 eventId（同一次写入产生的资源变更事件）。
 +    AuditEventList:
 +      type: object
@@ -167,40 +186,38 @@ index 622e552..fbfc671 100644
 +          items:
 +            $ref: "#/components/schemas/AuditEvent"
 +        count:
-+          type: integer
-+          minimum: 0
-+          description: 本页的条数。
++          $ref: "#/components/schemas/PageCount"
 +        nextPageToken:
 +          type: string
-+          description: 取下一页的令牌；只在还有下一页时出现。
++          description: >-
++            还有更早的记录时出现，最后一页不带此字段：作为 pageToken 传回即得下一页。
    responses:
      BadRequest:
        description: 请求不合法
 diff --git a/packages/control-plane/src/forgemesh/controlplane/api/routes.py b/packages/control-plane/src/forgemesh/controlplane/api/routes.py
-index ef2f7a9..d047d0f 100644
+index 574a8a8..6c4ca8f 100644
 --- a/packages/control-plane/src/forgemesh/controlplane/api/routes.py
 +++ b/packages/control-plane/src/forgemesh/controlplane/api/routes.py
-@@ -11,6 +11,7 @@
+@@ -14,6 +14,7 @@
  * ``POST   /workflows``                   —— 启动工作流运行（development-plan 5.4）
  * ``POST   /decisions``                   —— 结构化决策（决策≠授权，development-plan 5.5）
- * ``GET    /resources``                   —— 通用资源列表（可选 kind 过滤）
-+* ``GET    /audit-events``                —— 当前租户的审计记录（分页）
+ * ``GET    /resources``                   —— 通用资源列表（按 kind 过滤，分页同上）
++* ``GET    /audit-events``                —— 当前租户的审计记录（最新的在前，分页同上）
  
  租户取自已验证的凭证（见 :func:`.dependencies.get_principal` 与
  :mod:`forgemesh.controlplane.auth`），作为多租户隔离的权威来源，覆盖请求体中的
-@@ -24,18 +25,21 @@
+@@ -27,8 +28,10 @@
  
  from __future__ import annotations
  
 +import asyncio
+ import json
+ from collections.abc import Callable
 +from datetime import UTC, datetime
  from typing import Any
  from uuid import uuid4
  
--from fastapi import APIRouter, Depends, Header, HTTPException
-+from fastapi import APIRouter, Depends, Header, HTTPException, Query
- from fastapi.responses import JSONResponse, Response
- from forgemesh.core.errors import ConflictError, NotFoundError
+@@ -39,9 +42,10 @@ from forgemesh.core.objects import Resource
  from forgemesh.decision.provider import DecisionRequest as InternalDecisionRequest
  from forgemesh.resource.inference import InferenceService
  from forgemesh.workflow.runtime import WorkflowDefinition
@@ -208,12 +225,38 @@ index ef2f7a9..d047d0f 100644
 +from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, ValidationError
  
  from ..app import error_envelope
-+from ..audit import AuditEvent, InvalidPageTokenError
++from ..audit import AuditEvent
  from ..auth import Principal
+ from ..registry import ConflictReason, InvalidPageTokenError, SQLiteRegistry
  from .dependencies import (
-     ComponentNotReadyError,
-@@ -240,6 +244,74 @@ async def list_resources(
-     return {"items": [r.model_dump(by_alias=True) for r in items], "count": len(items)}
+@@ -79,6 +83,11 @@ INITIAL_GENERATION = 1
+ #: 列表接口单页条数上限。
+ MAX_LIST_LIMIT = 1000
+ 
++_INVALID_PAGE_TOKEN = (
++    "invalid pageToken: it is malformed, was modified, or was issued for "
++    "a different tenant or filter set"
++)
++
+ #: PUT / PATCH 在读取与写入之间遇到并发写入（如控制器写 status）时重新读取并重试，
+ #: 这是总尝试次数。
+ _UPDATE_ATTEMPTS = 5
+@@ -149,12 +158,7 @@ async def _list_response(
+             kind, tenant_id, namespace=namespace, page_token=page_token or None, limit=limit
+         )
+     except InvalidPageTokenError as exc:
+-        raise ApiError(
+-            400,
+-            "BAD_REQUEST",
+-            "invalid pageToken: it is malformed, was modified, or was issued for "
+-            "a different tenant or filter set",
+-        ) from exc
++        raise ApiError(400, "BAD_REQUEST", _INVALID_PAGE_TOKEN) from exc
+     body: dict[str, Any] = {
+         "items": [resource.model_dump(by_alias=True, mode="json") for resource in page.items],
+         "count": len(page.items),
+@@ -457,6 +461,76 @@ async def list_resources(
+     return await _list_response(registry, kind, tenant_id, namespace, page_token, limit)
  
  
 +# ------------------------------------------------------------------ #
@@ -249,29 +292,31 @@ index ef2f7a9..d047d0f 100644
 +@router.get("/audit-events", dependencies=[Depends(require_read)])
 +async def list_audit_events(
 +    tenant_id: str = Depends(get_tenant_id),
-+    correlation_id: str | None = Query(default=None, alias="correlationId"),
++    registry: SQLiteRegistry = Depends(require_registry),
++    correlation_filter: str | None = Query(default=None, alias="correlationId"),
 +    limit: int = 100,
 +    page_token: str | None = Query(default=None, alias="pageToken"),
++    correlation_id: str = Depends(get_correlation_id),
 +) -> Any:
 +    """列出当前租户的审计记录，最新的在前（可选按 ``correlationId`` 过滤）。
 +
-+    ``nextPageToken`` 只在还有下一页时返回，原样作为 ``pageToken`` 传入即取下一页；
-+    ``pageToken`` / ``correlationId`` 为空串时视为未给出。``limit`` 超出 1–1000、令牌无法
-+    解析或不是为这个租户与过滤条件签发的，返回 400。
++    响应带 ``nextPageToken`` 时还有下一页：以相同的 ``correlationId`` 把它作为 ``pageToken``
++    传回（``limit`` 可以不同）；``pageToken`` / ``correlationId`` 为空串时视为未给出。
++    ``limit`` 超出 1–1000，或 ``pageToken`` 无效、被篡改、签发给了另一租户 / 另一个过滤条件
++    时返回 400。
 +    """
-+    if (invalid := _invalid_limit(limit)) is not None:
++    if (invalid := _invalid_limit(limit, correlation_id)) is not None:
 +        return invalid
-+    audit_log = get_registry().audit_log
 +    try:
 +        page = await asyncio.to_thread(
-+            audit_log.list_page,
++            registry.audit_log.list_page,
 +            tenant_id,
 +            limit=limit,
 +            page_token=page_token or None,
-+            correlation_id=correlation_id or None,
++            correlation_id=correlation_filter or None,
 +        )
 +    except InvalidPageTokenError as exc:
-+        return _error_response(400, "BAD_REQUEST", f"invalid pageToken: {exc}", uuid4().hex)
++        raise ApiError(400, "BAD_REQUEST", _INVALID_PAGE_TOKEN) from exc
 +    body: dict[str, Any] = {
 +        "items": [
 +            AuditRecordResponse.from_event(event).model_dump(mode="json", by_alias=True)
@@ -288,29 +333,29 @@ index ef2f7a9..d047d0f 100644
  # 工作流运行端点（development-plan 5.4）
  # ------------------------------------------------------------------ #
 diff --git a/packages/control-plane/src/forgemesh/controlplane/audit.py b/packages/control-plane/src/forgemesh/controlplane/audit.py
-index 65a218e..5ce8d0b 100644
+index 65a218e..fa8283b 100644
 --- a/packages/control-plane/src/forgemesh/controlplane/audit.py
 +++ b/packages/control-plane/src/forgemesh/controlplane/audit.py
-@@ -5,13 +5,17 @@ correlation_id 全链路贯穿，支持调用链查询。
+@@ -5,7 +5,9 @@ correlation_id 全链路贯穿，支持调用链查询。
  
  资源注册表在 API 写入资源的同一个事务中写入审计记录（:meth:`AuditLog.put`），记录调用
  主体（租户、主体、凭证 id）与关联 ID：资源写入失败时不会留下审计记录。
 -:meth:`AuditLog.record` 单独写入并提交一条记录。
 +:meth:`AuditLog.record` 单独写入并提交一条记录。:meth:`AuditLog.list_page` 按租户分页
-+列出记录（``GET /api/v1/audit-events``）。
++列出记录（``GET /api/v1/audit-events``），游标与资源列表的游标一样签名
++（:mod:`forgemesh.controlplane.pagetokens`）。
  """
  
  from __future__ import annotations
+@@ -19,6 +21,7 @@ from typing import Any
  
-+import base64
-+import hashlib
- import json
- import logging
-+import math
- import sqlite3
- import time
- import uuid
-@@ -40,6 +44,8 @@ CREATE TABLE IF NOT EXISTS audit_events (
+ from pydantic import BaseModel, ConfigDict, Field
+ 
++from .pagetokens import PageTokenSigner, load_page_token_key, page_scope
+ from .sqlite import Database
+ 
+ logger = logging.getLogger(__name__)
+@@ -40,6 +43,8 @@ CREATE TABLE IF NOT EXISTS audit_events (
  );
  CREATE INDEX IF NOT EXISTS idx_audit_correlation ON audit_events(correlation_id);
  CREATE INDEX IF NOT EXISTS idx_audit_tenant ON audit_events(tenant_id, timestamp);
@@ -319,14 +364,20 @@ index 65a218e..5ce8d0b 100644
  """
  
  #: v1.0.0 的 ``audit_events`` 没有的列（打开存量库时补齐）。
-@@ -83,6 +89,24 @@ class AuditEvent(BaseModel):
+@@ -48,6 +53,9 @@ _ADDED_COLUMNS = (
+     ("namespace", "namespace TEXT"),
+ )
+ 
++#: 审计记录列表的游标位置：上一页最后一条记录的时间戳与 ``audit_id``。
++_PAGE_POSITION = {"ts": float, "id": str}
++
+ 
+ class AuditEvent(BaseModel):
+     """审计事件。
+@@ -83,9 +91,26 @@ class AuditEvent(BaseModel):
      timestamp: float = Field(default_factory=time.time)
  
  
-+class InvalidPageTokenError(ValueError):
-+    """分页令牌无法解析，或不是为这组查询条件（租户、过滤条件）签发的。"""
-+
-+
 +class AuditPage(BaseModel):
 +    """一页审计记录。
 +
@@ -344,7 +395,21 @@ index 65a218e..5ce8d0b 100644
  class AuditLog:
      """审计日志（SQLite 后端）。
  
-@@ -169,6 +193,50 @@ class AuditLog:
++    分页游标的签名密钥取自数据库的 ``registry_meta`` 表（没有时生成），与资源注册表共用
++    数据库时即注册表的密钥。
++
+     Args:
+         db_path: SQLite 数据库路径，默认 :memory:。
+         database: 与业务存储共用的数据库；给出时忽略 ``db_path``，:meth:`close`
+@@ -97,6 +122,7 @@ class AuditLog:
+         self._db = database if database is not None else Database(db_path)
+         self._conn = self._db.conn
+         self._init_schema()
++        self._page_tokens = PageTokenSigner(self._db.call(load_page_token_key, self._conn))
+ 
+     def _init_schema(self) -> None:
+         """创建表与索引（幂等），并为存量库补齐新增的列。"""
+@@ -169,6 +195,55 @@ class AuditLog:
              (tenant_id, limit),
          )
  
@@ -359,8 +424,9 @@ index 65a218e..5ce8d0b 100644
 +        """按租户分页列出审计记录：最新的在前，时间相同时按 ``audit_id`` 降序。
 +
 +        下一页从上一页最后一条记录的位置继续，翻页期间写入的新记录排在已经取过的位置之前，
-+        不会让后面的页重复或遗漏记录。令牌只记录位置并绑定这组查询条件，不是访问凭据：
-+        查询始终限定在 ``tenant_id`` 内。
++        不会让后面的页重复或遗漏记录。游标（格式见 :mod:`forgemesh.controlplane.pagetokens`）
++        记录这个位置并绑定这组查询条件（``limit`` 每页可以不同），不是访问凭据：查询始终
++        限定在 ``tenant_id`` 内。
 +
 +        Args:
 +            tenant_id: 只列出该租户的记录。
@@ -370,18 +436,21 @@ index 65a218e..5ce8d0b 100644
 +
 +        Raises:
 +            ValueError: ``limit`` 小于 1。
-+            InvalidPageTokenError: 令牌无法解析，或是为另一个租户、另一组过滤条件签发的。
++            InvalidPageTokenError: 游标无法解析、被篡改，或签发给了另一个列表、另一个租户或
++                另一个 ``correlation_id``（见 :mod:`forgemesh.controlplane.pagetokens`）。
 +        """
 +        if limit < 1:
 +            raise ValueError(f"limit must be at least 1, got {limit}")
-+        digest = _query_digest(tenant_id, correlation_id)
++        scope = page_scope(
++            {"list": "audit-events", "tenant": tenant_id, "correlationId": correlation_id}
++        )
 +        sql = "SELECT * FROM audit_events WHERE tenant_id = ?"
 +        params: list[Any] = [tenant_id]
 +        if correlation_id is not None:
 +            sql += " AND correlation_id = ?"
 +            params.append(correlation_id)
 +        if page_token is not None:
-+            timestamp, audit_id = _decode_page_token(page_token, digest)
++            timestamp, audit_id = self._page_tokens.decode(page_token, scope, _PAGE_POSITION)
 +            sql += " AND timestamp <= ? AND (timestamp < ? OR audit_id < ?)"
 +            params += [timestamp, timestamp, audit_id]
 +        sql += " ORDER BY timestamp DESC, audit_id DESC LIMIT ?"
@@ -390,51 +459,356 @@ index 65a218e..5ce8d0b 100644
 +        if len(events) <= limit:
 +            return AuditPage(items=events)
 +        items = events[:limit]
-+        return AuditPage(items=items, next_page_token=_encode_page_token(items[-1], digest))
++        position = {"ts": items[-1].timestamp, "id": items[-1].audit_id}
++        return AuditPage(items=items, next_page_token=self._page_tokens.encode(position, scope))
 +
      @staticmethod
      def _row_to_event(row: sqlite3.Row) -> AuditEvent:
          """将数据库行反序列化为 AuditEvent。"""
-@@ -193,4 +261,38 @@ class AuditLog:
+@@ -193,4 +268,4 @@ class AuditLog:
              self._db.close()
  
  
 -__all__ = ["AuditEvent", "AuditLog"]
-+def _query_digest(tenant_id: str, correlation_id: str | None) -> str:
-+    """一组查询条件的摘要：写入分页令牌，翻页时据此拒绝换了条件的令牌。"""
-+    conditions = json.dumps([tenant_id, correlation_id], ensure_ascii=False)
-+    return hashlib.sha256(conditions.encode("utf-8")).hexdigest()[:16]
++__all__ = ["AuditEvent", "AuditLog", "AuditPage"]
+diff --git a/packages/control-plane/src/forgemesh/controlplane/pagetokens.py b/packages/control-plane/src/forgemesh/controlplane/pagetokens.py
+new file mode 100644
+index 0000000..dbe770a
+--- /dev/null
++++ b/packages/control-plane/src/forgemesh/controlplane/pagetokens.py
+@@ -0,0 +1,135 @@
++"""签名的分页游标，资源列表与审计记录列表共用。
++
++游标格式为 ``<载荷>.<签名>``：载荷是本页最后一项的位置加格式版本 ``v`` 的紧凑 JSON 的
++base64url 编码（无填充），签名是对「载荷 + ``.`` + 上下文」计算的 HMAC-SHA256（同样
++base64url 编码）。上下文是 :func:`page_scope` 给出的查询条件（租户与过滤条件，不含
++``limit``），由各个列表决定：资源列表（:meth:`SQLiteRegistry.list_page
++<forgemesh.controlplane.registry.SQLiteRegistry.list_page>`）是租户、kind、namespace 与标签
++选择器，审计记录列表（:meth:`AuditLog.list_page
++<forgemesh.controlplane.audit.AuditLog.list_page>`）是列表名、租户与 correlationId。两种
++上下文的字段不同，游标不能在两种列表之间混用。
++
++签名密钥是 ``registry_meta`` 表 ``page_token_key`` 行中的 32 个随机字节（hex），首次打开
++数据库时生成并随数据库保存：控制平面重启后游标仍然有效，来自另一个数据库的游标被拒绝。
++游标只记录位置，不是访问凭据：查询始终限定在调用者的租户内。
++"""
++
++from __future__ import annotations
++
++import base64
++import hashlib
++import hmac
++import json
++import secrets
++import sqlite3
++from collections.abc import Mapping
++from typing import Any
++
++__all__ = ["InvalidPageTokenError", "PageTokenSigner", "load_page_token_key", "page_scope"]
++
++#: ``registry_meta`` 中保存签名密钥（hex）的行。
++_PAGE_TOKEN_KEY_NAME = "page_token_key"
++
++#: 游标载荷的格式版本。
++_PAGE_TOKEN_VERSION = 1
++
++_META_SCHEMA_SQL = """\
++CREATE TABLE IF NOT EXISTS registry_meta (
++    name TEXT PRIMARY KEY,
++    value TEXT NOT NULL
++)
++"""
++
++_INVALID_PAGE_TOKEN = (
++    "invalid page token: it is malformed, was modified, or was issued for "
++    "a different list, tenant or filter set"
++)
 +
 +
-+def _encode_page_token(last: AuditEvent, digest: str) -> str:
-+    """上一页最后一条记录的位置 → 不透明的分页令牌（URL 安全的 base64，无填充）。"""
-+    position = {"ts": last.timestamp, "id": last.audit_id, "q": digest}
-+    raw = json.dumps(position, separators=(",", ":")).encode("utf-8")
-+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
++class InvalidPageTokenError(ValueError):
++    """分页游标无效：无法解析、被篡改，或签发给了另一个列表、租户或另一组过滤条件。"""
 +
 +
-+def _decode_page_token(token: str, digest: str) -> tuple[float, str]:
-+    """解析分页令牌，返回上一页最后一条记录的 ``(timestamp, audit_id)``。
++def _b64encode(data: bytes) -> str:
++    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
 +
-+    Raises:
-+        InvalidPageTokenError: 令牌无法解析，或不是为 ``digest`` 这组查询条件签发的。
++
++def _b64decode(text: str) -> bytes:
++    return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
++
++
++def load_page_token_key(conn: sqlite3.Connection) -> bytes:
++    """读取签名密钥；库中还没有时生成并持久化（需要时先创建 ``registry_meta`` 表）。
++
++    多个进程同时打开同一个新库时，``INSERT OR IGNORE`` 保证只有先写入的密钥生效，
++    各方随后读到的都是同一个值。连接由多个存储共用时，调用方须持有它的锁。
 +    """
-+    try:
-+        position = json.loads(base64.urlsafe_b64decode(token + "=" * (-len(token) % 4)))
-+    except ValueError:
-+        position = None
-+    if not isinstance(position, dict) or set(position) != {"ts", "id", "q"}:
-+        raise InvalidPageTokenError("page token is malformed")
-+    timestamp, audit_id = position["ts"], position["id"]
-+    valid = isinstance(timestamp, float) and math.isfinite(timestamp) and isinstance(audit_id, str)
-+    if not valid:
-+        raise InvalidPageTokenError("page token is malformed")
-+    if position["q"] != digest:
-+        raise InvalidPageTokenError("page token was issued for a different tenant or filter")
-+    return timestamp, audit_id
++    conn.execute(_META_SCHEMA_SQL)
++    query = "SELECT value FROM registry_meta WHERE name=?"
++    row = conn.execute(query, (_PAGE_TOKEN_KEY_NAME,)).fetchone()
++    if row is None:
++        conn.execute(
++            "INSERT OR IGNORE INTO registry_meta (name, value) VALUES (?, ?)",
++            (_PAGE_TOKEN_KEY_NAME, secrets.token_hex(32)),
++        )
++        conn.commit()
++        row = conn.execute(query, (_PAGE_TOKEN_KEY_NAME,)).fetchone()
++    return bytes.fromhex(row[0])
 +
 +
-+__all__ = ["AuditEvent", "AuditLog", "AuditPage", "InvalidPageTokenError"]
++def page_scope(conditions: Mapping[str, Any]) -> str:
++    """游标绑定的上下文：查询条件的紧凑 JSON（键排序，与给出的顺序无关）。"""
++    return json.dumps(conditions, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
++
++
++class PageTokenSigner:
++    """用一个数据库的签名密钥签发与校验游标。
++
++    Args:
++        key: :func:`load_page_token_key` 读到的密钥。
++    """
++
++    def __init__(self, key: bytes) -> None:
++        self._key = key
++
++    def _sign(self, payload: str, scope: str) -> str:
++        message = f"{payload}.{scope}".encode()
++        return _b64encode(hmac.new(self._key, message, hashlib.sha256).digest())
++
++    def encode(self, position: Mapping[str, Any], scope: str) -> str:
++        """把本页最后一项的位置编码为绑定 ``scope`` 的签名游标。"""
++        data = {"v": _PAGE_TOKEN_VERSION, **position}
++        payload = _b64encode(
++            json.dumps(data, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
++        )
++        return f"{payload}.{self._sign(payload, scope)}"
++
++    def decode(self, token: str, scope: str, fields: Mapping[str, type]) -> tuple[Any, ...]:
++        """校验签名并解码游标，按 ``fields`` 的顺序返回位置中各字段的值。
++
++        Args:
++            token: :meth:`encode` 签发的游标。
++            scope: 当前查询的上下文，须与签发时相同。
++            fields: 位置的字段名 → 期望的类型。
++
++        Raises:
++            InvalidPageTokenError: 游标无法解析、被篡改、属于另一个上下文 ``scope``，或位置
++                缺少 ``fields`` 中的字段（或类型不符）。
++        """
++        # 签发的游标只含 base64url 字符与 "."；先排除非 ASCII 输入，compare_digest 才能比较 str
++        if not token.isascii():
++            raise InvalidPageTokenError(_INVALID_PAGE_TOKEN)
++        payload, _, signature = token.partition(".")
++        if not hmac.compare_digest(signature, self._sign(payload, scope)):
++            raise InvalidPageTokenError(_INVALID_PAGE_TOKEN)
++        try:
++            position = json.loads(_b64decode(payload))
++        except ValueError as exc:
++            raise InvalidPageTokenError(_INVALID_PAGE_TOKEN) from exc
++        if not (
++            isinstance(position, dict)
++            and position.get("v") == _PAGE_TOKEN_VERSION
++            and all(isinstance(position.get(name), kind) for name, kind in fields.items())
++        ):
++            raise InvalidPageTokenError(_INVALID_PAGE_TOKEN)
++        return tuple(position[name] for name in fields)
+diff --git a/packages/control-plane/src/forgemesh/controlplane/registry/store.py b/packages/control-plane/src/forgemesh/controlplane/registry/store.py
+index 0679bfa..e77304e 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/registry/store.py
++++ b/packages/control-plane/src/forgemesh/controlplane/registry/store.py
+@@ -68,6 +68,7 @@ Allocation 持久化
+ （``limit`` 每页可以不同），被篡改或用于另一租户 / kind / 另一组过滤条件时抛
+ :class:`InvalidPageTokenError`；密钥随数据库保存，控制平面重启后游标仍然有效。游标记录
+ 位置而不是快照：翻页期间新建或删除的资源可能出现也可能缺席，全程存在的资源恰好出现一次。
++签发与校验见 :mod:`forgemesh.controlplane.pagetokens`，审计记录列表的游标使用同一个密钥。
+ 
+ 变更记录
+ --------
+@@ -95,14 +96,10 @@ Outbox，信封与事件类型见 :mod:`forgemesh.controlplane.events`）；API
+ from __future__ import annotations
+ 
+ import asyncio
+-import base64
+ import builtins
+ import contextlib
+-import hashlib
+-import hmac
+ import json
+ import logging
+-import secrets
+ import sqlite3
+ from collections.abc import Callable, Collection, Iterator, Sequence
+ from dataclasses import dataclass, field
+@@ -124,6 +121,7 @@ from ..audit import AuditEvent, AuditLog
+ from ..auth import Principal
+ from ..events import ResourceEventChange, resource_event
+ from ..outbox import Outbox
++from ..pagetokens import InvalidPageTokenError, PageTokenSigner, load_page_token_key, page_scope
+ from ..sqlite import Database
+ 
+ logger = logging.getLogger(__name__)
+@@ -206,34 +204,10 @@ CREATE TABLE IF NOT EXISTS resource_changes (
+     change TEXT NOT NULL,
+     created_at TEXT NOT NULL DEFAULT (datetime('now'))
+ );
+-CREATE TABLE IF NOT EXISTS registry_meta (
+-    name TEXT PRIMARY KEY,
+-    value TEXT NOT NULL
+-);
+ """
+ 
+-#: ``registry_meta`` 中保存分页游标签名密钥（hex）的行。
+-_PAGE_TOKEN_KEY_NAME = "page_token_key"
+-
+-#: 分页游标载荷的格式版本。
+-_PAGE_TOKEN_VERSION = 1
+-
+-_INVALID_PAGE_TOKEN = (
+-    "invalid page token: it is malformed, was modified, or was issued for "
+-    "a different tenant, kind or filter set"
+-)
+-
+-
+-def _b64encode(data: bytes) -> str:
+-    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+-
+-
+-def _b64decode(text: str) -> bytes:
+-    return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+-
+-
+-class InvalidPageTokenError(ValueError):
+-    """分页游标无效：无法解析、被篡改，或签发给了另一个租户、kind 或另一组过滤条件。"""
++#: 资源列表的游标位置：本页最后一个资源的 namespace 排序键与 name。
++_PAGE_POSITION = {"ns": str, "name": str}
+ 
+ 
+ class ChangeType(StrEnum):
+@@ -363,7 +337,7 @@ class SQLiteRegistry(ResourceRegistry):
+         self._conn = self._db.conn
+         self._lock = self._db.lock
+         self._init_schema()
+-        self._page_token_key = self._load_page_token_key()
++        self._page_tokens = PageTokenSigner(load_page_token_key(self._conn))
+         self._outbox = Outbox(database=self._db)
+         self._audit = AuditLog(database=self._db)
+ 
+@@ -498,23 +472,6 @@ class SQLiteRegistry(ResourceRegistry):
+         self._ensure_identity_index()
+         self._conn.commit()
+ 
+-    def _load_page_token_key(self) -> bytes:
+-        """读取分页游标的签名密钥；库中还没有时生成并持久化。
+-
+-        多个进程同时打开同一个新库时，``INSERT OR IGNORE`` 保证只有先写入的密钥生效，
+-        各方随后读到的都是同一个值。
+-        """
+-        query = "SELECT value FROM registry_meta WHERE name=?"
+-        row = self._conn.execute(query, (_PAGE_TOKEN_KEY_NAME,)).fetchone()
+-        if row is None:
+-            self._conn.execute(
+-                "INSERT OR IGNORE INTO registry_meta (name, value) VALUES (?, ?)",
+-                (_PAGE_TOKEN_KEY_NAME, secrets.token_hex(32)),
+-            )
+-            self._conn.commit()
+-            row = self._conn.execute(query, (_PAGE_TOKEN_KEY_NAME,)).fetchone()
+-        return bytes.fromhex(row["value"])
+-
+     def _migrate_legacy_allocations(self) -> None:
+         """删除存量库中不分租户的旧索引 ``idx_allocations_one_active_per_resource``。
+ 
+@@ -630,29 +587,18 @@ class SQLiteRegistry(ResourceRegistry):
+         tenant_id: str, kind: str, namespace: str | None, labels: dict[str, str] | None
+     ) -> str:
+         """分页游标绑定的上下文：租户、kind 与过滤条件（不含 ``limit``）。"""
+-        return json.dumps(
++        return page_scope(
+             {
+                 "tenant": tenant_id,
+                 "kind": kind,
+                 "namespace": namespace,
+                 "labels": sorted((labels or {}).items()),
+-            },
+-            sort_keys=True,
+-            separators=(",", ":"),
+-            ensure_ascii=False,
++            }
+         )
+ 
+-    def _sign_page_token(self, payload: str, scope: str) -> str:
+-        message = f"{payload}.{scope}".encode()
+-        return _b64encode(hmac.new(self._page_token_key, message, hashlib.sha256).digest())
+-
+     def _encode_page_token(self, scope: str, namespace_key: str, name: str) -> str:
+         """把本页最后一个资源的位置编码为签名游标。"""
+-        position = {"v": _PAGE_TOKEN_VERSION, "ns": namespace_key, "name": name}
+-        payload = _b64encode(
+-            json.dumps(position, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+-        )
+-        return f"{payload}.{self._sign_page_token(payload, scope)}"
++        return self._page_tokens.encode({"ns": namespace_key, "name": name}, scope)
+ 
+     def _decode_page_token(self, token: str, scope: str) -> tuple[str, str]:
+         """校验签名并解码游标，返回 ``(namespace 排序键, name)``。
+@@ -660,24 +606,8 @@ class SQLiteRegistry(ResourceRegistry):
+         Raises:
+             InvalidPageTokenError: 游标无法解析、被篡改，或属于另一个上下文 ``scope``。
+         """
+-        # 签发的游标只含 base64url 字符与 "."；先排除非 ASCII 输入，compare_digest 才能比较 str
+-        if not token.isascii():
+-            raise InvalidPageTokenError(_INVALID_PAGE_TOKEN)
+-        payload, _, signature = token.partition(".")
+-        if not hmac.compare_digest(signature, self._sign_page_token(payload, scope)):
+-            raise InvalidPageTokenError(_INVALID_PAGE_TOKEN)
+-        try:
+-            position = json.loads(_b64decode(payload))
+-        except ValueError as exc:
+-            raise InvalidPageTokenError(_INVALID_PAGE_TOKEN) from exc
+-        if not (
+-            isinstance(position, dict)
+-            and position.get("v") == _PAGE_TOKEN_VERSION
+-            and isinstance(position.get("ns"), str)
+-            and isinstance(position.get("name"), str)
+-        ):
+-            raise InvalidPageTokenError(_INVALID_PAGE_TOKEN)
+-        return position["ns"], position["name"]
++        namespace_key, name = self._page_tokens.decode(token, scope, _PAGE_POSITION)
++        return namespace_key, name
+ 
+     @staticmethod
+     def _row_to_resource(row: sqlite3.Row) -> Resource:
+diff --git a/tests/contract/test_openapi_contract.py b/tests/contract/test_openapi_contract.py
+index 154a1b2..1001270 100644
+--- a/tests/contract/test_openapi_contract.py
++++ b/tests/contract/test_openapi_contract.py
+@@ -571,6 +571,27 @@ def _page_token_without_kind(api: Api) -> httpx.Response:
+     return api(params={"pageToken": "not-a-page-token"})
+ 
+ 
++@scenario("listAuditEvents", 200)
++def _audit_records_of_the_creates(api: Api) -> httpx.Response:
++    api.create("svc-1")
++    api.create("svc-2")
++    return api(params={"limit": 1})
++
++
++@scenario("listAuditEvents", 400, "BAD_REQUEST")
++def _resource_page_token_for_the_audit_list(api: Api) -> httpx.Response:
++    api.create("svc-1")
++    api.create("svc-2")
++    listed = Api(api.harness, "listInferenceServices")(params={"limit": 1})
++    return api(params={"pageToken": listed.json()["nextPageToken"]})
++
++
++@scenario("listAuditEvents", 503, "REGISTRY_UNAVAILABLE")
++def _audit_log_without_a_registry(api: Api) -> httpx.Response:
++    reset_registry()
++    return api()
++
++
+ def _without_credentials(api: Api) -> httpx.Response:
+     return api(authenticated=False)
+ 
 diff --git a/tests/security/test_tenant_isolation.py b/tests/security/test_tenant_isolation.py
 index 40f04c7..975ef64 100644
 --- a/tests/security/test_tenant_isolation.py
@@ -524,25 +898,28 @@ index 40f04c7..975ef64 100644
  # --------------------------------------------------------------------------- #
 diff --git a/tests/unit/controlplane/test_audit_api.py b/tests/unit/controlplane/test_audit_api.py
 new file mode 100644
-index 0000000..432d496
+index 0000000..53bc2d7
 --- /dev/null
 +++ b/tests/unit/controlplane/test_audit_api.py
-@@ -0,0 +1,365 @@
+@@ -0,0 +1,453 @@
 +"""审计记录查询测试：``AuditLog.list_page`` 分页与 ``GET /api/v1/audit-events``。
 +
 +* 最新的在前，时间相同时按 ``audit_id``；逐页取完不重不漏，翻页期间写入的新记录不影响
 +  后面的页；
-+* 令牌绑定租户与 correlationId：换了条件或无法解析的令牌被拒绝（HTTP 400）；
++* 游标与资源列表的游标一样签名，使用同一个数据库密钥：绑定租户与 correlationId，被篡改、
++  换了条件、取自资源列表或来自另一个数据库的游标被拒绝（HTTP 400），重启后仍然有效；
 +* 端点要求 read scope，返回 API 写入产生的审计记录，响应符合 OpenAPI ``AuditEventList``；
 +* ``limit`` 的校验与列表接口一致。
 +
-+租户隔离见 ``tests/security/test_tenant_isolation.py``。
++游标的签发与校验见 ``test_pagetokens.py``，租户隔离见 ``tests/security/test_tenant_isolation.py``。
 +"""
 +
 +from __future__ import annotations
 +
++import asyncio
 +import base64
 +import json
++from collections.abc import Callable
 +from datetime import UTC, datetime
 +from pathlib import Path
 +from typing import Any
@@ -552,8 +929,11 @@ index 0000000..432d496
 +from fastapi.testclient import TestClient
 +from forgemesh.controlplane.api.dependencies import get_registry
 +from forgemesh.controlplane.app import create_app
-+from forgemesh.controlplane.audit import AuditEvent, AuditLog, InvalidPageTokenError
++from forgemesh.controlplane.audit import AuditEvent, AuditLog
 +from forgemesh.controlplane.auth import ApiKeyAuthenticator, ApiKeyEntry, hash_api_key
++from forgemesh.controlplane.pagetokens import InvalidPageTokenError
++from forgemesh.controlplane.registry import SQLiteRegistry
++from forgemesh.core.objects import ObjectMeta, Resource
 +from jsonschema import Draft202012Validator
 +
 +TENANT_A = "tenant-a"
@@ -634,9 +1014,21 @@ index 0000000..432d496
 +            return pages
 +
 +
-+def _token(position: object) -> str:
-+    raw = json.dumps(position).encode("utf-8")
-+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
++def _b64(data: bytes) -> str:
++    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
++
++
++def _swap_payload(token: str) -> str:
++    """把载荷换成指向更晚位置的合法载荷，保留原签名。"""
++    payload, _, signature = token.partition(".")
++    position = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
++    position["ts"] += 1.0
++    return f"{_b64(json.dumps(position, separators=(',', ':')).encode())}.{signature}"
++
++
++def _unsigned(token: str) -> str:
++    """不带签名的旧式游标：只有位置与查询条件摘要。"""
++    return _b64(json.dumps({"ts": 101.0, "id": "id", "q": "0" * 16}).encode())
 +
 +
 +# ---------------------------------------------------------------------- #
@@ -724,31 +1116,96 @@ index 0000000..432d496
 +    assert token is not None
 +
 +    tenant_id, correlation_id = used_for
-+    with pytest.raises(InvalidPageTokenError, match="different tenant or filter"):
++    with pytest.raises(InvalidPageTokenError):
 +        log.list_page(tenant_id, limit=1, page_token=token, correlation_id=correlation_id)
 +
 +
 +@pytest.mark.unit
 +@pytest.mark.parametrize(
-+    "token",
++    "tamper",
 +    [
-+        "not a token",
-+        "令牌",
-+        base64.urlsafe_b64encode(b"\xff\xfe").decode("ascii"),
-+        _token([100.0, "id"]),
-+        _token({"ts": 100.0, "id": "id"}),
-+        _token({"ts": "100.0", "id": "id", "q": "0" * 16}),
-+        _token({"ts": 100, "id": "id", "q": "0" * 16}),
-+        _token({"ts": float("nan"), "id": "id", "q": "0" * 16}),
-+        _token({"ts": 100.0, "id": 7, "q": "0" * 16}),
++        pytest.param(_swap_payload, id="swapped-payload"),
++        pytest.param(
++            lambda token: token[:-1] + ("B" if token.endswith("A") else "A"),
++            id="altered-signature",
++        ),
++        pytest.param(lambda token: token.partition(".")[0], id="missing-signature"),
++        pytest.param(lambda token: f"{token}.extra", id="trailing-data"),
++        pytest.param(lambda token: f"{token}令", id="non-ascii"),
++        pytest.param(lambda token: "", id="empty"),
++        pytest.param(lambda token: "not a token", id="garbage"),
++        pytest.param(_unsigned, id="unsigned"),
 +    ],
 +)
-+def test_malformed_page_tokens_are_rejected(token: str) -> None:
++def test_tampered_page_tokens_are_rejected(tamper: Callable[[str], str]) -> None:
 +    log = AuditLog()
-+    log.record(_event("svc", 100.0))
++    for i in range(3):
++        log.record(_event(f"svc-{i}", 100.0 + i))
++    token = log.list_page(TENANT_A, limit=1).next_page_token
++    assert token is not None
 +
-+    with pytest.raises(InvalidPageTokenError, match="malformed"):
-+        log.list_page(TENANT_A, page_token=token)
++    with pytest.raises(InvalidPageTokenError):
++        log.list_page(TENANT_A, limit=1, page_token=tamper(token))
++
++
++def _widget(name: str) -> Resource:
++    return Resource(kind="Widget", metadata=ObjectMeta(name=name, tenant_id=TENANT_A))
++
++
++@pytest.mark.unit
++def test_resource_list_and_audit_list_tokens_are_not_interchangeable() -> None:
++    registry = SQLiteRegistry()
++    try:
++        for i in range(2):
++            asyncio.run(registry.put(_widget(f"w-{i}")))
++            registry.audit_log.record(_event(f"svc-{i}", 100.0 + i))
++        resource_page = asyncio.run(registry.list_page("Widget", TENANT_A, limit=1))
++        audit_page = registry.audit_log.list_page(TENANT_A, limit=1)
++        assert resource_page.next_page_token is not None
++        assert audit_page.next_page_token is not None
++
++        with pytest.raises(InvalidPageTokenError):
++            registry.audit_log.list_page(TENANT_A, page_token=resource_page.next_page_token)
++        with pytest.raises(InvalidPageTokenError):
++            asyncio.run(
++                registry.list_page("Widget", TENANT_A, page_token=audit_page.next_page_token)
++            )
++    finally:
++        asyncio.run(registry.close())
++
++
++@pytest.mark.unit
++def test_the_audit_log_signs_with_the_key_of_the_registry_database(tmp_path) -> None:
++    path = str(tmp_path / "cp.db")
++    registry = SQLiteRegistry(path)
++    try:
++        for i in range(3):
++            registry.audit_log.record(_event(f"svc-{i}", 100.0 + i))
++        token = registry.audit_log.list_page(TENANT_A, limit=1).next_page_token
++    finally:
++        asyncio.run(registry.close())
++
++    reopened = AuditLog(path)
++    try:
++        page = reopened.list_page(TENANT_A, limit=5, page_token=token)
++        keys = reopened.database.conn.execute("SELECT name FROM registry_meta").fetchall()
++    finally:
++        reopened.close()
++
++    assert [event.resource_id for event in page.items] == ["svc-1", "svc-0"]
++    assert [row["name"] for row in keys] == ["page_token_key"]
++
++
++@pytest.mark.unit
++def test_page_tokens_from_another_database_are_rejected() -> None:
++    issuer, other = AuditLog(), AuditLog()
++    for log in (issuer, other):
++        for i in range(2):
++            log.record(_event(f"svc-{i}", 100.0 + i))
++    token = issuer.list_page(TENANT_A, limit=1).next_page_token
++
++    with pytest.raises(InvalidPageTokenError):
++        other.list_page(TENANT_A, limit=1, page_token=token)
 +
 +
 +@pytest.mark.unit
@@ -862,11 +1319,16 @@ index 0000000..432d496
 +    for i in range(2):
 +        log.record(_event(f"svc-{i}", 100.0 + i, correlation_id="corr-1"))
 +    token = _get(client, limit=1).json()["nextPageToken"]
++    for name in ("svc-a", "svc-b"):
++        body = {**BODY, "metadata": {"name": name, "namespace": "default"}}
++        assert client.post(SERVICES_URL, json=body, headers=_bearer()).status_code == 201
++    listed = client.get(SERVICES_URL, params={"limit": 1}, headers=_bearer())
 +
 +    malformed = _get(client, pageToken="garbage")
 +    other_filter = _get(client, pageToken=token, correlationId="corr-1")
++    resource_token = _get(client, pageToken=listed.json()["nextPageToken"])
 +
-+    for response in (malformed, other_filter):
++    for response in (malformed, other_filter, resource_token):
 +        assert response.status_code == 400
 +        error = response.json()["error"]
 +        assert error["code"] == "BAD_REQUEST"
@@ -893,6 +1355,80 @@ index 0000000..432d496
 +
 +    assert response.status_code == 400
 +    assert response.json()["error"]["code"] == "BAD_REQUEST"
+diff --git a/tests/unit/controlplane/test_pagetokens.py b/tests/unit/controlplane/test_pagetokens.py
+new file mode 100644
+index 0000000..d27fbd6
+--- /dev/null
++++ b/tests/unit/controlplane/test_pagetokens.py
+@@ -0,0 +1,68 @@
++"""分页游标的签发与校验（:mod:`forgemesh.controlplane.pagetokens`）。
++
++资源列表与审计记录列表的游标行为（篡改、换条件、重启）分别见 ``test_registry.py`` 与
++``test_audit_api.py``。
++"""
++
++from __future__ import annotations
++
++import sqlite3
++
++import pytest
++from forgemesh.controlplane.pagetokens import (
++    InvalidPageTokenError,
++    PageTokenSigner,
++    load_page_token_key,
++    page_scope,
++)
++
++SCOPE = page_scope({"list": "things", "tenant": "tenant-a"})
++POSITION = {"name": str}
++
++
++@pytest.mark.unit
++def test_the_key_is_created_once_and_kept_in_the_database(tmp_path) -> None:
++    path = tmp_path / "meta.db"
++    conn = sqlite3.connect(path)
++    try:
++        key = load_page_token_key(conn)
++        again = load_page_token_key(conn)
++    finally:
++        conn.close()
++    reopened = sqlite3.connect(path)
++    try:
++        after_restart = load_page_token_key(reopened)
++        rows = reopened.execute("SELECT name FROM registry_meta").fetchall()
++    finally:
++        reopened.close()
++
++    assert len(key) == 32
++    assert key == again == after_restart
++    assert rows == [("page_token_key",)]
++
++
++@pytest.mark.unit
++def test_tokens_are_only_valid_for_their_scope_and_key() -> None:
++    signer = PageTokenSigner(b"k" * 32)
++    token = signer.encode({"name": "ü"}, SCOPE)
++
++    assert signer.decode(token, SCOPE, POSITION) == ("ü",)
++    with pytest.raises(InvalidPageTokenError):
++        signer.decode(token, page_scope({"list": "things", "tenant": "tenant-b"}), POSITION)
++    with pytest.raises(InvalidPageTokenError):
++        PageTokenSigner(b"o" * 32).decode(token, SCOPE, POSITION)
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize("position", [{}, {"name": 7}, {"name": None}])
++def test_signed_tokens_without_the_expected_position_are_rejected(position: dict) -> None:
++    signer = PageTokenSigner(b"k" * 32)
++    token = signer.encode(position, SCOPE)
++
++    with pytest.raises(InvalidPageTokenError):
++        signer.decode(token, SCOPE, POSITION)
++
++
++@pytest.mark.unit
++def test_the_scope_does_not_depend_on_the_order_of_the_conditions() -> None:
++    assert page_scope({"tenant": "t", "list": "x"}) == page_scope({"list": "x", "tenant": "t"})
 -- 
 2.43.0
 

@@ -1,42 +1,52 @@
-From e1a326ef6c8c6aa1572b3da3d15d4cfd78581cc4 Mon Sep 17 00:00:00 2001
+From 10e57a28d16d4a8bf0f08d4e64bd271f7563dc6d Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Tue, 13 Oct 2026 03:06:49 +0000
-Subject: [PATCH 04/11] feat(control-plane): carry W3C trace context into logs
+Subject: [PATCH 04/17] feat(control-plane): carry W3C trace context into logs
  and errors
 
 Requests reaching the control plane through the gateway carry a
-correlation id, but the control plane only echoed it in some error
-envelopes and wrote no structured logs, so a failing request could not
-be followed from the gateway into the control plane.
+correlation id, which error envelopes echo, but the control plane
+wrote no structured logs and knew no trace id, so a failing request
+could not be followed from the gateway into the control plane.
 
 A pure ASGI middleware now settles one correlation id (the first
 non-empty X-Correlation-Id, otherwise a generated one) and one W3C
 trace context per request: a single valid traceparent is kept, anything
 else starts a new unsampled trace and drops tracestate. Both ids are
 bound in contextvars for the duration of the request and written back
-into the request headers in place, so the 500 handler, which runs
-outside the middleware, reports the same ids.
+into the request headers in place. The routes' get_correlation_id
+dependency and the exception handlers read that header, so envelopes,
+audit records, change events and logs carry the same id, a generated
+one included, and the 500 handler, which runs outside the middleware,
+reports the same ids.
 
 Error envelopes gain an optional traceId, documented in the OpenAPI
-Error schema (additive). The two route paths that minted a fresh
-correlation id for their envelope now use the request's id.
+Error schema (additive); envelopes built by the routes take it from
+the request context. The contract drift test now sends a traceparent
+with every scenario and checks that error envelopes echo its trace id.
 
 main() configures the root logger from FORGEMESH_LOG_FORMAT (json by
 default, or text) and FORGEMESH_LOG_LEVEL (INFO by default), refuses to
 start on invalid values, and runs uvicorn with log_config=None so that
 uvicorn's error and access logs share the format and carry the ids.
+Run as forgemesh-control-plane, the default LogPublisher therefore no
+longer adds its own stdout handler: events become INFO records of the
+forgemesh.events logger in the configured format on stderr.
+configure_logging pins that logger at INFO, because an event filtered
+out by a higher FORGEMESH_LOG_LEVEL would still be marked published.
 ---
  api/openapi/openapi.yaml                      |   6 +
  .../src/forgemesh/controlplane/api/errors.py  |  26 +-
- .../forgemesh/controlplane/api/middleware.py  |  63 ++++-
- .../src/forgemesh/controlplane/api/routes.py  |   5 +-
+ .../forgemesh/controlplane/api/middleware.py  |  63 +++-
  .../src/forgemesh/controlplane/app.py         |  30 +-
- .../src/forgemesh/controlplane/logs.py        | 160 +++++++++++
- .../forgemesh/controlplane/tracecontext.py    | 123 ++++++++
- tests/unit/controlplane/test_logs.py          | 180 ++++++++++++
- .../unit/controlplane/test_request_context.py | 262 ++++++++++++++++++
- tests/unit/controlplane/test_tracecontext.py  |  95 +++++++
- 10 files changed, 933 insertions(+), 17 deletions(-)
+ .../src/forgemesh/controlplane/logs.py        | 166 ++++++++++
+ .../src/forgemesh/controlplane/publishers.py  |   6 +-
+ .../forgemesh/controlplane/tracecontext.py    | 123 +++++++
+ tests/contract/test_openapi_contract.py       |  12 +-
+ tests/unit/controlplane/test_logs.py          | 208 ++++++++++++
+ .../unit/controlplane/test_request_context.py | 301 ++++++++++++++++++
+ tests/unit/controlplane/test_tracecontext.py  |  95 ++++++
+ 11 files changed, 1015 insertions(+), 21 deletions(-)
  create mode 100644 packages/control-plane/src/forgemesh/controlplane/logs.py
  create mode 100644 packages/control-plane/src/forgemesh/controlplane/tracecontext.py
  create mode 100644 tests/unit/controlplane/test_logs.py
@@ -44,10 +54,10 @@ uvicorn's error and access logs share the format and carry the ids.
  create mode 100644 tests/unit/controlplane/test_tracecontext.py
 
 diff --git a/api/openapi/openapi.yaml b/api/openapi/openapi.yaml
-index 3f955ef..e16ca71 100644
+index cbca9b0..bc19ef9 100644
 --- a/api/openapi/openapi.yaml
 +++ b/api/openapi/openapi.yaml
-@@ -295,6 +295,12 @@ components:
+@@ -560,6 +560,12 @@ components:
                additionalProperties: true
              correlationId:
                type: string
@@ -59,7 +69,7 @@ index 3f955ef..e16ca71 100644
 +                与日志中的 trace_id 一致。
      InferenceService:
        type: object
-       description: "权威 Schema: api/schemas/inference-service.schema.json（此处为骨架摘要）。"
+       description: >-
 diff --git a/packages/control-plane/src/forgemesh/controlplane/api/errors.py b/packages/control-plane/src/forgemesh/controlplane/api/errors.py
 index fcc9eed..685cd8a 100644
 --- a/packages/control-plane/src/forgemesh/controlplane/api/errors.py
@@ -229,38 +239,8 @@ index a2e5c82..905a91f 100644
  
 -__all__ = ["TelemetryMiddleware"]
 +__all__ = ["RequestContextMiddleware", "TelemetryMiddleware"]
-diff --git a/packages/control-plane/src/forgemesh/controlplane/api/routes.py b/packages/control-plane/src/forgemesh/controlplane/api/routes.py
-index 3b5a0b4..faacdb4 100644
---- a/packages/control-plane/src/forgemesh/controlplane/api/routes.py
-+++ b/packages/control-plane/src/forgemesh/controlplane/api/routes.py
-@@ -36,6 +36,7 @@ from forgemesh.workflow.runtime import WorkflowDefinition
- from pydantic import BaseModel, ConfigDict, Field, ValidationError
- 
- from ..app import error_envelope
-+from ..tracecontext import current_correlation_id
- from .dependencies import (
-     ComponentNotReadyError,
-     get_decision_router,
-@@ -101,7 +102,7 @@ def _invalid_limit(limit: int) -> JSONResponse | None:
-         400,
-         "BAD_REQUEST",
-         f"limit must be between 1 and {MAX_LIST_LIMIT}, got {limit}",
--        uuid4().hex,
-+        current_correlation_id() or uuid4().hex,
-     )
- 
- 
-@@ -192,7 +193,7 @@ async def delete_inference_service(
-     except NotFoundError as exc:
-         raise HTTPException(status_code=404, detail=f"InferenceService '{name}' not found") from exc
-     except ConflictError as exc:
--        return _error_response(409, "CONFLICT", str(exc), uuid4().hex)
-+        return _error_response(409, "CONFLICT", str(exc), current_correlation_id() or uuid4().hex)
-     if result.deleted:
-         return Response(status_code=204)
-     return JSONResponse(status_code=202, content={"name": name, "phase": "Terminating"})
 diff --git a/packages/control-plane/src/forgemesh/controlplane/app.py b/packages/control-plane/src/forgemesh/controlplane/app.py
-index ae3f13a..8852c12 100644
+index f1e29cc..a509cf3 100644
 --- a/packages/control-plane/src/forgemesh/controlplane/app.py
 +++ b/packages/control-plane/src/forgemesh/controlplane/app.py
 @@ -4,7 +4,7 @@
@@ -272,7 +252,7 @@ index ae3f13a..8852c12 100644
    ``api/openapi/openapi.yaml`` 一致。
  * **配置**：权威存储路径取自环境变量 ``FORGEMESH_DB_PATH``（默认
    ``forgemesh.db``）；监听地址取自 ``FORGEMESH_HOST`` / ``FORGEMESH_PORT``
-@@ -35,6 +35,9 @@
+@@ -45,6 +45,9 @@
  * **探针与指标**：``/healthz``（存活）恒为 ok；``/readyz``（就绪）探测权威存储可用；
    ``/metrics`` 以 Prometheus 文本格式输出聚合指标（见 :mod:`forgemesh.controlplane.telemetry`）。
    三者都不要求认证。
@@ -282,21 +262,23 @@ index ae3f13a..8852c12 100644
  * **FastAPI 可选兜底**：若运行环境未安装 FastAPI，回退到纯标准库
    ``http.server``，仅提供探针与 501 占位。
  
-@@ -76,11 +79,13 @@ from .deployment import (
-     launcher_from_env,
-     mark_lost_instances,
+@@ -91,6 +94,7 @@ from .deployment import (
+     reclaim_orphaned_allocations,
+     record_file_path,
  )
 +from .logs import LogConfigError, configure_logging, log_settings_from_env
  from .metrics import CONTENT_TYPE
- from .reconciler import ProcessedKeyStore, ReconciliationController
+ from .outbox import Dispatcher
+ from .publishers import publisher_from_env
+@@ -98,6 +102,7 @@ from .reconciler import ProcessedKeyStore, ReconciliationController
  from .scheduler import INVENTORY_FILE_ENV, FirstFitScheduler, inventory_from_env
  from .sqlite import workflow_db_path
  from .telemetry import ControllerMetrics, ControlPlaneMetrics
 +from .tracecontext import current_correlation_id, current_trace_id
+ from .version import CONTROL_PLANE_VERSION
  
  if TYPE_CHECKING:  # pragma: no cover - 仅静态类型检查使用
-     from .auth import Authenticator
-@@ -132,18 +137,26 @@ def error_envelope(
+@@ -150,18 +155,26 @@ def error_envelope(
      message: str,
      correlation_id: str | None = None,
      details: dict[str, Any] | None = None,
@@ -324,8 +306,8 @@ index ae3f13a..8852c12 100644
      if details is not None:
          error["details"] = details
      return {"error": error}
-@@ -231,7 +244,7 @@ if _FASTAPI_AVAILABLE:
-             reset_authenticator,
+@@ -270,7 +283,7 @@ if _FASTAPI_AVAILABLE:
+             reset_registry,
          )
          from .api.errors import install_exception_handlers
 -        from .api.middleware import TelemetryMiddleware
@@ -333,7 +315,7 @@ index ae3f13a..8852c12 100644
  
          metrics = ControlPlaneMetrics()
  
-@@ -301,6 +314,7 @@ if _FASTAPI_AVAILABLE:
+@@ -356,6 +369,7 @@ if _FASTAPI_AVAILABLE:
              lifespan=lifespan,
          )
          application.add_middleware(TelemetryMiddleware, metrics=metrics.http)
@@ -341,7 +323,7 @@ index ae3f13a..8852c12 100644
  
          @application.get("/healthz", response_model=HealthResponse, tags=["probes"])
          async def healthz() -> HealthResponse:
-@@ -391,23 +405,27 @@ def _is_loopback(host: str) -> bool:
+@@ -448,23 +462,27 @@ def _is_loopback(host: str) -> bool:
  def main() -> None:
      """命令行入口：监听地址取自 ``FORGEMESH_HOST`` / ``FORGEMESH_PORT``。
  
@@ -374,10 +356,10 @@ index ae3f13a..8852c12 100644
  
 diff --git a/packages/control-plane/src/forgemesh/controlplane/logs.py b/packages/control-plane/src/forgemesh/controlplane/logs.py
 new file mode 100644
-index 0000000..2dd532c
+index 0000000..8ff3f5c
 --- /dev/null
 +++ b/packages/control-plane/src/forgemesh/controlplane/logs.py
-@@ -0,0 +1,160 @@
+@@ -0,0 +1,166 @@
 +"""控制平面的日志输出：JSON（默认）或文本，每条记录带上当前请求的 trace-id 与关联 ID。
 +
 +:func:`~forgemesh.controlplane.app.main` 在启动 uvicorn 之前调用 :func:`configure_logging`，
@@ -386,6 +368,8 @@ index 0000000..2dd532c
 +
 +* ``FORGEMESH_LOG_FORMAT``：``json``（默认）或 ``text``；
 +* ``FORGEMESH_LOG_LEVEL``：``DEBUG`` / ``INFO``（默认）/ ``WARNING`` / ``ERROR``，作用于根 logger。
++  资源变更事件（logger ``forgemesh.events``，见
++  :class:`~forgemesh.controlplane.publishers.LogPublisher`）不受它影响，总是以 INFO 写出。
 +
 +JSON 格式每行一个对象：``time``（UTC，ISO 8601，毫秒）、``level``、``logger``、``message``；
 +在请求中记录的日志加 ``trace_id`` 与 ``correlation_id``（见
@@ -404,6 +388,7 @@ index 0000000..2dd532c
 +from datetime import UTC, datetime
 +from typing import Any, TextIO
 +
++from .publishers import EVENT_LOGGER_NAME
 +from .tracecontext import current_correlation_id, current_trace_id
 +
 +LOG_FORMAT_ENV = "FORGEMESH_LOG_FORMAT"
@@ -507,7 +492,8 @@ index 0000000..2dd532c
 +
 +
 +def configure_logging(settings: LogSettings, stream: TextIO | None = None) -> logging.Handler:
-+    """在根 logger 上安装写到 ``stream``（默认标准错误）的处理器并设置级别。
++    """在根 logger 上安装写到 ``stream``（默认标准错误）的处理器并设置级别；
++    ``forgemesh.events`` 固定为 INFO。
 +
 +    之前由本函数安装的处理器被替换，其他处理器不受影响。返回新安装的处理器。
 +    """
@@ -519,6 +505,8 @@ index 0000000..2dd532c
 +    handler.setFormatter(JsonFormatter() if settings.format == LOG_FORMAT_JSON else TextFormatter())
 +    root.addHandler(handler)
 +    root.setLevel(settings.level)
++    # 事件日志是 LogPublisher 的输出，不是诊断日志：被级别过滤掉的事件同样会被标记为已发布。
++    logging.getLogger(EVENT_LOGGER_NAME).setLevel(logging.INFO)
 +    return handler
 +
 +
@@ -538,6 +526,23 @@ index 0000000..2dd532c
 +    "configure_logging",
 +    "log_settings_from_env",
 +]
+diff --git a/packages/control-plane/src/forgemesh/controlplane/publishers.py b/packages/control-plane/src/forgemesh/controlplane/publishers.py
+index 532bb2a..58f57eb 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/publishers.py
++++ b/packages/control-plane/src/forgemesh/controlplane/publishers.py
+@@ -6,8 +6,10 @@
+ ``dead``。
+ 
+ * :class:`LogPublisher`（默认）：每个事件写一条 INFO 日志（logger ``forgemesh.events``），
+-  消息是事件信封的 JSON。进程没有配置 logging 时（uvicorn 只配置它自己的 logger），给这个
+-  logger 加一个写标准输出的 handler，每行一个信封。写日志不会失败，事件随即标记为已发布。
++  消息是事件信封的 JSON。进程没有配置 logging 时（如直接以 uvicorn 运行应用：uvicorn 只配置
++  它自己的 logger），给这个 logger 加一个写标准输出的 handler，每行一个信封；
++  ``forgemesh-control-plane`` 配置了 logging（见 :mod:`forgemesh.controlplane.logs`），事件随
++  其他日志输出。写日志不会失败，事件随即标记为已发布。
+ * :class:`WebhookPublisher`：把事件信封以 JSON ``POST`` 到 webhook；2xx 视为成功，其余状态码
+   （不跟随重定向）、超时与连接错误视为失败。与 urllib 的默认行为一样，遵循 ``HTTPS_PROXY`` /
+   ``HTTP_PROXY`` / ``NO_PROXY`` 等代理环境变量。
 diff --git a/packages/control-plane/src/forgemesh/controlplane/tracecontext.py b/packages/control-plane/src/forgemesh/controlplane/tracecontext.py
 new file mode 100644
 index 0000000..079174f
@@ -667,12 +672,63 @@ index 0000000..079174f
 +    "parse_traceparent",
 +    "request_context",
 +]
+diff --git a/tests/contract/test_openapi_contract.py b/tests/contract/test_openapi_contract.py
+index 1001270..694fb29 100644
+--- a/tests/contract/test_openapi_contract.py
++++ b/tests/contract/test_openapi_contract.py
+@@ -7,8 +7,8 @@
+   每个路由都进入生成的 Schema（框架自带的文档页除外），没有路由能绕过比较；
+ * 动态：按场景表调用每个操作（方法与路径取自契约），响应的状态码必须是契约为该操作声明的，
+   响应体符合声明的 Schema（声明无正文时必须为空），声明的响应头存在，错误信封回显请求的
+-  ``X-Correlation-Id``，成功请求的请求体符合声明的请求体 Schema；契约为每个操作声明的每个
+-  状态码都至少有一个场景。
++  ``X-Correlation-Id`` 与 ``traceparent`` 中的 trace-id，成功请求的请求体符合声明的请求体
++  Schema；契约为每个操作声明的每个状态码都至少有一个场景。
+ 
+ 响应只做动态检查：FastAPI 生成的响应声明不含错误响应，比较它没有意义。
+ """
+@@ -60,6 +60,8 @@ API_KEY = "fmk_contract-tests"
+ TENANT = "tenant-a"
+ ENTRY = ApiKeyEntry(id="contract", sha256=hash_api_key(API_KEY), tenantId=TENANT, subject="ci")
+ CORRELATION_ID = "corr-contract"
++TRACE_ID = "4bf92f3577b34da6a3ce929d0e0e4736"
++TRACEPARENT = f"00-{TRACE_ID}-00f067aa0ba902b7-01"
+ NAMESPACE = {"namespace": "default"}
+ MERGE_PATCH = {"Content-Type": "application/merge-patch+json"}
+ 
+@@ -245,7 +247,8 @@ class Harness:
+ 
+ 
+ class Api:
+-    """绑定到一个契约操作的客户端：方法与路径模板取自契约；默认带凭证与关联 ID。"""
++    """绑定到一个契约操作的客户端：方法与路径模板取自契约；默认带凭证、关联 ID 与
++    ``traceparent``。"""
+ 
+     def __init__(self, harness: Harness, operation_id: str) -> None:
+         self.harness = harness
+@@ -261,7 +264,7 @@ class Api:
+         content: bytes | None = None,
+         authenticated: bool = True,
+     ) -> httpx.Response:
+-        request_headers = {"X-Correlation-Id": CORRELATION_ID}
++        request_headers = {"X-Correlation-Id": CORRELATION_ID, "traceparent": TRACEPARENT}
+         if authenticated:
+             request_headers["Authorization"] = f"Bearer {API_KEY}"
+         request_headers.update(headers or {})
+@@ -667,6 +670,7 @@ def _check_response(operation: Operation, response: httpx.Response) -> None:
+     _assert_valid(payload, content[media_type]["schema"], "the response body")
+     if response.status_code >= 400:
+         assert payload["error"]["correlationId"] == CORRELATION_ID
++        assert payload["error"]["traceId"] == TRACE_ID
+ 
+ 
+ def _check_request(operation: Operation, request: httpx.Request) -> None:
 diff --git a/tests/unit/controlplane/test_logs.py b/tests/unit/controlplane/test_logs.py
 new file mode 100644
-index 0000000..91c853c
+index 0000000..ba64b79
 --- /dev/null
 +++ b/tests/unit/controlplane/test_logs.py
-@@ -0,0 +1,180 @@
+@@ -0,0 +1,208 @@
 +"""控制平面日志：配置取自环境变量（非法时拒绝启动）、JSON / 文本格式、记录带上请求的 ID。"""
 +
 +from __future__ import annotations
@@ -694,6 +750,8 @@ index 0000000..91c853c
 +    configure_logging,
 +    log_settings_from_env,
 +)
++from forgemesh.controlplane.outbox import OutboxEvent
++from forgemesh.controlplane.publishers import EVENT_LOGGER_NAME, LogPublisher
 +from forgemesh.controlplane.tracecontext import request_context
 +
 +TRACE_ID = "4bf92f3577b34da6a3ce929d0e0e4736"
@@ -702,11 +760,13 @@ index 0000000..91c853c
 +@pytest.fixture
 +def root_logger():
 +    root = logging.getLogger()
-+    handlers, level = list(root.handlers), root.level
++    events = logging.getLogger(EVENT_LOGGER_NAME)
++    handlers, level, events_level = list(root.handlers), root.level, events.level
 +    yield root
 +    for handler in [h for h in root.handlers if h not in handlers]:
 +        root.removeHandler(handler)
 +    root.setLevel(level)
++    events.setLevel(events_level)
 +
 +
 +def _epoch_record(message: str) -> logging.LogRecord:
@@ -818,6 +878,30 @@ index 0000000..91c853c
 +
 +
 +@pytest.mark.unit
++def test_events_are_written_once_in_the_log_format_whatever_the_level(root_logger, capsys) -> None:
++    stream = io.StringIO()
++    configure_logging(LogSettings(level="WARNING"), stream)
++    publisher = LogPublisher()
++    payload = {"eventId": "evt-1", "eventType": "inference.service.created"}
++
++    logging.getLogger("forgemesh.test").info("filtered")
++    publisher(
++        OutboxEvent(
++            aggregate_type="InferenceService",
++            aggregate_id="uid-1",
++            event_type="inference.service.created",
++            payload=payload,
++        )
++    )
++
++    (entry,) = (json.loads(line) for line in stream.getvalue().splitlines())
++    assert (entry["logger"], entry["level"]) == (EVENT_LOGGER_NAME, "INFO")
++    assert json.loads(entry["message"]) == payload
++    assert logging.getLogger(EVENT_LOGGER_NAME).handlers == []
++    assert capsys.readouterr().out == ""
++
++
++@pytest.mark.unit
 +@pytest.mark.parametrize(("name", "value"), [(LOG_FORMAT_ENV, "xml"), (LOG_LEVEL_ENV, "loud")])
 +def test_main_refuses_invalid_log_configuration(monkeypatch, name: str, value: str) -> None:
 +    def fail_if_started(*args, **kwargs):
@@ -855,10 +939,10 @@ index 0000000..91c853c
 +    assert started["level"] == logging.WARNING
 diff --git a/tests/unit/controlplane/test_request_context.py b/tests/unit/controlplane/test_request_context.py
 new file mode 100644
-index 0000000..b827ced
+index 0000000..b681655
 --- /dev/null
 +++ b/tests/unit/controlplane/test_request_context.py
-@@ -0,0 +1,262 @@
+@@ -0,0 +1,301 @@
 +"""请求上下文：中间件沿用或生成关联 ID 与 trace-id，错误信封与日志带上同一对 ID。"""
 +
 +from __future__ import annotations
@@ -880,6 +964,7 @@ index 0000000..b827ced
 +from forgemesh.controlplane.auth import HeaderAuthenticator
 +from forgemesh.controlplane.deployment import RUNTIME_LAUNCHER_ENV
 +from forgemesh.controlplane.logs import LogSettings, configure_logging
++from forgemesh.controlplane.publishers import EVENT_LOGGER_NAME
 +from forgemesh.controlplane.scheduler import INVENTORY_FILE_ENV
 +from forgemesh.controlplane.tracecontext import (
 +    current_correlation_id,
@@ -908,12 +993,14 @@ index 0000000..b827ced
 +@pytest.fixture
 +def log_entries():
 +    root = logging.getLogger()
-+    level = root.level
++    events = logging.getLogger(EVENT_LOGGER_NAME)
++    level, events_level = root.level, events.level
 +    stream = io.StringIO()
 +    handler = configure_logging(LogSettings(), stream)
 +    yield lambda: [json.loads(line) for line in stream.getvalue().splitlines()]
 +    root.removeHandler(handler)
 +    root.setLevel(level)
++    events.setLevel(events_level)
 +
 +
 +async def _receive() -> dict[str, Any]:
@@ -1104,7 +1191,7 @@ index 0000000..b827ced
 +        raise RuntimeError("secret internal detail")
 +
 +    with TestClient(_dev_app(tmp_path), raise_server_exceptions=False) as client:
-+        monkeypatch.setattr(get_registry(), "list", failing_list)
++        monkeypatch.setattr(get_registry(), "list_page", failing_list)
 +        response = client.get("/api/v1/inference-services", headers=HEADERS)
 +
 +    assert response.status_code == 500
@@ -1121,6 +1208,42 @@ index 0000000..b827ced
 +            error["correlationId"],
 +        )
 +    assert "secret internal detail" in unhandled["exception"]
++
++
++@pytest.mark.unit
++def test_a_generated_correlation_id_is_the_one_in_the_logs_and_the_audit_record(
++    tmp_path, monkeypatch, log_entries
++) -> None:
++    body = {
++        "metadata": {"name": "llama", "namespace": "default"},
++        "spec": {
++            "model": {"reference": "models/llama"},
++            "runtime": {"provider": "vllm"},
++            "resources": {"accelerator": {"type": "nvidia-gpu", "minMemoryGiB": 16}},
++        },
++    }
++    with TestClient(_dev_app(tmp_path)) as client:
++        registry = get_registry()
++        put = registry.put
++
++        async def logged_put(*args, **kwargs):
++            logging.getLogger("forgemesh.test").warning("creating")
++            return await put(*args, **kwargs)
++
++        monkeypatch.setattr(registry, "put", logged_put)
++        created = client.post("/api/v1/inference-services", json=body, headers=HEADERS)
++        (logged,) = [entry for entry in log_entries() if entry["message"] == "creating"]
++        audit = client.get(
++            "/api/v1/audit-events",
++            params={"correlationId": logged["correlation_id"]},
++            headers=HEADERS,
++        )
++
++    assert created.status_code == 201
++    assert HEX32.fullmatch(logged["correlation_id"])
++    assert [(item["action"], item["resourceId"]) for item in audit.json()["items"]] == [
++        ("create", "llama")
++    ]
 diff --git a/tests/unit/controlplane/test_tracecontext.py b/tests/unit/controlplane/test_tracecontext.py
 new file mode 100644
 index 0000000..aefa194

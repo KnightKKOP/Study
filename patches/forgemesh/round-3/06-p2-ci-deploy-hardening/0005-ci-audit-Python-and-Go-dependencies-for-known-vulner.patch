@@ -1,0 +1,221 @@
+From 9d7bb024a7ed91776d9628eb7f3d186ed4a47b1f Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 13 Oct 2026 02:51:49 +0000
+Subject: [PATCH 05/14] ci: audit Python and Go dependencies for known
+ vulnerabilities
+
+Nothing checked the dependencies against published advisories. A new
+dependency-audit job runs two pinned scanners:
+
+- make audit runs pip-audit 2.10.1 from its own virtualenv against
+  the .venv created by make install, i.e. the third-party versions
+  that the dev environment and CI actually install. The editable
+  forgemesh-* packages are not on PyPI and are skipped
+  (--skip-editable); --strict cannot be combined with that, since it
+  treats every skipped distribution as fatal.
+- make -C gateway vulncheck runs govulncheck v1.9.0 on the gateway
+  with the Go version from GO_VERSION. It reports only
+  vulnerabilities in code the gateway calls, standard library
+  included. The target pins GOTOOLCHAIN to the toolchain that go.mod
+  selects: go run pkg@version ignores the go line, and a govulncheck
+  built with an older Go (x/vuln only needs 1.26) cannot load the
+  1.27 standard library.
+
+Both pass today. Python advisories without a fix, or assessed as not
+affecting ForgeMesh, are listed explicitly in PIP_AUDIT_IGNORE with
+the package, the reason and the removal condition (none so far).
+govulncheck has no suppression mechanism, so that step stays red
+until Go ships a fix or the call is avoided. SECURITY.md 3.1 now
+documents this policy and what a local run checks, and drops the
+claim that dependency versions are pinned in CI, which was never
+true.
+---
+ .github/workflows/ci.yml | 33 +++++++++++++++++++++++++++++++++
+ Makefile                 | 21 ++++++++++++++++++++-
+ SECURITY.md              | 11 +++++++++--
+ gateway/Makefile         | 11 ++++++++++-
+ gateway/README.md        |  7 +++++--
+ 5 files changed, 77 insertions(+), 6 deletions(-)
+
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 26612b7..9afcbfe 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -115,6 +115,39 @@ jobs:
+       - name: Go test (race detector)
+         run: go test -race ./...
+ 
++  dependency-audit:
++    name: Dependencies · vulnerability audit
++    runs-on: ubuntu-latest
++
++    steps:
++      - name: Checkout
++        uses: actions/checkout@v4
++
++      - name: Set up Python
++        uses: actions/setup-python@v5
++        with:
++          python-version: "3.12"
++          cache: pip
++
++      # setup-go 的缓存键只取决于 Go 版本与 go.sum，会与 go job 争用同一个缓存。
++      - name: Set up Go
++        uses: actions/setup-go@v5
++        with:
++          go-version: ${{ env.GO_VERSION }}
++          cache: false
++
++      # 审计 make install 实际安装的第三方依赖。工具版本与忽略列表在根 Makefile 中，
++      # 已知漏洞的处理规则见 SECURITY.md 3.1。
++      - name: pip-audit (make install environment)
++        run: |
++          make install
++          make audit
++
++      # pip-audit 失败时同样运行，两边的结果都要看到。
++      - name: govulncheck (gateway)
++        if: ${{ !cancelled() }}
++        run: make -C gateway vulncheck
++
+   compose-smoke:
+     name: Compose · end-to-end smoke
+     runs-on: ubuntu-latest
+diff --git a/Makefile b/Makefile
+index 185c73a..0d9e2ee 100644
+--- a/Makefile
++++ b/Makefile
+@@ -10,6 +10,7 @@
+ #   make install   创建 .venv，安装全部子包（editable）+ 开发依赖
+ #   make test      运行全部测试（pytest）
+ #   make coverage  运行全部测试并检查覆盖率下限（与 CI 相同）
++#   make audit     用 pip-audit 检查 .venv 中第三方依赖的已知漏洞（与 CI 相同）
+ #   make lint      ruff 静态检查
+ #   make fmt       ruff 自动修复 + 格式化
+ #   make clean     清理构建与缓存产物
+@@ -20,9 +21,16 @@ VENV    ?= .venv
+ VENV_PY := $(VENV)/bin/python
+ VENV_PIP:= $(VENV)/bin/pip
+ 
++# pip-audit 装在单独的虚拟环境中，它自己的依赖不混进被审计的 .venv。
++PIP_AUDIT_VERSION ?= 2.10.1
++AUDIT_VENV        ?= build/pip-audit
++# 尚无修复版本、或经评估不影响 ForgeMesh 的漏洞，写成 --ignore-vuln <ID>，并在这里注释
++# 包、原因与移除条件（见 SECURITY.md 3.1）。
++PIP_AUDIT_IGNORE  :=
++
+ .DEFAULT_GOAL := help
+ 
+-.PHONY: help install deps test test-unit test-contract coverage lint fmt clean
++.PHONY: help install deps test test-unit test-contract coverage audit lint fmt clean
+ 
+ help:
+ 	@echo "ForgeMesh 顶层命令："
+@@ -31,6 +39,7 @@ help:
+ 	@echo "  make test-unit      仅运行单元测试"
+ 	@echo "  make test-contract  仅运行契约测试"
+ 	@echo "  make coverage       运行全部测试并检查覆盖率下限（与 CI 相同）"
++	@echo "  make audit          用 pip-audit 检查 .venv 中第三方依赖的已知漏洞（与 CI 相同）"
+ 	@echo "  make lint           ruff 静态检查"
+ 	@echo "  make fmt            ruff 自动修复与格式化"
+ 	@echo "  make clean          清理构建与缓存产物"
+@@ -79,6 +88,16 @@ test-contract:
+ coverage:
+ 	$(VENV_PY) -m pytest --cov
+ 
++# 审计 make install 装进 $(VENV) 的依赖：PIPAPI_PYTHON_LOCATION 让 pip-audit 列出该解释器
++# 环境中的包（路径不能解析符号链接，否则指向的是基础解释器）。本仓库的 forgemesh-* 包以
++# editable 方式安装、不在 PyPI 上，跳过。
++audit:
++	@test -x $(VENV_PY) || { echo "ERROR: $(VENV_PY) 不存在，先运行 make install"; exit 1; }
++	$(PY) -m venv $(AUDIT_VENV)
++	$(AUDIT_VENV)/bin/pip install -q --disable-pip-version-check pip-audit==$(PIP_AUDIT_VERSION)
++	PIPAPI_PYTHON_LOCATION=$(abspath $(VENV_PY)) $(AUDIT_VENV)/bin/pip-audit \
++		--skip-editable --progress-spinner off $(PIP_AUDIT_IGNORE)
++
+ lint:
+ 	$(VENV_PY) -m ruff check .
+ 
+diff --git a/SECURITY.md b/SECURITY.md
+index 0110896..642b815 100644
+--- a/SECURITY.md
++++ b/SECURITY.md
+@@ -93,8 +93,15 @@ ForgeMesh 通过插件与多组件扩展，供应链完整性是重点防护面
+ 
+ ### 3.1 依赖与构建
+ 
+-- 依赖版本在 CI 中固定与缓存，变更需评审。
+-- CI 对 Python（ruff/pytest）与 Go（`go build`/`go test`）执行构建与测试门禁。
++- Python 依赖只声明版本下限（个别另有上限，如 `pydantic>=2,<3`），仓库中没有锁文件：`make install`、CI 与镜像构建都安装满足约束的最新版本。依赖变更需评审。
++- CI 门禁：Python 执行 `ruff check` 与 `pytest`（总覆盖率不得低于 `pyproject.toml` 中的 `fail_under`），并把每个包装进全新的虚拟环境、只带它声明的依赖，导入它的全部模块（`scripts/check_package_imports.py`）；Go 网关执行 `gofmt`、`go vet`、`go build` 与 `go test -race`。
++- 依赖漏洞扫描（CI `dependency-audit` job；本地为 `make audit` 与 `make -C gateway vulncheck`，工具版本固定在这两个 Makefile 中）：
++  - `pip-audit` 审计 `make install` 装进 `.venv` 的全部第三方包（含开发工具）；本仓库的 `forgemesh-*` 包以 editable 方式安装、不在 PyPI 上，不审计。发现任何已知漏洞即失败。
++  - `govulncheck` 只报告网关代码实际调用到的漏洞，包括标准库。网关只依赖标准库，标准库编译进二进制，修复随 Go 补丁版本发布：CI 与网关镜像使用同一个 Go 次版本（`.github/workflows/ci.yml` 中的 `GO_VERSION`）的最新补丁，这个次版本停止维护之前升级。本地运行时检查 go.mod 选定的工具链：默认的 go 命令比 `gateway/go.mod` 的 go 行旧时切换到其中的版本（`go1.27.0`），会报告此后的补丁已修复的漏洞；与 CI 一致可设置 `GOTOOLCHAIN` 为这个次版本的最新补丁（如 `GOTOOLCHAIN=go1.27.2`）。
++- 已知漏洞的处理：
++  - 有修复版本时升级：Python 依赖提高下限，或放宽阻止升级的上限；Go 标准库的修复发布之后，重新运行 CI、重新构建镜像（`docker build --pull`）即可取得，修复只在更新的次版本中提供时，一起升级 `GO_VERSION`、`deploy/docker/Dockerfile.gateway` 与 `gateway/go.mod` 的 go 行。
++  - Python 依赖的漏洞尚无修复版本，或经评估不影响 ForgeMesh（例如有漏洞的功能没有被使用）时，在根 `Makefile` 的 `PIP_AUDIT_IGNORE` 中以 `--ignore-vuln <ID>` 列出，注释写明包、原因与移除条件，经评审合入；修复版本可用之后移除。目前这个列表为空。
++  - govulncheck 没有忽略机制。标准库的漏洞通常与修复版本同时公布；尚无修复时 job 保持失败，由维护者决定改写调用方式绕开，还是等待修复。
+ - 定期更新依赖并及时响应上游安全公告。
+ 
+ ### 3.2 插件与制品签名
+diff --git a/gateway/Makefile b/gateway/Makefile
+index 3e937b2..1dff207 100644
+--- a/gateway/Makefile
++++ b/gateway/Makefile
+@@ -7,14 +7,16 @@
+ #   make run-dev 以 dev 认证模式在 127.0.0.1:8081 启动网关（信任租户头、只连接本机推理实例，仅限本地开发）
+ #   make fmt     格式化代码
+ #   make vet     静态检查
++#   make vulncheck 检查代码实际调用到的已知漏洞（govulncheck，含标准库）
+ #   make clean   清理构建产物
+ 
+ GO      ?= go
+ BINARY  := bin/gateway
+ PKGS    := ./...
+ RACE_FLAGS := -race -count=1
++GOVULNCHECK_VERSION ?= v1.9.0
+ 
+-.PHONY: all build test run run-dev fmt vet tidy clean
++.PHONY: all build test run run-dev fmt vet vulncheck tidy clean
+ 
+ all: fmt vet build test
+ 
+@@ -43,6 +45,13 @@ fmt:
+ vet:
+ 	$(GO) vet $(PKGS)
+ 
++## vulncheck: govulncheck 只报告实际调用到的漏洞；标准库的结果取决于构建并运行它的 Go 版本，
++##            即 go.mod 选定的工具链（更旧的 go 命令自动切换）。go run pkg@version 不看 go.mod，
++##            由更旧的 Go 构建的 govulncheck 无法加载更新的标准库，所以显式设置 GOTOOLCHAIN。
++vulncheck:
++	toolchain=$$($(GO) env GOVERSION) && \
++		GOTOOLCHAIN=$$toolchain $(GO) run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) $(PKGS)
++
+ ## tidy: 整理模块依赖（无第三方依赖，通常无变更）
+ tidy:
+ 	$(GO) mod tidy
+diff --git a/gateway/README.md b/gateway/README.md
+index 058695f..4b7a126 100644
+--- a/gateway/README.md
++++ b/gateway/README.md
+@@ -287,12 +287,15 @@ key 与 key 文件条目由控制平面工具生成（见根 README「运行控
+ python -m forgemesh.controlplane.keygen --tenant acme --subject ci-bot
+ ```
+ 
+-CI 门禁：
++CI 门禁（`.github/workflows/ci.yml` 的 `go` 与 `dependency-audit` job，Go 版本取其中的 `GO_VERSION`）：
+ 
+ ```bash
+ cd gateway
++test -z "$(gofmt -l .)"
++go vet ./...
+ go build ./...
+-go test ./...
++go test -race ./...
++make vulncheck       # govulncheck：代码实际调用到的已知漏洞（含标准库），见 SECURITY.md 3.1
+ ```
+ 
+ ---
+-- 
+2.43.0
+

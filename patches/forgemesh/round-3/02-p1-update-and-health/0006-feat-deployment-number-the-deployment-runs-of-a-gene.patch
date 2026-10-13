@@ -1,0 +1,210 @@
+From 32fc7c0facb0fcbfbaf0186ed5fe67e425a204d1 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 13 Oct 2026 06:01:48 +0000
+Subject: [PATCH 06/20] feat(deployment): number the deployment runs of a
+ generation
+
+Redeploying a service whose instance was lost needs a new deployment
+run for the same generation: the run of that generation has already
+succeeded, and its idempotency key (also the instance key) would hand
+back the run and the instance that are gone.
+
+deployment_run_key() takes an attempt number. The first attempt keeps
+the key deployment:{uid}:{generation}, so runs started before this
+change are found unchanged; later attempts append it, as in
+deployment:{uid}:{generation}:{attempt}. find_deployment_runs() parses
+the attempt and returns it with each run, so the release provider still
+finds every run of a resource when it is deleted or redeployed.
+---
+ .../controlplane/deployment/launcher.py       |  3 +-
+ .../controlplane/deployment/release.py        |  4 +--
+ .../controlplane/deployment/workflow.py       | 31 +++++++++++++------
+ tests/unit/controlplane/test_deployment.py    | 31 +++++++++++++------
+ 4 files changed, 46 insertions(+), 23 deletions(-)
+
+diff --git a/packages/control-plane/src/forgemesh/controlplane/deployment/launcher.py b/packages/control-plane/src/forgemesh/controlplane/deployment/launcher.py
+index 23bec6b..e65df4e 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/deployment/launcher.py
++++ b/packages/control-plane/src/forgemesh/controlplane/deployment/launcher.py
+@@ -26,7 +26,8 @@ class LaunchRequest(BaseModel):
+     """启动一个推理实例所需的信息（部署工作流的输入，可 JSON 序列化）。
+ 
+     Attributes:
+-        instance_key: 实例的幂等键，即部署运行的幂等键（资源 uid 的每一代 spec 一个）。
++        instance_key: 实例的幂等键，即部署运行的幂等键（资源 uid 的每一代 spec 的每次部署
++            一个）。
+         tenant_id: 资源所属租户。
+         resource: 被部署的资源（kind / namespace / name / uid）。
+         spec: 资源的期望状态（模型、运行时、加速器申请、副本数）。
+diff --git a/packages/control-plane/src/forgemesh/controlplane/deployment/release.py b/packages/control-plane/src/forgemesh/controlplane/deployment/release.py
+index c4f6c18..c4e7e42 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/deployment/release.py
++++ b/packages/control-plane/src/forgemesh/controlplane/deployment/release.py
+@@ -19,8 +19,8 @@ class DeploymentReleaser:
+     协调器同样先经它停止旧的实例。
+ 
+     按 :func:`~forgemesh.controlplane.deployment.workflow.find_deployment_runs` 找到资源（uid）
+-    的全部部署运行（每一代 spec 一次运行，含 1.1.0 之前不含 generation 的运行），按创建
+-    先后逐个处理：
++    的全部部署运行（每一代 spec 一次运行，实例丢失后重新部署时再启动一次，含 1.1.0 之前
++    不含 generation 的运行），按创建先后逐个处理：
+ 
+     * 运行未结束（正在部署）：``cancel(cleanup=True)`` 中断正在执行的步骤、补偿已完成的
+       步骤（停止已启动的实例），并等待运行结束；
+diff --git a/packages/control-plane/src/forgemesh/controlplane/deployment/workflow.py b/packages/control-plane/src/forgemesh/controlplane/deployment/workflow.py
+index de3eca3..ce2356d 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/deployment/workflow.py
++++ b/packages/control-plane/src/forgemesh/controlplane/deployment/workflow.py
+@@ -1,7 +1,8 @@
+ """推理服务的部署工作流：准备模型 → 启动实例 → 验证实例。
+ 
+ 协调器以 :func:`deployment_run_key` 为幂等键启动工作流（资源 uid 的每一代 spec 一次运行，
+-:func:`find_deployment_runs` 找回资源的全部运行），运行输入是 :func:`deployment_inputs` 包装的
++实例丢失后重新部署时同一代 spec 再启动一次，:func:`find_deployment_runs` 找回资源的全部
++运行），运行输入是 :func:`deployment_inputs` 包装的
+ :class:`~forgemesh.controlplane.deployment.launcher.LaunchRequest`。各步骤经
+ :class:`DeploymentSteps` 调用 :class:`~forgemesh.controlplane.deployment.launcher.RuntimeLauncher`：
+ 
+@@ -92,14 +93,21 @@ def deployment_workflow() -> WorkflowDefinition:
+     )
+ 
+ 
+-def deployment_run_key(uid: str, generation: int) -> str:
+-    """资源 ``uid`` 第 ``generation`` 代 spec 的部署运行的幂等键，也是实例的幂等键
+-    （``LaunchRequest.instance_key``），形如 ``deployment:{uid}:{generation}``。
++def deployment_run_key(uid: str, generation: int, attempt: int = 1) -> str:
++    """资源 ``uid`` 第 ``generation`` 代 spec 第 ``attempt`` 次部署的运行的幂等键，也是实例的
++    幂等键（``LaunchRequest.instance_key``）：第一次形如 ``deployment:{uid}:{generation}``，
++    之后（实例丢失后重新部署）形如 ``deployment:{uid}:{generation}:{attempt}``。
+ 
+-    spec 变化（新的 generation）启动新的运行与新的实例；删除资源或重新部署之前，
++    spec 变化（新的 generation）与重新部署都启动新的运行与新的实例；删除资源或部署之前，
+     :func:`find_deployment_runs` 找回资源的全部运行，旧实例不会无人管理。
++
++    Raises:
++        ValueError: ``attempt`` 小于 1。
+     """
+-    return f"{_RUN_KEY_PREFIX}{uid}:{generation}"
++    if attempt < 1:
++        raise ValueError(f"attempt must be >= 1, got {attempt}")
++    key = f"{_RUN_KEY_PREFIX}{uid}:{generation}"
++    return key if attempt == 1 else f"{key}:{attempt}"
+ 
+ 
+ @dataclass(frozen=True)
+@@ -111,11 +119,13 @@ class DeploymentRun:
+         generation: 运行部署的 spec 的 generation；1.1.0 之前的运行（键为
+             ``deployment:{uid}``，不含 generation）为 ``None``。
+         run: 运行快照。
++        attempt: 这一代 spec 的第几次部署（1.1.0 之前的运行为 1）。
+     """
+ 
+     key: str
+     generation: int | None
+     run: RunInfo
++    attempt: int = 1
+ 
+ 
+ async def find_deployment_runs(
+@@ -124,11 +134,11 @@ async def find_deployment_runs(
+     """资源 ``uid`` 的部署运行（不创建），按创建先后排列。
+ 
+     经 :meth:`~forgemesh.workflow.runtime.WorkflowRuntime.find_runs` 按幂等键前缀查找；给出
+-    ``generation`` 时只返回部署这一代 spec 的运行，否则返回全部运行，包括 1.1.0 之前的
+-    ``deployment:{uid}``。
++    ``generation`` 时只返回部署这一代 spec 的运行（各次部署），否则返回全部运行，包括 1.1.0
++    之前的 ``deployment:{uid}``。
+     """
+     prefix = f"{_RUN_KEY_PREFIX}{uid}"
+-    pattern = re.compile(rf"{re.escape(prefix)}(?::(\d+))?", re.ASCII)
++    pattern = re.compile(rf"{re.escape(prefix)}(?::(\d+)(?::(\d+))?)?", re.ASCII)
+     if generation is not None:
+         prefix = f"{prefix}:{generation}"
+     runs = []
+@@ -137,8 +147,9 @@ async def find_deployment_runs(
+         if match is None:
+             continue
+         found = int(match[1]) if match[1] is not None else None
++        attempt = int(match[2]) if match[2] is not None else 1
+         if generation is None or found == generation:
+-            runs.append(DeploymentRun(key=key, generation=found, run=run))
++            runs.append(DeploymentRun(key=key, generation=found, run=run, attempt=attempt))
+     return runs
+ 
+ 
+diff --git a/tests/unit/controlplane/test_deployment.py b/tests/unit/controlplane/test_deployment.py
+index 0db32f8..23a93ba 100644
+--- a/tests/unit/controlplane/test_deployment.py
++++ b/tests/unit/controlplane/test_deployment.py
+@@ -252,15 +252,21 @@ def test_deployment_workflow_prepares_launches_and_verifies() -> None:
+ 
+ 
+ @pytest.mark.unit
+-def test_deployment_run_key_is_per_resource_uid_and_generation() -> None:
++def test_deployment_run_key_is_per_resource_uid_generation_and_attempt() -> None:
++    """第一次部署的键不带次数（与之前的版本相同），之后的重新部署带上次数。"""
+     assert KEY == "deployment:uid-1:1"
++    assert deployment_run_key("uid-1", 1, attempt=1) == KEY
+     assert deployment_run_key("uid-1", 2) == "deployment:uid-1:2"
++    assert deployment_run_key("uid-1", 2, attempt=3) == "deployment:uid-1:2:3"
+     assert deployment_run_key("uid-2", 1) != KEY
++    with pytest.raises(ValueError, match="attempt must be >= 1"):
++        deployment_run_key("uid-1", 1, attempt=0)
+ 
+ 
+ @pytest.mark.unit
+ def test_find_deployment_runs_returns_the_runs_of_one_resource_in_creation_order() -> None:
+-    """包括 1.1.0 之前不含 generation 的键；uid 互为前缀的其他资源不算在内。"""
++    """包括 1.1.0 之前不含 generation 的键与重新部署的各次运行；uid 互为前缀的其他资源
++    不算在内。"""
+     keys = [
+         "deployment:uid-1:2",
+         "deployment:uid-1",
+@@ -268,9 +274,12 @@ def test_find_deployment_runs_returns_the_runs_of_one_resource_in_creation_order
+         "deployment:uid-1:1",
+         "deployment:uid-1:x",
+         "deployment:uid-1:12",
++        "deployment:uid-1:1:2",
++        "deployment:uid-1:1:y",
++        "deployment:uid-1:12:3",
+     ]
+ 
+-    async def scenario() -> dict[int | None, list[tuple[str, int | None]]]:
++    async def scenario() -> dict[int | None, list[tuple[str, int | None, int]]]:
+         runtime = _runtime(InMemoryLauncher())
+         try:
+             run_ids = {key: await _deploy(runtime, key) for key in keys}
+@@ -278,7 +287,7 @@ def test_find_deployment_runs_returns_the_runs_of_one_resource_in_creation_order
+             for generation in (None, 1, 2, 3):
+                 runs = await find_deployment_runs(runtime, "uid-1", generation)
+                 assert all(run.run.run_id == run_ids[run.key] for run in runs)
+-                found[generation] = [(run.key, run.generation) for run in runs]
++                found[generation] = [(run.key, run.generation, run.attempt) for run in runs]
+             return found
+         finally:
+             await runtime.aclose()
+@@ -286,13 +295,15 @@ def test_find_deployment_runs_returns_the_runs_of_one_resource_in_creation_order
+     found = asyncio.run(scenario())
+ 
+     assert found[None] == [
+-        ("deployment:uid-1:2", 2),
+-        ("deployment:uid-1", None),
+-        ("deployment:uid-1:1", 1),
+-        ("deployment:uid-1:12", 12),
++        ("deployment:uid-1:2", 2, 1),
++        ("deployment:uid-1", None, 1),
++        ("deployment:uid-1:1", 1, 1),
++        ("deployment:uid-1:12", 12, 1),
++        ("deployment:uid-1:1:2", 1, 2),
++        ("deployment:uid-1:12:3", 12, 3),
+     ]
+-    assert found[1] == [("deployment:uid-1:1", 1)]
+-    assert found[2] == [("deployment:uid-1:2", 2)]
++    assert found[1] == [("deployment:uid-1:1", 1, 1), ("deployment:uid-1:1:2", 1, 2)]
++    assert found[2] == [("deployment:uid-1:2", 2, 1)]
+     assert found[3] == []
+ 
+ 
+-- 
+2.43.0
+

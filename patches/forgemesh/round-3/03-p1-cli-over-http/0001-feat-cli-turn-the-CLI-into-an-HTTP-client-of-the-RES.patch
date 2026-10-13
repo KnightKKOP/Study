@@ -1,7 +1,7 @@
-From 186fae165e9714eafe8974768dd2bd56efb44a8f Mon Sep 17 00:00:00 2001
+From 334b70ae491ac1137103ae22e8a82c854e3ecc88 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Tue, 13 Oct 2026 05:43:13 +0000
-Subject: [PATCH 1/3] feat(cli): turn the CLI into an HTTP client of the REST
+Subject: [PATCH 1/6] feat(cli): turn the CLI into an HTTP client of the REST
  API
 
 Every command used to open a fresh in-memory SQLiteRegistry, so nothing

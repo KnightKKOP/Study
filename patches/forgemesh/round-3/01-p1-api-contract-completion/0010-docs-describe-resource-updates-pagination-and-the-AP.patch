@@ -1,7 +1,7 @@
 From 71765a8c7cf1156bbf07e7ceb0972f09e4c0e7ed Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Tue, 13 Oct 2026 04:01:05 +0000
-Subject: [PATCH 10/10] docs: describe resource updates, pagination and the API
+Subject: [PATCH 10/11] docs: describe resource updates, pagination and the API
  contract
 
 The CHANGELOG, README and module mapping did not mention the new PUT

@@ -1,0 +1,33 @@
+From a1e342f520059991d0ab5b67743c079864b23f83 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 13 Oct 2026 13:55:47 +0000
+Subject: [PATCH 1/4] build(dev): pin ruff to the 0.17 series
+
+requirements-dev.txt installed whatever ruff is newest. Ruff changes its
+formatter style and its rule set between minor releases, so the same
+commit could pass today and fail after the next release, and a format
+check would start failing on unchanged code. Pin the 0.17 series, the
+one the repository is about to be formatted with, and say how to
+upgrade.
+---
+ requirements-dev.txt | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/requirements-dev.txt b/requirements-dev.txt
+index 6fab0e4..5535e09 100644
+--- a/requirements-dev.txt
++++ b/requirements-dev.txt
+@@ -5,7 +5,9 @@ setuptools>=68
+ wheel
+ pytest>=7
+ pytest-cov
+-ruff
++# ruff 的格式风格与规则集随 minor 版本变化，限定在一个系列；升级时以 make fmt 重新格式化
++# 全仓库，与版本号一起提交。
++ruff>=0.17,<0.18
+ pydantic>=2,<3
+ cryptography>=42
+ jsonschema
+-- 
+2.43.0
+

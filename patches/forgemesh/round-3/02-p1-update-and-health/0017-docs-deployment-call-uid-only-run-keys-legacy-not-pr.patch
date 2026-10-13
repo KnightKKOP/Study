@@ -1,0 +1,112 @@
+From f3f8694c9c6b426d3c1542736ce9359eddb23fb0 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 13 Oct 2026 08:51:20 +0000
+Subject: [PATCH 17/20] docs(deployment): call uid-only run keys legacy, not
+ pre-1.1.0
+
+Runs keyed deployment:{uid} were only created by development builds
+of 1.1.0: 1.0.x has no deployment workflow at all. Saying such runs
+come from before 1.1.0 suggests that a released version left them
+behind, so the docstrings now call them runs of an older version.
+---
+ .../src/forgemesh/controlplane/deployment/release.py      | 4 ++--
+ .../src/forgemesh/controlplane/deployment/workflow.py     | 8 ++++----
+ .../src/forgemesh/controlplane/reconciler/core.py         | 2 +-
+ tests/unit/controlplane/test_deployment.py                | 4 ++--
+ tests/unit/controlplane/test_reconciler.py                | 2 +-
+ 5 files changed, 10 insertions(+), 10 deletions(-)
+
+diff --git a/packages/control-plane/src/forgemesh/controlplane/deployment/release.py b/packages/control-plane/src/forgemesh/controlplane/deployment/release.py
+index ee38b62..55e245b 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/deployment/release.py
++++ b/packages/control-plane/src/forgemesh/controlplane/deployment/release.py
+@@ -20,8 +20,8 @@ class DeploymentReleaser:
+     释放 ``Failed`` 服务的分配之前，协调器同样先经它停止旧的实例。
+ 
+     按 :func:`~forgemesh.controlplane.deployment.workflow.find_deployment_runs` 找到资源（uid）
+-    的全部部署运行（每一代 spec 一次运行，实例丢失后重新部署时再启动一次，含 1.1.0 之前
+-    不含 generation 的运行），按创建先后逐个处理：
++    的全部部署运行（每一代 spec 一次运行，实例丢失后重新部署时再启动一次，含旧版本以
++    ``deployment:{uid}`` 为键、不含 generation 的运行），按创建先后逐个处理：
+ 
+     * 运行未结束（正在部署）：``cancel(cleanup=True)`` 中断正在执行的步骤、补偿已完成的
+       步骤（停止已启动的实例），并等待运行结束；
+diff --git a/packages/control-plane/src/forgemesh/controlplane/deployment/workflow.py b/packages/control-plane/src/forgemesh/controlplane/deployment/workflow.py
+index ce2356d..c859215 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/deployment/workflow.py
++++ b/packages/control-plane/src/forgemesh/controlplane/deployment/workflow.py
+@@ -116,10 +116,10 @@ class DeploymentRun:
+ 
+     Attributes:
+         key: 运行的幂等键。
+-        generation: 运行部署的 spec 的 generation；1.1.0 之前的运行（键为
++        generation: 运行部署的 spec 的 generation；旧版本的运行（键为
+             ``deployment:{uid}``，不含 generation）为 ``None``。
+         run: 运行快照。
+-        attempt: 这一代 spec 的第几次部署（1.1.0 之前的运行为 1）。
++        attempt: 这一代 spec 的第几次部署（旧版本的运行为 1）。
+     """
+ 
+     key: str
+@@ -134,8 +134,8 @@ async def find_deployment_runs(
+     """资源 ``uid`` 的部署运行（不创建），按创建先后排列。
+ 
+     经 :meth:`~forgemesh.workflow.runtime.WorkflowRuntime.find_runs` 按幂等键前缀查找；给出
+-    ``generation`` 时只返回部署这一代 spec 的运行（各次部署），否则返回全部运行，包括 1.1.0
+-    之前的 ``deployment:{uid}``。
++    ``generation`` 时只返回部署这一代 spec 的运行（各次部署），否则返回全部运行，包括旧版本
++    的 ``deployment:{uid}``。
+     """
+     prefix = f"{_RUN_KEY_PREFIX}{uid}"
+     pattern = re.compile(rf"{re.escape(prefix)}(?::(\d+)(?::(\d+))?)?", re.ASCII)
+diff --git a/packages/control-plane/src/forgemesh/controlplane/reconciler/core.py b/packages/control-plane/src/forgemesh/controlplane/reconciler/core.py
+index 703228a..43eb0a6 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/reconciler/core.py
++++ b/packages/control-plane/src/forgemesh/controlplane/reconciler/core.py
+@@ -51,7 +51,7 @@
+ 资源的实例、释放这个分配，再重新分配（新的申请放不下时停在当前 phase，``AllocationFailed``）。
+ 启动部署运行之前总是先经 release provider 停止资源之前的部署（取消进行中的运行、停止实例），
+ 同一时刻只有一个实例占用分配的设备。``Deploying`` / ``Verifying`` / ``Updating`` 时没有当前
+-generation 的运行（spec 在部署过程中变化，或运行来自 1.1.0 之前、幂等键不含 generation）：
++generation 的运行（spec 在部署过程中变化，或运行来自旧版本、幂等键不含 generation）：
+ 停止之前的部署、取得分配并启动当前 generation 的运行，phase 不变，之后跟踪新的运行，旧的
+ 运行不会让服务以旧的 spec 进入 ``Ready``。
+ 
+diff --git a/tests/unit/controlplane/test_deployment.py b/tests/unit/controlplane/test_deployment.py
+index 23a93ba..14b0719 100644
+--- a/tests/unit/controlplane/test_deployment.py
++++ b/tests/unit/controlplane/test_deployment.py
+@@ -265,7 +265,7 @@ def test_deployment_run_key_is_per_resource_uid_generation_and_attempt() -> None
+ 
+ @pytest.mark.unit
+ def test_find_deployment_runs_returns_the_runs_of_one_resource_in_creation_order() -> None:
+-    """包括 1.1.0 之前不含 generation 的键与重新部署的各次运行；uid 互为前缀的其他资源
++    """包括旧版本不含 generation 的键与重新部署的各次运行；uid 互为前缀的其他资源
+     不算在内。"""
+     keys = [
+         "deployment:uid-1:2",
+@@ -588,7 +588,7 @@ def test_releaser_retries_a_stop_that_failed_during_compensation() -> None:
+ 
+ @pytest.mark.unit
+ def test_releaser_stops_the_instances_of_every_deployment_run(caplog) -> None:
+-    """每一代 spec 与 1.1.0 之前的运行都被处理；只为停止时仍在运行的实例记日志。"""
++    """每一代 spec 与旧版本的运行都被处理；只为停止时仍在运行的实例记日志。"""
+     launcher = _ScriptedLauncher()
+ 
+     async def scenario() -> tuple[list[RunInfo], list[str]]:
+diff --git a/tests/unit/controlplane/test_reconciler.py b/tests/unit/controlplane/test_reconciler.py
+index c856ee9..062187b 100644
+--- a/tests/unit/controlplane/test_reconciler.py
++++ b/tests/unit/controlplane/test_reconciler.py
+@@ -1803,7 +1803,7 @@ def test_a_redeployment_in_progress_is_polled_without_writing_status():
+ 
+ @pytest.mark.unit
+ def test_a_degraded_service_deployed_before_runs_were_keyed_by_generation_is_deployed_again():
+-    """运行来自 1.1.0 之前（幂等键 ``deployment:{uid}``，不含 generation）：这一代 spec 没有
++    """运行来自旧版本（幂等键 ``deployment:{uid}``，不含 generation）：这一代 spec 没有
+     运行，以它的第一次部署重新部署。"""
+     workflow = StubWorkflowRuntime(run=make_run(WorkflowStatus.SUCCEEDED), key="deployment:uid-1")
+     controller = _controller(scheduler=MockScheduler(), workflow=workflow, launcher=StubLauncher())
+-- 
+2.43.0
+

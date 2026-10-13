@@ -1,0 +1,131 @@
+From 4322c8304231bd3f933c2d29edbcd4eff2ec33f1 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 13 Oct 2026 08:55:00 +0000
+Subject: [PATCH 4/6] fix(cli): report wait --for delete the same way whatever
+ the timing
+
+wait --for delete printed "deleted" when it had seen the service before
+it disappeared and "not found" when its first read already got a 404.
+After delete returns 202 the controller can finish removing the service
+before that first read, so the same commands printed one or the other
+depending on timing, and "not found" read like an error although both
+cases exit 0. The e2e test, whose controller polls every 50 ms, failed
+intermittently because of it (3 of 60 runs here).
+
+What wait --for delete waits for is that the service does not exist, so
+it now prints "<service> deleted" and exits 0 whether or not it saw the
+service first, as kubectl wait --for=delete does for an object that is
+already gone. The README and the --help exit code table state that a
+404 means success for wait --for delete rather than exit code 3, and
+the README notes that a wrong name or namespace is reported as success
+too.
+---
+ README.md                                  |  4 ++--
+ packages/cli/src/forgemesh/cli/commands.py |  8 +++++---
+ packages/cli/src/forgemesh/cli/main.py     |  2 +-
+ tests/unit/cli/test_commands.py            | 11 ++++++-----
+ 4 files changed, 14 insertions(+), 11 deletions(-)
+
+diff --git a/README.md b/README.md
+index 16ca9b2..ebc8ca2 100644
+--- a/README.md
++++ b/README.md
+@@ -273,7 +273,7 @@ CLI 只管理 `InferenceService`（写作 `inferenceservice` 或 `inferenceservi
+ 
+ 文件是 YAML（可以有多个以 `---` 分隔的文档）或 JSON（对象或对象的数组）；省略 `kind` 时视为 `InferenceService`；文档没有 `metadata.namespace` 时使用 `-n`，两者都给出时必须相同。全部文档在发出任何请求之前读取并检查，有一个不合法就不发出请求；某个资源失败时报告错误、继续处理其余的资源，以第一个失败的退出码结束。文档中的 `metadata.tenantId` 作为 `X-Tenant-Id` 发送（与 `--tenant` 不同时报错）：与 key 绑定的租户不符时 API 返回 `403`，资源不会被写进 key 的租户。
+ 
+-**wait**：每秒读取一次资源。`--for ready` 在 `status.phase` 为 `Ready`、`Ready` 条件为 `True` 且控制器已经处理当前的 `spec`（`metadata.observedGeneration` 不小于 `generation`）时成功；控制器处理当前的 `spec` 之后进入 `Failed`，或者资源正在删除时立即失败；超时时报告最后看到的状态。控制器目前不按新的 `spec` 重新部署已经 `Ready` 的服务（见「REST API」），修改这样的服务的 `spec` 之后 `wait` 会等到超时。`--for delete` 在资源不存在时成功。读取遇到限流（`429`，按 `Retry-After` 推迟下一次读取）或 `502`–`504` 时继续等待；连接失败只在此前收到过 HTTP 响应时视为暂时故障，第一次请求就连不上时立即失败。
++**wait**：每秒读取一次资源。`--for ready` 在 `status.phase` 为 `Ready`、`Ready` 条件为 `True` 且控制器已经处理当前的 `spec`（`metadata.observedGeneration` 不小于 `generation`）时成功；控制器处理当前的 `spec` 之后进入 `Failed`，或者资源正在删除时立即失败；超时时报告最后看到的状态。控制器目前不按新的 `spec` 重新部署已经 `Ready` 的服务（见「REST API」），修改这样的服务的 `spec` 之后 `wait` 会等到超时。`--for delete` 在资源不存在时成功（退出码 `0`），输出如 `InferenceService default/llama deleted`：开始等待时资源已经不存在（例如 `delete` 之后控制器在第一次读取之前就删除了它）同样如此，结果不取决于这个先后；因此名称或命名空间写错时也报告成功。读取遇到限流（`429`，按 `Retry-After` 推迟下一次读取）或 `502`–`504` 时继续等待；连接失败只在此前收到过 HTTP 响应时视为暂时故障，第一次请求就连不上时立即失败。
+ 
+ **错误与退出码**：错误消息写到标准错误，以 `Error:` 开头（参数写错时是 argparse 的用法提示）。错误信封显示为 `<message> (HTTP <状态码> <code>[, reason <details.reason>], correlation id <关联 ID>)`，请求校验失败时逐行列出字段与原因；网关自己的纯文本 `429` 与 `502` 分别报告为被网关限流（附上 `Retry-After` 的秒数）与网关连不上控制平面。一次调用的全部请求带同一个随机的 `X-Correlation-Id`，可以用它在网关与控制平面的日志中找到这次调用。`forgemesh --help` 列出同一张退出码表：
+ 
+@@ -282,7 +282,7 @@ CLI 只管理 `InferenceService`（写作 `inferenceservice` 或 `inferenceservi
+ | `0` | 成功 |
+ | `1` | 其他错误，如地址不提供 ForgeMesh API（不是错误信封的 `404`、重定向）或响应无法解析 |
+ | `2` | 参数、配置或资源文档不合法，没有发出请求 |
+-| `3` | 资源不存在（`404`） |
++| `3` | 资源不存在（`404`）；`wait --for delete` 此时以 `0` 成功 |
+ | `4` | 冲突（`409`），如资源正在删除，或 `apply` 的 5 次尝试都遇到并发修改 |
+ | `5` | 请求被拒绝（`400`、`405`、`413`、`415` 等其他 4xx） |
+ | `6` | 认证或授权失败（`401`、`403`） |
+diff --git a/packages/cli/src/forgemesh/cli/commands.py b/packages/cli/src/forgemesh/cli/commands.py
+index ba454fc..aa619a8 100644
+--- a/packages/cli/src/forgemesh/cli/commands.py
++++ b/packages/cli/src/forgemesh/cli/commands.py
+@@ -166,12 +166,14 @@ def cmd_wait(args: argparse.Namespace, client: ApiClient) -> int:
+     ``spec``（``observedGeneration`` 不小于 ``generation``）。资源正在删除，或控制器处理当前的
+     ``spec`` 之后进入 ``Failed`` 时立即失败。API 应答过一次之后，限流、``502`` - ``504`` 与连接
+     失败视为暂时故障，继续等待。
++
++    ``--for delete`` 在资源不存在时成功。开始等待时资源已经不存在，输出与等到它被删除时相同：
++    ``delete`` 之后控制器可能在第一次读取之前就删除了资源，结果不能取决于这个先后。
+     """
+     ref = f"{KIND} {resource_ref(args.namespace, args.name)}"
+     goal = "become Ready" if args.condition == "ready" else "be deleted"
+     deadline = time.monotonic() + args.timeout
+     answered = False
+-    seen = False
+     last = "no response"
+     while True:
+         delay = POLL_INTERVAL_SECONDS
+@@ -180,7 +182,7 @@ def cmd_wait(args: argparse.Namespace, client: ApiClient) -> int:
+         except ApiError as exc:
+             answered = True
+             if exc.not_found and args.condition == "delete":
+-                print(f"{ref} deleted" if seen else f"{ref} not found")
++                print(f"{ref} deleted")
+                 return ExitCode.OK
+             if not exc.transient:
+                 raise _not_found_hint(exc, args.namespace) from exc
+@@ -191,7 +193,7 @@ def cmd_wait(args: argparse.Namespace, client: ApiClient) -> int:
+                 raise
+             last = exc.message
+         else:
+-            answered = seen = True
++            answered = True
+             if args.condition == "ready":
+                 outcome, last = _readiness(service)
+                 if outcome is True:
+diff --git a/packages/cli/src/forgemesh/cli/main.py b/packages/cli/src/forgemesh/cli/main.py
+index 4bcdd77..d74ce67 100644
+--- a/packages/cli/src/forgemesh/cli/main.py
++++ b/packages/cli/src/forgemesh/cli/main.py
+@@ -54,7 +54,7 @@ exit codes:
+   0    success
+   1    other errors, e.g. the URL does not serve the ForgeMesh API
+   2    invalid arguments, configuration or resource documents (nothing sent)
+-  3    not found (HTTP 404)
++  3    not found (HTTP 404); wait --for delete exits 0 instead
+   4    conflict (HTTP 409), e.g. the service is being deleted
+   5    request rejected (HTTP 400, 405, 413, 415 and other 4xx)
+   6    authentication or authorization failed (HTTP 401, 403)
+diff --git a/tests/unit/cli/test_commands.py b/tests/unit/cli/test_commands.py
+index 762efcf..94c6f6f 100644
+--- a/tests/unit/cli/test_commands.py
++++ b/tests/unit/cli/test_commands.py
+@@ -575,16 +575,17 @@ def test_wait_for_a_missing_service_fails_with_not_found(
+     assert clock.sleeps == []
+ 
+ 
+-def test_wait_for_delete_returns_once_the_service_is_gone(
++def test_wait_for_delete_reports_the_same_result_whether_or_not_it_saw_the_service(
+     api: FakeApi, cli: Cli, clock: FakeClock
+ ) -> None:
+     api.reply("GET", PATH, 200, resource(document(), phase="Terminating"))
+ 
+-    deleted = cli("wait", "inferenceservice", "llama", "-n", "default", "--for", "delete")
+-    missing = cli("wait", "inferenceservice", "llama", "-n", "default", "--for", "delete")
++    observed = cli("wait", "inferenceservice", "llama", "-n", "default", "--for", "delete")
++    already_gone = cli("wait", "inferenceservice", "llama", "-n", "default", "--for", "delete")
+ 
+-    assert (deleted.code, deleted.out) == (0, "InferenceService default/llama deleted\n")
+-    assert (missing.code, missing.out) == (0, "InferenceService default/llama not found\n")
++    deleted = Result(ExitCode.OK, "InferenceService default/llama deleted\n", "")
++    assert (observed, already_gone) == (deleted, deleted)
++    assert api.log() == [f"GET {PATH}?namespace=default"] * 3
+     assert clock.sleeps == [1.0]
+ 
+ 
+-- 
+2.43.0
+

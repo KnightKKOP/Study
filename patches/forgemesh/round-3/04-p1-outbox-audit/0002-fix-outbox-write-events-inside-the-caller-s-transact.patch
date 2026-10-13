@@ -1,7 +1,7 @@
-From 1cca1d7ce6dfcd83a0c0cf7f92c9859ab37e57df Mon Sep 17 00:00:00 2001
+From 7a511ae4d4806c8a2b51e0fbce9ed28003009b49 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Tue, 13 Oct 2026 02:45:07 +0000
-Subject: [PATCH 02/12] fix(outbox): write events inside the caller's
+Subject: [PATCH 02/14] fix(outbox): write events inside the caller's
  transaction
 
 Outbox.put committed on its own, so an event could never be part of the

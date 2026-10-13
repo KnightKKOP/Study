@@ -1,0 +1,2666 @@
+From de979517ff6a93d841fa01c1c059946facbd9451 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 13 Oct 2026 13:57:33 +0000
+Subject: [PATCH 3/4] style: format the repository with ruff format
+
+73 Python files were not formatted the way ruff format formats them;
+contributors have kept their own changes formatted, but the older files
+never were. Run ruff format 0.17 over the repository once, so that a
+format check can be enforced and future diffs stay free of formatting
+noise. Only formatting changes: the commit is reproduced by running
+make fmt (ruff check --fix finds nothing) on its parent.
+---
+ .../src/forgemesh/controlplane/heartbeat.py   | 10 +--
+ .../forgemesh/controlplane/observability.py   | 28 ++----
+ .../forgemesh/controlplane/plugin_manager.py  | 12 +--
+ .../src/forgemesh/controlplane/tasks.py       | 10 +--
+ .../src/forgemesh/core/secrets.py             |  3 +-
+ .../src/forgemesh/decision/provider.py        |  4 +-
+ .../src/forgemesh/decision/records.py         | 47 +++-------
+ .../src/forgemesh/decision/router.py          |  3 +-
+ .../src/forgemesh/nodeagent/__init__.py       |  6 +-
+ .../src/forgemesh/nodeagent/probe.py          |  4 +-
+ .../src/forgemesh/nodeagent/recover.py        |  4 +-
+ .../src/forgemesh/plugin/isolation.py         |  4 +-
+ .../src/forgemesh/plugin/manifest.py          |  4 +-
+ .../src/forgemesh/plugin/scaffold.py          |  5 +-
+ .../src/forgemesh/policy/engine.py            |  1 +
+ .../policy-engine/src/forgemesh/policy/qos.py |  5 +-
+ .../src/forgemesh/policy/quota.py             |  1 +
+ .../src/forgemesh/policy/rules.py             |  1 +
+ .../src/forgemesh/workflow/runtime.py         |  4 +-
+ .../src/forgemesh/workflow/states.py          | 16 +---
+ .../src/forgemesh/workflowruntime/__init__.py |  8 +-
+ .../forgemesh/workflowruntime/compensate.py   |  8 +-
+ .../src/forgemesh/workflowruntime/dsl.py      |  4 +-
+ .../src/forgemesh/workflowruntime/store.py    | 35 ++++----
+ plugins/decision-jev/provider.py              |  4 +-
+ plugins/gpu-nvidia/discovery.py               | 15 ++--
+ plugins/gpu-nvidia/health.py                  | 10 ++-
+ plugins/gpu-nvidia/hetero.py                  | 58 +++++++------
+ plugins/gpu-nvidia/mig.py                     |  4 +-
+ plugins/gpu-nvidia/preflight.py               |  2 +
+ plugins/metering-basic/provider.py            |  8 +-
+ plugins/metering-basic/usage.py               | 28 ++----
+ plugins/runtime-tgi/provider.py               |  4 +-
+ plugins/runtime-vllm/release.py               |  4 +-
+ plugins/runtime-vllm/verify.py                |  6 +-
+ plugins/workflow-temporal/provider.py         |  8 +-
+ scripts/check_metadata_consistency.py         | 12 ++-
+ scripts/openapi_semantic_check.py             |  6 +-
+ tests/chaos/test_cp_restart.py                |  6 +-
+ tests/chaos/test_duplicate_events.py          |  4 +-
+ tests/chaos/test_node_offline.py              | 28 ++----
+ tests/compat/test_plugin_compatibility.py     |  4 +-
+ tests/compat/test_plugin_conformance_v11.py   | 86 ++++++-------------
+ tests/contract/test_allocation_exclusivity.py | 27 ++----
+ tests/contract/test_finalizer_closed_loop.py  | 12 +--
+ tests/contract/test_registry_consistency.py   |  4 +-
+ tests/e2e/test_gpu_onboarding.py              | 30 ++-----
+ .../performance/test_conflict_correctness.py  |  8 +-
+ tests/security/test_plugin_permissions.py     |  7 +-
+ tests/security/test_secret_handling.py        |  4 +-
+ tests/unit/controlplane/test_audit.py         |  1 +
+ tests/unit/controlplane/test_diagnostics.py   | 37 ++++----
+ tests/unit/controlplane/test_heartbeat.py     |  1 +
+ tests/unit/controlplane/test_observability.py |  5 +-
+ tests/unit/controlplane/test_outbox.py        |  1 +
+ .../unit/controlplane/test_plugin_manager.py  |  4 +-
+ tests/unit/controlplane/test_tasks.py         |  1 +
+ tests/unit/decision/test_records.py           | 12 ++-
+ tests/unit/decision/test_router.py            | 28 ++----
+ tests/unit/plugins/test_decision_jev.py       | 45 ++++------
+ tests/unit/plugins/test_decision_rules.py     | 20 ++---
+ tests/unit/plugins/test_gpu_hetero.py         | 57 +++++++++---
+ tests/unit/plugins/test_gpu_mig.py            | 10 +--
+ tests/unit/plugins/test_isolation.py          |  4 +-
+ tests/unit/plugins/test_metering_basic.py     | 77 +++++++++++++----
+ tests/unit/plugins/test_qos_basic.py          |  1 -
+ tests/unit/policy/test_engine.py              |  9 +-
+ tests/unit/policy/test_qos.py                 |  1 +
+ tests/unit/policy/test_quota.py               |  1 +
+ tests/unit/resource/test_inference.py         |  8 +-
+ tests/unit/workflowruntime/test_compensate.py |  8 +-
+ tests/unit/workflowruntime/test_exec.py       | 55 ++++--------
+ tests/unit/workflowruntime/test_store.py      |  8 +-
+ 73 files changed, 419 insertions(+), 591 deletions(-)
+
+diff --git a/packages/control-plane/src/forgemesh/controlplane/heartbeat.py b/packages/control-plane/src/forgemesh/controlplane/heartbeat.py
+index 2651ce8..8ed6c84 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/heartbeat.py
++++ b/packages/control-plane/src/forgemesh/controlplane/heartbeat.py
+@@ -131,10 +131,7 @@ class HeartbeatManager:
+         if degraded_threshold_seconds <= 0:
+             raise ValueError("degraded_threshold_seconds must be positive")
+         if degraded_threshold_seconds > offline_threshold_seconds:
+-            raise ValueError(
+-                "degraded_threshold_seconds must not exceed "
+-                "offline_threshold_seconds"
+-            )
++            raise ValueError("degraded_threshold_seconds must not exceed offline_threshold_seconds")
+         self._offline_threshold = offline_threshold_seconds
+         self._degraded_threshold = degraded_threshold_seconds
+         #: agent_id → 追踪状态。
+@@ -230,10 +227,7 @@ class HeartbeatManager:
+         newly_offline: list[str] = []
+         for agent_id, tracker in self._agents.items():
+             new_state = self._compute_state(tracker, now)
+-            if (
+-                new_state is AgentState.OFFLINE
+-                and tracker.state is not AgentState.OFFLINE
+-            ):
++            if new_state is AgentState.OFFLINE and tracker.state is not AgentState.OFFLINE:
+                 newly_offline.append(agent_id)
+             tracker.state = new_state
+         return newly_offline
+diff --git a/packages/control-plane/src/forgemesh/controlplane/observability.py b/packages/control-plane/src/forgemesh/controlplane/observability.py
+index 1184ce7..e744519 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/observability.py
++++ b/packages/control-plane/src/forgemesh/controlplane/observability.py
+@@ -25,18 +25,10 @@ from pydantic import BaseModel, ConfigDict, Field
+ # 关联上下文
+ # ---------------------------------------------------------------------- #
+ 
+-_correlation_id_var: ContextVar[str | None] = ContextVar(
+-    "forgemesh_correlation_id", default=None
+-)
+-_tenant_id_var: ContextVar[str | None] = ContextVar(
+-    "forgemesh_tenant_id", default=None
+-)
+-_request_id_var: ContextVar[str | None] = ContextVar(
+-    "forgemesh_request_id", default=None
+-)
+-_operation_var: ContextVar[str | None] = ContextVar(
+-    "forgemesh_operation", default=None
+-)
++_correlation_id_var: ContextVar[str | None] = ContextVar("forgemesh_correlation_id", default=None)
++_tenant_id_var: ContextVar[str | None] = ContextVar("forgemesh_tenant_id", default=None)
++_request_id_var: ContextVar[str | None] = ContextVar("forgemesh_request_id", default=None)
++_operation_var: ContextVar[str | None] = ContextVar("forgemesh_operation", default=None)
+ 
+ 
+ def new_correlation_id() -> str:
+@@ -269,13 +261,9 @@ class MetricsRecorder:
+             每个条目含 ``name`` / ``tags`` / ``value``（histogram 为 ``values``）。
+         """
+         counters = [
+-            {"name": e.name, "tags": e.tags, "value": e.value}
+-            for e in self._counters.values()
+-        ]
+-        gauges = [
+-            {"name": e.name, "tags": e.tags, "value": e.value}
+-            for e in self._gauges.values()
++            {"name": e.name, "tags": e.tags, "value": e.value} for e in self._counters.values()
+         ]
++        gauges = [{"name": e.name, "tags": e.tags, "value": e.value} for e in self._gauges.values()]
+         histograms = [
+             {"name": e.name, "tags": e.tags, "values": list(e.values)}
+             for e in self._histograms.values()
+@@ -388,9 +376,7 @@ class StructuredLogger:
+ # 分布式追踪
+ # ---------------------------------------------------------------------- #
+ 
+-_parent_span_id_var: ContextVar[str | None] = ContextVar(
+-    "forgemesh_parent_span_id", default=None
+-)
++_parent_span_id_var: ContextVar[str | None] = ContextVar("forgemesh_parent_span_id", default=None)
+ 
+ 
+ class TraceSpan:
+diff --git a/packages/control-plane/src/forgemesh/controlplane/plugin_manager.py b/packages/control-plane/src/forgemesh/controlplane/plugin_manager.py
+index 88ef3e5..a14648f 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/plugin_manager.py
++++ b/packages/control-plane/src/forgemesh/controlplane/plugin_manager.py
+@@ -302,9 +302,7 @@ class PluginManager:
+             raise NotFoundError(f"plugin not found: {plugin_id}")
+         return self._plugins[plugin_id]
+ 
+-    def discover(
+-        self, category: PluginCategory | None = None
+-    ) -> list[PluginManifest]:
++    def discover(self, category: PluginCategory | None = None) -> list[PluginManifest]:
+         """发现已注册插件，可按类别过滤。
+ 
+         Args:
+@@ -323,9 +321,7 @@ class PluginManager:
+     # 生命周期管理
+     # ------------------------------------------------------------------ #
+ 
+-    def transition(
+-        self, plugin_id: str, target: PluginLifecycleState
+-    ) -> PluginRecord:
++    def transition(self, plugin_id: str, target: PluginLifecycleState) -> PluginRecord:
+         """执行生命周期状态转移。
+ 
+         合法转移由 :data:`forgemesh.plugin.manifest.PLUGIN_TRANSITIONS` 定义。
+@@ -470,9 +466,7 @@ class PluginManager:
+             PluginLifecycleState.ENABLED,
+             PluginLifecycleState.DISABLED,
+         }
+-        return [
+-            r for r in self._plugins.values() if r.lifecycle_state in installed_states
+-        ]
++        return [r for r in self._plugins.values() if r.lifecycle_state in installed_states]
+ 
+ 
+ __all__ = [
+diff --git a/packages/control-plane/src/forgemesh/controlplane/tasks.py b/packages/control-plane/src/forgemesh/controlplane/tasks.py
+index f5ab17b..ba5ecfe 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/tasks.py
++++ b/packages/control-plane/src/forgemesh/controlplane/tasks.py
+@@ -64,7 +64,8 @@ class TaskStatus(StrEnum):
+ 
+ #: 任务终态集合（无出边），用于 ``list_pending`` 过滤。
+ _TASK_TERMINAL_STATUSES: frozenset[str] = frozenset(
+-    s.value for s in (
++    s.value
++    for s in (
+         TaskStatus.SUCCEEDED,
+         TaskStatus.FAILED,
+         TaskStatus.CANCELLED,
+@@ -261,8 +262,7 @@ class TaskStore:
+         """同步更新任务状态与结果。"""
+         now = self._now()
+         cur = self._conn.execute(
+-            "UPDATE tasks SET status = ?, result = ?, updated_at = ? "
+-            "WHERE task_id = ?",
++            "UPDATE tasks SET status = ?, result = ?, updated_at = ? WHERE task_id = ?",
+             (status.value, result, now, task_id),
+         )
+         if cur.rowcount == 0:
+@@ -355,9 +355,7 @@ class TaskStore:
+ 
+     async def list_by_idempotency_key(self, idempotency_key: str) -> Task | None:
+         """按幂等键查询任务，不存在返回 ``None``。"""
+-        return await self._db.run(
+-            self._list_by_idempotency_key_sync, idempotency_key
+-        )
++        return await self._db.run(self._list_by_idempotency_key_sync, idempotency_key)
+ 
+     async def close(self) -> None:
+         """关闭数据库连接（共用的 ``database`` 由创建者关闭）。"""
+diff --git a/packages/core-contracts/src/forgemesh/core/secrets.py b/packages/core-contracts/src/forgemesh/core/secrets.py
+index ca2c770..1f4660d 100644
+--- a/packages/core-contracts/src/forgemesh/core/secrets.py
++++ b/packages/core-contracts/src/forgemesh/core/secrets.py
+@@ -32,8 +32,7 @@ class SecretRef(BaseModel):
+         子类覆盖此方法。绝不将明文写入日志、事件或资源对象。
+         """
+         raise NotImplementedError(
+-            "SecretRef.resolve() 必须由具体 Secret Provider 实现；"
+-            "核心契约不持有明文"
++            "SecretRef.resolve() 必须由具体 Secret Provider 实现；核心契约不持有明文"
+         )
+ 
+ 
+diff --git a/packages/decision-api/src/forgemesh/decision/provider.py b/packages/decision-api/src/forgemesh/decision/provider.py
+index d884b2f..e148657 100644
+--- a/packages/decision-api/src/forgemesh/decision/provider.py
++++ b/packages/decision-api/src/forgemesh/decision/provider.py
+@@ -36,9 +36,7 @@ class DecisionRequest(BaseModel):
+     risk_level: Literal["low", "medium", "high"] = Field(
+         default="low", description="风险等级（low/medium/high），高风险触发降级保护"
+     )
+-    deadline_ms: int = Field(
+-        default=2000, ge=1, description="决策时限（毫秒），超时视为失败"
+-    )
++    deadline_ms: int = Field(default=2000, ge=1, description="决策时限（毫秒），超时视为失败")
+ 
+ 
+ class DecisionCandidate(BaseModel):
+diff --git a/packages/decision-api/src/forgemesh/decision/records.py b/packages/decision-api/src/forgemesh/decision/records.py
+index db0d5c0..83a440a 100644
+--- a/packages/decision-api/src/forgemesh/decision/records.py
++++ b/packages/decision-api/src/forgemesh/decision/records.py
+@@ -106,12 +106,9 @@ class DecisionRecordStore:
+     @staticmethod
+     def _serialize_candidates(candidates: list[DecisionCandidate]) -> str:
+         """序列化候选列表为 JSON。"""
+-        return json.dumps(
+-            [c.model_dump() for c in candidates], ensure_ascii=False
+-        )
++        return json.dumps([c.model_dump() for c in candidates], ensure_ascii=False)
+ 
+     @staticmethod
+-
+     def _serialize_chosen(chosen: DecisionCandidate | None) -> str | None:
+         """序列化选中候选为 JSON。"""
+         if chosen is None:
+@@ -135,8 +132,7 @@ class DecisionRecordStore:
+             provider_version=row["provider_version"],
+             operation=row["operation"],
+             candidates=[
+-                DecisionCandidate.model_validate(item)
+-                for item in json.loads(row["candidates"])
++                DecisionCandidate.model_validate(item) for item in json.loads(row["candidates"])
+             ],
+             chosen=self._deserialize_chosen(row["chosen"]),
+             success=bool(row["success"]),
+@@ -186,20 +182,15 @@ class DecisionRecordStore:
+             raise NotFoundError(f"decision record not found: {record_id}")
+         return self._row_to_record(row)
+ 
+-    def _list_by_tenant_sync(
+-        self, tenant_id: str, limit: int = 100
+-    ) -> list[DecisionRecord]:
++    def _list_by_tenant_sync(self, tenant_id: str, limit: int = 100) -> list[DecisionRecord]:
+         """同步按租户列出记录。"""
+         rows = self._conn.execute(
+-            "SELECT * FROM decision_records WHERE tenant_id = ? "
+-            "ORDER BY created_at DESC LIMIT ?",
++            "SELECT * FROM decision_records WHERE tenant_id = ? ORDER BY created_at DESC LIMIT ?",
+             (tenant_id, limit),
+         ).fetchall()
+         return [self._row_to_record(r) for r in rows]
+ 
+-    def _list_pending_approvals_sync(
+-        self, tenant_id: str
+-    ) -> list[DecisionRecord]:
++    def _list_pending_approvals_sync(self, tenant_id: str) -> list[DecisionRecord]:
+         """同步列出待审批记录。"""
+         rows = self._conn.execute(
+             "SELECT * FROM decision_records "
+@@ -209,9 +200,7 @@ class DecisionRecordStore:
+         ).fetchall()
+         return [self._row_to_record(r) for r in rows]
+ 
+-    def _update_approval_status_sync(
+-        self, record_id: str, status: str
+-    ) -> None:
++    def _update_approval_status_sync(self, record_id: str, status: str) -> None:
+         """同步更新审批状态。"""
+         row = self._conn.execute(
+             "SELECT 1 FROM decision_records WHERE record_id = ?",
+@@ -245,25 +234,15 @@ class DecisionRecordStore:
+         """
+         return await asyncio.to_thread(self._get_sync, record_id)
+ 
+-    async def list_by_tenant(
+-        self, tenant_id: str, limit: int = 100
+-    ) -> list[DecisionRecord]:
++    async def list_by_tenant(self, tenant_id: str, limit: int = 100) -> list[DecisionRecord]:
+         """按租户列出决策记录（按创建时间降序）。"""
+-        return await asyncio.to_thread(
+-            self._list_by_tenant_sync, tenant_id, limit
+-        )
++        return await asyncio.to_thread(self._list_by_tenant_sync, tenant_id, limit)
+ 
+-    async def list_pending_approvals(
+-        self, tenant_id: str
+-    ) -> list[DecisionRecord]:
++    async def list_pending_approvals(self, tenant_id: str) -> list[DecisionRecord]:
+         """列出指定租户的待审批决策记录。"""
+-        return await asyncio.to_thread(
+-            self._list_pending_approvals_sync, tenant_id
+-        )
++        return await asyncio.to_thread(self._list_pending_approvals_sync, tenant_id)
+ 
+-    async def update_approval_status(
+-        self, record_id: str, status: str
+-    ) -> None:
++    async def update_approval_status(self, record_id: str, status: str) -> None:
+         """更新决策记录的审批状态。
+ 
+         Args:
+@@ -273,9 +252,7 @@ class DecisionRecordStore:
+         Raises:
+             NotFoundError: 记录不存在。
+         """
+-        await asyncio.to_thread(
+-            self._update_approval_status_sync, record_id, status
+-        )
++        await asyncio.to_thread(self._update_approval_status_sync, record_id, status)
+ 
+     async def close(self) -> None:
+         """关闭数据库连接。"""
+diff --git a/packages/decision-api/src/forgemesh/decision/router.py b/packages/decision-api/src/forgemesh/decision/router.py
+index 62642ee..15f1d3d 100644
+--- a/packages/decision-api/src/forgemesh/decision/router.py
++++ b/packages/decision-api/src/forgemesh/decision/router.py
+@@ -164,8 +164,7 @@ class DecisionRouter:
+                 status="FAILED",
+                 attempts=[],
+                 error=(
+-                    f"high-risk request (risk_level={req.risk_level}) "
+-                    "requires fallback providers"
++                    f"high-risk request (risk_level={req.risk_level}) requires fallback providers"
+                 ),
+             )
+ 
+diff --git a/packages/node-agent/src/forgemesh/nodeagent/__init__.py b/packages/node-agent/src/forgemesh/nodeagent/__init__.py
+index 3694a6c..8057ba4 100644
+--- a/packages/node-agent/src/forgemesh/nodeagent/__init__.py
++++ b/packages/node-agent/src/forgemesh/nodeagent/__init__.py
+@@ -91,8 +91,7 @@ class NodeAgent(ABC):
+     """
+ 
+     @abstractmethod
+-    async def register(self, *, agent_id: str, agent_version: str,
+-                       capabilities: list[str]) -> bool:
++    async def register(self, *, agent_id: str, agent_version: str, capabilities: list[str]) -> bool:
+         """注册并协商能力/兼容性。返回是否被接受。"""
+         raise NotImplementedError
+ 
+@@ -112,8 +111,7 @@ class NodeAgent(ABC):
+         raise NotImplementedError
+ 
+     @abstractmethod
+-    async def cancel_task(self, *, task_id: str, execution_id: str,
+-                          reason: str = "") -> TaskResult:
++    async def cancel_task(self, *, task_id: str, execution_id: str, reason: str = "") -> TaskResult:
+         """取消任务并返回其结果。"""
+         raise NotImplementedError
+ 
+diff --git a/packages/node-agent/src/forgemesh/nodeagent/probe.py b/packages/node-agent/src/forgemesh/nodeagent/probe.py
+index 0ea0595..7efe649 100644
+--- a/packages/node-agent/src/forgemesh/nodeagent/probe.py
++++ b/packages/node-agent/src/forgemesh/nodeagent/probe.py
+@@ -87,9 +87,7 @@ class DeviceProber:
+         return {
+             "node": node.model_dump(mode="json"),
+             "accelerators": [a.model_dump(mode="json") for a in result.accelerators],
+-            "device_instances": [
+-                d.model_dump(mode="json") for d in result.device_instances
+-            ],
++            "device_instances": [d.model_dump(mode="json") for d in result.device_instances],
+             "topology": result.topology.model_dump(mode="json"),
+         }
+ 
+diff --git a/packages/node-agent/src/forgemesh/nodeagent/recover.py b/packages/node-agent/src/forgemesh/nodeagent/recover.py
+index addad00..557c8ed 100644
+--- a/packages/node-agent/src/forgemesh/nodeagent/recover.py
++++ b/packages/node-agent/src/forgemesh/nodeagent/recover.py
+@@ -74,9 +74,7 @@ class RecoveryManager:
+         for ex in running_executions:
+             state = await server.get_execution_state(ex.execution_id)
+             action, reason = self._decide(state)
+-            actions.append(
+-                RecoveryAction(task_id=ex.task_id, action=action, reason=reason)
+-            )
++            actions.append(RecoveryAction(task_id=ex.task_id, action=action, reason=reason))
+         return actions
+ 
+     @staticmethod
+diff --git a/packages/plugin-sdk/src/forgemesh/plugin/isolation.py b/packages/plugin-sdk/src/forgemesh/plugin/isolation.py
+index 9b1832d..7697324 100644
+--- a/packages/plugin-sdk/src/forgemesh/plugin/isolation.py
++++ b/packages/plugin-sdk/src/forgemesh/plugin/isolation.py
+@@ -229,9 +229,7 @@ class PluginVersionCompat:
+         tgt = _parse_semver(target)
+ 
+         if tgt == cur:
+-            return UpgradeCheck(
+-                compatible=True, breaking=False, reason=f"same version {current}"
+-            )
++            return UpgradeCheck(compatible=True, breaking=False, reason=f"same version {current}")
+         if tgt < cur:
+             return UpgradeCheck(
+                 compatible=False,
+diff --git a/packages/plugin-sdk/src/forgemesh/plugin/manifest.py b/packages/plugin-sdk/src/forgemesh/plugin/manifest.py
+index 24e1fe4..e5a8d62 100644
+--- a/packages/plugin-sdk/src/forgemesh/plugin/manifest.py
++++ b/packages/plugin-sdk/src/forgemesh/plugin/manifest.py
+@@ -230,9 +230,7 @@ def validate_plugin_transition(
+     to_s = _coerce(to)
+     allowed = PLUGIN_TRANSITIONS.get(cur_s, set())
+     if to_s not in allowed:
+-        raise InvalidStateTransition(
+-            f"illegal plugin transition: {cur_s.value} -> {to_s.value}"
+-        )
++        raise InvalidStateTransition(f"illegal plugin transition: {cur_s.value} -> {to_s.value}")
+ 
+ 
+ __all__ = [
+diff --git a/packages/plugin-sdk/src/forgemesh/plugin/scaffold.py b/packages/plugin-sdk/src/forgemesh/plugin/scaffold.py
+index c0746ac..ecf8225 100644
+--- a/packages/plugin-sdk/src/forgemesh/plugin/scaffold.py
++++ b/packages/plugin-sdk/src/forgemesh/plugin/scaffold.py
+@@ -530,6 +530,7 @@ class ScaffoldTemplate:
+         Raises:
+             ScaffoldError: 模板中存在 ``context`` 未提供的占位符。
+         """
++
+         def _replace(match: re.Match[str]) -> str:
+             key = match.group(1)
+             if key not in context:
+@@ -612,9 +613,7 @@ class ScaffoldGenerator:
+     @staticmethod
+     def _validate_name(name: str) -> None:
+         if not _VALID_NAME_RE.match(name):
+-            raise ScaffoldError(
+-                f"invalid plugin name: {name!r} (must match [a-z][a-z0-9-]*)"
+-            )
++            raise ScaffoldError(f"invalid plugin name: {name!r} (must match [a-z][a-z0-9-]*)")
+ 
+     @staticmethod
+     def _assert_no_placeholders(files: list[tuple[Path, str]]) -> None:
+diff --git a/packages/policy-engine/src/forgemesh/policy/engine.py b/packages/policy-engine/src/forgemesh/policy/engine.py
+index a811811..f14e913 100644
+--- a/packages/policy-engine/src/forgemesh/policy/engine.py
++++ b/packages/policy-engine/src/forgemesh/policy/engine.py
+@@ -8,6 +8,7 @@
+ 全部通过返回 allow；条件授权/配额接近上限等降级类信息合并进
+ obligations（不改变 allow 语义），高风险操作返回 require_approval。
+ """
++
+ from __future__ import annotations
+ 
+ from typing import Any
+diff --git a/packages/policy-engine/src/forgemesh/policy/qos.py b/packages/policy-engine/src/forgemesh/policy/qos.py
+index a60e1ef..9a4d2de 100644
+--- a/packages/policy-engine/src/forgemesh/policy/qos.py
++++ b/packages/policy-engine/src/forgemesh/policy/qos.py
+@@ -10,6 +10,7 @@
+ * :class:`PriorityQueue` —— 优先级队列，按 :class:`Priority` 排序、同优先级 FIFO。
+ * :class:`QoSManager` —— 准入管理器，组合优先级 + 限流 + 全局并发数判断。
+ """
++
+ from __future__ import annotations
+ 
+ import asyncio
+@@ -229,9 +230,7 @@ class QoSManager:
+                     )
+             # 3. 占用并发槽
+             self._total_concurrent += 1
+-            self._concurrent[request.tenant_id] = (
+-                self._concurrent.get(request.tenant_id, 0) + 1
+-            )
++            self._concurrent[request.tenant_id] = self._concurrent.get(request.tenant_id, 0) + 1
+             return QoSDecision(
+                 allowed=True,
+                 reason="admitted",
+diff --git a/packages/policy-engine/src/forgemesh/policy/quota.py b/packages/policy-engine/src/forgemesh/policy/quota.py
+index 26a3a29..41fbd6f 100644
+--- a/packages/policy-engine/src/forgemesh/policy/quota.py
++++ b/packages/policy-engine/src/forgemesh/policy/quota.py
+@@ -10,6 +10,7 @@
+ * :meth:`QuotaPolicy.consume` 在锁内完成「检查 + 递增」，避免 check-then-act 竞态。
+ * :meth:`QuotaPolicy.get_usage` 返回副本，防止外部修改内部状态。
+ """
++
+ from __future__ import annotations
+ 
+ import asyncio
+diff --git a/packages/policy-engine/src/forgemesh/policy/rules.py b/packages/policy-engine/src/forgemesh/policy/rules.py
+index d5c845d..95b216a 100644
+--- a/packages/policy-engine/src/forgemesh/policy/rules.py
++++ b/packages/policy-engine/src/forgemesh/policy/rules.py
+@@ -9,6 +9,7 @@ development-plan 5.6 与 architecture 7.5（degraded 降级放行已移除，
+ * :class:`QuotaRule` —— 配额规则，超限 deny、接近上限 allow + 告警约束。
+ * :class:`RuleSet` —— 规则集合，组合授权与配额检查。
+ """
++
+ from __future__ import annotations
+ 
+ from pydantic import BaseModel, ConfigDict, Field
+diff --git a/packages/workflow-api/src/forgemesh/workflow/runtime.py b/packages/workflow-api/src/forgemesh/workflow/runtime.py
+index 70d54ac..32ed2d7 100644
+--- a/packages/workflow-api/src/forgemesh/workflow/runtime.py
++++ b/packages/workflow-api/src/forgemesh/workflow/runtime.py
+@@ -199,9 +199,7 @@ class WorkflowRuntime(ABC):
+         raise NotImplementedError
+ 
+     @abstractmethod
+-    async def signal(
+-        self, run_id: str, name: str, payload: dict[str, Any]
+-    ) -> None:
++    async def signal(self, run_id: str, name: str, payload: dict[str, Any]) -> None:
+         """向运行实例投递外部信号，唤醒处于 ``WAITING`` 的步骤/审批。
+ 
+         Args:
+diff --git a/packages/workflow-api/src/forgemesh/workflow/states.py b/packages/workflow-api/src/forgemesh/workflow/states.py
+index bacb3d3..1b75788 100644
+--- a/packages/workflow-api/src/forgemesh/workflow/states.py
++++ b/packages/workflow-api/src/forgemesh/workflow/states.py
+@@ -153,9 +153,7 @@ def _coerce_step(status: StepStatus | str) -> StepStatus:
+         raise InvalidStateTransition(f"unknown step status: {status!r}") from exc
+ 
+ 
+-def validate_workflow_transition(
+-    cur: WorkflowStatus | str, to: WorkflowStatus | str
+-) -> None:
++def validate_workflow_transition(cur: WorkflowStatus | str, to: WorkflowStatus | str) -> None:
+     """校验工作流状态转移是否合法。
+ 
+     Args:
+@@ -170,14 +168,10 @@ def validate_workflow_transition(
+     to_s = _coerce_workflow(to)
+     allowed = WORKFLOW_TRANSITIONS.get(cur_s, set())
+     if to_s not in allowed:
+-        raise InvalidStateTransition(
+-            f"illegal workflow transition: {cur_s.value} -> {to_s.value}"
+-        )
++        raise InvalidStateTransition(f"illegal workflow transition: {cur_s.value} -> {to_s.value}")
+ 
+ 
+-def validate_step_transition(
+-    cur: StepStatus | str, to: StepStatus | str
+-) -> None:
++def validate_step_transition(cur: StepStatus | str, to: StepStatus | str) -> None:
+     """校验步骤状态转移是否合法。
+ 
+     Args:
+@@ -192,9 +186,7 @@ def validate_step_transition(
+     to_s = _coerce_step(to)
+     allowed = STEP_TRANSITIONS.get(cur_s, set())
+     if to_s not in allowed:
+-        raise InvalidStateTransition(
+-            f"illegal step transition: {cur_s.value} -> {to_s.value}"
+-        )
++        raise InvalidStateTransition(f"illegal step transition: {cur_s.value} -> {to_s.value}")
+ 
+ 
+ __all__ = [
+diff --git a/packages/workflow-runtime/src/forgemesh/workflowruntime/__init__.py b/packages/workflow-runtime/src/forgemesh/workflowruntime/__init__.py
+index 566a060..f338e38 100644
+--- a/packages/workflow-runtime/src/forgemesh/workflowruntime/__init__.py
++++ b/packages/workflow-runtime/src/forgemesh/workflowruntime/__init__.py
+@@ -49,9 +49,7 @@ class WorkflowProvider(ABC):
+         raise NotImplementedError
+ 
+     @abstractmethod
+-    async def approve(
+-        self, *, run_id: str, step_id: str, tenant_id: str, approver: str
+-    ) -> None:
++    async def approve(self, *, run_id: str, step_id: str, tenant_id: str, approver: str) -> None:
+         """对等待人工审批的高风险步骤进行审批。"""
+         raise NotImplementedError
+ 
+@@ -100,9 +98,7 @@ class ReferenceWorkflowProvider(WorkflowProvider):
+             return {"runId": run_id, "state": "Unknown", "tenantId": tenant_id}
+         return {"runId": run_id, **record}
+ 
+-    async def approve(
+-        self, *, run_id: str, step_id: str, tenant_id: str, approver: str
+-    ) -> None:
++    async def approve(self, *, run_id: str, step_id: str, tenant_id: str, approver: str) -> None:
+         raise NotImplementedError("阶段 0 占位：审批流程尚未实现。")
+ 
+     async def cancel(self, *, run_id: str, tenant_id: str, reason: str = "") -> None:
+diff --git a/packages/workflow-runtime/src/forgemesh/workflowruntime/compensate.py b/packages/workflow-runtime/src/forgemesh/workflowruntime/compensate.py
+index 2833b81..9848a7c 100644
+--- a/packages/workflow-runtime/src/forgemesh/workflowruntime/compensate.py
++++ b/packages/workflow-runtime/src/forgemesh/workflowruntime/compensate.py
+@@ -45,9 +45,7 @@ class CompensationRegistry:
+         """检查指定步骤是否注册了补偿 handler。"""
+         return step_id in self._handlers
+ 
+-    async def compensate_step(
+-        self, step: Step, inputs: dict[str, Any]
+-    ) -> dict[str, Any]:
++    async def compensate_step(self, step: Step, inputs: dict[str, Any]) -> dict[str, Any]:
+         """执行指定步骤的补偿。
+ 
+         Args:
+@@ -113,9 +111,7 @@ class CompensationExecutor:
+                 results[step_id] = StepStatus.SKIPPED
+                 continue
+             try:
+-                await self._registry.compensate_step(
+-                    step, step_results.get(step_id, {})
+-                )
++                await self._registry.compensate_step(step, step_results.get(step_id, {}))
+                 results[step_id] = StepStatus.COMPENSATED
+             except Exception:
+                 # 补偿失败不中断，继续补偿其余步骤以最大化清理。
+diff --git a/packages/workflow-runtime/src/forgemesh/workflowruntime/dsl.py b/packages/workflow-runtime/src/forgemesh/workflowruntime/dsl.py
+index 76c5b7b..14c5022 100644
+--- a/packages/workflow-runtime/src/forgemesh/workflowruntime/dsl.py
++++ b/packages/workflow-runtime/src/forgemesh/workflowruntime/dsl.py
+@@ -44,9 +44,7 @@ def validate_dag(steps: list[Step]) -> None:
+                 in_degree[step.id] += 1
+ 
+     # Kahn 拓扑排序。
+-    queue: deque[str] = deque(
+-        sid for sid, deg in in_degree.items() if deg == 0
+-    )
++    queue: deque[str] = deque(sid for sid, deg in in_degree.items() if deg == 0)
+     processed = 0
+     while queue:
+         node = queue.popleft()
+diff --git a/packages/workflow-runtime/src/forgemesh/workflowruntime/store.py b/packages/workflow-runtime/src/forgemesh/workflowruntime/store.py
+index 7132cc2..1ff0f0a 100644
+--- a/packages/workflow-runtime/src/forgemesh/workflowruntime/store.py
++++ b/packages/workflow-runtime/src/forgemesh/workflowruntime/store.py
+@@ -76,7 +76,8 @@ CREATE INDEX IF NOT EXISTS idx_runs_idempotency ON workflow_runs(idempotency_key
+ 
+ #: 工作流终态集合（无出边），用于 ``list_pending_runs`` 过滤。
+ _WORKFLOW_TERMINAL_STATUSES: frozenset[str] = frozenset(
+-    s.value for s in (
++    s.value
++    for s in (
+         WorkflowStatus.SUCCEEDED,
+         WorkflowStatus.FAILED,
+         WorkflowStatus.CANCELLED,
+@@ -160,8 +161,7 @@ class WorkflowStore:
+         """同步创建运行实例（幂等）。"""
+         # 幂等检查：同一 idempotency_key 已存在则返回已有实例。
+         existing = self._conn.execute(
+-            "SELECT run_id, definition_version FROM workflow_runs "
+-            "WHERE idempotency_key = ?",
++            "SELECT run_id, definition_version FROM workflow_runs WHERE idempotency_key = ?",
+             (idempotency_key,),
+         ).fetchone()
+         if existing is not None:
+@@ -302,9 +302,7 @@ class WorkflowStore:
+             (run_id, step_id),
+         ).fetchone()
+         if row is None:
+-            raise NotFoundError(
+-                f"step not found: run_id={run_id}, step_id={step_id}"
+-            )
++            raise NotFoundError(f"step not found: run_id={run_id}, step_id={step_id}")
+ 
+         cur_status = row["status"]
+         # 校验转移合法性。
+@@ -314,14 +312,19 @@ class WorkflowStore:
+         started_at = row["started_at"]
+         if status == StepStatus.RUNNING.value and started_at is None:
+             started_at = now
+-        finished_at = now if status in (
+-            StepStatus.SUCCEEDED.value,
+-            StepStatus.FAILED.value,
+-            StepStatus.SKIPPED.value,
+-            StepStatus.CANCELLED.value,
+-            StepStatus.COMPENSATED.value,
+-            StepStatus.COMPENSATION_FAILED.value,
+-        ) else None
++        finished_at = (
++            now
++            if status
++            in (
++                StepStatus.SUCCEEDED.value,
++                StepStatus.FAILED.value,
++                StepStatus.SKIPPED.value,
++                StepStatus.CANCELLED.value,
++                StepStatus.COMPENSATED.value,
++                StepStatus.COMPENSATION_FAILED.value,
++            )
++            else None
++        )
+ 
+         attempt_count = row["attempt_count"]
+         if status == StepStatus.RUNNING.value:
+@@ -343,9 +346,7 @@ class WorkflowStore:
+     def _list_pending_runs_sync(self) -> list[dict[str, Any]]:
+         """同步列出非终态运行（用于恢复）。"""
+         rows = self._conn.execute(
+-            "SELECT * FROM workflow_runs "
+-            "WHERE status NOT IN (?, ?, ?, ?) "
+-            "ORDER BY created_at",
++            "SELECT * FROM workflow_runs WHERE status NOT IN (?, ?, ?, ?) ORDER BY created_at",
+             tuple(_WORKFLOW_TERMINAL_STATUSES),
+         ).fetchall()
+         return [
+diff --git a/plugins/decision-jev/provider.py b/plugins/decision-jev/provider.py
+index 0a0a47b..bb489ed 100644
+--- a/plugins/decision-jev/provider.py
++++ b/plugins/decision-jev/provider.py
+@@ -153,9 +153,7 @@ class JEVProvider:
+ 
+         使用 ``req.context`` 作为 JEV 评估上下文。无匹配时返回空列表。
+         """
+-        return [
+-            rule.to_candidate() for rule in self.rules if rule.evaluate(req.context)
+-        ]
++        return [rule.to_candidate() for rule in self.rules if rule.evaluate(req.context)]
+ 
+     @classmethod
+     def from_file(cls, path: str | Path) -> JEVProvider:
+diff --git a/plugins/gpu-nvidia/discovery.py b/plugins/gpu-nvidia/discovery.py
+index f5860c4..3e4e5d3 100644
+--- a/plugins/gpu-nvidia/discovery.py
++++ b/plugins/gpu-nvidia/discovery.py
+@@ -81,18 +81,21 @@ async def _default_enumerate() -> list[dict[str, Any]]:
+     """
+     try:
+         import pynvml as nvml  # noqa: PLC0415
++
+         nvml.nvmlInit()
+         count = nvml.nvmlDeviceGetCount()
+         devices: list[dict[str, Any]] = []
+         for index in range(count):
+             handle = nvml.nvmlDeviceGetHandleByIndex(index)
+             mem = nvml.nvmlDeviceGetMemoryInfo(handle)
+-            devices.append({
+-                "index": index,
+-                "name": _decode(nvml.nvmlDeviceGetName(handle)),
+-                "uuid": _decode(nvml.nvmlDeviceGetUUID(handle)),
+-                "memory_bytes": int(mem.total),
+-            })
++            devices.append(
++                {
++                    "index": index,
++                    "name": _decode(nvml.nvmlDeviceGetName(handle)),
++                    "uuid": _decode(nvml.nvmlDeviceGetUUID(handle)),
++                    "memory_bytes": int(mem.total),
++                }
++            )
+         nvml.nvmlShutdown()
+     except Exception:
+         return []
+diff --git a/plugins/gpu-nvidia/health.py b/plugins/gpu-nvidia/health.py
+index 886d37a..7da83ff 100644
+--- a/plugins/gpu-nvidia/health.py
++++ b/plugins/gpu-nvidia/health.py
+@@ -65,14 +65,18 @@ async def _default_check(device_index: int) -> dict[str, Any]:
+     """默认设备检查：通过 pynvml 采集指标，不可用返回空 dict。"""
+     try:
+         import pynvml as nvml  # noqa: PLC0415
++
+         nvml.nvmlInit()
+         handle = nvml.nvmlDeviceGetHandleByIndex(device_index)
+         temp = int(nvml.nvmlDeviceGetTemperature(handle, nvml.NVML_TEMPERATURE_GPU))
+         util = nvml.nvmlDeviceGetUtilizationRates(handle)
+         mem = nvml.nvmlDeviceGetMemoryInfo(handle)
+-        ecc = int(nvml.nvmlDeviceGetTotalEccErrors(
+-            handle, nvml.NVML_SINGLE_BIT_ECC_ERROR,
+-        ))
++        ecc = int(
++            nvml.nvmlDeviceGetTotalEccErrors(
++                handle,
++                nvml.NVML_SINGLE_BIT_ECC_ERROR,
++            )
++        )
+         nvml.nvmlShutdown()
+     except Exception:
+         return {}
+diff --git a/plugins/gpu-nvidia/hetero.py b/plugins/gpu-nvidia/hetero.py
+index b6cada1..bd7ae52 100644
+--- a/plugins/gpu-nvidia/hetero.py
++++ b/plugins/gpu-nvidia/hetero.py
+@@ -42,13 +42,15 @@ WARNING = "warning"
+ INFO = "info"
+ 
+ #: 关键能力字段：其缺失或差异直接影响调度正确性，视为 ``critical``。
+-_CRITICAL_FIELDS: frozenset[str] = frozenset({
+-    "mig_enabled",
+-    "memory_bytes",
+-    "compute_capability",
+-    "cuda_version",
+-    "driver_version",
+-})
++_CRITICAL_FIELDS: frozenset[str] = frozenset(
++    {
++        "mig_enabled",
++        "memory_bytes",
++        "compute_capability",
++        "cuda_version",
++        "driver_version",
++    }
++)
+ 
+ 
+ class CapabilityDiff(BaseModel):
+@@ -103,26 +105,32 @@ class HeteroReporter:
+             in_nvidia = field in nvidia_capability
+             in_other = field in other_capability
+             if in_nvidia and not in_other:
+-                diffs.append(CapabilityDiff(
+-                    field_name=field,
+-                    nvidia_value=nvidia_capability[field],
+-                    other_vendor_value=None,
+-                    diff_type=DIFF_MISSING,
+-                ))
++                diffs.append(
++                    CapabilityDiff(
++                        field_name=field,
++                        nvidia_value=nvidia_capability[field],
++                        other_vendor_value=None,
++                        diff_type=DIFF_MISSING,
++                    )
++                )
+             elif not in_nvidia and in_other:
+-                diffs.append(CapabilityDiff(
+-                    field_name=field,
+-                    nvidia_value=None,
+-                    other_vendor_value=other_capability[field],
+-                    diff_type=DIFF_EXTRA,
+-                ))
++                diffs.append(
++                    CapabilityDiff(
++                        field_name=field,
++                        nvidia_value=None,
++                        other_vendor_value=other_capability[field],
++                        diff_type=DIFF_EXTRA,
++                    )
++                )
+             elif nvidia_capability[field] != other_capability[field]:
+-                diffs.append(CapabilityDiff(
+-                    field_name=field,
+-                    nvidia_value=nvidia_capability[field],
+-                    other_vendor_value=other_capability[field],
+-                    diff_type=DIFF_DIFFERENT,
+-                ))
++                diffs.append(
++                    CapabilityDiff(
++                        field_name=field,
++                        nvidia_value=nvidia_capability[field],
++                        other_vendor_value=other_capability[field],
++                        diff_type=DIFF_DIFFERENT,
++                    )
++                )
+         return diffs
+ 
+     def classify_severity(self, diff: CapabilityDiff) -> str:
+diff --git a/plugins/gpu-nvidia/mig.py b/plugins/gpu-nvidia/mig.py
+index f0b7505..b311bed 100644
+--- a/plugins/gpu-nvidia/mig.py
++++ b/plugins/gpu-nvidia/mig.py
+@@ -229,9 +229,7 @@ class MigManager:
+         self._discover_profiles_fn: MigProfileDiscoveryFn = (
+             profile_discovery_fn or _default_discover_profiles
+         )
+-        self._health_check_fn: MigHealthCheckFn = (
+-            health_check_fn or _default_health_check
+-        )
++        self._health_check_fn: MigHealthCheckFn = health_check_fn or _default_health_check
+         # 实例注册表：instance_id -> MigInstance
+         self._instances: dict[str, MigInstance] = {}
+         # 状态注册表：instance_id -> 状态字符串
+diff --git a/plugins/gpu-nvidia/preflight.py b/plugins/gpu-nvidia/preflight.py
+index e46698d..a90e0a3 100644
+--- a/plugins/gpu-nvidia/preflight.py
++++ b/plugins/gpu-nvidia/preflight.py
+@@ -90,6 +90,7 @@ async def _default_driver_info() -> dict[str, Any]:
+     """默认驱动信息提供者：尝试 pynvml，不可用返回空版本。"""
+     try:
+         import pynvml as nvml  # noqa: PLC0415
++
+         nvml.nvmlInit()
+         version = str(nvml.nvmlSystemGetDriverVersion())
+         nvml.nvmlShutdown()
+@@ -103,6 +104,7 @@ async def _default_cuda_info() -> dict[str, Any]:
+     """默认 CUDA 信息提供者：尝试 pynvml，不可用返回空版本。"""
+     try:
+         import pynvml as nvml  # noqa: PLC0415
++
+         nvml.nvmlInit()
+         cuda_version = nvml.nvmlSystemGetCudaDriverVersion()
+         nvml.nvmlShutdown()
+diff --git a/plugins/metering-basic/provider.py b/plugins/metering-basic/provider.py
+index 1af35b1..638d4c5 100644
+--- a/plugins/metering-basic/provider.py
++++ b/plugins/metering-basic/provider.py
+@@ -42,9 +42,7 @@ class MeteringProvider:
+         """
+         await self._store.record(record)
+ 
+-    async def get_summary(
+-        self, tenant_id: str, start: float, end: float
+-    ) -> UsageSummary:
++    async def get_summary(self, tenant_id: str, start: float, end: float) -> UsageSummary:
+         """获取指定租户在 ``[start, end)`` 时间范围内的聚合统计。
+ 
+         Args:
+@@ -57,9 +55,7 @@ class MeteringProvider:
+         """
+         return await self._store.aggregate(tenant_id, start, end)
+ 
+-    async def correct_usage(
+-        self, original_id: str, correction: UsageRecord
+-    ) -> None:
++    async def correct_usage(self, original_id: str, correction: UsageRecord) -> None:
+         """修正计量：新增一条 ``correction_of`` 记录指向原记录，原记录保留（IVT-10）。
+ 
+         Args:
+diff --git a/plugins/metering-basic/usage.py b/plugins/metering-basic/usage.py
+index b6b13ae..3bc1d71 100644
+--- a/plugins/metering-basic/usage.py
++++ b/plugins/metering-basic/usage.py
+@@ -202,9 +202,7 @@ class UsageStore:
+             end: 结束时间戳（不包含），``None`` 表示不限制上界。
+             limit: 最大返回条数。
+         """
+-        return await asyncio.to_thread(
+-            self._list_by_tenant_sync, tenant_id, start, end, limit
+-        )
++        return await asyncio.to_thread(self._list_by_tenant_sync, tenant_id, start, end, limit)
+ 
+     def _list_by_tenant_sync(
+         self,
+@@ -230,20 +228,14 @@ class UsageStore:
+     # aggregate
+     # ------------------------------------------------------------------ #
+ 
+-    async def aggregate(
+-        self, tenant_id: str, start: float, end: float
+-    ) -> UsageSummary:
++    async def aggregate(self, tenant_id: str, start: float, end: float) -> UsageSummary:
+         """聚合统计指定租户在 ``[start, end)`` 时间范围内的使用记录。
+ 
+         无记录时返回各字段为零的空统计。
+         """
+-        return await asyncio.to_thread(
+-            self._aggregate_sync, tenant_id, start, end
+-        )
++        return await asyncio.to_thread(self._aggregate_sync, tenant_id, start, end)
+ 
+-    def _aggregate_sync(
+-        self, tenant_id: str, start: float, end: float
+-    ) -> UsageSummary:
++    def _aggregate_sync(self, tenant_id: str, start: float, end: float) -> UsageSummary:
+         row = self._conn.execute(
+             """
+             SELECT
+@@ -269,9 +261,7 @@ class UsageStore:
+             success_count=row["success_count"],
+             failure_count=row["failure_count"],
+             total_latency_ms=total_latency,
+-            avg_latency_ms=(
+-                total_latency / record_count if record_count > 0 else 0.0
+-            ),
++            avg_latency_ms=(total_latency / record_count if record_count > 0 else 0.0),
+             record_count=record_count,
+         )
+ 
+@@ -279,9 +269,7 @@ class UsageStore:
+     # correct — 计量修正（IVT-10）
+     # ------------------------------------------------------------------ #
+ 
+-    async def correct(
+-        self, original_id: str, correction: UsageRecord
+-    ) -> None:
++    async def correct(self, original_id: str, correction: UsageRecord) -> None:
+         """计量修正：新增一条 ``correction_of`` 记录指向原记录，原记录保留。
+ 
+         修正记录使用自身的 ``record_id``（须唯一），其 ``correction_of``
+@@ -299,9 +287,7 @@ class UsageStore:
+             (original_id,),
+         ).fetchone()
+         if existing is None:
+-            raise NotFoundError(
+-                f"original usage record not found: {original_id}"
+-            )
++            raise NotFoundError(f"original usage record not found: {original_id}")
+         correction.correction_of = original_id
+         self._record_sync(correction)
+ 
+diff --git a/plugins/runtime-tgi/provider.py b/plugins/runtime-tgi/provider.py
+index ccd9b38..4456e5f 100644
+--- a/plugins/runtime-tgi/provider.py
++++ b/plugins/runtime-tgi/provider.py
+@@ -228,9 +228,7 @@ class TgiRuntimeProvider:
+     ) -> None:
+         self._launcher: InstanceLauncher = launcher or _default_launcher
+         self._http: HttpClient = http_client or _default_http_client
+-        self._release_lease_fn: LeaseReleaser = (
+-            lease_releaser or _default_release_lease
+-        )
++        self._release_lease_fn: LeaseReleaser = lease_releaser or _default_release_lease
+         self._verify_allocation_fn: AllocationVerifier = (
+             allocation_verifier or _default_verify_allocation
+         )
+diff --git a/plugins/runtime-vllm/release.py b/plugins/runtime-vllm/release.py
+index 3f42922..32d94b7 100644
+--- a/plugins/runtime-vllm/release.py
++++ b/plugins/runtime-vllm/release.py
+@@ -88,9 +88,7 @@ class ResourceReleaser:
+         lease_releaser: LeaseReleaser | None = None,
+         allocation_verifier: AllocationVerifier | None = None,
+     ) -> None:
+-        self._release_lease_fn: LeaseReleaser = (
+-            lease_releaser or _default_release_lease
+-        )
++        self._release_lease_fn: LeaseReleaser = lease_releaser or _default_release_lease
+         self._verify_allocation_fn: AllocationVerifier = (
+             allocation_verifier or _default_verify_allocation
+         )
+diff --git a/plugins/runtime-vllm/verify.py b/plugins/runtime-vllm/verify.py
+index dcb1072..1ff6820 100644
+--- a/plugins/runtime-vllm/verify.py
++++ b/plugins/runtime-vllm/verify.py
+@@ -173,10 +173,12 @@ class ServiceVerifier:
+         """
+         smoke_ok = await self.smoke_test(config.endpoint, config.test_prompt)
+         latency_ms = await self.measure_latency(
+-            config.endpoint, config.num_requests,
++            config.endpoint,
++            config.num_requests,
+         )
+         error_rate = await self.measure_error_rate(
+-            config.endpoint, config.num_requests,
++            config.endpoint,
++            config.num_requests,
+         )
+ 
+         # 冒烟响应文本（再发一次以取文本，避免影响上述测量计数）。
+diff --git a/plugins/workflow-temporal/provider.py b/plugins/workflow-temporal/provider.py
+index 228f521..aaed0e1 100644
+--- a/plugins/workflow-temporal/provider.py
++++ b/plugins/workflow-temporal/provider.py
+@@ -308,7 +308,9 @@ class TemporalWorkflowProvider(WorkflowRuntime):
+         workflow_type = self._map_to_workflow_type(defn)
+         args = self._map_to_temporal_args(defn, inputs)
+         workflow_id = await self._client.start_workflow(
+-            workflow_type, args, idempotency_key,
++            workflow_type,
++            args,
++            idempotency_key,
+         )
+         self._run_to_definition[workflow_id] = defn
+         self._run_to_inputs[workflow_id] = inputs
+@@ -440,9 +442,7 @@ def temporal_eval_report() -> dict[str, Any]:
+                 "mechanism": "RunRef.definition_version 固定，升级定义不影响既有实例",
+             },
+         },
+-        "status_mapping": {
+-            str(k): str(v) for k, v in _TEMPORAL_TO_WORKFLOW_STATUS.items()
+-        },
++        "status_mapping": {str(k): str(v) for k, v in _TEMPORAL_TO_WORKFLOW_STATUS.items()},
+         "invariants": [
+             "业务语义不变性：与参考执行器（workflow-reference）行为一致",
+             "不产出资源终态（INV-1/INV-3），状态写入经 Registry",
+diff --git a/scripts/check_metadata_consistency.py b/scripts/check_metadata_consistency.py
+index 170abf6..c543f2e 100644
+--- a/scripts/check_metadata_consistency.py
++++ b/scripts/check_metadata_consistency.py
+@@ -61,8 +61,10 @@ def main() -> int:
+     """入口：遍历全部包，任一违规列出包名与字段并以退出码 1 结束。"""
+     pyprojects = sorted(PACKAGES_DIR.glob("*/pyproject.toml"))
+     if not pyprojects:
+-        print(f"ERROR: {PACKAGES_DIR.relative_to(REPO_ROOT)}/ 下未找到任何 pyproject.toml",
+-              file=sys.stderr)
++        print(
++            f"ERROR: {PACKAGES_DIR.relative_to(REPO_ROOT)}/ 下未找到任何 pyproject.toml",
++            file=sys.stderr,
++        )
+         return 1
+ 
+     errors: list[str] = []
+@@ -74,8 +76,10 @@ def main() -> int:
+             print(f"ERROR: {err}", file=sys.stderr)
+         print(f"FAIL: {len(errors)} 处元数据不一致", file=sys.stderr)
+         return 1
+-    print(f"OK: {len(pyprojects)} 个包元数据一致 (requires-python={EXPECTED_REQUIRES_PYTHON!r}, "
+-          "无 skeleton/placeholder 描述)")
++    print(
++        f"OK: {len(pyprojects)} 个包元数据一致 (requires-python={EXPECTED_REQUIRES_PYTHON!r}, "
++        "无 skeleton/placeholder 描述)"
++    )
+     return 0
+ 
+ 
+diff --git a/scripts/openapi_semantic_check.py b/scripts/openapi_semantic_check.py
+index 6eb66ae..760d4d6 100644
+--- a/scripts/openapi_semantic_check.py
++++ b/scripts/openapi_semantic_check.py
+@@ -143,8 +143,10 @@ def main() -> int:
+         for err in errors:
+             print(f"ERROR: {err}", file=sys.stderr)
+         return 1
+-    print(f"OK: OpenAPI {doc.get('openapi')} 语义校验通过（{op_count} 个 operation，"
+-          "operationId 唯一、$ref 可解析、响应族完备）")
++    print(
++        f"OK: OpenAPI {doc.get('openapi')} 语义校验通过（{op_count} 个 operation，"
++        "operationId 唯一、$ref 可解析、响应族完备）"
++    )
+     return 0
+ 
+ 
+diff --git a/tests/chaos/test_cp_restart.py b/tests/chaos/test_cp_restart.py
+index 477a9d5..e988e42 100644
+--- a/tests/chaos/test_cp_restart.py
++++ b/tests/chaos/test_cp_restart.py
+@@ -99,11 +99,7 @@ def test_restart_preserves_step_status(tmp_path: pytest.TempPathFactory) -> None
+     store = WorkflowStore(str(db_file))
+     ref = _run(store.create_run(defn, {}, "key-1"))
+     _run(store.update_step_status(ref.run_id, "s1", StepStatus.RUNNING.value))
+-    _run(
+-        store.update_step_status(
+-            ref.run_id, "s1", StepStatus.SUCCEEDED.value, {"ok": True}
+-        )
+-    )
++    _run(store.update_step_status(ref.run_id, "s1", StepStatus.SUCCEEDED.value, {"ok": True}))
+     _run(store.close())
+ 
+     restarted = WorkflowStore(str(db_file))
+diff --git a/tests/chaos/test_duplicate_events.py b/tests/chaos/test_duplicate_events.py
+index 3f032a8..aec1648 100644
+--- a/tests/chaos/test_duplicate_events.py
++++ b/tests/chaos/test_duplicate_events.py
+@@ -182,9 +182,7 @@ def test_recovery_resume_only_when_running_or_unknown() -> None:
+             mgr.recover(
+                 server,
+                 agent_id="agent-1",
+-                running_executions=[
+-                    RunningExecution(task_id="t1", execution_id="e1")
+-                ],
++                running_executions=[RunningExecution(task_id="t1", execution_id="e1")],
+             )
+         )
+         is_resume = actions[0].action == "resume"
+diff --git a/tests/chaos/test_node_offline.py b/tests/chaos/test_node_offline.py
+index ffd7993..e861f8c 100644
+--- a/tests/chaos/test_node_offline.py
++++ b/tests/chaos/test_node_offline.py
+@@ -61,9 +61,7 @@ def test_heartbeat_timeout_marks_offline(monkeypatch: pytest.MonkeyPatch) -> Non
+     """心跳超过离线阈值后 get_agent_state 返回 OFFLINE。"""
+     t = [1000.0]
+     monkeypatch.setattr(time, "time", lambda: t[0])
+-    mgr = HeartbeatManager(
+-        offline_threshold_seconds=30.0, degraded_threshold_seconds=15.0
+-    )
++    mgr = HeartbeatManager(offline_threshold_seconds=30.0, degraded_threshold_seconds=15.0)
+     _run(mgr.receive(_heartbeat("agent-1")))
+ 
+     t[0] = 1031.0  # 超过离线阈值
+@@ -74,9 +72,7 @@ def test_check_offline_returns_offline_agents(monkeypatch: pytest.MonkeyPatch) -
+     """check_offline 返回本次新转为 OFFLINE 的 agent 列表。"""
+     t = [1000.0]
+     monkeypatch.setattr(time, "time", lambda: t[0])
+-    mgr = HeartbeatManager(
+-        offline_threshold_seconds=30.0, degraded_threshold_seconds=15.0
+-    )
++    mgr = HeartbeatManager(offline_threshold_seconds=30.0, degraded_threshold_seconds=15.0)
+     _run(mgr.receive(_heartbeat("agent-1")))
+     _run(mgr.receive(_heartbeat("agent-2")))
+ 
+@@ -99,9 +95,7 @@ def test_offline_agent_resources_not_available(
+     """INV-4：离线 agent 资源健康为 Unknown，不可标记 Available/Healthy。"""
+     t = [1000.0]
+     monkeypatch.setattr(time, "time", lambda: t[0])
+-    mgr = HeartbeatManager(
+-        offline_threshold_seconds=30.0, degraded_threshold_seconds=15.0
+-    )
++    mgr = HeartbeatManager(offline_threshold_seconds=30.0, degraded_threshold_seconds=15.0)
+     _run(mgr.receive(_heartbeat("agent-1")))
+ 
+     t[0] = 1031.0
+@@ -119,9 +113,7 @@ def test_degraded_agent_resources_not_available(
+     """DEGRADED agent 资源为 Degraded，同样不可标记 Available。"""
+     t = [1000.0]
+     monkeypatch.setattr(time, "time", lambda: t[0])
+-    mgr = HeartbeatManager(
+-        offline_threshold_seconds=30.0, degraded_threshold_seconds=15.0
+-    )
++    mgr = HeartbeatManager(offline_threshold_seconds=30.0, degraded_threshold_seconds=15.0)
+     _run(mgr.receive(_heartbeat("agent-1")))
+ 
+     t[0] = 1016.0  # 超过降级阈值但未达离线阈值
+@@ -139,9 +131,7 @@ def test_offline_agent_excluded_from_online_list(
+     """INV-4：离线 agent 不出现在 list_online_agents 中（不回收到调度池）。"""
+     t = [1000.0]
+     monkeypatch.setattr(time, "time", lambda: t[0])
+-    mgr = HeartbeatManager(
+-        offline_threshold_seconds=30.0, degraded_threshold_seconds=15.0
+-    )
++    mgr = HeartbeatManager(offline_threshold_seconds=30.0, degraded_threshold_seconds=15.0)
+     _run(mgr.receive(_heartbeat("agent-1")))
+     _run(mgr.receive(_heartbeat("agent-2")))
+ 
+@@ -169,9 +159,7 @@ def test_offline_then_recover(monkeypatch: pytest.MonkeyPatch) -> None:
+     """离线后重新心跳恢复 ONLINE，资源恢复 Healthy。"""
+     t = [1000.0]
+     monkeypatch.setattr(time, "time", lambda: t[0])
+-    mgr = HeartbeatManager(
+-        offline_threshold_seconds=30.0, degraded_threshold_seconds=15.0
+-    )
++    mgr = HeartbeatManager(offline_threshold_seconds=30.0, degraded_threshold_seconds=15.0)
+     _run(mgr.receive(_heartbeat("agent-1")))
+ 
+     t[0] = 1031.0
+@@ -188,9 +176,7 @@ def test_partial_outage_isolates_offline(monkeypatch: pytest.MonkeyPatch) -> Non
+     """部分节点离线不影响在线节点：仅离线 agent 资源不可用。"""
+     t = [1000.0]
+     monkeypatch.setattr(time, "time", lambda: t[0])
+-    mgr = HeartbeatManager(
+-        offline_threshold_seconds=30.0, degraded_threshold_seconds=15.0
+-    )
++    mgr = HeartbeatManager(offline_threshold_seconds=30.0, degraded_threshold_seconds=15.0)
+     _run(mgr.receive(_heartbeat("agent-1")))
+     _run(mgr.receive(_heartbeat("agent-2")))
+ 
+diff --git a/tests/compat/test_plugin_compatibility.py b/tests/compat/test_plugin_compatibility.py
+index 694f819..f3c630e 100644
+--- a/tests/compat/test_plugin_compatibility.py
++++ b/tests/compat/test_plugin_compatibility.py
+@@ -103,9 +103,7 @@ class TestPluginVersionCompat:
+             ("1.3.1", "1.3.0", True),
+         ],
+     )
+-    def test_is_compatible(
+-        self, plugin_ver: str, required_ver: str, expected: bool
+-    ) -> None:
++    def test_is_compatible(self, plugin_ver: str, required_ver: str, expected: bool) -> None:
+         """同 major 且不低于所需版本则兼容。"""
+         compat = PluginVersionCompat()
+         assert compat.is_compatible(plugin_ver, required_ver) is expected
+diff --git a/tests/compat/test_plugin_conformance_v11.py b/tests/compat/test_plugin_conformance_v11.py
+index 8b14c29..66c52d2 100644
+--- a/tests/compat/test_plugin_conformance_v11.py
++++ b/tests/compat/test_plugin_conformance_v11.py
+@@ -126,7 +126,9 @@ def _ensure_plugin_package(package_name: str, plugin_dir: str) -> None:
+     if not init_path.is_file():
+         raise ImportError(f"plugin package __init__ not found: {init_path}")
+     spec = importlib.util.spec_from_file_location(
+-        package_name, init_path, submodule_search_locations=[str(pkg_path)],
++        package_name,
++        init_path,
++        submodule_search_locations=[str(pkg_path)],
+     )
+     if spec is None or spec.loader is None:
+         raise ImportError(f"cannot create spec for {init_path}")
+@@ -166,9 +168,8 @@ class TestManifestAndIsolationConformance:
+         manifest = _load_manifest_dict(plugin_dir)
+         validator = Draft202012Validator(_MANIFEST_SCHEMA)
+         errors = sorted(validator.iter_errors(manifest), key=lambda e: list(e.path))
+-        assert not errors, (
+-            f"{plugin_dir}/manifest.yaml schema 校验失败: "
+-            + "; ".join(f"{list(e.path)}: {e.message}" for e in errors)
++        assert not errors, f"{plugin_dir}/manifest.yaml schema 校验失败: " + "; ".join(
++            f"{list(e.path)}: {e.message}" for e in errors
+         )
+ 
+     @_compat
+@@ -176,9 +177,7 @@ class TestManifestAndIsolationConformance:
+         "plugin_dir",
+         [pytest.param(p, id=p) for p in ALL_PLUGIN_DIRS],
+     )
+-    def test_manifest_parses_into_plugin_manifest_model(
+-        self, plugin_dir: str
+-    ) -> None:
++    def test_manifest_parses_into_plugin_manifest_model(self, plugin_dir: str) -> None:
+         """manifest 须能加载进 PluginManifest 模型（extra=forbid，捕获模型与 schema 漂移）。"""
+         manifest = PluginManifest.model_validate(_load_manifest_dict(plugin_dir))
+         raw = _load_manifest_dict(plugin_dir)
+@@ -192,14 +191,10 @@ class TestManifestAndIsolationConformance:
+         "plugin_dir",
+         [pytest.param(p, id=p) for p in ALL_PLUGIN_DIRS],
+     )
+-    def test_isolation_declaration_within_allowed_enum(
+-        self, plugin_dir: str
+-    ) -> None:
++    def test_isolation_declaration_within_allowed_enum(self, plugin_dir: str) -> None:
+         """isolation 只能声明 in-process（restricted-rpc / sandbox 尚无进程边界实现）。"""
+         isolation = _load_manifest_dict(plugin_dir)["spec"]["isolation"]
+-        assert isolation in _ALLOWED_ISOLATION, (
+-            f"{plugin_dir}: 非法 isolation 声明 {isolation!r}"
+-        )
++        assert isolation in _ALLOWED_ISOLATION, f"{plugin_dir}: 非法 isolation 声明 {isolation!r}"
+ 
+     @_compat
+     @pytest.mark.parametrize(
+@@ -291,9 +286,7 @@ def _make_typesafe_provider(
+     delay_s: float = 0.0,
+ ) -> Any:
+     """构造 decision-typesafe-jev 的 TypeSafeJevProvider（注入离线 fake 客户端）。"""
+-    _ensure_plugin_module(
+-        "decision_typesafe_jev_provider", "decision-typesafe-jev"
+-    )
++    _ensure_plugin_module("decision_typesafe_jev_provider", "decision-typesafe-jev")
+     from decision_typesafe_jev_provider import (
+         JevQuestion,
+         StaticJevClient,
+@@ -356,9 +349,7 @@ class TestDecisionProviderConformance:
+             for p in ("decision-rules", "decision-jev", "decision-typesafe-jev")
+         ],
+     )
+-    def test_normal_input_returns_structured_candidates(
+-        self, plugin_dir: str
+-    ) -> None:
++    def test_normal_input_returns_structured_candidates(self, plugin_dir: str) -> None:
+         """正常输入返回结构化候选：含建议动作（action）与理由（rationale）字段。"""
+         provider = _DECISION_FACTORIES[plugin_dir]()
+         candidates = _run(provider.decide(_make_decision_request()))
+@@ -368,9 +359,9 @@ class TestDecisionProviderConformance:
+         # 按契约真实字段断言：建议动作 + 理由 + 置信度（仅排序/解释用）。
+         assert cand.candidate_id, "candidate_id 不得为空"
+         assert cand.action, "建议动作 action 不得为空"
+-        assert cand.action.startswith("inference.") or cand.action.startswith(
+-            "bind."
+-        ), f"动作应为推理域动作: {cand.action!r}"
++        assert cand.action.startswith("inference.") or cand.action.startswith("bind."), (
++            f"动作应为推理域动作: {cand.action!r}"
++        )
+         assert isinstance(cand.rationale, list) and cand.rationale, (
+             "理由 rationale 应为非空列表（可解释性要求）"
+         )
+@@ -385,9 +376,7 @@ class TestDecisionProviderConformance:
+             for p in ("decision-rules", "decision-jev", "decision-typesafe-jev")
+         ],
+     )
+-    def test_provider_identity_declared_and_matches_manifest(
+-        self, plugin_dir: str
+-    ) -> None:
++    def test_provider_identity_declared_and_matches_manifest(self, plugin_dir: str) -> None:
+         """provider_id/provider_version 须声明（IVT-11）且与 manifest metadata.id 一致。"""
+         provider = _DECISION_FACTORIES[plugin_dir]()
+         assert provider.provider_id, "provider_id 不得为空（IVT-11 决策记录）"
+@@ -452,9 +441,7 @@ class TestDecisionProviderConformance:
+     @_compat
+     def test_typesafe_jev_invalid_output_raises_protocol_error(self) -> None:
+         """typesafe-jev：Jev 返回 choice 越界/结构非法 → JevProtocolError（触发降级）。"""
+-        _ensure_plugin_module(
+-            "decision_typesafe_jev_provider", "decision-typesafe-jev"
+-        )
++        _ensure_plugin_module("decision_typesafe_jev_provider", "decision-typesafe-jev")
+         from decision_typesafe_jev_provider import JevProtocolError
+ 
+         # choice 不在预定义 options 内 → 类型安全校验失败。
+@@ -472,9 +459,7 @@ class TestDecisionProviderConformance:
+     @_compat
+     def test_typesafe_jev_unavailable_dependency_raises_for_degrade(self) -> None:
+         """typesafe-jev：依赖故障 → JevUnavailableError，绝不默认放行。"""
+-        _ensure_plugin_module(
+-            "decision_typesafe_jev_provider", "decision-typesafe-jev"
+-        )
++        _ensure_plugin_module("decision_typesafe_jev_provider", "decision-typesafe-jev")
+         from decision_typesafe_jev_provider import JevUnavailableError
+ 
+         provider = _make_typesafe_provider(error=RuntimeError("backend down"))
+@@ -502,10 +487,7 @@ class TestDecisionProviderConformance:
+     @_compat
+     @pytest.mark.parametrize(
+         "plugin_dir",
+-        [
+-            pytest.param(p, id=p)
+-            for p in ("decision-rules", "decision-jev")
+-        ],
++        [pytest.param(p, id=p) for p in ("decision-rules", "decision-jev")],
+     )
+     def test_local_providers_complete_within_deadline(self, plugin_dir: str) -> None:
+         """rules/jev 为纯本地计算：decide 须在 deadline_ms 内完成（不超时）。"""
+@@ -518,9 +500,7 @@ class TestDecisionProviderConformance:
+     @_compat
+     def test_typesafe_jev_deadline_timeout_raises(self) -> None:
+         """typesafe-jev 超时语义：慢依赖 + 极小 deadline → JevTimeoutError 失败。"""
+-        _ensure_plugin_module(
+-            "decision_typesafe_jev_provider", "decision-typesafe-jev"
+-        )
++        _ensure_plugin_module("decision_typesafe_jev_provider", "decision-typesafe-jev")
+         from decision_typesafe_jev_provider import JevTimeoutError
+ 
+         # 注入永远慢于 deadline 的依赖（5s 延迟），deadline 仅 80ms；
+@@ -834,9 +814,7 @@ class TestRuntimeVllmConformance:
+         assert stored is not None and stored.status == InstanceStatus.RUNNING
+ 
+         # 2. verify：冒烟通过；通过后注册路由推进 Ready。
+-        result = _run(
+-            verifier.verify(VerifyConfig(endpoint=instance.endpoint, num_requests=2))
+-        )
++        result = _run(verifier.verify(VerifyConfig(endpoint=instance.endpoint, num_requests=2)))
+         assert result.passed is True
+         endpoint = _run(deployer.register_route(instance))
+         assert endpoint == instance.endpoint
+@@ -844,9 +822,7 @@ class TestRuntimeVllmConformance:
+         assert ready is not None and ready.status == InstanceStatus.READY
+ 
+         # 3. release：停止 + 租约释放 + 分配核验全部成功。
+-        release = _run(
+-            releaser.release(deployer, instance.instance_id, "lease-1", [0])
+-        )
++        release = _run(releaser.release(deployer, instance.instance_id, "lease-1", [0]))
+         assert release.released is True
+         assert release.verified is True
+         stopped = _run(deployer.get_instance(instance.instance_id))
+@@ -862,9 +838,7 @@ class TestRuntimeVllmConformance:
+         verifier = self._make_verifier(ok=False)  # 推理全部失败。
+ 
+         instance = _run(deployer.deploy(DeployConfig(model_path="/m", port=8101, gpu_ids=[0])))
+-        result = _run(
+-            verifier.verify(VerifyConfig(endpoint=instance.endpoint, num_requests=2))
+-        )
++        result = _run(verifier.verify(VerifyConfig(endpoint=instance.endpoint, num_requests=2)))
+         assert result.passed is False, "推理失败时 verify 不得通过"
+         # conformance：verify 失败后不得推进 Ready（register_route 不应被调用）。
+         stored = _run(deployer.get_instance(instance.instance_id))
+@@ -883,13 +857,9 @@ class TestRuntimeVllmConformance:
+         releaser = self._make_releaser()
+         instance = _run(deployer.deploy(DeployConfig(model_path="/m", port=8102, gpu_ids=[0])))
+ 
+-        first = _run(
+-            releaser.release(deployer, instance.instance_id, "lease-2", [0])
+-        )
++        first = _run(releaser.release(deployer, instance.instance_id, "lease-2", [0]))
+         # 第二次 release：stop_instance 对已停止实例幂等返回，不抛错。
+-        second = _run(
+-            releaser.release(deployer, instance.instance_id, "lease-2", [0])
+-        )
++        second = _run(releaser.release(deployer, instance.instance_id, "lease-2", [0]))
+         assert first.released is True
+         assert second.released is True, "重复 release 应幂等成功（实现语义）"
+ 
+@@ -1113,9 +1083,7 @@ class TestUpgradeAndUnloadSafety:
+         """卸载未注册插件须被拒绝（NotFoundError）。"""
+         manager = PluginManager()
+         with pytest.raises(NotFoundError):
+-            manager.transition(
+-                "forgemesh.ghost:0.0.1", PluginLifecycleState.UNINSTALLED
+-            )
++            manager.transition("forgemesh.ghost:0.0.1", PluginLifecycleState.UNINSTALLED)
+ 
+     @_compat
+     def test_disorderly_transition_rejected(self) -> None:
+@@ -1152,11 +1120,7 @@ class TestUpgradeAndUnloadSafety:
+         pid2 = _register(manager, m_v2)
+ 
+         assert pid1 != pid2, "不同版本应有不同 plugin_id（id:version）"
+-        same_id = [
+-            m
+-            for m in manager.discover()
+-            if m.metadata.id == "forgemesh.decision.rules"
+-        ]
++        same_id = [m for m in manager.discover() if m.metadata.id == "forgemesh.decision.rules"]
+         assert len(same_id) == 2, "同 id 两版本应同时可被发现（并存）"
+         assert {manager.get_version(pid1), manager.get_version(pid2)} == {
+             "0.0.1",
+diff --git a/tests/contract/test_allocation_exclusivity.py b/tests/contract/test_allocation_exclusivity.py
+index b65fb88..750d95d 100644
+--- a/tests/contract/test_allocation_exclusivity.py
++++ b/tests/contract/test_allocation_exclusivity.py
+@@ -57,8 +57,7 @@ def _make_allocation(
+ def _count_active(reg: SQLiteRegistry, resource_id: str) -> int:
+     """统计某 resource_id 当前 Active 记录数（直读 DB 的证据口径）。"""
+     row = reg._conn.execute(
+-        "SELECT COUNT(*) AS n FROM allocations "
+-        "WHERE resource_id=? AND status='Active'",
++        "SELECT COUNT(*) AS n FROM allocations WHERE resource_id=? AND status='Active'",
+         (resource_id,),
+     ).fetchone()
+     return int(row["n"])
+@@ -80,12 +79,8 @@ def test_concurrent_put_allocation_single_active_winner(tmp_path) -> None:
+         try:
+             # 两写入方并发为同一资源创建 Active 分配（不同幂等键）
+             results = await asyncio.gather(
+-                writer1.put_allocation(
+-                    _make_allocation("gpu-0", idempotency_key="idem-a")
+-                ),
+-                writer2.put_allocation(
+-                    _make_allocation("gpu-0", idempotency_key="idem-b")
+-                ),
++                writer1.put_allocation(_make_allocation("gpu-0", idempotency_key="idem-a")),
++                writer2.put_allocation(_make_allocation("gpu-0", idempotency_key="idem-b")),
+                 return_exceptions=True,
+             )
+ 
+@@ -140,9 +135,7 @@ def test_release_then_reallocate_same_resource() -> None:
+     """Active → Released 后，同一 resource_id 可再次分配（新 Active 成立）。"""
+     reg = SQLiteRegistry()
+     try:
+-        first_id = _run(
+-            reg.put_allocation(_make_allocation("gpu-0", idempotency_key="idem-1"))
+-        )
++        first_id = _run(reg.put_allocation(_make_allocation("gpu-0", idempotency_key="idem-1")))
+ 
+         # 释放后不再持有 Active
+         _run(reg.release_allocation(first_id, TENANT, reason="contract-test"))
+@@ -150,9 +143,7 @@ def test_release_then_reallocate_same_resource() -> None:
+         assert _count_active(reg, "gpu-0") == 0
+ 
+         # 同一 resource_id 可重新分配：部分唯一索引仅约束 Active 存量
+-        second_id = _run(
+-            reg.put_allocation(_make_allocation("gpu-0", idempotency_key="idem-2"))
+-        )
++        second_id = _run(reg.put_allocation(_make_allocation("gpu-0", idempotency_key="idem-2")))
+         assert second_id != first_id
+ 
+         active = _run(reg.get_active_allocation("gpu-0", TENANT))
+@@ -183,12 +174,8 @@ def test_distinct_resource_ids_independent(tmp_path) -> None:
+         writer2 = SQLiteRegistry(str(db_file))
+         try:
+             ids = await asyncio.gather(
+-                writer1.put_allocation(
+-                    _make_allocation("gpu-0", idempotency_key="idem-gpu0")
+-                ),
+-                writer2.put_allocation(
+-                    _make_allocation("gpu-1", idempotency_key="idem-gpu1")
+-                ),
++                writer1.put_allocation(_make_allocation("gpu-0", idempotency_key="idem-gpu0")),
++                writer2.put_allocation(_make_allocation("gpu-1", idempotency_key="idem-gpu1")),
+             )
+             assert all(isinstance(i, str) and i for i in ids)
+ 
+diff --git a/tests/contract/test_finalizer_closed_loop.py b/tests/contract/test_finalizer_closed_loop.py
+index ce5dae4..f3b0fe1 100644
+--- a/tests/contract/test_finalizer_closed_loop.py
++++ b/tests/contract/test_finalizer_closed_loop.py
+@@ -80,9 +80,7 @@ def _make_inference_service(
+ 
+ def _stored_phase(reg: SQLiteRegistry, name: str = "svc-1") -> str | None:
+     """直读 DB 列取 phase（与既有单测一致的证据口径）。"""
+-    row = reg._conn.execute(
+-        "SELECT phase FROM resources WHERE name=?", (name,)
+-    ).fetchone()
++    row = reg._conn.execute("SELECT phase FROM resources WHERE name=?", (name,)).fetchone()
+     return row["phase"] if row is not None else None
+ 
+ 
+@@ -96,9 +94,7 @@ def _stored_version(reg: SQLiteRegistry, name: str = "svc-1") -> int | None:
+ 
+ def _stored_finalizers(reg: SQLiteRegistry, name: str = "svc-1") -> list[str]:
+     """直读 DB 列取 finalizers。"""
+-    row = reg._conn.execute(
+-        "SELECT finalizers FROM resources WHERE name=?", (name,)
+-    ).fetchone()
++    row = reg._conn.execute("SELECT finalizers FROM resources WHERE name=?", (name,)).fetchone()
+     return json.loads(row["finalizers"]) if row is not None else []
+ 
+ 
+@@ -236,9 +232,7 @@ def test_release_failure_keeps_terminating_then_retry_completes() -> None:
+         # 第二轮：释放成功 → 闭环完成（幂等重入）
+         recovered = StubReleaseProvider()
+         retry_controller = _make_controller(reg, release_provider=recovered)
+-        second = _run(
+-            retry_controller.reconcile(_terminating_context(reg, dedup_key="term-retry"))
+-        )
++        second = _run(retry_controller.reconcile(_terminating_context(reg, dedup_key="term-retry")))
+ 
+         assert recovered.released == ["svc-1"]
+         assert second.done is True
+diff --git a/tests/contract/test_registry_consistency.py b/tests/contract/test_registry_consistency.py
+index 56dfe0c..79648d5 100644
+--- a/tests/contract/test_registry_consistency.py
++++ b/tests/contract/test_registry_consistency.py
+@@ -177,9 +177,7 @@ def test_resource_version_strictly_monotonic() -> None:
+ 
+         # 连续 4 次成功 CAS：版本严格单调 +1，无跳变、无回退
+         for expected in range(4):
+-            current = _run(
+-                reg.put(current, expected_version=str(expected))
+-            )
++            current = _run(reg.put(current, expected_version=str(expected)))
+             assert current.metadata.resourceVersion == str(expected + 1)
+ 
+         # 冲突的 CAS 不推进版本（失败方不得影响单调性）
+diff --git a/tests/e2e/test_gpu_onboarding.py b/tests/e2e/test_gpu_onboarding.py
+index 721e8c4..1f39e71 100644
+--- a/tests/e2e/test_gpu_onboarding.py
++++ b/tests/e2e/test_gpu_onboarding.py
+@@ -124,9 +124,7 @@ def test_onboarding_full_loop() -> None:
+     handler = MockOnboardingHandler()
+ 
+     results = asyncio.run(
+-        _no_retry_executor().execute_workflow(
+-            defn, inputs, "key-full-loop", handler
+-        )
++        _no_retry_executor().execute_workflow(defn, inputs, "key-full-loop", handler)
+     )
+ 
+     # 全部 6 步按序执行
+@@ -152,9 +150,7 @@ def test_onboarding_discover_failure() -> None:
+ 
+     with pytest.raises(RuntimeError, match="discover"):
+         asyncio.run(
+-            _no_retry_executor().execute_workflow(
+-                defn, inputs, "key-discover-fail", handler
+-            )
++            _no_retry_executor().execute_workflow(defn, inputs, "key-discover-fail", handler)
+         )
+ 
+     # 仅 discover 执行，后续 5 步未执行
+@@ -171,9 +167,7 @@ def test_onboarding_validate_failure() -> None:
+ 
+     with pytest.raises(RuntimeError, match="validate"):
+         asyncio.run(
+-            _no_retry_executor().execute_workflow(
+-                defn, inputs, "key-validate-fail", handler
+-            )
++            _no_retry_executor().execute_workflow(defn, inputs, "key-validate-fail", handler)
+         )
+ 
+     # discover + validate 执行，后续 4 步未执行
+@@ -189,11 +183,7 @@ def test_onboarding_verify_failure() -> None:
+     handler = MockOnboardingHandler(fail_at="verify")
+ 
+     with pytest.raises(RuntimeError, match="verify"):
+-        asyncio.run(
+-            _no_retry_executor().execute_workflow(
+-                defn, inputs, "key-verify-fail", handler
+-            )
+-        )
++        asyncio.run(_no_retry_executor().execute_workflow(defn, inputs, "key-verify-fail", handler))
+ 
+     # discover → validate → prepare → deploy → verify 执行，commit 未执行
+     assert handler.executed == ["discover", "validate", "prepare", "deploy", "verify"]
+@@ -214,9 +204,7 @@ def test_onboarding_with_workflow_executor() -> None:
+ 
+     # 使用默认执行器（含默认重试策略）
+     executor = WorkflowExecutor()
+-    results = asyncio.run(
+-        executor.execute_workflow(defn, inputs, "key-executor", handler)
+-    )
++    results = asyncio.run(executor.execute_workflow(defn, inputs, "key-executor", handler))
+ 
+     # 全部 6 步执行
+     assert handler.executed == wf.ONBOARDING_STEPS
+@@ -255,9 +243,7 @@ def test_onboarding_persist_and_recover() -> None:
+ 
+     # 3. 模拟执行 discover 和 validate（步骤状态 Pending → Running → Succeeded）
+     for step_id in ("discover", "validate"):
+-        asyncio.run(
+-            store.update_step_status(ref.run_id, step_id, StepStatus.RUNNING.value)
+-        )
++        asyncio.run(store.update_step_status(ref.run_id, step_id, StepStatus.RUNNING.value))
+         asyncio.run(
+             store.update_step_status(
+                 ref.run_id,
+@@ -284,9 +270,7 @@ def test_onboarding_persist_and_recover() -> None:
+     # 7. 恢复后继续执行剩余步骤
+     remaining = ["prepare", "deploy", "verify", "commit"]
+     for step_id in remaining:
+-        asyncio.run(
+-            store.update_step_status(ref.run_id, step_id, StepStatus.RUNNING.value)
+-        )
++        asyncio.run(store.update_step_status(ref.run_id, step_id, StepStatus.RUNNING.value))
+         asyncio.run(
+             store.update_step_status(
+                 ref.run_id,
+diff --git a/tests/performance/test_conflict_correctness.py b/tests/performance/test_conflict_correctness.py
+index 78ae8f3..90bd49d 100644
+--- a/tests/performance/test_conflict_correctness.py
++++ b/tests/performance/test_conflict_correctness.py
+@@ -94,16 +94,12 @@ def test_concurrent_cas_exactly_one_winner(tmp_path: pytest.TempPathFactory) ->
+         ok, conflict, final_version = asyncio.run(_round(round_index))
+         total_ok += ok
+         total_conflict += conflict
+-        assert ok == 1, (
+-            f"round {round_index}: 并发 CAS 成功 {ok} 次（期望恰 1 次）——出现双重写入"
+-        )
++        assert ok == 1, f"round {round_index}: 并发 CAS 成功 {ok} 次（期望恰 1 次）——出现双重写入"
+         assert conflict == N_CONCURRENT - 1, (
+             f"round {round_index}: 冲突被正确拒绝 {conflict} 次"
+             f"（期望 {N_CONCURRENT - 1} 次，100% 正确率）"
+         )
+-        assert final_version == "1", (
+-            f"round {round_index}: 落库版本 {final_version!r}（期望 '1'）"
+-        )
++        assert final_version == "1", f"round {round_index}: 落库版本 {final_version!r}（期望 '1'）"
+ 
+     # 正确率口径：16 个并发写中每轮仅 1 个合法成功，其余 (N-1) 个应被
+     # 拒绝；分母为"应被拒绝的冲突预期总数"，而非全部并发数。
+diff --git a/tests/security/test_plugin_permissions.py b/tests/security/test_plugin_permissions.py
+index 06d3457..ce7d5fd 100644
+--- a/tests/security/test_plugin_permissions.py
++++ b/tests/security/test_plugin_permissions.py
+@@ -195,8 +195,9 @@ def test_plugin_upgrade_ivt8() -> None:
+     }
+     original = instance_record["plugin_version"]
+     # 升级发生后，既有实例解析出的版本仍是原版本
+-    assert compat.instance_version_after_upgrade(
+-        instance_record["plugin_version"], target_version
+-    ) == original
++    assert (
++        compat.instance_version_after_upgrade(instance_record["plugin_version"], target_version)
++        == original
++    )
+     # 实例记录本身未被修改
+     assert instance_record["plugin_version"] == original
+diff --git a/tests/security/test_secret_handling.py b/tests/security/test_secret_handling.py
+index d51b020..3520e11 100644
+--- a/tests/security/test_secret_handling.py
++++ b/tests/security/test_secret_handling.py
+@@ -109,9 +109,7 @@ def test_sensitive_fields_redacted() -> None:
+     assert redacted["count"] == 42
+ 
+     # 确认 SENSITIVE_FIELDS 覆盖全部五种敏感字段名
+-    assert frozenset(
+-        {"password", "token", "secret", "api_key", "credentials"}
+-    ) == SENSITIVE_FIELDS
++    assert frozenset({"password", "token", "secret", "api_key", "credentials"}) == SENSITIVE_FIELDS
+ 
+     # 大小写不敏感匹配（键名小写后比对）
+     mixed = {"Password": _PLAINTEXT_PASSWORD, "API_KEY": _PLAINTEXT_API_KEY}
+diff --git a/tests/unit/controlplane/test_audit.py b/tests/unit/controlplane/test_audit.py
+index 50855a7..e43fb79 100644
+--- a/tests/unit/controlplane/test_audit.py
++++ b/tests/unit/controlplane/test_audit.py
+@@ -11,6 +11,7 @@
+ * ``put`` 只在调用方的事务中写入，``record`` 自行提交；与业务存储共用数据库；
+ * 存量库补齐 ``key_id`` / ``namespace`` 列。
+ """
++
+ from __future__ import annotations
+ 
+ import sqlite3
+diff --git a/tests/unit/controlplane/test_diagnostics.py b/tests/unit/controlplane/test_diagnostics.py
+index 8421e61..c59ba2a 100644
+--- a/tests/unit/controlplane/test_diagnostics.py
++++ b/tests/unit/controlplane/test_diagnostics.py
+@@ -10,6 +10,7 @@
+ * collect_plugins 全局（不按租户隔离）。
+ * correlation_id 累计贯穿。
+ """
++
+ from __future__ import annotations
+ 
+ import asyncio
+@@ -339,14 +340,17 @@ def test_collect_plugins_global_in_bundle() -> None:
+ def test_collect_logs_redaction() -> None:
+     """collect_logs 对敏感字段脱敏。"""
+     collector = DiagnosticCollector()
+-    collector.register_log("t1", {
+-        "message": "login",
+-        "password": "secret123",
+-        "token": "tok",
+-        "secret": "s",
+-        "api_key": "ak",
+-        "credentials": "cr",
+-    })
++    collector.register_log(
++        "t1",
++        {
++            "message": "login",
++            "password": "secret123",
++            "token": "tok",
++            "secret": "s",
++            "api_key": "ak",
++            "credentials": "cr",
++        },
++    )
+ 
+     logs = asyncio.run(collector.collect_logs("t1", None))
+     assert logs[0]["password"] == "***"
+@@ -361,14 +365,17 @@ def test_collect_logs_redaction() -> None:
+ def test_collect_logs_nested_redaction() -> None:
+     """collect_logs 递归脱敏嵌套字典中的敏感字段。"""
+     collector = DiagnosticCollector()
+-    collector.register_log("t1", {
+-        "message": "request",
+-        "context": {
+-            "user": "alice",
+-            "password": "pw",
+-            "headers": {"authorization": "Bearer x", "token": "t"},
++    collector.register_log(
++        "t1",
++        {
++            "message": "request",
++            "context": {
++                "user": "alice",
++                "password": "pw",
++                "headers": {"authorization": "Bearer x", "token": "t"},
++            },
+         },
+-    })
++    )
+ 
+     logs = asyncio.run(collector.collect_logs("t1", None))
+     assert logs[0]["context"]["user"] == "alice"
+diff --git a/tests/unit/controlplane/test_heartbeat.py b/tests/unit/controlplane/test_heartbeat.py
+index 3a2f064..6560abc 100644
+--- a/tests/unit/controlplane/test_heartbeat.py
++++ b/tests/unit/controlplane/test_heartbeat.py
+@@ -12,6 +12,7 @@
+ 测试以 ``asyncio.run`` 驱动异步方法，不依赖 pytest-asyncio。
+ 通过 monkeypatch ``time.time`` 控制时间推进，精确验证阈值边界。
+ """
++
+ from __future__ import annotations
+ 
+ import asyncio
+diff --git a/tests/unit/controlplane/test_observability.py b/tests/unit/controlplane/test_observability.py
+index 177681c..49fcc29 100644
+--- a/tests/unit/controlplane/test_observability.py
++++ b/tests/unit/controlplane/test_observability.py
+@@ -8,6 +8,7 @@
+ * TraceSpan：start / end / duration、add_attribute、parent 链。
+ * TraceRecorder：多 span、correlation_id 累计贯穿。
+ """
++
+ from __future__ import annotations
+ 
+ import asyncio
+@@ -49,7 +50,9 @@ def test_new_correlation_id_is_string() -> None:
+ def test_correlation_context_set_and_get() -> None:
+     """set 后可 get，reset 后恢复 None。"""
+     cid = new_correlation_id()
+-    tokens = CorrelationContext.set(correlation_id=cid, tenant_id="t1", request_id="r1", operation="op1")
++    tokens = CorrelationContext.set(
++        correlation_id=cid, tenant_id="t1", request_id="r1", operation="op1"
++    )
+     assert CorrelationContext.get_correlation_id() == cid
+     assert CorrelationContext.get_tenant_id() == "t1"
+     assert CorrelationContext.get_request_id() == "r1"
+diff --git a/tests/unit/controlplane/test_outbox.py b/tests/unit/controlplane/test_outbox.py
+index 57fdba6..da03e44 100644
+--- a/tests/unit/controlplane/test_outbox.py
++++ b/tests/unit/controlplane/test_outbox.py
+@@ -18,6 +18,7 @@
+ 
+ 测试以 ``asyncio.run`` 驱动异步方法，不依赖 pytest-asyncio。
+ """
++
+ from __future__ import annotations
+ 
+ import asyncio
+diff --git a/tests/unit/controlplane/test_plugin_manager.py b/tests/unit/controlplane/test_plugin_manager.py
+index 5627ed3..a9e7e4d 100644
+--- a/tests/unit/controlplane/test_plugin_manager.py
++++ b/tests/unit/controlplane/test_plugin_manager.py
+@@ -587,9 +587,7 @@ def test_check_permissions_granted() -> None:
+     assert mgr.check_permissions(pid, {"device.read"}) is True
+     assert mgr.check_permissions(pid, {"device.read", "device.partition"}) is True
+     # 全部权限
+-    assert mgr.check_permissions(
+-        pid, {"device.read", "device.partition", "metering.read"}
+-    ) is True
++    assert mgr.check_permissions(pid, {"device.read", "device.partition", "metering.read"}) is True
+ 
+ 
+ @pytest.mark.unit
+diff --git a/tests/unit/controlplane/test_tasks.py b/tests/unit/controlplane/test_tasks.py
+index 348847e..a6b50a3 100644
+--- a/tests/unit/controlplane/test_tasks.py
++++ b/tests/unit/controlplane/test_tasks.py
+@@ -11,6 +11,7 @@
+ 
+ 测试以 ``asyncio.run`` 驱动异步方法，不依赖 pytest-asyncio。
+ """
++
+ from __future__ import annotations
+ 
+ import asyncio
+diff --git a/tests/unit/decision/test_records.py b/tests/unit/decision/test_records.py
+index 5e84ce3..cd40498 100644
+--- a/tests/unit/decision/test_records.py
++++ b/tests/unit/decision/test_records.py
+@@ -239,8 +239,16 @@ def test_update_approval_status_not_found() -> None:
+ def test_list_pending_approvals_tenant_isolation() -> None:
+     """待审批列表按租户隔离。"""
+     store = DecisionRecordStore()
+-    asyncio.run(store.save(_make_record(record_id="t1-pending", tenant_id="t1", approval_status=APPROVAL_PENDING)))
+-    asyncio.run(store.save(_make_record(record_id="t2-pending", tenant_id="t2", approval_status=APPROVAL_PENDING)))
++    asyncio.run(
++        store.save(
++            _make_record(record_id="t1-pending", tenant_id="t1", approval_status=APPROVAL_PENDING)
++        )
++    )
++    asyncio.run(
++        store.save(
++            _make_record(record_id="t2-pending", tenant_id="t2", approval_status=APPROVAL_PENDING)
++        )
++    )
+ 
+     t1_pending = asyncio.run(store.list_pending_approvals("t1"))
+     assert len(t1_pending) == 1
+diff --git a/tests/unit/decision/test_router.py b/tests/unit/decision/test_router.py
+index 2a5fec5..2042807 100644
+--- a/tests/unit/decision/test_router.py
++++ b/tests/unit/decision/test_router.py
+@@ -36,9 +36,7 @@ class SlowProvider(DecisionProvider):
+ 
+     async def decide(self, req: DecisionRequest) -> Sequence[DecisionCandidate]:
+         await asyncio.sleep(0.5)
+-        return [
+-            DecisionCandidate(candidate_id="slow-1", action="schedule.slow")
+-        ]
++        return [DecisionCandidate(candidate_id="slow-1", action="schedule.slow")]
+ 
+ 
+ class FastProvider(DecisionProvider):
+@@ -48,9 +46,7 @@ class FastProvider(DecisionProvider):
+     provider_version = "0.0.1"
+ 
+     async def decide(self, req: DecisionRequest) -> Sequence[DecisionCandidate]:
+-        return [
+-            DecisionCandidate(candidate_id="fast-1", action="schedule.fast")
+-        ]
++        return [DecisionCandidate(candidate_id="fast-1", action="schedule.fast")]
+ 
+ 
+ class EmptyProvider(DecisionProvider):
+@@ -169,9 +165,7 @@ def test_high_risk_fallback_required_when_candidate_from_fallback() -> None:
+         timeout_seconds=0.05,
+     )
+ 
+-    result = asyncio.get_event_loop().run_until_complete(
+-        router.route(_request(risk_level="high"))
+-    )
++    result = asyncio.get_event_loop().run_until_complete(router.route(_request(risk_level="high")))
+ 
+     # 候选仍返回供人工/上游决策，但不设置 chosen、不自动采用
+     assert result.status == "FALLBACK_REQUIRED"
+@@ -192,9 +186,7 @@ def test_high_risk_ok_when_primary_succeeds() -> None:
+         timeout_seconds=0.05,
+     )
+ 
+-    result = asyncio.get_event_loop().run_until_complete(
+-        router.route(_request(risk_level="high"))
+-    )
++    result = asyncio.get_event_loop().run_until_complete(router.route(_request(risk_level="high")))
+ 
+     assert result.status == "OK"
+     assert result.success is True
+@@ -210,9 +202,7 @@ def test_high_risk_without_fallback_provider_fails() -> None:
+         timeout_seconds=0.05,
+     )
+ 
+-    result = asyncio.get_event_loop().run_until_complete(
+-        router.route(_request(risk_level="high"))
+-    )
++    result = asyncio.get_event_loop().run_until_complete(router.route(_request(risk_level="high")))
+ 
+     assert result.status == "FAILED"
+     assert result.success is False
+@@ -248,9 +238,7 @@ def test_deadline_ms_tighter_than_global_timeout() -> None:
+         timeout_seconds=5.0,
+     )
+ 
+-    result = asyncio.get_event_loop().run_until_complete(
+-        router.route(_request(deadline_ms=50))
+-    )
++    result = asyncio.get_event_loop().run_until_complete(router.route(_request(deadline_ms=50)))
+ 
+     # SlowProvider 睡 0.5s，被 50ms 请求时限打断 → 备用成功
+     assert result.status == "OK"
+@@ -266,9 +254,7 @@ def test_deadline_ms_looser_than_global_timeout() -> None:
+         timeout_seconds=0.05,
+     )
+ 
+-    result = asyncio.get_event_loop().run_until_complete(
+-        router.route(_request(deadline_ms=5000))
+-    )
++    result = asyncio.get_event_loop().run_until_complete(router.route(_request(deadline_ms=5000)))
+ 
+     assert result.status == "OK"
+     assert result.chosen is not None
+diff --git a/tests/unit/plugins/test_decision_jev.py b/tests/unit/plugins/test_decision_jev.py
+index a33787b..3b0bde0 100644
+--- a/tests/unit/plugins/test_decision_jev.py
++++ b/tests/unit/plugins/test_decision_jev.py
+@@ -84,14 +84,9 @@ def test_jev_in() -> None:
+ def test_jev_contains() -> None:
+     ctx = {"tags": ["ai", "inference"]}
+     assert evaluate_jev({"field": "tags", "op": "contains", "value": "ai"}, ctx) is True
+-    assert (
+-        evaluate_jev({"field": "tags", "op": "contains", "value": "training"}, ctx)
+-        is False
+-    )
++    assert evaluate_jev({"field": "tags", "op": "contains", "value": "training"}, ctx) is False
+     # 字段缺失时返回 False
+-    assert (
+-        evaluate_jev({"field": "missing", "op": "contains", "value": "a"}, ctx) is False
+-    )
++    assert evaluate_jev({"field": "missing", "op": "contains", "value": "a"}, ctx) is False
+ 
+ 
+ # --------------------------------------------------------------------------- #
+@@ -150,10 +145,12 @@ def test_jev_nested_combination() -> None:
+     ctx = {"x": 5, "y": 10}
+     expr = {
+         "and": [
+-            {"or": [
+-                {"field": "x", "op": "eq", "value": 5},
+-                {"field": "y", "op": "gt", "value": 100},
+-            ]},
++            {
++                "or": [
++                    {"field": "x", "op": "eq", "value": 5},
++                    {"field": "y", "op": "gt", "value": 100},
++                ]
++            },
+             {"not": {"field": "y", "op": "lt", "value": 1}},
+         ]
+     }
+@@ -249,9 +246,7 @@ def test_provider_decide_no_match_returns_empty() -> None:
+         ]
+     )
+     result = list(
+-        asyncio.get_event_loop().run_until_complete(
+-            provider.decide(_request({"x": 999}))
+-        )
++        asyncio.get_event_loop().run_until_complete(provider.decide(_request({"x": 999})))
+     )
+     assert result == []
+ 
+@@ -278,10 +273,12 @@ def test_provider_from_file(tmp_path: pytest.fixture) -> None:
+             },
+             {
+                 "name": "rule-b",
+-                "expression": {"and": [
+-                    {"field": "x", "op": "lt", "value": 100},
+-                    {"field": "y", "op": "eq", "value": "ready"},
+-                ]},
++                "expression": {
++                    "and": [
++                        {"field": "x", "op": "lt", "value": 100},
++                        {"field": "y", "op": "eq", "value": "ready"},
++                    ]
++                },
+                 "action": "act-b",
+             },
+         ],
+@@ -346,9 +343,7 @@ def test_router_integration_fallback_when_no_match() -> None:
+         provider_id = "fallback"
+         provider_version = "0.0.1"
+ 
+-        async def decide(
+-            self, req: DecisionRequest
+-        ) -> Sequence[DecisionCandidate]:
++        async def decide(self, req: DecisionRequest) -> Sequence[DecisionCandidate]:
+             return [DecisionCandidate(candidate_id="fb-1", action="schedule.cpu")]
+ 
+     primary = JEVProvider(
+@@ -360,12 +355,8 @@ def test_router_integration_fallback_when_no_match() -> None:
+             )
+         ]
+     )
+-    router = DecisionRouter(
+-        providers=[primary, FallbackProvider()], timeout_seconds=1.0
+-    )
+-    result = asyncio.get_event_loop().run_until_complete(
+-        router.route(_request({"x": 999}))
+-    )
++    router = DecisionRouter(providers=[primary, FallbackProvider()], timeout_seconds=1.0)
++    result = asyncio.get_event_loop().run_until_complete(router.route(_request({"x": 999})))
+     assert result.success is True
+     assert result.chosen is not None
+     assert result.chosen.candidate_id == "fb-1"
+diff --git a/tests/unit/plugins/test_decision_rules.py b/tests/unit/plugins/test_decision_rules.py
+index 8acfe71..d61f080 100644
+--- a/tests/unit/plugins/test_decision_rules.py
++++ b/tests/unit/plugins/test_decision_rules.py
+@@ -129,12 +129,8 @@ def test_provider_decide_returns_all_matching_candidates() -> None:
+ @pytest.mark.unit
+ def test_provider_decide_no_match_returns_empty() -> None:
+     """无规则匹配时应返回空列表（非 None）。"""
+-    provider = RulesProvider(
+-        rules=[Rule(name="r1", condition=lambda req: False, action="act-1")]
+-    )
+-    result = list(
+-        asyncio.get_event_loop().run_until_complete(provider.decide(_request()))
+-    )
++    provider = RulesProvider(rules=[Rule(name="r1", condition=lambda req: False, action="act-1")])
++    result = list(asyncio.get_event_loop().run_until_complete(provider.decide(_request())))
+     assert result == []
+ 
+ 
+@@ -142,9 +138,7 @@ def test_provider_decide_no_match_returns_empty() -> None:
+ def test_provider_decide_no_rules_returns_empty() -> None:
+     """无规则时 decide 应返回空列表。"""
+     provider = RulesProvider()
+-    result = list(
+-        asyncio.get_event_loop().run_until_complete(provider.decide(_request()))
+-    )
++    result = list(asyncio.get_event_loop().run_until_complete(provider.decide(_request())))
+     assert result == []
+ 
+ 
+@@ -184,17 +178,13 @@ def test_router_integration_fallback_when_no_match() -> None:
+         provider_id = "fallback"
+         provider_version = "0.0.1"
+ 
+-        async def decide(
+-            self, req: DecisionRequest
+-        ) -> Sequence[DecisionCandidate]:
++        async def decide(self, req: DecisionRequest) -> Sequence[DecisionCandidate]:
+             return [DecisionCandidate(candidate_id="fb-1", action="schedule.cpu")]
+ 
+     empty_provider = RulesProvider(
+         rules=[Rule(name="r1", condition=lambda req: False, action="act-1")]
+     )
+-    router = DecisionRouter(
+-        providers=[empty_provider, FallbackProvider()], timeout_seconds=1.0
+-    )
++    router = DecisionRouter(providers=[empty_provider, FallbackProvider()], timeout_seconds=1.0)
+     result = asyncio.get_event_loop().run_until_complete(router.route(_request()))
+     assert result.success is True
+     assert result.chosen is not None
+diff --git a/tests/unit/plugins/test_gpu_hetero.py b/tests/unit/plugins/test_gpu_hetero.py
+index ac8735e..00ec66b 100644
+--- a/tests/unit/plugins/test_gpu_hetero.py
++++ b/tests/unit/plugins/test_gpu_hetero.py
+@@ -241,8 +241,13 @@ def test_classify_severity_info_for_extra() -> None:
+ def test_classify_severity_all_critical_fields() -> None:
+     """所有关键字段缺失都应分类为 critical。"""
+     reporter = HeteroReporter()
+-    critical_fields = ["mig_enabled", "memory_bytes", "compute_capability",
+-                       "cuda_version", "driver_version"]
++    critical_fields = [
++        "mig_enabled",
++        "memory_bytes",
++        "compute_capability",
++        "cuda_version",
++        "driver_version",
++    ]
+     for field in critical_fields:
+         diff = CapabilityDiff(
+             field_name=field,
+@@ -273,12 +278,24 @@ def test_format_report_contains_all_diffs() -> None:
+     """报告文本应包含每项差异的字段名与值。"""
+     reporter = HeteroReporter()
+     diffs = [
+-        CapabilityDiff(field_name="mig_enabled", nvidia_value=True,
+-                       other_vendor_value=None, diff_type=DIFF_MISSING),
+-        CapabilityDiff(field_name="memory_bytes", nvidia_value=80,
+-                       other_vendor_value=64, diff_type=DIFF_DIFFERENT),
+-        CapabilityDiff(field_name="rocm_version", nvidia_value=None,
+-                       other_vendor_value="6.0", diff_type=DIFF_EXTRA),
++        CapabilityDiff(
++            field_name="mig_enabled",
++            nvidia_value=True,
++            other_vendor_value=None,
++            diff_type=DIFF_MISSING,
++        ),
++        CapabilityDiff(
++            field_name="memory_bytes",
++            nvidia_value=80,
++            other_vendor_value=64,
++            diff_type=DIFF_DIFFERENT,
++        ),
++        CapabilityDiff(
++            field_name="rocm_version",
++            nvidia_value=None,
++            other_vendor_value="6.0",
++            diff_type=DIFF_EXTRA,
++        ),
+     ]
+ 
+     text = reporter.format_report(diffs)
+@@ -298,12 +315,24 @@ def test_format_report_summary_counts() -> None:
+     """报告汇总应正确统计 critical / warning / info 数量。"""
+     reporter = HeteroReporter()
+     diffs = [
+-        CapabilityDiff(field_name="mig_enabled", nvidia_value=True,
+-                       other_vendor_value=None, diff_type=DIFF_MISSING),       # critical
+-        CapabilityDiff(field_name="name", nvidia_value="H100",
+-                       other_vendor_value="MI300X", diff_type=DIFF_DIFFERENT),  # warning
+-        CapabilityDiff(field_name="rocm_version", nvidia_value=None,
+-                       other_vendor_value="6.0", diff_type=DIFF_EXTRA),         # info
++        CapabilityDiff(
++            field_name="mig_enabled",
++            nvidia_value=True,
++            other_vendor_value=None,
++            diff_type=DIFF_MISSING,
++        ),  # critical
++        CapabilityDiff(
++            field_name="name",
++            nvidia_value="H100",
++            other_vendor_value="MI300X",
++            diff_type=DIFF_DIFFERENT,
++        ),  # warning
++        CapabilityDiff(
++            field_name="rocm_version",
++            nvidia_value=None,
++            other_vendor_value="6.0",
++            diff_type=DIFF_EXTRA,
++        ),  # info
+     ]
+ 
+     text = reporter.format_report(diffs)
+diff --git a/tests/unit/plugins/test_gpu_mig.py b/tests/unit/plugins/test_gpu_mig.py
+index 9a352cb..f40743d 100644
+--- a/tests/unit/plugins/test_gpu_mig.py
++++ b/tests/unit/plugins/test_gpu_mig.py
+@@ -492,10 +492,7 @@ def test_concurrent_create_on_same_gpu_does_not_oversubscribe_slices() -> None:
+     profile = MIG_PROFILES["1g.5gb"]  # 各 1 切片
+ 
+     async def run_concurrent() -> list[Any]:
+-        tasks = [
+-            manager.create_instance(0, profile, f"tenant-{i}")
+-            for i in range(8)
+-        ]
++        tasks = [manager.create_instance(0, profile, f"tenant-{i}") for i in range(8)]
+         return await asyncio.gather(*tasks, return_exceptions=True)
+ 
+     results = _run(run_concurrent())
+@@ -516,10 +513,7 @@ def test_concurrent_create_on_different_gpus_do_not_block_each_other() -> None:
+     manager = MigManager(gpu_capability_provider=_cap_provider(total_compute_slices=1))
+ 
+     async def run_concurrent() -> list[Any]:
+-        tasks = [
+-            manager.create_instance(i, MIG_PROFILES["1g.5gb"], f"t-{i}")
+-            for i in range(4)
+-        ]
++        tasks = [manager.create_instance(i, MIG_PROFILES["1g.5gb"], f"t-{i}") for i in range(4)]
+         return await asyncio.gather(*tasks, return_exceptions=True)
+ 
+     results = _run(run_concurrent())
+diff --git a/tests/unit/plugins/test_isolation.py b/tests/unit/plugins/test_isolation.py
+index 707738a..30e50e3 100644
+--- a/tests/unit/plugins/test_isolation.py
++++ b/tests/unit/plugins/test_isolation.py
+@@ -74,9 +74,7 @@ class TestIsolationPolicy:
+         assert policy.resolve(TrustLevel.VERIFIED) == IsolationMode.RESTRICTED_RPC
+ 
+     def test_custom_mapping(self) -> None:
+-        policy = IsolationPolicy(
+-            mapping={TrustLevel.TRUSTED: IsolationMode.RESTRICTED_RPC}
+-        )
++        policy = IsolationPolicy(mapping={TrustLevel.TRUSTED: IsolationMode.RESTRICTED_RPC})
+ 
+         assert policy.resolve(TrustLevel.TRUSTED) == IsolationMode.RESTRICTED_RPC
+ 
+diff --git a/tests/unit/plugins/test_metering_basic.py b/tests/unit/plugins/test_metering_basic.py
+index 1b0a228..e056394 100644
+--- a/tests/unit/plugins/test_metering_basic.py
++++ b/tests/unit/plugins/test_metering_basic.py
+@@ -180,18 +180,45 @@ def test_list_by_tenant_empty() -> None:
+ def test_aggregate_statistics() -> None:
+     """aggregate 应正确统计总 Token / 成功失败数 / 延迟。"""
+     store = UsageStore()
+-    _run(store.record(_record(
+-        record_id="r1", input_tokens=100, output_tokens=50, cached_tokens=10,
+-        success=True, latency_ms=200.0, created_at=1000.0,
+-    )))
+-    _run(store.record(_record(
+-        record_id="r2", input_tokens=200, output_tokens=100, cached_tokens=20,
+-        success=True, latency_ms=400.0, created_at=1500.0,
+-    )))
+-    _run(store.record(_record(
+-        record_id="r3", input_tokens=50, output_tokens=20, cached_tokens=0,
+-        success=False, latency_ms=100.0, created_at=1800.0,
+-    )))
++    _run(
++        store.record(
++            _record(
++                record_id="r1",
++                input_tokens=100,
++                output_tokens=50,
++                cached_tokens=10,
++                success=True,
++                latency_ms=200.0,
++                created_at=1000.0,
++            )
++        )
++    )
++    _run(
++        store.record(
++            _record(
++                record_id="r2",
++                input_tokens=200,
++                output_tokens=100,
++                cached_tokens=20,
++                success=True,
++                latency_ms=400.0,
++                created_at=1500.0,
++            )
++        )
++    )
++    _run(
++        store.record(
++            _record(
++                record_id="r3",
++                input_tokens=50,
++                output_tokens=20,
++                cached_tokens=0,
++                success=False,
++                latency_ms=100.0,
++                created_at=1800.0,
++            )
++        )
++    )
+ 
+     summary = _run(store.aggregate("tenant-a", 1000.0, 2000.0))
+     assert isinstance(summary, UsageSummary)
+@@ -293,12 +320,26 @@ def test_correct_duplicate_correction_id_raises_conflict() -> None:
+ def test_multi_tenant_isolation() -> None:
+     """不同租户的记录互不可见（list / aggregate 均隔离）。"""
+     store = UsageStore()
+-    _run(store.record(_record(
+-        record_id="a1", tenant_id="alpha", input_tokens=100, created_at=100.0,
+-    )))
+-    _run(store.record(_record(
+-        record_id="b1", tenant_id="beta", input_tokens=200, created_at=100.0,
+-    )))
++    _run(
++        store.record(
++            _record(
++                record_id="a1",
++                tenant_id="alpha",
++                input_tokens=100,
++                created_at=100.0,
++            )
++        )
++    )
++    _run(
++        store.record(
++            _record(
++                record_id="b1",
++                tenant_id="beta",
++                input_tokens=200,
++                created_at=100.0,
++            )
++        )
++    )
+ 
+     alpha_list = _run(store.list_by_tenant("alpha"))
+     assert [r.record_id for r in alpha_list] == ["a1"]
+diff --git a/tests/unit/plugins/test_qos_basic.py b/tests/unit/plugins/test_qos_basic.py
+index 0d74029..4fca755 100644
+--- a/tests/unit/plugins/test_qos_basic.py
++++ b/tests/unit/plugins/test_qos_basic.py
+@@ -217,7 +217,6 @@ def test_evaluate_priority_default_when_missing() -> None:
+     config = QoSConfig(max_concurrent=10)
+     provider = QoSProvider(config)
+ 
+-
+     req: dict[str, object] = {"request_id": "r1", "tenant_id": "t1"}
+     result = _run(provider.evaluate(req))
+     assert result.priority == "NORMAL"
+diff --git a/tests/unit/policy/test_engine.py b/tests/unit/policy/test_engine.py
+index d0dd6d1..6a86049 100644
+--- a/tests/unit/policy/test_engine.py
++++ b/tests/unit/policy/test_engine.py
+@@ -11,6 +11,7 @@
+ * 有条件授权 → allow + 条件约束；
+ * PolicyDecision 的 policy_id / approvers 审计字段。
+ """
++
+ from __future__ import annotations
+ 
+ import asyncio
+@@ -171,14 +172,10 @@ def test_tenant_isolation_in_authz() -> None:
+         ],
+     )
+     # team-a 有 allow 规则 → allow
+-    result_a = _run(
+-        engine.check(ctx=None, action=_action("inference.deploy", tenant_id="team-a"))
+-    )
++    result_a = _run(engine.check(ctx=None, action=_action("inference.deploy", tenant_id="team-a")))
+     assert result_a.decision == "allow"
+     # team-b 无匹配规则 → 默认拒绝
+-    result_b = _run(
+-        engine.check(ctx=None, action=_action("inference.deploy", tenant_id="team-b"))
+-    )
++    result_b = _run(engine.check(ctx=None, action=_action("inference.deploy", tenant_id="team-b")))
+     assert result_b.decision == "deny"
+ 
+ 
+diff --git a/tests/unit/policy/test_qos.py b/tests/unit/policy/test_qos.py
+index e469ab3..fee08d0 100644
+--- a/tests/unit/policy/test_qos.py
++++ b/tests/unit/policy/test_qos.py
+@@ -7,6 +7,7 @@
+ * QoSManager admit（优先级准入 + 限流 + 并发数限制）；
+ * release_slot 释放并发槽。
+ """
++
+ from __future__ import annotations
+ 
+ import asyncio
+diff --git a/tests/unit/policy/test_quota.py b/tests/unit/policy/test_quota.py
+index 1b001e6..dd2ccb5 100644
+--- a/tests/unit/policy/test_quota.py
++++ b/tests/unit/policy/test_quota.py
+@@ -7,6 +7,7 @@
+ * set_limit / get_usage；
+ * 多租户隔离（不同租户独立配额）。
+ """
++
+ from __future__ import annotations
+ 
+ import asyncio
+diff --git a/tests/unit/resource/test_inference.py b/tests/unit/resource/test_inference.py
+index 1a02e22..5cda435 100644
+--- a/tests/unit/resource/test_inference.py
++++ b/tests/unit/resource/test_inference.py
+@@ -73,9 +73,7 @@ def test_status_default_factory_is_isolated() -> None:
+     first = _make_service()
+     second = _make_service()
+ 
+-    first.status.conditions.append(
+-        Condition(type="Ready", status="True", reason="Deployed")
+-    )
++    first.status.conditions.append(Condition(type="Ready", status="True", reason="Deployed"))
+ 
+     assert len(first.status.conditions) == 1
+     assert second.status.conditions == []
+@@ -136,9 +134,7 @@ def test_extra_field_forbidden() -> None:
+ 
+ def test_status_can_be_provided_explicitly() -> None:
+     """可显式提供 status；phase 接受字符串字面量。"""
+-    service = _make_service(
+-        status=InferenceServiceStatus(phase="Ready", observedGeneration=3)
+-    )
++    service = _make_service(status=InferenceServiceStatus(phase="Ready", observedGeneration=3))
+     assert service.status.phase is InferencePhase.READY
+     assert service.status.observedGeneration == 3
+ 
+diff --git a/tests/unit/workflowruntime/test_compensate.py b/tests/unit/workflowruntime/test_compensate.py
+index 38af197..496acef 100644
+--- a/tests/unit/workflowruntime/test_compensate.py
++++ b/tests/unit/workflowruntime/test_compensate.py
+@@ -125,9 +125,7 @@ def test_compensate_success() -> None:
+ 
+     executor.registry.register("a", handler)
+ 
+-    defn = WorkflowDefinition(
+-        name="flow", steps=[Step(id="a", uses="x")]
+-    )
++    defn = WorkflowDefinition(name="flow", steps=[Step(id="a", uses="x")])
+     results = asyncio.run(executor.compensate(defn, ["a"], {"a": {}}))
+ 
+     assert results["a"] == StepStatus.COMPENSATED
+@@ -146,9 +144,7 @@ def test_compensate_failure() -> None:
+ 
+     executor.registry.register("a", failing_handler)
+ 
+-    defn = WorkflowDefinition(
+-        name="flow", steps=[Step(id="a", uses="x")]
+-    )
++    defn = WorkflowDefinition(name="flow", steps=[Step(id="a", uses="x")])
+     results = asyncio.run(executor.compensate(defn, ["a"], {"a": {}}))
+ 
+     assert results["a"] == StepStatus.COMPENSATION_FAILED
+diff --git a/tests/unit/workflowruntime/test_exec.py b/tests/unit/workflowruntime/test_exec.py
+index f84e444..e10bcec 100644
+--- a/tests/unit/workflowruntime/test_exec.py
++++ b/tests/unit/workflowruntime/test_exec.py
+@@ -60,9 +60,7 @@ def test_execute_step_success() -> None:
+     executor = StepExecutor()
+     step = _make_step()
+ 
+-    result = asyncio.run(
+-        executor.execute_step(step, {"x": 1}, "key-success", _ok_handler)
+-    )
++    result = asyncio.run(executor.execute_step(step, {"x": 1}, "key-success", _ok_handler))
+ 
+     assert result == {"step_id": "s1", "status": "ok"}
+ 
+@@ -73,12 +71,8 @@ def test_execute_step_idempotent() -> None:
+     executor = StepExecutor()
+     step = _make_step()
+ 
+-    result1 = asyncio.run(
+-        executor.execute_step(step, {}, "key-idem", _ok_handler)
+-    )
+-    result2 = asyncio.run(
+-        executor.execute_step(step, {}, "key-idem", _ok_handler)
+-    )
++    result1 = asyncio.run(executor.execute_step(step, {}, "key-idem", _ok_handler))
++    result2 = asyncio.run(executor.execute_step(step, {}, "key-idem", _ok_handler))
+ 
+     assert result1 == {"step_id": "s1", "status": "ok"}
+     assert result2 == {"status": "skipped", "reason": "idempotent"}
+@@ -97,15 +91,11 @@ def test_execute_step_retry_then_success() -> None:
+         return {"status": "ok", "attempt": call_count}
+ 
+     # 退避设为 0 以加速测试。
+-    policy = RetryPolicy(
+-        max_attempts=3, initial_backoff_seconds=0.0, max_backoff_seconds=0.0
+-    )
++    policy = RetryPolicy(max_attempts=3, initial_backoff_seconds=0.0, max_backoff_seconds=0.0)
+     executor = StepExecutor(retry_policy=policy)
+     step = _make_step()
+ 
+-    result = asyncio.run(
+-        executor.execute_step(step, {}, "key-retry", flaky_handler)
+-    )
++    result = asyncio.run(executor.execute_step(step, {}, "key-retry", flaky_handler))
+ 
+     assert result == {"status": "ok", "attempt": 2}
+     assert call_count == 2
+@@ -114,38 +104,32 @@ def test_execute_step_retry_then_success() -> None:
+ @pytest.mark.unit
+ def test_execute_step_all_retries_fail() -> None:
+     """全部重试失败抛异常。"""
++
+     async def failing_handler(step: Step, inputs: dict[str, Any]) -> dict[str, Any]:
+         raise RuntimeError("always fails")
+ 
+-    policy = RetryPolicy(
+-        max_attempts=2, initial_backoff_seconds=0.0, max_backoff_seconds=0.0
+-    )
++    policy = RetryPolicy(max_attempts=2, initial_backoff_seconds=0.0, max_backoff_seconds=0.0)
+     executor = StepExecutor(retry_policy=policy)
+     step = _make_step()
+ 
+     with pytest.raises(RuntimeError, match="always fails"):
+-        asyncio.run(
+-            executor.execute_step(step, {}, "key-fail", failing_handler)
+-        )
++        asyncio.run(executor.execute_step(step, {}, "key-fail", failing_handler))
+ 
+ 
+ @pytest.mark.unit
+ def test_execute_step_timeout() -> None:
+     """步骤超时抛 ExecutionError(timeout_level=STEP)。"""
++
+     async def slow_handler(step: Step, inputs: dict[str, Any]) -> dict[str, Any]:
+         await asyncio.sleep(10)
+         return {"status": "ok"}
+ 
+-    policy = RetryPolicy(
+-        max_attempts=1, initial_backoff_seconds=0.0, max_backoff_seconds=0.0
+-    )
++    policy = RetryPolicy(max_attempts=1, initial_backoff_seconds=0.0, max_backoff_seconds=0.0)
+     executor = StepExecutor(retry_policy=policy)
+     step = _make_step(timeout=1)
+ 
+     with pytest.raises(ExecutionError) as exc_info:
+-        asyncio.run(
+-            executor.execute_step(step, {}, "key-timeout", slow_handler)
+-        )
++        asyncio.run(executor.execute_step(step, {}, "key-timeout", slow_handler))
+ 
+     assert exc_info.value.timeout_level == TimeoutLevel.STEP
+     assert "timed out" in str(exc_info.value)
+@@ -162,9 +146,7 @@ def test_execute_workflow_success() -> None:
+     )
+     executor = WorkflowExecutor()
+ 
+-    results = asyncio.run(
+-        executor.execute_workflow(defn, {"input": 1}, "wf-key", _ok_handler)
+-    )
++    results = asyncio.run(executor.execute_workflow(defn, {"input": 1}, "wf-key", _ok_handler))
+ 
+     assert set(results.keys()) == {"a", "b"}
+     assert results["a"] == {"step_id": "a", "status": "ok"}
+@@ -174,6 +156,7 @@ def test_execute_workflow_success() -> None:
+ @pytest.mark.unit
+ def test_execute_workflow_timeout() -> None:
+     """工作流超时抛 ExecutionError(timeout_level=WORKFLOW)。"""
++
+     async def slow_handler(step: Step, inputs: dict[str, Any]) -> dict[str, Any]:
+         await asyncio.sleep(10)
+         return {"status": "ok"}
+@@ -182,9 +165,7 @@ def test_execute_workflow_timeout() -> None:
+     executor = WorkflowExecutor()
+ 
+     with pytest.raises(ExecutionError) as exc_info:
+-        asyncio.run(
+-            executor.execute_workflow(defn, {}, "wf-timeout", slow_handler)
+-        )
++        asyncio.run(executor.execute_workflow(defn, {}, "wf-timeout", slow_handler))
+ 
+     assert exc_info.value.timeout_level == TimeoutLevel.WORKFLOW
+     assert "timed out" in str(exc_info.value)
+@@ -204,16 +185,12 @@ def test_retry_backoff() -> None:
+ 
+     # 退避：initial=0.05, max=1.0, max_attempts=3
+     # 退避序列：0.05, 0.1（第 0 次后等 0.05，第 1 次后等 0.1）
+-    policy = RetryPolicy(
+-        max_attempts=3, initial_backoff_seconds=0.05, max_backoff_seconds=1.0
+-    )
++    policy = RetryPolicy(max_attempts=3, initial_backoff_seconds=0.05, max_backoff_seconds=1.0)
+     executor = StepExecutor(retry_policy=policy)
+     step = _make_step()
+ 
+     with pytest.raises(RuntimeError):
+-        asyncio.run(
+-            executor.execute_step(step, {}, "key-backoff", failing_handler)
+-        )
++        asyncio.run(executor.execute_step(step, {}, "key-backoff", failing_handler))
+ 
+     # 验证三次调用之间的间隔递增。
+     assert len(call_times) == 3
+diff --git a/tests/unit/workflowruntime/test_store.py b/tests/unit/workflowruntime/test_store.py
+index 4364e60..585c60a 100644
+--- a/tests/unit/workflowruntime/test_store.py
++++ b/tests/unit/workflowruntime/test_store.py
+@@ -139,9 +139,7 @@ def test_update_step_status() -> None:
+     ref = asyncio_run(store.create_run(defn, {}, "key-step"))
+ 
+     # Pending → Running
+-    asyncio_run(
+-        store.update_step_status(ref.run_id, "prepare", StepStatus.RUNNING.value)
+-    )
++    asyncio_run(store.update_step_status(ref.run_id, "prepare", StepStatus.RUNNING.value))
+     statuses = asyncio_run(store.get_step_statuses(ref.run_id))
+     assert statuses["prepare"] == StepStatus.RUNNING
+ 
+@@ -166,9 +164,7 @@ def test_update_step_status_invalid_transition() -> None:
+     ref = asyncio_run(store.create_run(defn, {}, "key-step-invalid"))
+ 
+     with pytest.raises(InvalidStateTransition):
+-        asyncio_run(
+-            store.update_step_status(ref.run_id, "prepare", StepStatus.SUCCEEDED.value)
+-        )
++        asyncio_run(store.update_step_status(ref.run_id, "prepare", StepStatus.SUCCEEDED.value))
+ 
+ 
+ # --------------------------------------------------------------------------- #
+-- 
+2.43.0
+

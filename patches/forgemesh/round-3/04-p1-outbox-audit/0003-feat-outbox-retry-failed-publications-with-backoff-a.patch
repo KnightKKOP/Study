@@ -1,7 +1,7 @@
-From d0c2cc22179ef761bb216695492aa02d18549a16 Mon Sep 17 00:00:00 2001
+From 2f9bb867e24916de9f45e5bd2e37b6ea7ade46c7 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Tue, 13 Oct 2026 02:52:51 +0000
-Subject: [PATCH 03/12] feat(outbox): retry failed publications with backoff
+Subject: [PATCH 03/14] feat(outbox): retry failed publications with backoff
  and a dead state
 
 A single publish failure marked the event 'failed', and get_pending

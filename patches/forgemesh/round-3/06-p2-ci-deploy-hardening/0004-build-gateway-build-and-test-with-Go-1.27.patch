@@ -1,0 +1,220 @@
+From 2702883ad71f95ec169013b5da418a106ab4ec28 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 13 Oct 2026 02:49:40 +0000
+Subject: [PATCH 04/14] build(gateway): build and test with Go 1.27
+
+The gateway image and the CI go job used Go 1.22, which has been out
+of support since February 2025. The gateway depends only on the
+standard library, which is compiled into the binary, so its security
+fixes arrive only with Go patch releases: govulncheck reports 41
+vulnerabilities in standard library code the gateway calls (net/http,
+crypto/tls, crypto/x509, net/url and others) with go1.22.12, the last
+1.22 release, and none with go1.26.9 or go1.27.2.
+
+Build the image from golang:1.27 and run the go job with the same
+minor version, read from a workflow-level GO_VERSION so that jobs
+cannot drift apart; both take the latest patch release.
+
+Raise the go line in go.mod from 1.22 to 1.27.0 too: it selects the
+GODEBUG defaults, and a Go 1.27 build of a "go 1.22" module keeps the
+old behaviour of every setting changed since. For the gateway that
+meant no limit on the number of query parameters the reverse proxy
+parses, a re-encoded and therefore reordered query on every request
+forwarded to the control plane (TestAPIKeyMode_ForwardsAuditEventsQuery
+failed on Go 1.27), and a GOMAXPROCS that ignores the container's CPU
+limit. Now a query is forwarded as sent unless it has more than 10000
+parameters, in which case it is dropped; GOMAXPROCS follows the CPU
+limit, rounded up to at least 2; and the listener accepts Multipath
+TCP where the kernel enables it. A new test fails when the build
+keeps the old defaults for the query limit or GOMAXPROCS.
+
+Developing the gateway now needs Go 1.27; go commands since 1.21
+download it unless GOTOOLCHAIN forbids it. The line names the release
+1.27.0 because older go commands such as go1.22.2 look for a
+nonexistent "go1.27" toolchain when the line is a bare "go 1.27".
+---
+ .github/workflows/ci.yml            |  7 ++++++-
+ CONTRIBUTING.md                     |  2 +-
+ README.md                           |  2 +-
+ deploy/docker/Dockerfile.gateway    |  4 +++-
+ docs/architecture/architecture.md   |  2 +-
+ docs/architecture/module-mapping.md |  8 ++++----
+ gateway/README.md                   |  2 +-
+ gateway/cmd/gateway/godebug_test.go | 31 +++++++++++++++++++++++++++++
+ gateway/go.mod                      |  4 +++-
+ 9 files changed, 51 insertions(+), 11 deletions(-)
+ create mode 100644 gateway/cmd/gateway/godebug_test.go
+
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 44bf896..26612b7 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -11,6 +11,11 @@ concurrency:
+   group: ci-${{ github.ref }}
+   cancel-in-progress: true
+ 
++env:
++  # 网关的 Go 次版本，与 deploy/docker/Dockerfile.gateway 和 gateway/go.mod 的 go 行保持一致。
++  # setup-go 取它的最新补丁版本，标准库的漏洞修复随补丁版本发布；这个次版本停止维护之前一起升级。
++  GO_VERSION: "1.27"
++
+ jobs:
+   python:
+     name: Python ${{ matrix.python-version }} · lint & test
+@@ -88,7 +93,7 @@ jobs:
+       - name: Set up Go
+         uses: actions/setup-go@v5
+         with:
+-          go-version: "1.22"
++          go-version: ${{ env.GO_VERSION }}
+           cache: true
+           cache-dependency-path: gateway/go.sum
+ 
+diff --git a/CONTRIBUTING.md b/CONTRIBUTING.md
+index 970bdd7..d4ae06b 100644
+--- a/CONTRIBUTING.md
++++ b/CONTRIBUTING.md
+@@ -12,7 +12,7 @@
+ 
+ - Python **3.12+**（CI 覆盖 3.12）
+ - GNU Make
+-- Go **1.22+**（仅开发 `gateway/` 时需要）
++- Go **1.27+**（仅开发 `gateway/` 时需要；Go 1.21 起的 go 命令默认会按 `gateway/go.mod` 自动下载所需版本。CI 与网关镜像使用同一次版本的最新补丁，见 `.github/workflows/ci.yml` 中的 `GO_VERSION`）
+ - Git
+ 
+ ### 1.2 初始化
+diff --git a/README.md b/README.md
+index d873856..5a73dce 100644
+--- a/README.md
++++ b/README.md
+@@ -106,7 +106,7 @@ forgemesh/
+ 
+ - Python **3.12+**（CI 覆盖 3.12）
+ - GNU Make
+-- Go **1.22+**（仅当需要开发/构建 `gateway/` 时）
++- Go **1.27+**（仅当需要开发/构建 `gateway/` 时）
+ - Docker 与 Docker Compose v2（仅容器部署时）
+ - Git
+ 
+diff --git a/deploy/docker/Dockerfile.gateway b/deploy/docker/Dockerfile.gateway
+index 6404fb4..024f65f 100644
+--- a/deploy/docker/Dockerfile.gateway
++++ b/deploy/docker/Dockerfile.gateway
+@@ -2,7 +2,9 @@
+ #   docker build -f deploy/docker/Dockerfile.gateway -t forgemesh/gateway:0.0.1 .
+ #
+ # 静态编译（网关只依赖标准库），运行在 distroless 镜像中，用户为 nonroot（uid 65532）。
+-FROM golang:1.22 AS build
++# 标准库编译进二进制，它的漏洞修复随 Go 补丁版本发布：构建镜像使用与 CI 相同的 Go 次版本
++# （.github/workflows/ci.yml 中的 GO_VERSION）的最新补丁，重新构建镜像即可取得修复。
++FROM golang:1.27 AS build
+ 
+ WORKDIR /src
+ COPY gateway/ ./
+diff --git a/docs/architecture/architecture.md b/docs/architecture/architecture.md
+index 0930eb4..d34dfe9 100644
+--- a/docs/architecture/architecture.md
++++ b/docs/architecture/architecture.md
+@@ -1079,7 +1079,7 @@ data:
+ | 领域         | 推荐方案                           |
+ | ------------ | ---------------------------------- |
+ | 核心语言     | Python                             |
+-| 数据平面网关 | Go 1.22（REST 反代 / SSE 流式 / 实例路由 / 摘流） |
++| 数据平面网关 | Go 1.27（REST 反代 / SSE 流式 / 实例路由 / 摘流） |
+ | API          | FastAPI、OpenAPI                   |
+ | 数据验证     | Pydantic 或等效强类型 Schema       |
+ | 权威数据库   | PostgreSQL                         |
+diff --git a/docs/architecture/module-mapping.md b/docs/architecture/module-mapping.md
+index a5ceedf..bdb321c 100644
+--- a/docs/architecture/module-mapping.md
++++ b/docs/architecture/module-mapping.md
+@@ -76,7 +76,7 @@
+ | 字段 | 内容 |
+ |---|---|
+ | 架构模块 | Data Plane Gateway（L1 推理流量入口，architecture.md 3.1 L1 / Dev-5） |
+-| 当前代码路径 | `gateway/cmd/gateway/main.go`；`gateway/internal/{config,health,metrics,middleware,router,stream,upstream}/`（共 53 个 `.go` 文件，其中 31 个 `_test.go`，glob 核对）；`gateway/go.mod`（`github.com/Mekoforge/ForgeMesh/gateway`，go 1.22）；`gateway/Makefile`、`gateway/README.md` |
++| 当前代码路径 | `gateway/cmd/gateway/main.go`；`gateway/internal/{config,health,metrics,middleware,router,stream,upstream}/`（共 54 个 `.go` 文件，其中 32 个 `_test.go`，glob 核对）；`gateway/go.mod`（`github.com/Mekoforge/ForgeMesh/gateway`，go 1.27.0）；`gateway/Makefile`、`gateway/README.md` |
+ | 核心契约 | `/api/v1/` REST + SSE 流式转发（见 openapi.yaml）；中间件链 `Observe → Recovery → Correlation → TraceContext → AccessLog → Authenticate → RateLimit → LimitRequestBody → Route`；API key 认证（ADR-014，`middleware/{authz,apikey}.go`）；上游解析 `upstream/resolver.go`（按命名空间解析 ready 实例、`protocol` → 实例推理路径、合并回源、健康摘流）；实例地址限制 `stream/addrpolicy.go`；`/metrics`（Prometheus 文本格式，不经认证/限流，`metrics/{metrics,gateway}.go`，测试用解析 `metrics/metricstest`）；W3C `traceparent` 沿用/生成并转发、访问日志（`middleware/{observe,tracecontext,accesslog}.go`） |
+ | 运行形态 | 独立进程（Go 二进制），经 `GATEWAY_UPSTREAM_URL` 转发至控制平面 |
+ | 数据所有权 | 无权威数据（运行态转发；端点解析缓存为派生数据） |
+@@ -388,12 +388,12 @@ grep -rn "controlplane" packages/node-agent/src/ --include="*.py" | grep -v egg-
+ 
+ ```bash
+ ls gateway/*.go gateway/cmd/... 2>/dev/null | head   # 根级无 *.go，代码在 cmd/ 与 internal/
+-find gateway -name "*.go" | wc -l                     # → 53
++find gateway -name "*.go" | wc -l                     # → 54
+ find gateway -name "*.py" -o -name "requirements*.txt" | wc -l   # → 0
+-cat gateway/go.mod                                     # module github.com/Mekoforge/ForgeMesh/gateway (go 1.22)
++cat gateway/go.mod                                     # module github.com/Mekoforge/ForgeMesh/gateway (go 1.27.0)
+ ```
+ 
+-**输出：** 53 个 `.go`（含 31 个 `_test.go`）、0 个 `.py`、无 Python 依赖清单；`go.mod` 无任何第三方 require（仅标准库 + go 1.22）。
++**输出：** 54 个 `.go`（含 32 个 `_test.go`）、0 个 `.py`、无 Python 依赖清单；`go.mod` 无任何第三方 require（仅标准库 + go 1.27.0）。
+ 
+ **结论：✅ 符合** —— 网关与 Python 控制平面为进程边界隔离（HTTP 上游），无语言互操作。
+ 
+diff --git a/gateway/README.md b/gateway/README.md
+index 8cc27be..058695f 100644
+--- a/gateway/README.md
++++ b/gateway/README.md
+@@ -238,7 +238,7 @@ gateway 2026/10/13 03:53:36 access method=POST path="/api/v1/namespaces/default/
+ 
+ ```
+ gateway/
+-├── go.mod                          # module + go 1.22（无外部依赖）
++├── go.mod                          # module + go 1.27.0（无外部依赖）
+ ├── Makefile                        # build / test / run / fmt / vet
+ ├── cmd/gateway/main.go             # 入口：配置 → 路由 → http.Server → 优雅停机
+ └── internal/
+diff --git a/gateway/cmd/gateway/godebug_test.go b/gateway/cmd/gateway/godebug_test.go
+new file mode 100644
+index 0000000..286bdeb
+--- /dev/null
++++ b/gateway/cmd/gateway/godebug_test.go
+@@ -0,0 +1,31 @@
++package main
++
++import (
++	"runtime/debug"
++	"slices"
++	"strings"
++	"testing"
++)
++
++// 这些设置的旧默认值关掉网关依赖的行为：不限制 URL 查询参数个数（反代还会重新编码转发的查询串）、
++// GOMAXPROCS 不考虑容器的 CPU 限制。
++var requiredGODEBUGDefaults = []string{"urlmaxqueryparams", "containermaxprocs", "updatemaxprocs"}
++
++// 构建信息中的 DefaultGODEBUG 列出因 go.mod 的 go 行较旧而沿用旧默认值的设置。
++func TestBuildUsesCurrentGODEBUGDefaults(t *testing.T) {
++	info, ok := debug.ReadBuildInfo()
++	if !ok {
++		t.Fatal("测试二进制没有构建信息")
++	}
++	for _, s := range info.Settings {
++		if s.Key != "DefaultGODEBUG" {
++			continue
++		}
++		for _, kv := range strings.Split(s.Value, ",") {
++			name, _, _ := strings.Cut(kv, "=")
++			if slices.Contains(requiredGODEBUGDefaults, name) {
++				t.Errorf("构建沿用了旧的默认值 %s：gateway/go.mod 的 go 行落后于构建所用的 Go 版本", kv)
++			}
++		}
++	}
++}
+diff --git a/gateway/go.mod b/gateway/go.mod
+index 84c07eb..3b88122 100644
+--- a/gateway/go.mod
++++ b/gateway/go.mod
+@@ -1,3 +1,5 @@
+ module github.com/Mekoforge/ForgeMesh/gateway
+ 
+-go 1.22
+\ No newline at end of file
++// go 行也决定 GODEBUG 的默认值，落后于构建所用的 Go 次版本时二进制沿用旧版本的行为：
++// 与 .github/workflows/ci.yml 的 GO_VERSION、deploy/docker/Dockerfile.gateway 一起升级。
++go 1.27.0
+-- 
+2.43.0
+

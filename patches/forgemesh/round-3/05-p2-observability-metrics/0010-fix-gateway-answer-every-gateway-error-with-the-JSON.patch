@@ -1,7 +1,7 @@
-From ce9fe7fd2062d5b124fd7ad8afee91bb795ff11c Mon Sep 17 00:00:00 2001
+From 4ca2e88410ddd173ed24ce563d69f0dcdd2bb35e Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Tue, 13 Oct 2026 05:06:03 +0000
-Subject: [PATCH 10/11] fix(gateway): answer every gateway error with the JSON
+Subject: [PATCH 10/17] fix(gateway): answer every gateway error with the JSON
  envelope
 
 The rate limiter's 429, the 502 when the reverse proxy or the stream
@@ -13,24 +13,37 @@ could not be matched to the logs by its body.
 
 They now use the shared envelope with stable codes: RATE_LIMITED
 (Retry-After is unchanged), UPSTREAM_UNAVAILABLE, INVALID_UPSTREAM
-when the request to an instance cannot be built, and NOT_FOUND for
-unknown paths. Under /api/v1/ the 404 still goes through the whole
-chain; elsewhere it gets the correlation id, the trace id and an
+when the request to an instance cannot be built, and ROUTE_NOT_FOUND
+for unknown paths. Under /api/v1/ the 404 still goes through the
+whole chain; elsewhere it gets the correlation id, the trace id and an
 access log line but, as before, no authentication or rate limit.
 /metrics answers methods other than GET and HEAD with
 METHOD_NOT_ALLOWED. Status codes and existing codes are unchanged,
 and responses from the control plane or instances pass through
 untouched.
+
+Unknown paths do not reuse the control plane's NOT_FOUND because the
+CLI reads that code as "the resource does not exist": with it, a
+wrong --api-url would make "forgemesh wait --for delete" succeed at
+once. The CLI still picks its exit code from the status, so the
+envelopes change only its messages. A 404 with any other code still
+exits 1 and, as for the plain-text 404 before, tells the user to check
+--api-url. Plain-text 429 and 502 can now only come from something in
+front of the gateway, so the CLI no longer attributes them to it.
 ---
  gateway/internal/middleware/chain_test.go     |   7 +-
  gateway/internal/middleware/ratelimit.go      |   5 +-
  gateway/internal/router/errors_test.go        | 200 ++++++++++++++++++
- gateway/internal/router/router.go             |  33 ++-
+ gateway/internal/router/router.go             |  34 ++-
  gateway/internal/stream/proxy.go              |   4 +-
  gateway/internal/stream/proxy_test.go         |  22 ++
  gateway/internal/upstream/client.go           |   2 +-
  .../internal/upstream/tracecontext_test.go    |  11 +-
- 8 files changed, 271 insertions(+), 13 deletions(-)
+ packages/cli/src/forgemesh/cli/client.py      |  14 +-
+ packages/cli/src/forgemesh/cli/errors.py      |   9 +-
+ tests/unit/cli/fakes.py                       |   2 +-
+ tests/unit/cli/test_client.py                 |  78 ++++++-
+ 12 files changed, 355 insertions(+), 33 deletions(-)
  create mode 100644 gateway/internal/router/errors_test.go
 
 diff --git a/gateway/internal/middleware/chain_test.go b/gateway/internal/middleware/chain_test.go
@@ -83,7 +96,7 @@ index 0a87e3a..6c4a6fa 100644
  			next.ServeHTTP(w, r)
 diff --git a/gateway/internal/router/errors_test.go b/gateway/internal/router/errors_test.go
 new file mode 100644
-index 0000000..1158264
+index 0000000..cbfaebf
 --- /dev/null
 +++ b/gateway/internal/router/errors_test.go
 @@ -0,0 +1,200 @@
@@ -165,9 +178,9 @@ index 0000000..1158264
 +		{"推理实例不可达", cp.URL, false, http.MethodPost, "/api/v1/inference/svc-a/chat", routerKeyTenantA,
 +			http.StatusBadGateway, "UPSTREAM_UNAVAILABLE"},
 +		{"/api/v1/ 下的未知路径", cp.URL, false, http.MethodGet, "/api/v1/unknown", routerKeyTenantA,
-+			http.StatusNotFound, "NOT_FOUND"},
++			http.StatusNotFound, "ROUTE_NOT_FOUND"},
 +		{"其他未知路径（不需要凭证）", cp.URL, false, http.MethodGet, "/unknown", "",
-+			http.StatusNotFound, "NOT_FOUND"},
++			http.StatusNotFound, "ROUTE_NOT_FOUND"},
 +	}
 +	for _, tc := range cases {
 +		t.Run(tc.name, func(t *testing.T) {
@@ -288,15 +301,15 @@ index 0000000..1158264
 +	}
 +}
 diff --git a/gateway/internal/router/router.go b/gateway/internal/router/router.go
-index 1a4a854..b7a7643 100644
+index cdede2c..cb5576e 100644
 --- a/gateway/internal/router/router.go
 +++ b/gateway/internal/router/router.go
-@@ -15,11 +15,15 @@
+@@ -16,11 +16,15 @@
  //	                                          ready 实例，轮询分发，按实例协议映射
  //	                                          路径；要求 read 作用域）
  //	ANY  /api/v1/inference/{svc}/chat          同上，用于不带命名空间的服务
-+//	ANY  /api/v1/ 下的其他路径                 404 NOT_FOUND（经过完整的中间件链）
-+//	ANY  其他路径                              404 NOT_FOUND（经过 Correlation、TraceContext 与
++//	ANY  /api/v1/ 下的其他路径                 404 ROUTE_NOT_FOUND（经过完整的中间件链）
++//	ANY  其他路径                              404 ROUTE_NOT_FOUND（经过 Correlation、TraceContext 与
 +//	                                          AccessLog，不经过认证与限流）
  //
  // 中间件链（执行顺序）：Observe → Recovery → Correlation → TraceContext → AccessLog →
@@ -307,7 +320,7 @@ index 1a4a854..b7a7643 100644
  // 认证模式见 config.AuthModeAPIKey / config.AuthModeDev 与 ADR-014。
  package router
  
-@@ -112,6 +116,7 @@ func New(cfg config.Config, logger *log.Logger) (*Router, error) {
+@@ -114,6 +118,7 @@ func New(cfg config.Config, logger *log.Logger) (*Router, error) {
  	streamHandler := middleware.RequireScope(middleware.ScopeRead)(streamProxy)
  	apiMux.Handle(streamRoutePattern, streamHandler)
  	apiMux.Handle(streamWithoutNamespacePattern, streamHandler)
@@ -315,7 +328,7 @@ index 1a4a854..b7a7643 100644
  
  	maxBody := cfg.MaxRequestBodyBytes
  	if maxBody <= 0 {
-@@ -137,12 +142,18 @@ func New(cfg config.Config, logger *log.Logger) (*Router, error) {
+@@ -139,12 +144,18 @@ func New(cfg config.Config, logger *log.Logger) (*Router, error) {
  	m.WatchRateLimiter(limiter.Rejected)
  	m.WatchInstances(resolver.InstanceStates)
  
@@ -336,13 +349,14 @@ index 1a4a854..b7a7643 100644
  
  	// Recovery 兜底全量请求的 panic；Observe 在它外层，兜底返回的 500 也被计入。
  	return &Router{handler: middleware.Chain(root,
-@@ -177,6 +188,24 @@ func classifier(root, api *http.ServeMux) func(*http.Request) metrics.Route {
+@@ -179,6 +190,25 @@ func classifier(root, api *http.ServeMux) func(*http.Request) metrics.Route {
  	}
  }
  
-+// notFound 回复没有匹配路由的请求。
++// notFound 回复没有匹配路由的请求。错误码不能是控制平面表示资源不存在的 NOT_FOUND：客户端
++// （如 CLI）以错误码区分资源不存在与地址配置错误。
 +func notFound(w http.ResponseWriter, r *http.Request) {
-+	middleware.WriteError(w, r, http.StatusNotFound, "NOT_FOUND", "route not found")
++	middleware.WriteError(w, r, http.StatusNotFound, "ROUTE_NOT_FOUND", "route not found")
 +}
 +
 +// getOrHead 只把 GET 与 HEAD 交给 next，其他方法返回 405 错误信封。用于 /metrics：它不经过
@@ -463,6 +477,220 @@ index 1fc0059..da48b8d 100644
  	if want := "corr=corr-1 trace=" + testTraceID + " "; !strings.Contains(logs.String(), want) {
  		t.Fatalf("错误日志应含 %q，实际 %q", want, logs.String())
  	}
+diff --git a/packages/cli/src/forgemesh/cli/client.py b/packages/cli/src/forgemesh/cli/client.py
+index 24b87a9..4f80cb5 100644
+--- a/packages/cli/src/forgemesh/cli/client.py
++++ b/packages/cli/src/forgemesh/cli/client.py
+@@ -2,9 +2,9 @@
+ 
+ 网关与控制平面提供同一套 ``/api/v1`` API。一次命令行调用的全部请求带同一个
+ ``X-Correlation-Id``，错误消息中显示它，便于在网关与控制平面的日志中找到这次调用。
+-错误响应是控制平面与网关的错误信封，或网关自己的纯文本响应（限流 ``429``、连不上控制
+-平面 ``502``）；两者都转换为 :class:`~.errors.ApiError`。客户端不跟随重定向，
+-``Authorization`` 只发给配置的地址。
++控制平面与网关的错误响应都是错误信封；不是错误信封的错误响应（如网关前面的反向代理返回的
++纯文本 ``429`` / ``502``，或不提供 API 的地址返回的内容）同样转换为
++:class:`~.errors.ApiError`。客户端不跟随重定向，``Authorization`` 只发给配置的地址。
+ """
+ 
+ from __future__ import annotations
+@@ -244,6 +244,8 @@ class ApiClient:
+                 f"correlation id {printable(correlation_id)})",
+                 *_validation_errors(details),
+             ]
++            if status == 404 and code != "NOT_FOUND":
++                lines[0] += "; check --api-url"
+         else:
+             lines = [
+                 f"{_plain_message(status, headers, raw)} (correlation id {self.correlation_id})"
+@@ -296,12 +298,12 @@ def _validation_errors(details: Any) -> list[str]:
+ 
+ 
+ def _plain_message(status: int, headers: Message, raw: bytes) -> str:
+-    """不是错误信封的错误响应（网关的纯文本响应，或不提供 API 的地址）的说明。"""
++    """不是错误信封的错误响应（如网关前面的反向代理或不提供 API 的地址返回的）的说明。"""
+     status_line = f"HTTP {status} {_phrase(status)}".rstrip()
+     if status == 429:
+-        return f"rate limited by the gateway ({status_line})"
++        return f"rate limited ({status_line})"
+     if status == 502:
+-        return f"the gateway could not reach the control plane ({status_line})"
++        return f"the server could not reach its upstream ({status_line})"
+     if 300 <= status < 400:
+         location = headers.get("Location")
+         target = f" to {printable(location)}" if location else ""
+diff --git a/packages/cli/src/forgemesh/cli/errors.py b/packages/cli/src/forgemesh/cli/errors.py
+index 78806c3..7ca260d 100644
+--- a/packages/cli/src/forgemesh/cli/errors.py
++++ b/packages/cli/src/forgemesh/cli/errors.py
+@@ -18,7 +18,7 @@ class ExitCode(IntEnum):
+     USAGE = 2
+     """参数、配置或资源文档不合法，没有发出请求（与 argparse 的用法错误相同）。"""
+     NOT_FOUND = 3
+-    """API 报告资源不存在（``404`` 错误信封）。"""
++    """API 报告资源不存在（``404`` 错误信封，错误码 ``NOT_FOUND``）。"""
+     CONFLICT = 4
+     REJECTED = 5
+     """API 拒绝了请求：``400``、``405``、``413``、``415`` 等其他 4xx。"""
+@@ -86,8 +86,8 @@ class ApiError(CliError):
+ 
+     Attributes:
+         status: HTTP 状态码。
+-        code: 错误信封的 ``error.code``；响应不是错误信封（如网关的纯文本 ``429`` / ``502``）
+-            时为 ``None``。
++        code: 错误信封的 ``error.code``；响应不是错误信封（如反向代理的纯文本 ``502``）时为
++            ``None``。
+         reason: 错误信封的 ``details.reason``（如 ``409`` 的 ``ResourceVersionMismatch``）。
+         retry_after: ``Retry-After`` 响应头给出的秒数。
+     """
+@@ -113,7 +113,8 @@ class ApiError(CliError):
+ 
+     @property
+     def not_found(self) -> bool:
+-        """资源不存在：``404`` 错误信封，而不是不提供 API 的地址返回的 ``404``。"""
++        """资源不存在：错误码为 ``NOT_FOUND`` 的 ``404``，而不是网关对没有路由的路径返回的
++        ``ROUTE_NOT_FOUND`` 或不提供 API 的地址返回的 ``404``。"""
+         return self.status == 404 and self.code == "NOT_FOUND"
+ 
+     @property
+diff --git a/tests/unit/cli/fakes.py b/tests/unit/cli/fakes.py
+index b5f2c20..b2df539 100644
+--- a/tests/unit/cli/fakes.py
++++ b/tests/unit/cli/fakes.py
+@@ -103,7 +103,7 @@ def error_body(
+     correlation_id: str = "cid-server",
+     details: dict[str, Any] | None = None,
+ ) -> dict[str, Any]:
+-    """控制平面的错误信封。"""
++    """控制平面与网关的错误信封。"""
+     error: dict[str, Any] = {"code": code, "message": message, "correlationId": correlation_id}
+     if details is not None:
+         error["details"] = details
+diff --git a/tests/unit/cli/test_client.py b/tests/unit/cli/test_client.py
+index 91ea844..e80b7a3 100644
+--- a/tests/unit/cli/test_client.py
++++ b/tests/unit/cli/test_client.py
+@@ -1,7 +1,7 @@
+ """HTTP 客户端单元测试：请求头、错误响应到消息与退出码的映射、重定向、连接失败与翻页。
+ 
+-错误响应有两种：控制平面与网关的错误信封，以及网关自己的纯文本 ``429`` / ``502``（和
+-不提供 API 的地址返回的任何内容）。
++错误响应有两种：控制平面与网关的错误信封，以及不是错误信封的响应（如网关前面的反向代理
++返回的纯文本 ``429`` / ``502``，和不提供 API 的地址返回的任何内容）。
+ """
+ 
+ from __future__ import annotations
+@@ -98,7 +98,29 @@ def test_an_envelope_without_a_correlation_id_shows_the_one_the_cli_sent(api: Fa
+     )
+ 
+ 
+-def test_the_gateway_rate_limit_is_plain_text_with_retry_after(api: FakeApi) -> None:
++def test_the_gateway_rate_limit_keeps_its_code_and_retry_after(api: FakeApi) -> None:
++    api.reply(
++        "GET",
++        PATH,
++        429,
++        error_body("RATE_LIMITED", "rate limit exceeded", "cid-gw"),
++        headers={"Retry-After": "2"},
++    )
++
++    error = get_error(api)
++
++    assert (error.exit_code, error.code, error.retry_after, error.transient) == (
++        ExitCode.RATE_LIMITED,
++        "RATE_LIMITED",
++        2,
++        True,
++    )
++    assert error.message == (
++        "rate limit exceeded (HTTP 429 RATE_LIMITED, correlation id cid-gw); retry after 2 s"
++    )
++
++
++def test_a_plain_text_rate_limit_keeps_retry_after(api: FakeApi) -> None:
+     api.reply("GET", PATH, 429, raw=b"Too Many Requests\n", headers={"Retry-After": "2"})
+ 
+     error = get_error(api)
+@@ -110,8 +132,7 @@ def test_the_gateway_rate_limit_is_plain_text_with_retry_after(api: FakeApi) ->
+         True,
+     )
+     assert error.message == (
+-        "rate limited by the gateway (HTTP 429 Too Many Requests) (correlation id cid-cli); "
+-        "retry after 2 s"
++        "rate limited (HTTP 429 Too Many Requests) (correlation id cid-cli); retry after 2 s"
+     )
+ 
+ 
+@@ -124,15 +145,27 @@ def test_a_retry_after_that_is_not_a_number_of_seconds_is_ignored(api: FakeApi)
+     assert "retry after" not in error.message
+ 
+ 
+-def test_the_gateway_bad_gateway_is_plain_text(api: FakeApi) -> None:
++def test_the_gateway_without_a_control_plane_is_unavailable(api: FakeApi) -> None:
++    api.reply(
++        "GET", PATH, 502, error_body("UPSTREAM_UNAVAILABLE", "control plane unavailable", "cid-gw")
++    )
++
++    error = get_error(api)
++
++    assert (error.exit_code, error.transient) == (ExitCode.UNAVAILABLE, True)
++    assert error.message == (
++        "control plane unavailable (HTTP 502 UPSTREAM_UNAVAILABLE, correlation id cid-gw)"
++    )
++
++
++def test_a_plain_text_bad_gateway_is_unavailable(api: FakeApi) -> None:
+     api.reply("GET", PATH, 502, raw=b"Bad Gateway\n")
+ 
+     error = get_error(api)
+ 
+     assert (error.exit_code, error.transient) == (ExitCode.UNAVAILABLE, True)
+     assert error.message == (
+-        "the gateway could not reach the control plane (HTTP 502 Bad Gateway) "
+-        "(correlation id cid-cli)"
++        "the server could not reach its upstream (HTTP 502 Bad Gateway) (correlation id cid-cli)"
+     )
+ 
+ 
+@@ -144,10 +177,37 @@ def test_a_control_plane_that_is_not_ready_is_unavailable(api: FakeApi) -> None:
+     assert (error.exit_code, error.transient) == (ExitCode.UNAVAILABLE, True)
+ 
+ 
++def test_the_gateway_route_not_found_does_not_mean_the_service_is_missing(api: FakeApi) -> None:
++    """网关对没有路由的路径返回 ``ROUTE_NOT_FOUND``：地址错了，退出码不能是"资源不存在"。"""
++    api.reply("GET", PATH, 404, error_body("ROUTE_NOT_FOUND", "route not found", "cid-gw"))
++
++    error = get_error(api)
++
++    assert (error.exit_code, error.not_found, error.code) == (
++        ExitCode.ERROR,
++        False,
++        "ROUTE_NOT_FOUND",
++    )
++    assert error.message == (
++        "route not found (HTTP 404 ROUTE_NOT_FOUND, correlation id cid-gw); check --api-url"
++    )
++
++
++def test_a_missing_service_is_not_found(api: FakeApi) -> None:
++    api.reply("GET", PATH, 404, error_body("NOT_FOUND", "InferenceService 'llama' not found"))
++
++    error = get_error(api)
++
++    assert (error.exit_code, error.not_found) == (ExitCode.NOT_FOUND, True)
++    assert error.message == (
++        "InferenceService 'llama' not found (HTTP 404 NOT_FOUND, correlation id cid-server)"
++    )
++
++
+ def test_a_404_that_is_not_from_the_api_does_not_mean_the_service_is_missing(
+     api: FakeApi,
+ ) -> None:
+-    """网关对没有路由的路径返回纯文本 404：地址错了，退出码不能是"资源不存在"。"""
++    """不提供 API 的地址返回纯文本 404：地址错了，退出码不能是"资源不存在"。"""
+     api.reply("GET", PATH, 404, raw=b"404 page not found\n")
+ 
+     error = get_error(api)
 -- 
 2.43.0
 

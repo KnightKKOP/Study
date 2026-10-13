@@ -1,7 +1,7 @@
-From 7103105b100c7246c86f1cf68bbce4971c894816 Mon Sep 17 00:00:00 2001
+From 03fa9261354ec363eaf54b2abf79c80e77fb3fff Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Tue, 13 Oct 2026 05:43:24 +0000
-Subject: [PATCH 2/3] test(e2e): drive the CLI against the control plane over
+Subject: [PATCH 2/6] test(e2e): drive the CLI against the control plane over
  HTTP
 
 The unit tests run the CLI against a fake API. This test runs it against

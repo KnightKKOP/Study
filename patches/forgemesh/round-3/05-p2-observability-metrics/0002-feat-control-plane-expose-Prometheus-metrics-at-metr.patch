@@ -1,7 +1,7 @@
-From da31a9eaacbdc0b95bd1bc4463152d4c895c0d4e Mon Sep 17 00:00:00 2001
+From 07e647dcfd7b064413bd17996d5b0c979136c16b Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Tue, 13 Oct 2026 02:37:45 +0000
-Subject: [PATCH 02/11] feat(control-plane): expose Prometheus metrics at
+Subject: [PATCH 02/17] feat(control-plane): expose Prometheus metrics at
  /metrics
 
 The control plane only kept metrics in memory, so operators could not
@@ -31,7 +31,7 @@ probes.
  create mode 100644 tests/unit/controlplane/test_metrics_endpoint.py
 
 diff --git a/api/openapi/openapi.yaml b/api/openapi/openapi.yaml
-index 622e552..3f955ef 100644
+index c39bed6..cbca9b0 100644
 --- a/api/openapi/openapi.yaml
 +++ b/api/openapi/openapi.yaml
 @@ -8,7 +8,7 @@ info:
@@ -42,17 +42,17 @@ index 622e552..3f955ef 100644
 +    认证（ADR-014）：除探针与 /metrics 外的全部端点要求 Authorization: Bearer <API key>，
      租户取自 key 绑定的租户；X-Tenant-Id 请求头可以省略，携带时必须与之一致，
      否则返回 403。读接口要求 read scope，写接口要求 write scope。
-   x-stability: beta
-@@ -29,7 +29,7 @@ tags:
-   - name: decisions
-     description: 结构化决策请求（决策≠授权；授权由 Scheduler/Policy 完成）
+     任何端点遇到未预期的内部错误都返回 500（错误码 INTERNAL_ERROR，不含内部细节），
+@@ -35,7 +35,7 @@ tags:
+   - name: audit
+     description: 审计记录查询（只读，限定在凭证绑定的租户内）
    - name: probes
 -    description: 存活与就绪探针
 +    description: 存活与就绪探针、Prometheus 指标
  
  paths:
    /healthz:
-@@ -64,6 +64,23 @@ paths:
+@@ -70,6 +70,23 @@ paths:
              application/json:
                schema:
                  $ref: "#/components/schemas/Error"
@@ -75,7 +75,7 @@ index 622e552..3f955ef 100644
 +                type: string
  
    /api/v1/inference-services:
-     get:
+     parameters:
 diff --git a/packages/control-plane/src/forgemesh/controlplane/api/middleware.py b/packages/control-plane/src/forgemesh/controlplane/api/middleware.py
 new file mode 100644
 index 0000000..a2e5c82
@@ -127,11 +127,11 @@ index 0000000..a2e5c82
 +
 +__all__ = ["TelemetryMiddleware"]
 diff --git a/packages/control-plane/src/forgemesh/controlplane/app.py b/packages/control-plane/src/forgemesh/controlplane/app.py
-index e735f6a..4f8dc89 100644
+index 1d131a4..f9a9dc5 100644
 --- a/packages/control-plane/src/forgemesh/controlplane/app.py
 +++ b/packages/control-plane/src/forgemesh/controlplane/app.py
-@@ -32,7 +32,9 @@
-   协调器在分配之前即报告 ``WorkflowRuntimeUnavailable``。
+@@ -42,7 +42,9 @@
+   控制器（含定期核对实例与回收分配）、工作流运行时与启动器之后，关闭数据库之前最后停止。
  * **无导入副作用**：数据库在应用启动（lifespan）时才打开，导入本模块不会
    创建文件。
 -* **探针**：``/healthz``（存活）恒为 ok；``/readyz``（就绪）探测权威存储可用。
@@ -141,19 +141,21 @@ index e735f6a..4f8dc89 100644
  * **FastAPI 可选兜底**：若运行环境未安装 FastAPI，回退到纯标准库
    ``http.server``，仅提供探针与 501 占位。
  
-@@ -74,9 +76,11 @@ from .deployment import (
-     launcher_from_env,
-     mark_lost_instances,
+@@ -89,11 +91,13 @@ from .deployment import (
+     reclaim_orphaned_allocations,
+     record_file_path,
  )
 +from .metrics import CONTENT_TYPE
+ from .outbox import Dispatcher
+ from .publishers import publisher_from_env
  from .reconciler import ProcessedKeyStore, ReconciliationController
  from .scheduler import INVENTORY_FILE_ENV, FirstFitScheduler, inventory_from_env
  from .sqlite import workflow_db_path
 +from .telemetry import ControlPlaneMetrics
+ from .version import CONTROL_PLANE_VERSION
  
  if TYPE_CHECKING:  # pragma: no cover - 仅静态类型检查使用
-     from .auth import Authenticator
-@@ -86,7 +90,7 @@ if TYPE_CHECKING:  # pragma: no cover - 仅静态类型检查使用
+@@ -105,7 +109,7 @@ if TYPE_CHECKING:  # pragma: no cover - 仅静态类型检查使用
  
  try:  # pragma: no cover - 取决于运行环境是否安装 FastAPI
      from fastapi import FastAPI
@@ -162,8 +164,8 @@ index e735f6a..4f8dc89 100644
  
      _FASTAPI_AVAILABLE = True
  except Exception:  # pragma: no cover - 兜底路径
-@@ -224,6 +228,9 @@ if _FASTAPI_AVAILABLE:
-             reset_authenticator,
+@@ -264,6 +268,9 @@ if _FASTAPI_AVAILABLE:
+             reset_registry,
          )
          from .api.errors import install_exception_handlers
 +        from .api.middleware import TelemetryMiddleware
@@ -172,7 +174,7 @@ index e735f6a..4f8dc89 100644
  
          @asynccontextmanager
          async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-@@ -288,6 +295,7 @@ if _FASTAPI_AVAILABLE:
+@@ -338,6 +345,7 @@ if _FASTAPI_AVAILABLE:
              version=CONTROL_PLANE_VERSION,
              lifespan=lifespan,
          )
@@ -180,7 +182,7 @@ index e735f6a..4f8dc89 100644
  
          @application.get("/healthz", response_model=HealthResponse, tags=["probes"])
          async def healthz() -> HealthResponse:
-@@ -306,6 +314,11 @@ if _FASTAPI_AVAILABLE:
+@@ -356,6 +364,11 @@ if _FASTAPI_AVAILABLE:
                  )
              return HealthResponse(status="ok")
  
@@ -262,7 +264,7 @@ index 0000000..09dad88
 +]
 diff --git a/tests/unit/controlplane/test_metrics_endpoint.py b/tests/unit/controlplane/test_metrics_endpoint.py
 new file mode 100644
-index 0000000..ae2026d
+index 0000000..76b084d
 --- /dev/null
 +++ b/tests/unit/controlplane/test_metrics_endpoint.py
 @@ -0,0 +1,112 @@
@@ -372,7 +374,7 @@ index 0000000..ae2026d
 +        raise RuntimeError("boom")
 +
 +    with TestClient(_dev_app(tmp_path), raise_server_exceptions=False) as client:
-+        monkeypatch.setattr(get_registry(), "list", failing_list)
++        monkeypatch.setattr(get_registry(), "list_page", failing_list)
 +        assert client.get("/api/v1/inference-services", headers=HEADERS).status_code == 500
 +        text = client.get("/metrics").text
 +

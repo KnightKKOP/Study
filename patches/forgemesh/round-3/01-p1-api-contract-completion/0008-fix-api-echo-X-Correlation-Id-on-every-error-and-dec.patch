@@ -1,7 +1,7 @@
 From 5ea7ac52602a854a433489a1aa57e323d55342f2 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Tue, 13 Oct 2026 03:35:09 +0000
-Subject: [PATCH 08/10] fix(api): echo X-Correlation-Id on every error and
+Subject: [PATCH 08/11] fix(api): echo X-Correlation-Id on every error and
  declare the header
 
 The limit check on both list endpoints and the delete conflict path built

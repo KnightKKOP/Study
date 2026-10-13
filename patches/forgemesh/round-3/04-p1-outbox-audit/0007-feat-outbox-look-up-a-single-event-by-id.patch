@@ -1,7 +1,7 @@
-From eaf702730b7c8d474e8e487da016ae20858ac419 Mon Sep 17 00:00:00 2001
+From 3514c407519eadeb15ecadac11d7b994deb1c34b Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Tue, 13 Oct 2026 03:31:17 +0000
-Subject: [PATCH 07/12] feat(outbox): look up a single event by id
+Subject: [PATCH 07/14] feat(outbox): look up a single event by id
 
 Outbox.get returns an event in any state, or None when it does not exist
 (or was published and purged). Audit records carry the id of the event
@@ -34,10 +34,10 @@ index 3f037a7..952e65c 100644
          """获取 pending 事件（含尚在退避中的），按创建时间升序排列。"""
          rows = self._query(
 diff --git a/tests/unit/controlplane/test_auth.py b/tests/unit/controlplane/test_auth.py
-index 5cc8080..efdfb8a 100644
+index 44997d1..5a162de 100644
 --- a/tests/unit/controlplane/test_auth.py
 +++ b/tests/unit/controlplane/test_auth.py
-@@ -308,19 +308,19 @@ def test_api_writes_are_audited_with_the_principal(api_client) -> None:
+@@ -321,19 +321,19 @@ def test_api_writes_are_audited_with_the_principal(api_client) -> None:
      assert (created.status_code, deleted.status_code) == (201, 204)
      registry = get_registry()
      records = sorted(registry.audit_log.query_by_tenant("tenant-a"), key=lambda e: e.timestamp)

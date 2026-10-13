@@ -1,7 +1,7 @@
-From a8c0328952c70d300c9f0d537a3fa3db336ce286 Mon Sep 17 00:00:00 2001
+From 530b9d8e9b5745fffe75c8ccfb60def35b59cee1 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Tue, 13 Oct 2026 02:54:41 +0000
-Subject: [PATCH 04/12] feat(outbox): persist consumer idempotency in SQLite
+Subject: [PATCH 04/14] feat(outbox): persist consumer idempotency in SQLite
 
 IdempotentConsumer kept processed event ids in a set: it grew without
 bound and was empty after a restart, so a redelivered event ran its

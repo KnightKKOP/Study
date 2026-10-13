@@ -1,7 +1,7 @@
 From f58fabccdd4a32adfa7ad819df0902cd7902f38b Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Tue, 13 Oct 2026 03:44:26 +0000
-Subject: [PATCH 09/10] test(api): add an OpenAPI contract drift test
+Subject: [PATCH 09/11] test(api): add an OpenAPI contract drift test
 
 Nothing kept api/openapi/openapi.yaml in step with the routes: the workflow
 endpoint served 404, 500 and 503 and the decision endpoint 500 without

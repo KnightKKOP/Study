@@ -1,7 +1,7 @@
-From a7ff74f80800b1591a35d25760a1a1c28c6caf79 Mon Sep 17 00:00:00 2001
+From 498aaee254c082179eac5d154fa0f7df39d719a9 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Tue, 13 Oct 2026 03:34:22 +0000
-Subject: [PATCH 05/11] feat(gateway): expose Prometheus metrics at /metrics
+Subject: [PATCH 05/17] feat(gateway): expose Prometheus metrics at /metrics
 
 The gateway is the single entry point for the resource API and for
 streaming inference, but it exported nothing: request rates, latency,
@@ -37,14 +37,14 @@ requests cancelled by the client are not counted as upstream errors.
  gateway/internal/middleware/observe_test.go   | 141 +++++++
  gateway/internal/middleware/ratelimit.go      |   7 +
  gateway/internal/middleware/ratelimit_test.go |  17 +
- gateway/internal/router/metrics_test.go       | 164 ++++++++
+ gateway/internal/router/metrics_test.go       | 165 ++++++++
  gateway/internal/router/router.go             |  62 ++-
  gateway/internal/stream/metrics_test.go       | 142 +++++++
  gateway/internal/stream/proxy.go              |  29 +-
  gateway/internal/upstream/client.go           |  15 +
  gateway/internal/upstream/metrics_test.go     | 278 ++++++++++++
  gateway/internal/upstream/resolver.go         |  44 +-
- 18 files changed, 2071 insertions(+), 15 deletions(-)
+ 18 files changed, 2072 insertions(+), 15 deletions(-)
  create mode 100644 gateway/internal/metrics/gateway.go
  create mode 100644 gateway/internal/metrics/gateway_test.go
  create mode 100644 gateway/internal/metrics/metrics.go
@@ -1511,10 +1511,10 @@ index e21f517..1fece45 100644
 +}
 diff --git a/gateway/internal/router/metrics_test.go b/gateway/internal/router/metrics_test.go
 new file mode 100644
-index 0000000..2fc0e65
+index 0000000..397251c
 --- /dev/null
 +++ b/gateway/internal/router/metrics_test.go
-@@ -0,0 +1,164 @@
+@@ -0,0 +1,165 @@
 +// metrics_test.go 从网关入口验证 /metrics：
 +//
 +//   - 与探针一样不需要凭证、不经过限流，只响应 GET / HEAD；
@@ -1600,6 +1600,7 @@ index 0000000..2fc0e65
 +		want      int
 +	}{
 +		{"/api/v1/inference-services", routerKeyTenantA, http.StatusOK},
++		{"/api/v1/audit-events", routerKeyTenantA, http.StatusOK},
 +		{"/api/v1/resources", "", http.StatusUnauthorized},
 +		{"/api/v1/unknown", routerKeyTenantA, http.StatusNotFound},
 +		{"/unknown", "", http.StatusNotFound},
@@ -1620,7 +1621,7 @@ index 0000000..2fc0e65
 +	text := scrapeText(t, env.router)
 +	assertSamples(t, metricstest.MustParse(t, text), map[string]float64{
 +		requestsKey(metrics.RouteInference, "200"):                               1,
-+		requestsKey(metrics.RouteControlPlane, "200"):                            1,
++		requestsKey(metrics.RouteControlPlane, "200"):                            2,
 +		requestsKey(metrics.RouteControlPlane, "401"):                            1,
 +		requestsKey(metrics.RouteUnmatched, "404"):                               2,
 +		requestsKey(metrics.RouteProbe, "200"):                                   1,
@@ -1680,7 +1681,7 @@ index 0000000..2fc0e65
 +	})
 +}
 diff --git a/gateway/internal/router/router.go b/gateway/internal/router/router.go
-index 4049580..ea08f9c 100644
+index e8f18e3..fc527de 100644
 --- a/gateway/internal/router/router.go
 +++ b/gateway/internal/router/router.go
 @@ -4,6 +4,8 @@
@@ -1692,7 +1693,7 @@ index 4049580..ea08f9c 100644
  //	ANY  /api/v1/resources[/...]               反代到 Python 控制平面
  //	ANY  /api/v1/inference-services[/...]      反代到 Python 控制平面
  //	ANY  /api/v1/workflows[/...]               反代到 Python 控制平面
-@@ -14,9 +16,10 @@
+@@ -15,9 +17,10 @@
  //	                                          路径；要求 read 作用域）
  //	ANY  /api/v1/inference/{svc}/chat          同上，用于不带命名空间的服务
  //
@@ -1705,7 +1706,7 @@ index 4049580..ea08f9c 100644
  // 认证模式见 config.AuthModeAPIKey / config.AuthModeDev 与 ADR-014。
  package router
  
-@@ -29,6 +32,7 @@ import (
+@@ -30,6 +33,7 @@ import (
  
  	"github.com/Mekoforge/ForgeMesh/gateway/internal/config"
  	"github.com/Mekoforge/ForgeMesh/gateway/internal/health"
@@ -1713,7 +1714,7 @@ index 4049580..ea08f9c 100644
  	"github.com/Mekoforge/ForgeMesh/gateway/internal/middleware"
  	"github.com/Mekoforge/ForgeMesh/gateway/internal/stream"
  	"github.com/Mekoforge/ForgeMesh/gateway/internal/upstream"
-@@ -37,6 +41,13 @@ import (
+@@ -38,6 +42,13 @@ import (
  // apiPrefix 是所有对外 API 的版本前缀。
  const apiPrefix = "/api/v1/"
  
@@ -1727,7 +1728,7 @@ index 4049580..ea08f9c 100644
  // proxyRoutes 是需要反代到 Python 控制平面的资源类路由前缀。
  var proxyRoutes = []string{
  	"/api/v1/resources",
-@@ -116,14 +127,51 @@ func New(cfg config.Config, logger *log.Logger) (*Router, error) {
+@@ -118,14 +129,51 @@ func New(cfg config.Config, logger *log.Logger) (*Router, error) {
  		middleware.LimitRequestBody(maxBody),
  	)
  

@@ -1,0 +1,206 @@
+From c92e00131ff08245cae258a22b7b1ae42b302a8f Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 13 Oct 2026 12:36:00 +0000
+Subject: [PATCH 10/14] feat(deploy): send resource events to a webhook on
+ Kubernetes
+
+The control plane can now POST resource events to a webhook, but the
+Kubernetes manifests had no way to set the FORGEMESH_EVENT_WEBHOOK_*
+variables, and the default policies only let the control plane reach
+the cluster DNS, so every delivery would time out until the events
+went dead.
+
+event-webhook/patch.yaml sets the URL, the timeout and the token. The
+token comes from the forgemesh-event-webhook Secret through an
+optional reference, so the patch also works without a token and the
+value never appears in the Deployment. event-webhook/network-policy.yaml
+adds the egress rule for the receiver. A NetworkPolicy cannot match
+host names, so the file carries one rule for an in-cluster receiver
+(namespace, pod labels and container port) and one for an external
+receiver (an address block), both with placeholder values, and the
+README explains which one to keep, how to go through an egress proxy
+when the receiver's addresses are not stable, and how to redrive dead
+events with kubectl exec.
+
+Validated on kind with the patch (only the URL edited) and a token
+Secret created from a file that ends with a newline: every delivery
+timed out until the egress policy was applied unmodified for a
+receiver behind a Service on port 80 with target port 8080. The
+retries then arrived with the bearer token, later events arrived on
+the first attempt, and the redrive command ran through kubectl exec.
+---
+ CHANGELOG.md                                  |  1 +
+ README.md                                     | 12 +++++-
+ .../kubernetes/control-plane-deployment.yaml  |  1 +
+ .../event-webhook/network-policy.yaml         | 39 +++++++++++++++++++
+ deploy/kubernetes/event-webhook/patch.yaml    | 29 ++++++++++++++
+ deploy/kubernetes/network-policies.yaml       |  3 +-
+ docs/architecture/module-mapping.md           |  2 +-
+ 7 files changed, 84 insertions(+), 3 deletions(-)
+ create mode 100644 deploy/kubernetes/event-webhook/network-policy.yaml
+ create mode 100644 deploy/kubernetes/event-webhook/patch.yaml
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 5988659..783b037 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -74,6 +74,7 @@
+ - pytest 总覆盖率下限：根 `pyproject.toml` 的 `[tool.coverage.report]` 设 `fail_under = 97`（引入时实测 97.20%）与 `precision = 2`（默认取整到整数，96.5% 会被当作 97% 而通过）；CI `python` job 改以 `pytest --cov` 运行，本地为 `make coverage`。下限只升不降。
+ - Kubernetes 网关清单 `deploy/kubernetes/gateway-deployment.yaml`（ServiceAccount、Deployment 与 Service `forgemesh-gateway`，8081 端口）：与控制平面共用 Secret `forgemesh-api-keys`，经 Service `forgemesh-control-plane` 访问控制平面；探针为 `/readyz`（控制平面就绪之后才通过）与 `/healthz`；安全上下文与控制平面一致（非 root、只读根文件系统、去掉全部 capability、`RuntimeDefault` seccomp）；宽限期 35 秒，长于网关排空在途请求的 30 秒。启用启动器时使用 `deploy/kubernetes/launcher/`：`network-policy.yaml` 允许网关访问控制平面 Pod 上推理实例的临时端口（32768–60999），`fake-runtime-patch.yaml` 为控制平面加上来自 ConfigMap `forgemesh-inventory` 的加速器清单与 `fake` 启动器（实例监听全部地址，写进 `status.endpoints` 的主机是 Pod IP）。用法见 README「Kubernetes 部署」，包括 `vllm-process` 在 Kubernetes 上的前提与单节点限制。
+ - Kubernetes 可选的网络策略 `deploy/kubernetes/monitoring/network-policy.yaml`：允许 Prometheus 的 Pod（默认为命名空间 `monitoring` 中带有 `app.kubernetes.io/name: prometheus` 标签的 Pod，按部署修改）访问控制平面的 8080 与网关的 8081 端口，抓取两边的 `/metrics`。默认的策略下从 Pod 网络抓取不到控制平面的 `/metrics`；它与网关的 `/metrics` 一样不要求认证，只输出跨租户聚合的指标。说明与抓取配置示例见 README「Kubernetes 部署」的「指标抓取」。
++- Kubernetes 上把资源变更事件发往 webhook：`deploy/kubernetes/event-webhook/patch.yaml` 为控制平面设置 `FORGEMESH_EVENT_WEBHOOK_URL`、`FORGEMESH_EVENT_WEBHOOK_TOKEN`（取自 Secret `forgemesh-event-webhook` 的键 `token`，Secret 不存在时不设置）与 `FORGEMESH_EVENT_WEBHOOK_TIMEOUT_SECONDS`；`network-policy.yaml` 允许控制平面出站访问接收方（集群内按命名空间与 Pod 标签，集群外按 IP 地址段，按部署修改）。默认的策略只允许控制平面访问集群 DNS，没有这条出站规则时每次发送都超时。用法见 README「Kubernetes 部署」。
+ 
+ ### Changed
+ 
+diff --git a/README.md b/README.md
+index 75cf51c..9ce4426 100644
+--- a/README.md
++++ b/README.md
+@@ -419,7 +419,7 @@ kubectl -n forgemesh port-forward service/forgemesh-gateway 8081:8081 &
+ curl -s -H "Authorization: Bearer fmk_…" http://127.0.0.1:8081/api/v1/inference-services
+ ```
+ 
+-**网络策略**（`network-policies.yaml`）：默认拒绝命名空间内全部 Pod 的入站与出站流量，只放行全部 Pod 访问集群 DNS（`kube-system` 中 `k8s-app: kube-dns` 的 Pod）、网关访问控制平面的 8080 端口、任何来源访问网关的 8081 端口。集群内的其他工作负载因此不能直接访问控制平面，改为访问 `forgemesh-gateway:8081`，API 路径不变。kubelet 的探针与 `kubectl exec` / `cp` / `port-forward` 不受网络策略限制，容器中的备份与恢复照常进行。NetworkPolicy 只在执行它的 CNI（如 Calico、Cilium）上生效，其他 CNI 静默忽略。命名空间中新增的工作负载同样默认拒绝，需要为它另写策略；集群 DNS 的标签或端口不同（例如使用 NodeLocal DNSCache）时修改 `forgemesh-allow-dns`；调用方只经 Ingress 控制器访问时，可以把网关的入站来源收窄到 Ingress 控制器所在的命名空间。`kubectl apply -f deploy/kubernetes/` 不包括子目录，下文的 `launcher/` 与 `monitoring/` 按需另行应用。
++**网络策略**（`network-policies.yaml`）：默认拒绝命名空间内全部 Pod 的入站与出站流量，只放行全部 Pod 访问集群 DNS（`kube-system` 中 `k8s-app: kube-dns` 的 Pod）、网关访问控制平面的 8080 端口、任何来源访问网关的 8081 端口。集群内的其他工作负载因此不能直接访问控制平面，改为访问 `forgemesh-gateway:8081`，API 路径不变。kubelet 的探针与 `kubectl exec` / `cp` / `port-forward` 不受网络策略限制，容器中的备份与恢复照常进行。NetworkPolicy 只在执行它的 CNI（如 Calico、Cilium）上生效，其他 CNI 静默忽略。命名空间中新增的工作负载同样默认拒绝，需要为它另写策略；集群 DNS 的标签或端口不同（例如使用 NodeLocal DNSCache）时修改 `forgemesh-allow-dns`；调用方只经 Ingress 控制器访问时，可以把网关的入站来源收窄到 Ingress 控制器所在的命名空间。`kubectl apply -f deploy/kubernetes/` 不包括子目录，下文的 `launcher/`、`monitoring/` 与 `event-webhook/` 按需另行应用。
+ 
+ **指标抓取**：控制平面（8080）与网关（8081）的 `/metrics` 不要求认证，只输出跨租户聚合的指标（见「可观测性」），但仍能反映整体负载。默认的策略下只有网关能访问控制平面，而网关不转发 `/metrics`，从 Pod 网络抓取不到控制平面；网关的 `/metrics` 与探针和 API 共用对任何来源开放的 8081 端口，经 Ingress 暴露网关时只路由 `/api/v1/`，不要把整个端口暴露到公网。可选的 `monitoring/network-policy.yaml` 允许命名空间 `monitoring` 中带有 `app.kubernetes.io/name: prometheus` 标签的 Pod 访问这两个端口：应用之前把两条策略的 `namespaceSelector` 与 `podSelector` 改成自己的 Prometheus 所在的命名空间与它的 Pod 的标签。网关的那条在收窄了网关的入站来源之后才起作用。NetworkPolicy 按端口而不是路径放行，这些 Pod 也能直接调用控制平面的 API（仍须 API key），不经过网关的限流与请求体上限。Prometheus 应按 Pod 抓取，不经 Service：网关有多个副本时，经 Service 每次抓到的是不同副本的计数。例如（Prometheus 需要读取命名空间 `forgemesh` 中 EndpointSlice、Service 与 Pod 的 RBAC 权限）：
+ 
+@@ -436,6 +436,16 @@ scrape_configs:
+         action: keep
+ ```
+ 
++**资源变更事件的 webhook**：资源变更事件默认写进控制平面的日志（见「运行控制平面」）。`event-webhook/patch.yaml` 为控制平面设置 `FORGEMESH_EVENT_WEBHOOK_URL`（应用之前改成接收方的地址）、`FORGEMESH_EVENT_WEBHOOK_TOKEN`（取自 Secret `forgemesh-event-webhook` 的键 `token`，Secret 不存在时不发送 token）与 `FORGEMESH_EVENT_WEBHOOK_TIMEOUT_SECONDS`。默认的策略只允许控制平面出站访问集群 DNS，还要应用 `event-webhook/network-policy.yaml`。NetworkPolicy 不能按域名放行：接收方在集群内时把规则改成它的命名空间、Pod 的标签与容器端口，在集群外时改成它的 IP 地址段与端口；地址不固定的接收方改经出站代理发送（控制平面遵循 `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY`），规则改为允许访问代理。缺少出站规则时每次发送都超时，事件失败 10 次之后不再自动发送（`dead`）；放行之后按[备份与灾备演练](docs/operations/backup-restore.md)第 5 节重新投递，命令以 `kubectl -n forgemesh exec deployment/forgemesh-control-plane -- python -c "…"` 执行，数据库路径为 `/var/lib/forgemesh/forgemesh.db`。
++
++```bash
++kubectl -n forgemesh create secret generic forgemesh-event-webhook --from-file=token=./webhook-token
++# 先按接收方修改 event-webhook/network-policy.yaml 的规则与 patch.yaml 中的地址
++kubectl apply -f deploy/kubernetes/event-webhook/network-policy.yaml
++kubectl -n forgemesh patch deployment forgemesh-control-plane \
++  --patch-file deploy/kubernetes/event-webhook/patch.yaml
++```
++
+ **加速器清单与启动器**：控制平面的 Deployment 没有设置 `FORGEMESH_INVENTORY_FILE` 与 `FORGEMESH_RUNTIME_LAUNCHER`，新建的服务停在 `Pending`（`SchedulerUnavailable`）。在 Kubernetes 上启用它们（变量见「运行控制平面」与「部署推理服务」）：
+ 
+ - 加速器清单放在 ConfigMap 中，挂载到 `/etc/forgemesh` 以外的目录（`/etc/forgemesh` 是 key 文件 Secret 的只读挂载点），`FORGEMESH_INVENTORY_FILE` 指向挂载的文件。控制平面只在启动时读取清单，修改 ConfigMap 之后执行 `kubectl -n forgemesh rollout restart deployment/forgemesh-control-plane`。
+diff --git a/deploy/kubernetes/control-plane-deployment.yaml b/deploy/kubernetes/control-plane-deployment.yaml
+index fbfa252..f7d574b 100644
+--- a/deploy/kubernetes/control-plane-deployment.yaml
++++ b/deploy/kubernetes/control-plane-deployment.yaml
+@@ -15,6 +15,7 @@
+ # 服务停在 Pending（SchedulerUnavailable）。设置方法见 README「Kubernetes 部署」：不需要 GPU 的
+ # 假启动器见 launcher/fake-runtime-patch.yaml；vllm-process / tgi-process 启动器在控制平面的容器内
+ # 运行 vLLM / TGI，需要装有它们的镜像与分配了 GPU 的 Pod，仓库没有提供。
++# 资源变更事件默认写进日志；发往 webhook 见 event-webhook/patch.yaml。
+ apiVersion: v1
+ kind: ServiceAccount
+ metadata:
+diff --git a/deploy/kubernetes/event-webhook/network-policy.yaml b/deploy/kubernetes/event-webhook/network-policy.yaml
+new file mode 100644
+index 0000000..da941ce
+--- /dev/null
++++ b/deploy/kubernetes/event-webhook/network-policy.yaml
+@@ -0,0 +1,39 @@
++# 与 patch.yaml 一起应用：允许控制平面访问 webhook 的接收方，其他出站流量仍被
++# ../network-policies.yaml 拒绝。NetworkPolicy 不能按域名放行：按接收方的位置保留下面的
++# 一条规则并改成实际的取值，删去另一条。
++#
++# - 接收方在集群内：它所在的命名空间、它的 Pod 的标签与容器端口（经 Service 访问时同样按
++#   Pod 的容器端口匹配，不是 Service 的端口）；
++# - 接收方在集群外：它的 IP 地址段与端口。地址不固定的接收方（如经 CDN 提供的服务）无法用
++#   IP 地址段可靠地放行，改经出站代理发送：控制平面遵循 HTTPS_PROXY / HTTP_PROXY / NO_PROXY
++#   环境变量，这条规则改为允许访问代理。
++apiVersion: networking.k8s.io/v1
++kind: NetworkPolicy
++metadata:
++  name: forgemesh-control-plane-event-webhook
++  namespace: forgemesh
++spec:
++  podSelector:
++    matchLabels:
++      app.kubernetes.io/name: control-plane
++  policyTypes:
++    - Egress
++  egress:
++    # 集群内的接收方
++    - to:
++        - namespaceSelector:
++            matchLabels:
++              kubernetes.io/metadata.name: event-receiver
++          podSelector:
++            matchLabels:
++              app.kubernetes.io/name: event-receiver
++      ports:
++        - protocol: TCP
++          port: 8080
++    # 集群外的接收方（192.0.2.0/24 是文档专用的地址段）
++    - to:
++        - ipBlock:
++            cidr: 192.0.2.10/32
++      ports:
++        - protocol: TCP
++          port: 443
+diff --git a/deploy/kubernetes/event-webhook/patch.yaml b/deploy/kubernetes/event-webhook/patch.yaml
+new file mode 100644
+index 0000000..c277589
+--- /dev/null
++++ b/deploy/kubernetes/event-webhook/patch.yaml
+@@ -0,0 +1,29 @@
++# 把资源变更事件 POST 到 webhook（strategic merge patch），不设置时事件写进控制平面的日志：
++#
++#   kubectl -n forgemesh create secret generic forgemesh-event-webhook \
++#     --from-file=token=./webhook-token
++#   kubectl apply -f deploy/kubernetes/event-webhook/network-policy.yaml
++#   kubectl -n forgemesh patch deployment forgemesh-control-plane \
++#     --patch-file deploy/kubernetes/event-webhook/patch.yaml
++#
++# 应用之前把 FORGEMESH_EVENT_WEBHOOK_URL 改成接收方的地址（http / https，不得含用户信息与片段）。
++# token 取自 Secret forgemesh-event-webhook 的键 token，以 Authorization: Bearer 发送；Secret
++# 不存在时不设置这个变量，不发送 token。取值非法时控制平面拒绝启动（见 README「运行控制平面」）。
++# 默认的网络策略只允许控制平面访问集群 DNS：还要按接收方修改并应用 network-policy.yaml，否则每次
++# 发送都超时，事件失败 10 次之后不再自动发送（dead）。
++spec:
++  template:
++    spec:
++      containers:
++        - name: control-plane
++          env:
++            - name: FORGEMESH_EVENT_WEBHOOK_URL
++              value: https://events.example.com/forgemesh
++            - name: FORGEMESH_EVENT_WEBHOOK_TOKEN
++              valueFrom:
++                secretKeyRef:
++                  name: forgemesh-event-webhook
++                  key: token
++                  optional: true
++            - name: FORGEMESH_EVENT_WEBHOOK_TIMEOUT_SECONDS
++              value: "5"
+diff --git a/deploy/kubernetes/network-policies.yaml b/deploy/kubernetes/network-policies.yaml
+index eb2db15..ab54b21 100644
+--- a/deploy/kubernetes/network-policies.yaml
++++ b/deploy/kubernetes/network-policies.yaml
+@@ -9,7 +9,8 @@
+ #   /metrics 不要求认证），出站只能访问控制平面的 8080 端口。
+ #
+ # 启用启动器之后推理实例运行在控制平面的 Pod 内，还要应用 launcher/network-policy.yaml；
+-# 让 Prometheus 抓取两边的 /metrics 见 monitoring/network-policy.yaml。
++# 让 Prometheus 抓取两边的 /metrics 见 monitoring/network-policy.yaml；把资源变更事件发往
++# webhook 时，控制平面访问接收方的出站规则见 event-webhook/network-policy.yaml。
+ # 集群外的调用方只经 Ingress 控制器访问网关时，可以把网关入站规则的来源收窄到 Ingress 控制器
+ # 所在的命名空间；集群 DNS 的标签或端口不同（例如使用 NodeLocal DNSCache）时相应修改 DNS 规则。
+ apiVersion: networking.k8s.io/v1
+diff --git a/docs/architecture/module-mapping.md b/docs/architecture/module-mapping.md
+index fb4799f..3be4dcd 100644
+--- a/docs/architecture/module-mapping.md
++++ b/docs/architecture/module-mapping.md
+@@ -316,7 +316,7 @@
+ | 字段 | 内容 |
+ |---|---|
+ | 架构模块 | 部署拓扑与运维文档（L6 平台基础设施落地） |
+-| 当前代码路径 | `deploy/docker/{Dockerfile.control-plane,Dockerfile.gateway}`（均以非 root 用户运行：控制平面 uid 10001，网关 distroless `nonroot`）与根目录 `.dockerignore`；`deploy/docker/docker-compose.yaml`（control-plane + gateway，只发布在 127.0.0.1；postgres 在 `postgres` profile 中、默认不启动；含 ADR-013 单实例注记；不设置加速器清单与启动器，不部署推理实例）与叠加文件 `deploy/docker/docker-compose.fake-runtime.yaml`（一块虚构设备的清单 `deploy/docker/fake-runtime-inventory.json` + 假启动器，不需要 GPU 的推理服务闭环）；`deploy/kubernetes/{namespace,control-plane-deployment,gateway-deployment,network-policies}.yaml`（控制平面 replicas: 1、`strategy: Recreate`、数据库在 PVC 上；网关无状态；两者共用 Secret `forgemesh-api-keys` 中的 key 文件，各用不挂载 token 的 ServiceAccount；NetworkPolicy 默认拒绝，只放行 DNS、网关访问控制平面 8080 与任何来源访问网关 8081；不设置加速器清单与启动器，不部署推理实例）与 `deploy/kubernetes/launcher/`（推理实例端口的 NetworkPolicy、启用加速器清单与 `fake` 启动器的补丁）、`deploy/kubernetes/monitoring/`（可选：允许 Prometheus 抓取两边 `/metrics` 的 NetworkPolicy）；`scripts/compose_smoke.sh`；`docs/operations/backup-restore.md`（RPO≤5min / RTO≤15min、在线备份与恢复演练）；示例 `examples/single-node/{inference-service,plugin-vllm}.yaml`、`examples/multi-tenant/tenant-quota.yaml` |
++| 当前代码路径 | `deploy/docker/{Dockerfile.control-plane,Dockerfile.gateway}`（均以非 root 用户运行：控制平面 uid 10001，网关 distroless `nonroot`）与根目录 `.dockerignore`；`deploy/docker/docker-compose.yaml`（control-plane + gateway，只发布在 127.0.0.1；postgres 在 `postgres` profile 中、默认不启动；含 ADR-013 单实例注记；不设置加速器清单与启动器，不部署推理实例）与叠加文件 `deploy/docker/docker-compose.fake-runtime.yaml`（一块虚构设备的清单 `deploy/docker/fake-runtime-inventory.json` + 假启动器，不需要 GPU 的推理服务闭环）；`deploy/kubernetes/{namespace,control-plane-deployment,gateway-deployment,network-policies}.yaml`（控制平面 replicas: 1、`strategy: Recreate`、数据库在 PVC 上；网关无状态；两者共用 Secret `forgemesh-api-keys` 中的 key 文件，各用不挂载 token 的 ServiceAccount；NetworkPolicy 默认拒绝，只放行 DNS、网关访问控制平面 8080 与任何来源访问网关 8081；不设置加速器清单与启动器，不部署推理实例）与 `deploy/kubernetes/launcher/`（推理实例端口的 NetworkPolicy、启用加速器清单与 `fake` 启动器的补丁）、`deploy/kubernetes/monitoring/`（可选：允许 Prometheus 抓取两边 `/metrics` 的 NetworkPolicy）、`deploy/kubernetes/event-webhook/`（可选：资源变更事件 webhook 的环境变量补丁与控制平面访问接收方的出站 NetworkPolicy）；`scripts/compose_smoke.sh`；`docs/operations/backup-restore.md`（RPO≤5min / RTO≤15min、在线备份与恢复演练）；示例 `examples/single-node/{inference-service,plugin-vllm}.yaml`、`examples/multi-tenant/tenant-quota.yaml` |
+ | 核心契约 | ADR-013 单控制平面实例约束：compose 不扩展 control-plane；k8s 清单 `replicas: 1` 且更新策略为 `Recreate`（旧 Pod 退出后才启动新 Pod，更新期间不会有两个写者）；控制平面只使用 SQLite，postgres 为目标态预置 |
+ | 运行形态 | 容器镜像（Dockerfile）+ 部署工件（YAML）+ 运维文档（Markdown） |
+ | 数据所有权 | 无；控制平面的 SQLite 库（叠加 `docker-compose.fake-runtime.yaml` 时还有工作流存储 `forgemesh.workflows.db`）位于 compose 卷 `control-plane-data` / k8s PVC `forgemesh-control-plane-data`（pgdata 卷属目标态预置，仅 `postgres` profile 使用） |
+-- 
+2.43.0
+

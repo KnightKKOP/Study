@@ -1,0 +1,98 @@
+From 01746edfc8162462351170c2286c87f2cf47df44 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 13 Oct 2026 04:23:08 +0000
+Subject: [PATCH 12/14] fix(api): declare the audit actions as an enum in
+ OpenAPI
+
+The OpenAPI AuditEvent described action only in prose, so a strict
+client could not tell from the contract which values to expect, and
+nothing tied that description to what the registry records. The
+registry also mapped status writes to an "update_status" action that
+could never be recorded: status writes never carry a principal, so
+they write no audit record.
+
+action is now an enum of create, update (PUT and PATCH) and delete, and
+the registry no longer has the "update_status" mapping. A test runs
+every registry write that takes a principal, update_spec included, and
+checks that the recorded actions are exactly the OpenAPI enum.
+---
+ api/openapi/openapi.yaml                      |  1 +
+ .../forgemesh/controlplane/registry/store.py  |  4 ++--
+ .../unit/controlplane/test_registry_audit.py  | 21 +++++++++++++++++++
+ 3 files changed, 24 insertions(+), 2 deletions(-)
+
+diff --git a/api/openapi/openapi.yaml b/api/openapi/openapi.yaml
+index 085eafc..c39bed6 100644
+--- a/api/openapi/openapi.yaml
++++ b/api/openapi/openapi.yaml
+@@ -844,6 +844,7 @@ components:
+             correlationId 相同。
+         action:
+           type: string
++          enum: [create, update, delete]
+           description: >-
+             操作：create（创建资源）、update（PUT / PATCH 更新资源）或 delete（受理删除，含置为
+             Terminating）。
+diff --git a/packages/control-plane/src/forgemesh/controlplane/registry/store.py b/packages/control-plane/src/forgemesh/controlplane/registry/store.py
+index e77304e..9ca88e8 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/registry/store.py
++++ b/packages/control-plane/src/forgemesh/controlplane/registry/store.py
+@@ -229,11 +229,11 @@ _EVENT_CHANGES = {
+     ChangeType.DELETED: ResourceEventChange.DELETED,
+ }
+ 
+-#: 变更记录类型 → 审计记录的 ``action``（受理的删除请求与物理删除都是 ``delete``）。
++#: 变更记录类型 → 审计记录的 ``action``（受理的删除请求与物理删除都是 ``delete``）。status
++#: 写入不带调用主体，不产生审计记录。取值须与 OpenAPI ``AuditEvent.action`` 的枚举一致。
+ _AUDIT_ACTIONS = {
+     ChangeType.CREATED: "create",
+     ChangeType.UPDATED: "update",
+-    ChangeType.STATUS: "update_status",
+     ChangeType.TERMINATING: "delete",
+     ChangeType.DELETED: "delete",
+ }
+diff --git a/tests/unit/controlplane/test_registry_audit.py b/tests/unit/controlplane/test_registry_audit.py
+index 7e44809..64163dc 100644
+--- a/tests/unit/controlplane/test_registry_audit.py
++++ b/tests/unit/controlplane/test_registry_audit.py
+@@ -5,9 +5,11 @@ from __future__ import annotations
+ import asyncio
+ import sqlite3
+ from collections.abc import Callable, Coroutine
++from pathlib import Path
+ from typing import Any
+ 
+ import pytest
++import yaml
+ from forgemesh.controlplane.audit import AuditEvent
+ from forgemesh.controlplane.auth import Principal
+ from forgemesh.controlplane.deployment import InMemoryLauncher, check_instances
+@@ -130,6 +132,25 @@ def test_api_writes_record_the_principal_with_the_event(write: str) -> None:
+     assert record.timestamp == event.created_at
+ 
+ 
++@pytest.mark.unit
++def test_the_recorded_actions_are_the_openapi_enum() -> None:
++    """带调用主体的各种写入记下的 action 恰好是 OpenAPI ``AuditEvent.action`` 的枚举值。"""
++    openapi = yaml.safe_load(
++        (Path(__file__).resolve().parents[3] / "api" / "openapi" / "openapi.yaml").read_text(
++            encoding="utf-8"
++        )
++    )
++    actions = set()
++    for write in _WRITES.values():
++        reg = _registry()
++        _run(write(reg, ALICE))
++        actions.update(record.action for record in _audit(reg))
++
++    assert actions == set(
++        openapi["components"]["schemas"]["AuditEvent"]["properties"]["action"]["enum"]
++    )
++
++
+ @pytest.mark.unit
+ def test_api_writes_without_a_correlation_id_share_a_generated_one() -> None:
+     reg = SQLiteRegistry()
+-- 
+2.43.0
+

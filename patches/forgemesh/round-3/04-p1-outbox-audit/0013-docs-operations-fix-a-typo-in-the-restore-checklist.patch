@@ -1,0 +1,30 @@
+From d434e9a4d51a76c75ac33cf404039f3b6def9ecb Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 13 Oct 2026 13:53:02 +0000
+Subject: [PATCH 13/14] docs(operations): fix a typo in the restore checklist
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The checklist item for the correlation id read "贯计贯穿"; it should
+read "贯穿".
+---
+ docs/operations/backup-restore.md | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/docs/operations/backup-restore.md b/docs/operations/backup-restore.md
+index 01def62..3ecb6d6 100644
+--- a/docs/operations/backup-restore.md
++++ b/docs/operations/backup-restore.md
+@@ -415,7 +415,7 @@ Kubernetes 上先 `kubectl -n forgemesh scale deploy/forgemesh-control-plane --r
+ 
+ - [ ] **租户隔离**：跨租户 `get` 返回 `NotFoundError`（IVT-7）
+ - [ ] **审计可追溯**：`query_by_correlation` 返回完整调用链
+-- [ ] **correlation_id 贯计贯穿**：审计事件与决策记录的 correlation_id 一致
++- [ ] **correlation_id 贯穿**：审计事件与决策记录的 correlation_id 一致
+ - [ ] **密钥脱敏**：日志中敏感字段均为 `"***"`，无明文泄露
+ - [ ] **资源版本连续**：`resourceVersion` 无跳跃（除已知 CAS 冲突）
+ 
+-- 
+2.43.0
+

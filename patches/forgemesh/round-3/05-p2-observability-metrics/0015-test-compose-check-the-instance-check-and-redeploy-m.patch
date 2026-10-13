@@ -1,0 +1,136 @@
+From 907ebf4b29ed7fe9cb7531980ab21c4338cc6471 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 13 Oct 2026 11:53:48 +0000
+Subject: [PATCH 15/17] test(compose): check the instance check and redeploy
+ metrics
+
+The smoke already exercises both runtime paths that the new counters
+describe: a fake instance exits and the periodic check reports it, and
+the control plane restarts so that the startup check finds the
+instance gone. Scrape the control plane's /metrics after each of them,
+so a deployment built from the images shows the same counts as the
+unit tests.
+
+The first scrape checks that the counters are exported at zero. After
+the lost instance, the periodic check has reported exactly one loss
+and one redeployment was started (updates and deletions change the
+phase before stopping an instance, so no other loss can be seen).
+After the restart the counters start from zero again: the startup
+check reported one loss, one redeployment was started and no
+allocation was reclaimed. No periodic check may have failed.
+---
+ CHANGELOG.md                        |  2 +-
+ README.md                           |  2 +-
+ docs/architecture/module-mapping.md |  2 +-
+ scripts/compose_smoke.sh            | 28 +++++++++++++++++++++++++---
+ 4 files changed, 28 insertions(+), 6 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 3687f6a..7dad165 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -68,7 +68,7 @@
+ - 网关 `GET /metrics`（`internal/metrics`，只用标准库，文本格式与标签上限同上）：`forgemesh_gateway_http_requests_total{route,status}` 与 `forgemesh_gateway_http_request_duration_seconds{route}`（`route` 为按路由表确定的路由类别 `probe` / `metrics` / `control_plane` / `inference` / `unmatched`，不取请求路径；含 Recovery 兜底的 `500`）、`forgemesh_gateway_stream_first_byte_seconds`（流式代理从开始处理请求到写出实例的第一个响应字节，只统计实例返回 2xx 的流）、`forgemesh_gateway_upstream_errors_total{upstream,kind}`（`control_plane` / `instance`；`connect` / `status`（5xx）/ `body` / `address_not_allowed` / `invalid_endpoint`，客户端已断开的请求不计）、`forgemesh_gateway_rate_limited_total`、`forgemesh_gateway_resolver_lookups_total{result}`（`hit` / `miss` / `coalesced`）与 `forgemesh_gateway_instances{state}`（Resolver 缓存中 `healthy` / `unhealthy` 的实例数）。与探针一样不经过认证与限流，只输出聚合数据，见网关 README「可观测性」。
+ - W3C Trace Context：网关的 `TraceContext` 中间件沿用请求中恰好一个合法的 `traceparent`（连同 `tracestate`），否则（缺失、不合法或多个）生成新的 `traceparent`（版本 `00`，flags `00`）并丢弃 `tracestate`；确定的 `traceparent` 随请求转发给控制平面（资源反代与 Resolver 的查询）与推理实例，响应不回写。控制平面的 `RequestContextMiddleware` 按同样的规则确定 trace-id，沿用 `X-Correlation-Id`（缺失时生成一次并写回请求头，路由回显的、审计记录与资源变更事件中的关联 ID 因此与日志一致），在请求处理期间绑定两者，这个请求的日志与错误信封都带上它们。两边都不记录 span、不导出追踪，OTLP 导出留待后续。错误信封新增可选字段 `traceId`（OpenAPI `Error.traceId`，32 个小写十六进制字符），网关与控制平面一致。
+ - 网关访问日志：每个 `/api/v1` 请求与没有匹配路由的请求输出一行 `access method=… path="…" status=… duration=… corr=<关联 ID> trace=<trace-id>`（路径加引号转义、不含查询串；流式请求的 `duration` 是整个流的时长；处理器在写出响应头之前 panic 时记 `500`），位于认证与限流之前，被拒绝的请求同样记录；探针与 `/metrics` 不记录。反代与流式代理的错误日志、Recovery 的 panic 日志同样带 `trace=`。
+-- `scripts/compose_smoke.sh` 在第一次对话之后不带凭证抓取一次控制平面与网关的 `/metrics`，核对 Content-Type、若干指标及其此时确定的取值，以及输出不含租户、服务名、key 与实例 id；并带 `traceparent` 经网关读取不存在的服务，核对控制平面的 `404` 信封与日志、网关的访问日志都带同一个 trace-id。
++- `scripts/compose_smoke.sh` 在第一次对话之后不带凭证抓取一次控制平面与网关的 `/metrics`，核对 Content-Type、若干指标及其此时确定的取值，以及输出不含租户、服务名、key 与实例 id；并带 `traceparent` 经网关读取不存在的服务，核对控制平面的 `404` 信封与日志、网关的访问日志都带同一个 trace-id。实例丢失后重新部署之后与重启控制平面之后再各抓取一次控制平面的 `/metrics`：定期核对与启动时的核对各发现一次丢失，各重新部署一次（重启之后计数从 0 开始），定期核对没有失败，没有回收分配。
+ 
+ ### Changed
+ 
+diff --git a/README.md b/README.md
+index 7ba9c84..6119410 100644
+--- a/README.md
++++ b/README.md
+@@ -393,7 +393,7 @@ docker compose -f deploy/docker/docker-compose.yaml \
+ scripts/compose_smoke.sh   # 端到端冒烟（CI 同样执行）
+ ```
+ 
+-只用 `docker-compose.yaml` 时控制平面没有清单与启动器，新建的服务停在 `Pending`（`SchedulerUnavailable`）。`docker-compose.fake-runtime.yaml` 为控制平面加上清单 `deploy/docker/fake-runtime-inventory.json`（一个节点、一块设备 `gpu-0`）与 `fake` 启动器：实例在控制平面容器内监听全部地址，写进 `status.endpoints` 的主机是服务名 `control-plane`，网关经 compose 网络连接它（私网地址默认允许），实例端口不发布到宿主机。`scripts/compose_smoke.sh` 用这两个文件经网关走完闭环：无 key 的请求返回 `401`；创建 → `Ready`（一个就绪的 `openai-chat` 端点）→ 流式对话到达实例、以 `[DONE]` 结束 → 不带凭证抓取两边的 `/metrics`，带 `traceparent` 的请求在两边的日志与错误信封中带同一个 trace-id（见「可观测性」）→ 删除后资源消失、实例停止监听 → 同名重新创建（只有一块设备，可见分配已释放）→ 再次对话到达新实例 → 以 `PUT` 修改 `spec` → `Updating` → 以新实例回到 `Ready`（`observedGeneration` 为 `2`，旧实例停止监听）并再次对话 → 让实例退出（在控制平面容器内 `POST /fake/exit`）→ `Degraded`（`InstanceLost`）→ 重新部署，以新实例回到 `Ready` 并再次对话 → 重启控制平面：资源仍在，服务转为 `Degraded`（`InstanceLost`）后重新部署，以新实例回到 `Ready` 并再次对话 → 删除。叠加文件把核对实例的间隔设为 1 秒；每一步都有时限，只等待状态变化，不依赖网关在某一刻返回的状态码。
++只用 `docker-compose.yaml` 时控制平面没有清单与启动器，新建的服务停在 `Pending`（`SchedulerUnavailable`）。`docker-compose.fake-runtime.yaml` 为控制平面加上清单 `deploy/docker/fake-runtime-inventory.json`（一个节点、一块设备 `gpu-0`）与 `fake` 启动器：实例在控制平面容器内监听全部地址，写进 `status.endpoints` 的主机是服务名 `control-plane`，网关经 compose 网络连接它（私网地址默认允许），实例端口不发布到宿主机。`scripts/compose_smoke.sh` 用这两个文件经网关走完闭环：无 key 的请求返回 `401`；创建 → `Ready`（一个就绪的 `openai-chat` 端点）→ 流式对话到达实例、以 `[DONE]` 结束 → 不带凭证抓取两边的 `/metrics`，带 `traceparent` 的请求在两边的日志与错误信封中带同一个 trace-id（见「可观测性」）→ 删除后资源消失、实例停止监听 → 同名重新创建（只有一块设备，可见分配已释放）→ 再次对话到达新实例 → 以 `PUT` 修改 `spec` → `Updating` → 以新实例回到 `Ready`（`observedGeneration` 为 `2`，旧实例停止监听）并再次对话 → 让实例退出（在控制平面容器内 `POST /fake/exit`）→ `Degraded`（`InstanceLost`）→ 重新部署，以新实例回到 `Ready` 并再次对话，控制平面的 `/metrics` 计入定期核对发现的一次丢失与一次重新部署 → 重启控制平面：资源仍在，服务转为 `Degraded`（`InstanceLost`）后重新部署，以新实例回到 `Ready` 并再次对话，`/metrics`（随新进程从 0 计数）计入启动时核对发现的一次丢失与一次重新部署 → 删除。叠加文件把核对实例的间隔设为 1 秒；每一步都有时限，只等待状态变化，不依赖网关在某一刻返回的状态码。
+ 
+ 控制平面的 SQLite 数据库（部署推理服务时还有工作流存储 `forgemesh.workflows.db`）在 compose 卷 `control-plane-data` 中。Kubernetes 清单见 `deploy/kubernetes/`：数据库放在 PersistentVolumeClaim 上，key 文件来自 Secret `forgemesh-api-keys`，更新策略为 `Recreate`，保证任何时刻只有一个控制平面写数据库（ADR-013）；清单没有设置加速器清单与启动器，不部署推理实例。容器中的备份与恢复见 [备份与灾备演练](docs/operations/backup-restore.md) 2.5 / 3.4 节。
+ 
+diff --git a/docs/architecture/module-mapping.md b/docs/architecture/module-mapping.md
+index 2778450..a5ceedf 100644
+--- a/docs/architecture/module-mapping.md
++++ b/docs/architecture/module-mapping.md
+@@ -322,7 +322,7 @@
+ | 数据所有权 | 无；控制平面的 SQLite 库（叠加 `docker-compose.fake-runtime.yaml` 时还有工作流存储 `forgemesh.workflows.db`）位于 compose 卷 `control-plane-data` / k8s PVC `forgemesh-control-plane-data`（pgdata 卷属目标态预置，仅 `postgres` profile 使用） |
+ | 允许依赖 | — |
+ | 禁止依赖 | —（约束：部署不得暗示多副本写同一 SQLite） |
+-| 测试路径 | `scripts/compose_smoke.sh`（CI `compose-smoke` job：构建镜像，以两个 compose 文件启动，经网关验证无 key 返回 401，创建 `InferenceService` → `Ready` → 经网关流式对话 → 不带凭证抓取两边的 `/metrics`，带 `traceparent` 的请求在控制平面的错误信封与两边的日志中带同一个 trace-id → 删除（实例端口关闭）→ 同名重新创建并再次对话 → `PUT` 修改 `spec` → `Updating` → 以新实例回到 `Ready` 并再次对话 → 让假实例退出 → `Degraded`（`InstanceLost`）→ 重新部署、回到 `Ready` 并再次对话 → 重启控制平面：资源仍在，服务经 `Degraded`（`InstanceLost`）重新部署、回到 `Ready` 并再次对话 → 删除）；k8s 清单无自动化测试；备份恢复有人工演练清单 |
++| 测试路径 | `scripts/compose_smoke.sh`（CI `compose-smoke` job：构建镜像，以两个 compose 文件启动，经网关验证无 key 返回 401，创建 `InferenceService` → `Ready` → 经网关流式对话 → 不带凭证抓取两边的 `/metrics`，带 `traceparent` 的请求在控制平面的错误信封与两边的日志中带同一个 trace-id → 删除（实例端口关闭）→ 同名重新创建并再次对话 → `PUT` 修改 `spec` → `Updating` → 以新实例回到 `Ready` 并再次对话 → 让假实例退出 → `Degraded`（`InstanceLost`）→ 重新部署、回到 `Ready` 并再次对话，控制平面的 `/metrics` 计入定期核对发现的丢失与重新部署 → 重启控制平面：资源仍在，服务经 `Degraded`（`InstanceLost`）重新部署、回到 `Ready` 并再次对话，`/metrics` 计入启动时核对发现的丢失与重新部署 → 删除）；k8s 清单无自动化测试；备份恢复有人工演练清单 |
+ | 状态 | compose 已实现且有测试覆盖；k8s 清单实现待核验（无自动化测试，尚未提供网关清单、ServiceAccount、NetworkPolicy）；运维文档已交付 |
+ | 演进动作 | k8s 补网关清单、ServiceAccount 与 NetworkPolicy；A1.5 已核对部署文档含单实例约束；目标态 PostgreSQL 部署属阶段 F |
+ 
+diff --git a/scripts/compose_smoke.sh b/scripts/compose_smoke.sh
+index 9419994..d91b67c 100755
+--- a/scripts/compose_smoke.sh
++++ b/scripts/compose_smoke.sh
+@@ -7,8 +7,9 @@
+ #   删除 → 资源消失、实例停止 → 同名重新创建（只有一块设备，可见分配已释放）→ 再次对话 →
+ #   PUT 修改 spec → Updating → 以新实例回到 Ready（旧实例已停止）→ 再次对话 →
+ #   假实例退出（POST /fake/exit）→ Degraded（InstanceLost）→ 重新部署，以新实例回到 Ready →
+-#   再次对话 → 重启控制平面：资源仍在，实例随旧进程结束，服务转为 Degraded（InstanceLost）
+-#   后重新部署，以新实例回到 Ready → 再次对话 → 删除。
++#   再次对话 → /metrics 计入定期核对发现的丢失与一次重新部署 → 重启控制平面：资源仍在，实例
++#   随旧进程结束，服务转为 Degraded（InstanceLost）后重新部署，以新实例回到 Ready → 再次对话 →
++#   /metrics（随新进程从 0 计数）计入启动时核对发现的丢失与一次重新部署 → 删除。
+ #
+ # 每一步都有时限，整个闭环只等待状态变化，不依赖网关在某一刻返回的状态码。
+ #
+@@ -256,6 +257,7 @@ expect_reply "$first_instance"
+ echo "ok: the workflow store lives next to the registry"
+ 
+ # 此时只有 smoke-svc：Ready，占用清单中唯一的设备，部署工作流已成功。事件写日志，不会发布失败。
++# 还没有丢失过实例，也没有孤立的分配。
+ scrape "control plane /metrics" http://127.0.0.1:8080/metrics \
+   'forgemesh_http_requests_total{method="POST",route="/api/v1/inference-services",status="201"} ' \
+   'forgemesh_reconcile_total{operation="reconcile",outcome="done"} ' \
+@@ -269,7 +271,12 @@ scrape "control plane /metrics" http://127.0.0.1:8080/metrics \
+   'forgemesh_outbox_publish_attempts_total{outcome="published"} [1-9]' \
+   'forgemesh_outbox_publish_attempts_total{outcome="failed"} 0$' \
+   'forgemesh_outbox_events{state="retrying"} 0$' \
+-  'forgemesh_outbox_events{state="dead"} 0$'
++  'forgemesh_outbox_events{state="dead"} 0$' \
++  'forgemesh_instance_checks_total{outcome="failed"} 0$' \
++  'forgemesh_instance_check_results_total{check="startup",result="lost"} 0$' \
++  'forgemesh_instance_check_results_total{check="periodic",result="lost"} 0$' \
++  'forgemesh_lost_instance_redeploys_total 0$' \
++  'forgemesh_orphaned_allocation_reclaims_total{outcome="reclaimed"} 0$'
+ scrape "gateway /metrics" "$gateway/metrics" \
+   'forgemesh_gateway_http_requests_total{route="control_plane",status="401"} 1$' \
+   'forgemesh_gateway_http_requests_total{route="inference",status="200"} ' \
+@@ -356,6 +363,13 @@ fourth_port=$(endpoint_port)
+   || fail "the service still reports the lost instance $third_instance"
+ echo "ok: the service was redeployed with a new instance"
+ expect_reply "$fourth_instance"
++# 更新与删除都先改变 phase、再停止实例，定期核对只会发现这一次丢失。
++scrape "control plane /metrics after the lost instance" http://127.0.0.1:8080/metrics \
++  'forgemesh_instance_checks_total{outcome="completed"} [1-9]' \
++  'forgemesh_instance_checks_total{outcome="failed"} 0$' \
++  'forgemesh_instance_check_results_total{check="periodic",result="lost"} 1$' \
++  'forgemesh_instance_check_results_total{check="startup",result="lost"} 0$' \
++  'forgemesh_lost_instance_redeploys_total 1$'
+ 
+ # 假实例随控制平面进程结束：启动时服务转为 Degraded（InstanceLost，日志记录丢失的实例），
+ # 控制器随后以同一分配重新部署，服务以新实例回到 Ready。
+@@ -374,6 +388,14 @@ fifth_instance=$(jq -r '.status.endpoints[0].instanceId' "$resource")
+   || fail "the service still reports the lost instance $fourth_instance"
+ echo "ok: the service was redeployed with a new instance after the restart"
+ expect_reply "$fifth_instance"
++# 计数随新进程从 0 开始：启动时的核对发现了丢失的实例，之后没有再丢失。
++scrape "control plane /metrics after the restart" http://127.0.0.1:8080/metrics \
++  'forgemesh_instance_checks_total{outcome="failed"} 0$' \
++  'forgemesh_instance_check_results_total{check="startup",result="lost"} 1$' \
++  'forgemesh_instance_check_results_total{check="periodic",result="lost"} 0$' \
++  'forgemesh_lost_instance_redeploys_total 1$' \
++  'forgemesh_orphaned_allocation_reclaims_total{outcome="reclaimed"} 0$' \
++  'forgemesh_orphaned_allocation_reclaims_total{outcome="failed"} 0$'
+ check "delete the redeployed service" 202 "${auth[@]}" -X DELETE "$service"
+ wait_gone
+ 
+-- 
+2.43.0
+

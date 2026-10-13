@@ -1,7 +1,7 @@
 From 6bc2c22f9772d0c470eeb28df09c3b3e239afd5f Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Tue, 13 Oct 2026 03:10:30 +0000
-Subject: [PATCH 05/10] feat(registry): sign list page tokens and expose them
+Subject: [PATCH 05/11] feat(registry): sign list page tokens and expose them
  through list_page
 
 The registry could only continue a listing from a token built with the

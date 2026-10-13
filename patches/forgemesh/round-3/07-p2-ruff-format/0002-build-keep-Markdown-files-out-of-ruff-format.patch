@@ -1,0 +1,32 @@
+From 2beb8606e4c25101020fb17e7fb6c8d42f502656 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 13 Oct 2026 13:56:42 +0000
+Subject: [PATCH 2/4] build: keep Markdown files out of ruff format
+
+Ruff 0.17 also formats the Python code blocks of Markdown files. The
+code in the docs is illustrative (interface sketches with aligned
+trailing comments, abbreviated classes), and reformatting it would turn
+a formatting change of the sources into an edit of the design and
+operations documents. Exclude Markdown from the formatter; ruff check
+does not read Markdown either.
+---
+ pyproject.toml | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/pyproject.toml b/pyproject.toml
+index dd723cd..c583ed4 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -21,6 +21,9 @@ ignore = ["E501", "B008"]
+ [tool.ruff.format]
+ quote-style = "double"
+ indent-style = "space"
++# ruff 0.17 也格式化 Markdown 中的 Python 代码块。文档里的代码是示意（如对齐的行尾注释），
++# 不按源码的格式要求。
++exclude = ["*.md"]
+ 
+ [tool.pytest.ini_options]
+ minversion = "7.0"
+-- 
+2.43.0
+

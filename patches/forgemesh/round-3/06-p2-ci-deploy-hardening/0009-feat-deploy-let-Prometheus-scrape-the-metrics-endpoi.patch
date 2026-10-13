@@ -1,0 +1,220 @@
+From 5e05c38793cdbb26059d7a53b61127f2c11f78be Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 13 Oct 2026 12:32:50 +0000
+Subject: [PATCH 09/14] feat(deploy): let Prometheus scrape the metrics
+ endpoints on Kubernetes
+
+Both services now serve /metrics without authentication, but on
+Kubernetes nothing could scrape the control plane: the default
+policies only let the gateway reach port 8080, and the gateway does
+not forward /metrics. The gateway's /metrics shares the open port 8081
+with the API and the probes, and the manifests did not say what an
+Ingress should expose.
+
+monitoring/network-policy.yaml is an optional pair of policies that
+lets pods labelled app.kubernetes.io/name=prometheus in the monitoring
+namespace reach 8080 on the control plane and 8081 on the gateway.
+Both selectors are meant to be edited for the actual Prometheus; the
+gateway rule only matters once the gateway's ingress is narrowed.
+
+The README states that the endpoints serve unauthenticated aggregate
+data, that a NetworkPolicy opens the whole port (these pods can also
+call the control plane API directly, still with a key), and that an
+Ingress should only route /api/v1/. It also gives a scrape
+configuration that scrapes each pod rather than the Service, so the
+counters of different gateway replicas are not mixed. The manifest
+headers point to the new file.
+
+Validated on kind with Calico 3.33 in nftables mode. Without the file
+the control plane's /metrics times out from a Prometheus-labelled pod;
+with it that pod gets the metrics, while an unlabelled pod in the
+monitoring namespace and a Prometheus-labelled pod in another
+namespace still time out. With the gateway's ingress narrowed to an
+ingress controller namespace, only the Prometheus pod and the ingress
+controller reach port 8081. Prometheus 3.15 running the README scrape
+configuration with only the documented RBAC scrapes both pods.
+---
+ CHANGELOG.md                                  |  1 +
+ README.md                                     | 19 +++++-
+ .../kubernetes/control-plane-deployment.yaml  |  1 +
+ deploy/kubernetes/gateway-deployment.yaml     |  4 +-
+ .../kubernetes/monitoring/network-policy.yaml | 58 +++++++++++++++++++
+ deploy/kubernetes/network-policies.yaml       |  6 +-
+ docs/architecture/module-mapping.md           |  2 +-
+ 7 files changed, 85 insertions(+), 6 deletions(-)
+ create mode 100644 deploy/kubernetes/monitoring/network-policy.yaml
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 7d5947c..5988659 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -73,6 +73,7 @@
+ - CI 新增 `dependency-audit` job：`pip-audit` 2.10.1 审计 `make install` 装进 `.venv` 的全部第三方包（以 editable 方式安装的本仓库 `forgemesh-*` 包不审计），`govulncheck` v1.9.0 检查网关代码实际调用到的已知漏洞（含标准库）；本地为 `make audit` 与 `make -C gateway vulncheck`。尚无修复或经评估不适用的 Python 漏洞以 `--ignore-vuln` 记入根 `Makefile` 的 `PIP_AUDIT_IGNORE`（目前为空），govulncheck 没有忽略机制；处理规则见 `SECURITY.md` 3.1（同步改写，删去「依赖版本在 CI 中固定」这一并不属实的说法）。
+ - pytest 总覆盖率下限：根 `pyproject.toml` 的 `[tool.coverage.report]` 设 `fail_under = 97`（引入时实测 97.20%）与 `precision = 2`（默认取整到整数，96.5% 会被当作 97% 而通过）；CI `python` job 改以 `pytest --cov` 运行，本地为 `make coverage`。下限只升不降。
+ - Kubernetes 网关清单 `deploy/kubernetes/gateway-deployment.yaml`（ServiceAccount、Deployment 与 Service `forgemesh-gateway`，8081 端口）：与控制平面共用 Secret `forgemesh-api-keys`，经 Service `forgemesh-control-plane` 访问控制平面；探针为 `/readyz`（控制平面就绪之后才通过）与 `/healthz`；安全上下文与控制平面一致（非 root、只读根文件系统、去掉全部 capability、`RuntimeDefault` seccomp）；宽限期 35 秒，长于网关排空在途请求的 30 秒。启用启动器时使用 `deploy/kubernetes/launcher/`：`network-policy.yaml` 允许网关访问控制平面 Pod 上推理实例的临时端口（32768–60999），`fake-runtime-patch.yaml` 为控制平面加上来自 ConfigMap `forgemesh-inventory` 的加速器清单与 `fake` 启动器（实例监听全部地址，写进 `status.endpoints` 的主机是 Pod IP）。用法见 README「Kubernetes 部署」，包括 `vllm-process` 在 Kubernetes 上的前提与单节点限制。
++- Kubernetes 可选的网络策略 `deploy/kubernetes/monitoring/network-policy.yaml`：允许 Prometheus 的 Pod（默认为命名空间 `monitoring` 中带有 `app.kubernetes.io/name: prometheus` 标签的 Pod，按部署修改）访问控制平面的 8080 与网关的 8081 端口，抓取两边的 `/metrics`。默认的策略下从 Pod 网络抓取不到控制平面的 `/metrics`；它与网关的 `/metrics` 一样不要求认证，只输出跨租户聚合的指标。说明与抓取配置示例见 README「Kubernetes 部署」的「指标抓取」。
+ 
+ ### Changed
+ 
+diff --git a/README.md b/README.md
+index 7f682fd..75cf51c 100644
+--- a/README.md
++++ b/README.md
+@@ -419,7 +419,22 @@ kubectl -n forgemesh port-forward service/forgemesh-gateway 8081:8081 &
+ curl -s -H "Authorization: Bearer fmk_…" http://127.0.0.1:8081/api/v1/inference-services
+ ```
+ 
+-**网络策略**（`network-policies.yaml`）：默认拒绝命名空间内全部 Pod 的入站与出站流量，只放行全部 Pod 访问集群 DNS（`kube-system` 中 `k8s-app: kube-dns` 的 Pod）、网关访问控制平面的 8080 端口、任何来源访问网关的 8081 端口。集群内的其他工作负载因此不能直接访问控制平面，改为访问 `forgemesh-gateway:8081`，API 路径不变。kubelet 的探针与 `kubectl exec` / `cp` / `port-forward` 不受网络策略限制，容器中的备份与恢复照常进行。NetworkPolicy 只在执行它的 CNI（如 Calico、Cilium）上生效，其他 CNI 静默忽略。命名空间中新增的工作负载同样默认拒绝，需要为它另写策略；集群 DNS 的标签或端口不同（例如使用 NodeLocal DNSCache）时修改 `forgemesh-allow-dns`；调用方只经 Ingress 控制器访问时，可以把网关的入站来源收窄到 Ingress 控制器所在的命名空间。
++**网络策略**（`network-policies.yaml`）：默认拒绝命名空间内全部 Pod 的入站与出站流量，只放行全部 Pod 访问集群 DNS（`kube-system` 中 `k8s-app: kube-dns` 的 Pod）、网关访问控制平面的 8080 端口、任何来源访问网关的 8081 端口。集群内的其他工作负载因此不能直接访问控制平面，改为访问 `forgemesh-gateway:8081`，API 路径不变。kubelet 的探针与 `kubectl exec` / `cp` / `port-forward` 不受网络策略限制，容器中的备份与恢复照常进行。NetworkPolicy 只在执行它的 CNI（如 Calico、Cilium）上生效，其他 CNI 静默忽略。命名空间中新增的工作负载同样默认拒绝，需要为它另写策略；集群 DNS 的标签或端口不同（例如使用 NodeLocal DNSCache）时修改 `forgemesh-allow-dns`；调用方只经 Ingress 控制器访问时，可以把网关的入站来源收窄到 Ingress 控制器所在的命名空间。`kubectl apply -f deploy/kubernetes/` 不包括子目录，下文的 `launcher/` 与 `monitoring/` 按需另行应用。
++
++**指标抓取**：控制平面（8080）与网关（8081）的 `/metrics` 不要求认证，只输出跨租户聚合的指标（见「可观测性」），但仍能反映整体负载。默认的策略下只有网关能访问控制平面，而网关不转发 `/metrics`，从 Pod 网络抓取不到控制平面；网关的 `/metrics` 与探针和 API 共用对任何来源开放的 8081 端口，经 Ingress 暴露网关时只路由 `/api/v1/`，不要把整个端口暴露到公网。可选的 `monitoring/network-policy.yaml` 允许命名空间 `monitoring` 中带有 `app.kubernetes.io/name: prometheus` 标签的 Pod 访问这两个端口：应用之前把两条策略的 `namespaceSelector` 与 `podSelector` 改成自己的 Prometheus 所在的命名空间与它的 Pod 的标签。网关的那条在收窄了网关的入站来源之后才起作用。NetworkPolicy 按端口而不是路径放行，这些 Pod 也能直接调用控制平面的 API（仍须 API key），不经过网关的限流与请求体上限。Prometheus 应按 Pod 抓取，不经 Service：网关有多个副本时，经 Service 每次抓到的是不同副本的计数。例如（Prometheus 需要读取命名空间 `forgemesh` 中 EndpointSlice、Service 与 Pod 的 RBAC 权限）：
++
++```yaml
++scrape_configs:
++  - job_name: forgemesh
++    kubernetes_sd_configs:
++      - role: endpointslice
++        namespaces:
++          names: [forgemesh]
++    relabel_configs:
++      - source_labels: [__meta_kubernetes_service_name]
++        regex: forgemesh-control-plane|forgemesh-gateway
++        action: keep
++```
+ 
+ **加速器清单与启动器**：控制平面的 Deployment 没有设置 `FORGEMESH_INVENTORY_FILE` 与 `FORGEMESH_RUNTIME_LAUNCHER`，新建的服务停在 `Pending`（`SchedulerUnavailable`）。在 Kubernetes 上启用它们（变量见「运行控制平面」与「部署推理服务」）：
+ 
+@@ -457,7 +472,7 @@ curl -s http://127.0.0.1:8080/metrics   # 控制平面
+ curl -s http://127.0.0.1:8081/metrics   # 网关
+ ```
+ 
+-两个 `/metrics` 与探针一样不要求认证，网关也不对它限流。输出只有跨租户聚合的计数与耗时：标签只取路由模板（网关为路由类别）、方法、状态码与固定的枚举值（加速器类型取自运维配置的清单），不含租户、服务名、命名空间、uid、路径或实例地址；每个指标最多 200 个标签组合，超出的计入标签全为 `overflow` 的一个序列。控制平面的 `/metrics` 不在 `/api/v1` 之下，网关不转发它。指标仍能反映整体负载，不要经公网入口暴露这两个端点，只让 Prometheus 所在的网络访问（compose 只发布在 `127.0.0.1`）。
++两个 `/metrics` 与探针一样不要求认证，网关也不对它限流。输出只有跨租户聚合的计数与耗时：标签只取路由模板（网关为路由类别）、方法、状态码与固定的枚举值（加速器类型取自运维配置的清单），不含租户、服务名、命名空间、uid、路径或实例地址；每个指标最多 200 个标签组合，超出的计入标签全为 `overflow` 的一个序列。控制平面的 `/metrics` 不在 `/api/v1` 之下，网关不转发它。指标仍能反映整体负载，不要经公网入口暴露这两个端点，只让 Prometheus 所在的网络访问（compose 只发布在 `127.0.0.1`，Kubernetes 见「Kubernetes 部署」的「指标抓取」）。
+ 
+ 控制平面的指标（网关的指标见 [gateway/README.md](gateway/README.md)「可观测性」）：
+ 
+diff --git a/deploy/kubernetes/control-plane-deployment.yaml b/deploy/kubernetes/control-plane-deployment.yaml
+index 605c8ff..fbfa252 100644
+--- a/deploy/kubernetes/control-plane-deployment.yaml
++++ b/deploy/kubernetes/control-plane-deployment.yaml
+@@ -10,6 +10,7 @@
+ # 备份与恢复见 docs/operations/backup-restore.md 2.5 / 3.4 节。
+ # 控制平面不访问 Kubernetes API：以专用的 ServiceAccount 运行，不挂载它的 token。
+ # network-policies.yaml 只允许网关访问控制平面，调用方都经网关（gateway-deployment.yaml）访问 API。
++# 网关不转发 /metrics（聚合指标，不要求认证）：让 Prometheus 抓取见 monitoring/network-policy.yaml。
+ # 没有设置 FORGEMESH_INVENTORY_FILE 与 FORGEMESH_RUNTIME_LAUNCHER：控制平面不部署推理实例，新建的
+ # 服务停在 Pending（SchedulerUnavailable）。设置方法见 README「Kubernetes 部署」：不需要 GPU 的
+ # 假启动器见 launcher/fake-runtime-patch.yaml；vllm-process / tgi-process 启动器在控制平面的容器内
+diff --git a/deploy/kubernetes/gateway-deployment.yaml b/deploy/kubernetes/gateway-deployment.yaml
+index 30f296d..9245fdc 100644
+--- a/deploy/kubernetes/gateway-deployment.yaml
++++ b/deploy/kubernetes/gateway-deployment.yaml
+@@ -4,7 +4,9 @@
+ # 与控制平面共用 Secret forgemesh-api-keys 中的 key 文件（见 control-plane-deployment.yaml），
+ # 经 Service forgemesh-control-plane 访问控制平面；/readyz 在控制平面就绪之后才返回 200。
+ # 网关是调用方访问 API 的唯一入口：network-policies.yaml 只允许网关访问控制平面。集群外的
+-# 调用方经 Ingress、LoadBalancer 等暴露 Service forgemesh-gateway 访问。
++# 调用方经 Ingress、LoadBalancer 等暴露 Service forgemesh-gateway 访问。/healthz、/readyz 与
++# /metrics（跨租户聚合的指标）不要求认证，与 API 共用 8081 端口：经 Ingress 暴露时只路由
++# /api/v1/，不要把它们暴露到公网；Prometheus 的抓取见 monitoring/network-policy.yaml。
+ #
+ # 网关无状态，可以增加副本；限流与服务实例的解析缓存按副本各自计算（每个副本对每个租户都
+ # 允许 GATEWAY_RATE_LIMIT_RPS）。推理实例的地址默认只拒绝回环、链路本地与云元数据地址，
+diff --git a/deploy/kubernetes/monitoring/network-policy.yaml b/deploy/kubernetes/monitoring/network-policy.yaml
+new file mode 100644
+index 0000000..ed31370
+--- /dev/null
++++ b/deploy/kubernetes/monitoring/network-policy.yaml
+@@ -0,0 +1,58 @@
++# 可选：允许 Prometheus 抓取控制平面（8080）与网关（8081）的 /metrics，与 ../network-policies.yaml
++# 一起应用：
++#   kubectl apply -f deploy/kubernetes/monitoring/network-policy.yaml
++#
++# 两个 /metrics 与探针一样不要求认证，只输出跨租户聚合的计数与耗时（标签不含租户、服务名、
++# 命名空间、uid 或地址，见 README「可观测性」），但仍能反映整体负载，只应让监控组件访问。
++# 默认的策略只允许网关访问控制平面，网关又不转发 /metrics，不应用这个文件时从 Pod 网络抓取
++# 不到控制平面；网关的 8081 端口默认对任何来源开放，第二条策略在收窄了网关的入站来源之后才起作用。
++#
++# 来源是命名空间 monitoring 中带有 app.kubernetes.io/name: prometheus 标签的 Pod：应用之前把
++# 两条策略中的 namespaceSelector 与 podSelector 改成自己的 Prometheus 所在的命名空间与它的 Pod
++# 的标签（kubectl get pods -A --show-labels 查看）。NetworkPolicy 按端口而不是路径放行：这些 Pod
++# 也能直接调用控制平面的 API（仍须 API key），不经过网关的限流与请求体上限。
++apiVersion: networking.k8s.io/v1
++kind: NetworkPolicy
++metadata:
++  name: forgemesh-prometheus-control-plane
++  namespace: forgemesh
++spec:
++  podSelector:
++    matchLabels:
++      app.kubernetes.io/name: control-plane
++  policyTypes:
++    - Ingress
++  ingress:
++    - from:
++        - namespaceSelector:
++            matchLabels:
++              kubernetes.io/metadata.name: monitoring
++          podSelector:
++            matchLabels:
++              app.kubernetes.io/name: prometheus
++      ports:
++        - protocol: TCP
++          port: 8080
++---
++apiVersion: networking.k8s.io/v1
++kind: NetworkPolicy
++metadata:
++  name: forgemesh-prometheus-gateway
++  namespace: forgemesh
++spec:
++  podSelector:
++    matchLabels:
++      app.kubernetes.io/name: gateway
++  policyTypes:
++    - Ingress
++  ingress:
++    - from:
++        - namespaceSelector:
++            matchLabels:
++              kubernetes.io/metadata.name: monitoring
++          podSelector:
++            matchLabels:
++              app.kubernetes.io/name: prometheus
++      ports:
++        - protocol: TCP
++          port: 8081
+diff --git a/deploy/kubernetes/network-policies.yaml b/deploy/kubernetes/network-policies.yaml
+index 2491a53..eb2db15 100644
+--- a/deploy/kubernetes/network-policies.yaml
++++ b/deploy/kubernetes/network-policies.yaml
+@@ -5,9 +5,11 @@
+ # - 全部 Pod 都可以访问集群 DNS（kube-system 中 k8s-app=kube-dns 的 Pod，53 端口）；
+ # - 控制平面只接受网关对 8080 端口的访问。kubelet 的探针与 kubectl exec / cp / port-forward
+ #   不受网络策略限制，容器中的备份与恢复（docs/operations/backup-restore.md 2.5 / 3.4 节）照常进行；
+-# - 网关接受任何来源对 8081 端口的访问（它是 API 的入口，自行认证），出站只能访问控制平面的 8080 端口。
++# - 网关接受任何来源对 8081 端口的访问（它是 API 的入口，自行认证；/healthz、/readyz 与聚合指标
++#   /metrics 不要求认证），出站只能访问控制平面的 8080 端口。
+ #
+-# 启用启动器之后推理实例运行在控制平面的 Pod 内，还要应用 launcher/network-policy.yaml。
++# 启用启动器之后推理实例运行在控制平面的 Pod 内，还要应用 launcher/network-policy.yaml；
++# 让 Prometheus 抓取两边的 /metrics 见 monitoring/network-policy.yaml。
+ # 集群外的调用方只经 Ingress 控制器访问网关时，可以把网关入站规则的来源收窄到 Ingress 控制器
+ # 所在的命名空间；集群 DNS 的标签或端口不同（例如使用 NodeLocal DNSCache）时相应修改 DNS 规则。
+ apiVersion: networking.k8s.io/v1
+diff --git a/docs/architecture/module-mapping.md b/docs/architecture/module-mapping.md
+index defdf7c..fb4799f 100644
+--- a/docs/architecture/module-mapping.md
++++ b/docs/architecture/module-mapping.md
+@@ -316,7 +316,7 @@
+ | 字段 | 内容 |
+ |---|---|
+ | 架构模块 | 部署拓扑与运维文档（L6 平台基础设施落地） |
+-| 当前代码路径 | `deploy/docker/{Dockerfile.control-plane,Dockerfile.gateway}`（均以非 root 用户运行：控制平面 uid 10001，网关 distroless `nonroot`）与根目录 `.dockerignore`；`deploy/docker/docker-compose.yaml`（control-plane + gateway，只发布在 127.0.0.1；postgres 在 `postgres` profile 中、默认不启动；含 ADR-013 单实例注记；不设置加速器清单与启动器，不部署推理实例）与叠加文件 `deploy/docker/docker-compose.fake-runtime.yaml`（一块虚构设备的清单 `deploy/docker/fake-runtime-inventory.json` + 假启动器，不需要 GPU 的推理服务闭环）；`deploy/kubernetes/{namespace,control-plane-deployment,gateway-deployment,network-policies}.yaml`（控制平面 replicas: 1、`strategy: Recreate`、数据库在 PVC 上；网关无状态；两者共用 Secret `forgemesh-api-keys` 中的 key 文件，各用不挂载 token 的 ServiceAccount；NetworkPolicy 默认拒绝，只放行 DNS、网关访问控制平面 8080 与任何来源访问网关 8081；不设置加速器清单与启动器，不部署推理实例）与 `deploy/kubernetes/launcher/`（推理实例端口的 NetworkPolicy、启用加速器清单与 `fake` 启动器的补丁）；`scripts/compose_smoke.sh`；`docs/operations/backup-restore.md`（RPO≤5min / RTO≤15min、在线备份与恢复演练）；示例 `examples/single-node/{inference-service,plugin-vllm}.yaml`、`examples/multi-tenant/tenant-quota.yaml` |
++| 当前代码路径 | `deploy/docker/{Dockerfile.control-plane,Dockerfile.gateway}`（均以非 root 用户运行：控制平面 uid 10001，网关 distroless `nonroot`）与根目录 `.dockerignore`；`deploy/docker/docker-compose.yaml`（control-plane + gateway，只发布在 127.0.0.1；postgres 在 `postgres` profile 中、默认不启动；含 ADR-013 单实例注记；不设置加速器清单与启动器，不部署推理实例）与叠加文件 `deploy/docker/docker-compose.fake-runtime.yaml`（一块虚构设备的清单 `deploy/docker/fake-runtime-inventory.json` + 假启动器，不需要 GPU 的推理服务闭环）；`deploy/kubernetes/{namespace,control-plane-deployment,gateway-deployment,network-policies}.yaml`（控制平面 replicas: 1、`strategy: Recreate`、数据库在 PVC 上；网关无状态；两者共用 Secret `forgemesh-api-keys` 中的 key 文件，各用不挂载 token 的 ServiceAccount；NetworkPolicy 默认拒绝，只放行 DNS、网关访问控制平面 8080 与任何来源访问网关 8081；不设置加速器清单与启动器，不部署推理实例）与 `deploy/kubernetes/launcher/`（推理实例端口的 NetworkPolicy、启用加速器清单与 `fake` 启动器的补丁）、`deploy/kubernetes/monitoring/`（可选：允许 Prometheus 抓取两边 `/metrics` 的 NetworkPolicy）；`scripts/compose_smoke.sh`；`docs/operations/backup-restore.md`（RPO≤5min / RTO≤15min、在线备份与恢复演练）；示例 `examples/single-node/{inference-service,plugin-vllm}.yaml`、`examples/multi-tenant/tenant-quota.yaml` |
+ | 核心契约 | ADR-013 单控制平面实例约束：compose 不扩展 control-plane；k8s 清单 `replicas: 1` 且更新策略为 `Recreate`（旧 Pod 退出后才启动新 Pod，更新期间不会有两个写者）；控制平面只使用 SQLite，postgres 为目标态预置 |
+ | 运行形态 | 容器镜像（Dockerfile）+ 部署工件（YAML）+ 运维文档（Markdown） |
+ | 数据所有权 | 无；控制平面的 SQLite 库（叠加 `docker-compose.fake-runtime.yaml` 时还有工作流存储 `forgemesh.workflows.db`）位于 compose 卷 `control-plane-data` / k8s PVC `forgemesh-control-plane-data`（pgdata 卷属目标态预置，仅 `postgres` profile 使用） |
+-- 
+2.43.0
+

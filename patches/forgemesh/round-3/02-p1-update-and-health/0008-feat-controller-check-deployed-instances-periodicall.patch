@@ -1,0 +1,804 @@
+From 083f6a714dfff621e081cbb262c60c222e3fbe3b Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 13 Oct 2026 06:46:18 +0000
+Subject: [PATCH 08/20] feat(controller): check deployed instances periodically
+
+Instances were only checked once, when the control plane started, so
+an instance that exited while the control plane kept running stayed
+behind a Ready service: the gateway kept routing to it and nothing
+redeployed it.
+
+The controller manager now takes an optional instance check and runs
+it every instance_check_interval seconds, next to the change poll and
+the resync, queueing the services it reports. The application binds
+check_instances to its registry and launcher, so a lost instance turns
+its service Degraded at the next check and the reconciler redeploys it
+with the existing backoff; a Degraded service whose instance is back
+is reported and returns to Ready. A failing check is logged and
+retried at the next interval, and stopping the manager cancels it.
+
+FORGEMESH_INSTANCE_CHECK_INTERVAL_SECONDS sets the interval (default
+10 seconds) and must be a finite positive number; the application
+validates it even without a launcher so that a typo does not go
+unnoticed. The check only asks the launcher whether the instance runs:
+verify() is the launch readiness wait of the process launchers, not a
+cheap probe, so a hung but alive process is not detected.
+---
+ .../src/forgemesh/controlplane/app.py         | 26 ++++--
+ .../controlplane/controller/manager.py        | 43 +++++++++-
+ .../controlplane/deployment/__init__.py       | 17 +++-
+ .../controlplane/deployment/config.py         | 23 +++++-
+ .../controlplane/deployment/recovery.py       | 11 ++-
+ .../forgemesh/controlplane/reconciler/core.py |  2 +-
+ tests/unit/controlplane/test_app.py           | 67 +++++++++++++++-
+ .../controlplane/test_controller_manager.py   | 79 ++++++++++++++++++-
+ .../controlplane/test_deployment_lifecycle.py | 49 +++++++++++-
+ .../unit/controlplane/test_launcher_config.py | 42 +++++++++-
+ 10 files changed, 336 insertions(+), 23 deletions(-)
+
+diff --git a/packages/control-plane/src/forgemesh/controlplane/app.py b/packages/control-plane/src/forgemesh/controlplane/app.py
+index 0465ba0..cc6132a 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/app.py
++++ b/packages/control-plane/src/forgemesh/controlplane/app.py
+@@ -27,9 +27,11 @@
+   ``status.endpoints``；删除时停止实例、释放分配。工作流运行存放在单独的数据库文件
+   （:func:`~forgemesh.controlplane.sqlite.workflow_db_path`，如 ``forgemesh.workflows.db``）
+   中。启动时先恢复未完成的部署，再把实例已不在运行的 ``Ready`` 服务转为 ``Degraded``
+-  （控制器随后重新部署它们），然后才启动控制器；关闭时依次停止控制器、工作流运行时、
+-  启动器（其实例随之停止）。``POST /workflows`` 不使用这个运行时（仍返回 503）。未设置时
+-  不部署，协调器在分配之前即报告 ``WorkflowRuntimeUnavailable``。
++  （控制器随后重新部署它们），然后才启动控制器；控制器运行中每隔
++  ``FORGEMESH_INSTANCE_CHECK_INTERVAL_SECONDS`` 秒（默认 10，不论是否选择启动器都校验）
++  再核对一次实例。关闭时依次停止控制器、工作流运行时、启动器（其实例随之停止）。
++  ``POST /workflows`` 不使用这个运行时（仍返回 503）。未设置时不部署，协调器在分配之前
++  即报告 ``WorkflowRuntimeUnavailable``。
+ * **无导入副作用**：数据库在应用启动（lifespan）时才打开，导入本模块不会
+   创建文件。
+ * **探针**：``/healthz``（存活）恒为 ok；``/readyz``（就绪）探测权威存储可用。
+@@ -41,6 +43,7 @@
+ 
+ from __future__ import annotations
+ 
++import functools
+ import ipaddress
+ import json
+ import logging
+@@ -68,10 +71,12 @@ from .auth import (
+ )
+ from .controller import ControllerManager
+ from .deployment import (
++    DEFAULT_INSTANCE_CHECK_INTERVAL_SECONDS,
+     RUNTIME_LAUNCHER_ENV,
+     DeploymentReleaser,
+     DeploymentSteps,
+     check_instances,
++    instance_check_interval_from_env,
+     launcher_from_env,
+ )
+ from .reconciler import ProcessedKeyStore, ReconciliationController
+@@ -178,6 +183,7 @@ def _build_controller(
+     inventory: Inventory | None,
+     runtime: LocalWorkflowRuntime | None = None,
+     launcher: RuntimeLauncher | None = None,
++    instance_check_interval: float = DEFAULT_INSTANCE_CHECK_INTERVAL_SECONDS,
+ ) -> ControllerManager:
+     # 没有授权规则的 DefaultPolicyEngine 拒绝一切操作。资源的创建和删除已经由 API 的
+     # 认证与 scope 把关，协调只是推进这些已被接受的期望状态，因此放行 reconcile。
+@@ -199,7 +205,16 @@ def _build_controller(
+         workflow_poll_interval=WORKFLOW_POLL_INTERVAL_SECONDS,
+         launcher=launcher,
+     )
+-    return ControllerManager(registry, reconciler, poll_interval=CONTROLLER_POLL_INTERVAL_SECONDS)
++    instance_check = (
++        functools.partial(check_instances, registry, launcher) if launcher is not None else None
++    )
++    return ControllerManager(
++        registry,
++        reconciler,
++        poll_interval=CONTROLLER_POLL_INTERVAL_SECONDS,
++        instance_check=instance_check,
++        instance_check_interval=instance_check_interval,
++    )
+ 
+ 
+ if _FASTAPI_AVAILABLE:
+@@ -245,6 +260,7 @@ if _FASTAPI_AVAILABLE:
+                     sum(len(node.devices) for node in inventory.nodes),
+                 )
+             launcher = launcher_from_env(inventory)
++            instance_check_interval = instance_check_interval_from_env()
+             path = resolve_db_path(db_path)
+             async with AsyncExitStack() as cleanup:
+                 registry = init_registry(path)
+@@ -279,7 +295,7 @@ if _FASTAPI_AVAILABLE:
+                         len(checked),
+                     )
+                 controller = _build_controller(
+-                    registry, processed_store, inventory, runtime, launcher
++                    registry, processed_store, inventory, runtime, launcher, instance_check_interval
+                 )
+                 cleanup.push_async_callback(controller.stop)
+                 await controller.start()
+diff --git a/packages/control-plane/src/forgemesh/controlplane/controller/manager.py b/packages/control-plane/src/forgemesh/controlplane/controller/manager.py
+index ef2cc32..937da51 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/controller/manager.py
++++ b/packages/control-plane/src/forgemesh/controlplane/controller/manager.py
+@@ -9,6 +9,11 @@
+ * **变更来源**：启动时先记下当前变更序号，再全量列出资源键重建队列，之后按
+   序号增量轮询 ``resource_changes`` 并清理已读记录，另有周期性全量同步兜底。
+   ``status`` 变更（包括控制器自己的写入）不触发协调。
++* **实例核对**：注入 ``instance_check`` 时每隔 ``instance_check_interval`` 秒调用一次，把它
++  报告的资源加入队列（应用注入绑定了注册表与启动器的
++  :func:`~forgemesh.controlplane.deployment.check_instances`：实例已不在运行的 ``Ready``
++  服务由它转为 ``Degraded``，实例回来了的 ``Degraded`` 服务由它报告）；核对失败时记日志，
++  下一个周期重试。
+ * **并发**：``workers`` 个 worker 协程；同一资源同一时刻只由一个 worker 处理。
+ * **status 回写**：以协调前读到的 ``resource_version`` 做 CAS。冲突时重读：
+   ``uid``、``generation`` 与操作（reconcile / recover / terminate）都没变就以新版本重试，
+@@ -24,7 +29,7 @@ from __future__ import annotations
+ 
+ import asyncio
+ import logging
+-from collections.abc import Collection
++from collections.abc import Awaitable, Callable, Collection, Iterable
+ from typing import Any
+ from uuid import uuid4
+ 
+@@ -32,6 +37,7 @@ from forgemesh.core.errors import ConflictError, NotFoundError
+ from forgemesh.core.objects import Resource
+ from forgemesh.core.reconciler import ReconcileContext
+ 
++from ..deployment import DEFAULT_INSTANCE_CHECK_INTERVAL_SECONDS
+ from ..reconciler import ReconciliationController, compute_dedup_key
+ from ..registry import ChangeType, ResourceKey, SQLiteRegistry
+ from .queue import WorkQueue
+@@ -78,6 +84,8 @@ class ControllerManager:
+         resync_period: 全量同步周期（秒）。
+         batch_size: 每次读取的变更记录条数上限。
+         status_write_attempts: status 写入遇到版本冲突时的最多尝试次数。
++        instance_check: 可选，核对已部署实例的协程函数，返回要协调的资源键。
++        instance_check_interval: 两次核对实例之间的秒数。
+         queue: 工作队列；为空时新建（测试可注入）。
+     """
+ 
+@@ -92,6 +100,8 @@ class ControllerManager:
+         resync_period: float = 600.0,
+         batch_size: int = 500,
+         status_write_attempts: int = 3,
++        instance_check: Callable[[], Awaitable[Iterable[ResourceKey]]] | None = None,
++        instance_check_interval: float = DEFAULT_INSTANCE_CHECK_INTERVAL_SECONDS,
+         queue: WorkQueue[ResourceKey] | None = None,
+     ) -> None:
+         if reconciler.records_dedup_keys:
+@@ -101,8 +111,8 @@ class ControllerManager:
+             )
+         if workers < 1 or batch_size < 1 or status_write_attempts < 1:
+             raise ValueError("workers, batch_size and status_write_attempts must be >= 1")
+-        if poll_interval <= 0 or resync_period <= 0:
+-            raise ValueError("poll_interval and resync_period must be > 0")
++        if poll_interval <= 0 or resync_period <= 0 or instance_check_interval <= 0:
++            raise ValueError("poll_interval, resync_period and instance_check_interval must be > 0")
+         self._registry = registry
+         self._reconciler = reconciler
+         self._kinds = frozenset(kinds)
+@@ -111,6 +121,8 @@ class ControllerManager:
+         self._resync_period = resync_period
+         self._batch_size = batch_size
+         self._status_write_attempts = status_write_attempts
++        self._instance_check = instance_check
++        self._instance_check_interval = instance_check_interval
+         self._queue: WorkQueue[ResourceKey] = queue if queue is not None else WorkQueue()
+         self._cursor = 0
+         self._started = False
+@@ -118,7 +130,7 @@ class ControllerManager:
+         self._workers: list[asyncio.Task[None]] = []
+ 
+     async def start(self) -> None:
+-        """重建工作队列，然后启动变更轮询、全量同步与 worker 任务。"""
++        """重建工作队列，然后启动变更轮询、全量同步、实例核对与 worker 任务。"""
+         if self._started:
+             raise RuntimeError("a controller manager can only be started once")
+         self._started = True
+@@ -128,6 +140,12 @@ class ControllerManager:
+             asyncio.create_task(self._watch_changes(), name="forgemesh-controller-changes"),
+             asyncio.create_task(self._resync_periodically(), name="forgemesh-controller-resync"),
+         ]
++        if self._instance_check is not None:
++            self._watchers.append(
++                asyncio.create_task(
++                    self._check_instances_periodically(), name="forgemesh-controller-instances"
++                )
++            )
+         self._workers = [
+             asyncio.create_task(self._work(), name=f"forgemesh-controller-worker-{index}")
+             for index in range(self._worker_count)
+@@ -157,6 +175,15 @@ class ControllerManager:
+         for key in await self._registry.list_resource_keys(self._kinds):
+             self._queue.add(key)
+ 
++    async def check_instances(self) -> None:
++        """核对一次已部署的实例，把报告的受管资源加入队列；没有注入 ``instance_check`` 时
++        什么都不做。"""
++        if self._instance_check is None:
++            return
++        for key in await self._instance_check():
++            if key.kind in self._kinds:
++                self._queue.add(key)
++
+     async def poll_changes(self) -> int:
+         """读取一批新的变更记录，把相关资源加入队列并清理已读记录，返回读到的条数。"""
+         changes = await self._registry.changes_since(self._cursor, limit=self._batch_size)
+@@ -275,5 +302,13 @@ class ControllerManager:
+             except Exception:  # noqa: BLE001 - 下一个周期重试
+                 logger.exception("controller resync failed")
+ 
++    async def _check_instances_periodically(self) -> None:
++        while True:
++            await asyncio.sleep(self._instance_check_interval)
++            try:
++                await self.check_instances()
++            except Exception:  # noqa: BLE001 - 下一个周期重试
++                logger.exception("controller instance check failed")
++
+ 
+ __all__ = ["DEFAULT_KINDS", "ControllerManager"]
+diff --git a/packages/control-plane/src/forgemesh/controlplane/deployment/__init__.py b/packages/control-plane/src/forgemesh/controlplane/deployment/__init__.py
+index 4d02ce3..ba0335e 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/deployment/__init__.py
++++ b/packages/control-plane/src/forgemesh/controlplane/deployment/__init__.py
+@@ -6,12 +6,12 @@
+ * :mod:`.release` —— 删除资源或部署新的 spec 之前取消部署、停止实例的
+   :class:`DeploymentReleaser`；
+ * :mod:`.recovery` —— 把实例已不在运行的 ``Ready`` 服务转为 ``Degraded`` 的
+-  :func:`check_instances`；
++  :func:`check_instances`（控制平面启动时与运行中定期调用）；
+ * :mod:`.fake` —— 在控制平面进程内为每个实例提供 OpenAI 兼容桩服务的
+   :class:`FakeLauncher`（CI 与本地开发）；
+ * :mod:`.vllm_process` —— 把每个实例作为本机 vLLM 子进程运行的 :class:`VLLMProcessLauncher`；
+ * :mod:`.config` —— 按环境变量（``FORGEMESH_RUNTIME_LAUNCHER`` 等）选择启动器的
+-  :func:`launcher_from_env`；
++  :func:`launcher_from_env` 与核对实例的间隔 :func:`instance_check_interval_from_env`；
+ * :mod:`.network` —— 启动器共用的地址校验与健康检查；
+ * :mod:`.memory` —— 测试替身 :class:`InMemoryLauncher`。
+ 
+@@ -20,11 +20,17 @@
+ 
+ from __future__ import annotations
+ 
+-from .config import RUNTIME_LAUNCHER_ENV, LauncherConfigError, launcher_from_env
++from .config import (
++    INSTANCE_CHECK_INTERVAL_ENV,
++    RUNTIME_LAUNCHER_ENV,
++    LauncherConfigError,
++    instance_check_interval_from_env,
++    launcher_from_env,
++)
+ from .fake import FakeLauncher
+ from .launcher import LaunchedInstance, LaunchRequest, RuntimeLauncher
+ from .memory import InMemoryLauncher
+-from .recovery import INSTANCE_LOST_REASON, check_instances
++from .recovery import DEFAULT_INSTANCE_CHECK_INTERVAL_SECONDS, INSTANCE_LOST_REASON, check_instances
+ from .release import DeploymentReleaser
+ from .vllm_process import VLLMProcessLauncher
+ from .workflow import (
+@@ -43,7 +49,9 @@ from .workflow import (
+ )
+ 
+ __all__ = [
++    "DEFAULT_INSTANCE_CHECK_INTERVAL_SECONDS",
+     "DEPLOYMENT_WORKFLOW",
++    "INSTANCE_CHECK_INTERVAL_ENV",
+     "INSTANCE_LOST_REASON",
+     "LAUNCH_INSTANCE",
+     "PREPARE_MODEL",
+@@ -65,6 +73,7 @@ __all__ = [
+     "deployment_run_key",
+     "deployment_workflow",
+     "find_deployment_runs",
++    "instance_check_interval_from_env",
+     "launched_instance",
+     "launcher_from_env",
+ ]
+diff --git a/packages/control-plane/src/forgemesh/controlplane/deployment/config.py b/packages/control-plane/src/forgemesh/controlplane/deployment/config.py
+index 1a27310..fdcaeed 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/deployment/config.py
++++ b/packages/control-plane/src/forgemesh/controlplane/deployment/config.py
+@@ -1,4 +1,4 @@
+-"""按环境变量选择推理实例的启动器。
++"""按环境变量选择推理实例的启动器，以及控制器核对实例的间隔。
+ 
+ * ``FORGEMESH_RUNTIME_LAUNCHER``：``fake``（:class:`~.fake.FakeLauncher`，控制平面进程内的
+   OpenAI 兼容桩服务，供 CI 与本地开发）或 ``vllm-process``
+@@ -16,6 +16,10 @@
+   ``10``）为 ``SIGTERM`` 之后的宽限期。实例只运行在控制平面所在的主机上，因此清单必须
+   恰好有一个节点，其设备 id 都能写进 ``CUDA_VISIBLE_DEVICES``，且不会有两个 id 选中同一块
+   设备（见 :func:`~.vllm_process.cuda_device`）。
++* ``FORGEMESH_INSTANCE_CHECK_INTERVAL_SECONDS``（默认 ``10``，见
++  :func:`instance_check_interval_from_env`）：选择了启动器时，控制器每隔这么多秒经启动器
++  核对一次 ``Ready`` / ``Degraded`` 服务的实例（见 :func:`~.recovery.check_instances`），
++  实例退出之后的下一次核对把服务转为 ``Degraded``。
+ 
+ 未选中的启动器的变量不读取。空白值视同未设置。
+ """
+@@ -35,6 +39,7 @@ from . import fake, vllm_process
+ from .fake import FakeLauncher
+ from .launcher import RuntimeLauncher
+ from .network import check_advertise_host, check_bind_host, resolve_hosts
++from .recovery import DEFAULT_INSTANCE_CHECK_INTERVAL_SECONDS
+ from .vllm_process import (
+     DEFAULT_COMMAND,
+     DEFAULT_READY_TIMEOUT_SECONDS,
+@@ -56,6 +61,7 @@ VLLM_BIND_HOST_ENV = "FORGEMESH_VLLM_BIND_HOST"
+ VLLM_ADVERTISE_HOST_ENV = "FORGEMESH_VLLM_ADVERTISE_HOST"
+ VLLM_READY_TIMEOUT_ENV = "FORGEMESH_VLLM_READY_TIMEOUT_SECONDS"
+ VLLM_STOP_GRACE_ENV = "FORGEMESH_VLLM_STOP_GRACE_SECONDS"
++INSTANCE_CHECK_INTERVAL_ENV = "FORGEMESH_INSTANCE_CHECK_INTERVAL_SECONDS"
+ 
+ 
+ class LauncherConfigError(ValueError):
+@@ -194,10 +200,24 @@ def launcher_from_env(
+     )
+ 
+ 
++def instance_check_interval_from_env(environ: Mapping[str, str] | None = None) -> float:
++    """控制器两次核对已部署实例之间的秒数（``FORGEMESH_INSTANCE_CHECK_INTERVAL_SECONDS``）。
++
++    Args:
++        environ: 环境变量，默认 :data:`os.environ`。
++
++    Raises:
++        LauncherConfigError: 取值不是有限的正数秒。
++    """
++    env = os.environ if environ is None else environ
++    return _seconds(env, INSTANCE_CHECK_INTERVAL_ENV, DEFAULT_INSTANCE_CHECK_INTERVAL_SECONDS)
++
++
+ __all__ = [
+     "FAKE_ADVERTISE_HOST_ENV",
+     "FAKE_BIND_HOST_ENV",
+     "FAKE_LAUNCHER",
++    "INSTANCE_CHECK_INTERVAL_ENV",
+     "RUNTIME_LAUNCHER_ENV",
+     "VLLM_ADVERTISE_HOST_ENV",
+     "VLLM_BIND_HOST_ENV",
+@@ -206,5 +226,6 @@ __all__ = [
+     "VLLM_READY_TIMEOUT_ENV",
+     "VLLM_STOP_GRACE_ENV",
+     "LauncherConfigError",
++    "instance_check_interval_from_env",
+     "launcher_from_env",
+ ]
+diff --git a/packages/control-plane/src/forgemesh/controlplane/deployment/recovery.py b/packages/control-plane/src/forgemesh/controlplane/deployment/recovery.py
+index 847dd6b..bb01348 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/deployment/recovery.py
++++ b/packages/control-plane/src/forgemesh/controlplane/deployment/recovery.py
+@@ -5,7 +5,12 @@
+ 继续转发过去。:func:`check_instances` 经启动器核对实例：实例已不在运行的服务转为
+ ``Degraded``，这些实例的 endpoint 标记为未就绪，``Ready=False``（``InstanceLost``），网关
+ 不再向它们转发（网关缓存解析结果的几秒内除外）；协调器随后按退避重新部署这些服务（见
+-:mod:`forgemesh.controlplane.reconciler.core`）。应用在启动控制器之前调用一次。
++:mod:`forgemesh.controlplane.reconciler.core`）。应用在启动控制器之前调用一次
++（``after_restart=True``），之后由控制器管理器定期调用（间隔见
++:mod:`~forgemesh.controlplane.deployment.config`），把它返回的服务加入工作队列。
++
++核对只问启动器实例是否在运行（``is_running``），不探测实例能否服务请求：进程仍在、却
++不再响应的实例不会被发现。
+ """
+ 
+ from __future__ import annotations
+@@ -25,6 +30,8 @@ logger = logging.getLogger(__name__)
+ 
+ #: 实例已不在运行时 ``Ready`` 条件的原因。
+ INSTANCE_LOST_REASON = "InstanceLost"
++#: 控制器两次核对已部署实例之间的默认秒数。
++DEFAULT_INSTANCE_CHECK_INTERVAL_SECONDS = 10.0
+ 
+ _KIND = "InferenceService"
+ 
+@@ -132,4 +139,4 @@ async def check_instances(
+     return found
+ 
+ 
+-__all__ = ["INSTANCE_LOST_REASON", "check_instances"]
++__all__ = ["DEFAULT_INSTANCE_CHECK_INTERVAL_SECONDS", "INSTANCE_LOST_REASON", "check_instances"]
+diff --git a/packages/control-plane/src/forgemesh/controlplane/reconciler/core.py b/packages/control-plane/src/forgemesh/controlplane/reconciler/core.py
+index 4306de5..d2dc409 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/reconciler/core.py
++++ b/packages/control-plane/src/forgemesh/controlplane/reconciler/core.py
+@@ -59,7 +59,7 @@ generation 的运行（spec 在部署过程中变化，或运行来自 1.1.0 之
+ ------------------------
+ 实例已不在运行的 ``Ready`` 服务由
+ :func:`~forgemesh.controlplane.deployment.recovery.check_instances` 转为 ``Degraded``（控制
+-平面启动时）。spec 没有变化的 ``Degraded`` 服务每一轮：
++平面启动时，以及控制器运行中定期核对时）。spec 没有变化的 ``Degraded`` 服务每一轮：
+ 
+ * 这一代 spec 最近一次部署的运行进行中：每 ``workflow_poll_interval`` 秒查询一次；
+ * 运行成功、实例在运行（实例回来了，或重新部署成功）：回到 ``Ready``，写入实例地址；
+diff --git a/tests/unit/controlplane/test_app.py b/tests/unit/controlplane/test_app.py
+index 56be04e..8c3082b 100644
+--- a/tests/unit/controlplane/test_app.py
++++ b/tests/unit/controlplane/test_app.py
+@@ -1,5 +1,6 @@
+ """控制平面应用入口测试：真实路由已挂载、存储可配置、探针反映存储状态、控制器随应用运行、
+-配置加速器清单时启用调度器、配置启动器时启用部署（完整闭环见 ``tests/e2e/test_closed_loop.py``）。"""
++配置加速器清单时启用调度器、配置启动器时启用部署并定期核对实例（完整闭环见
++``tests/e2e/test_closed_loop.py``）。"""
+ 
+ from __future__ import annotations
+ 
+@@ -80,6 +81,25 @@ def _wait_for_ready_condition(client: TestClient, timeout: float = 5.0) -> dict[
+         time.sleep(0.02)
+ 
+ 
++def _wait_for_instance(
++    client: TestClient, other_than: str | None = None, timeout: float = 5.0
++) -> dict[str, Any]:
++    """轮询直到 ``llama`` 为 Ready，且实例不是 ``other_than``，返回它的 endpoint。"""
++    deadline = time.monotonic() + timeout
++    while True:
++        response = client.get(
++            "/api/v1/inference-services/llama", params={"namespace": "default"}, headers=HEADERS
++        )
++        assert response.status_code == 200
++        status = response.json()["status"]
++        if status["phase"] == "Ready":
++            [endpoint] = status["endpoints"]
++            if endpoint["instanceId"] != other_than:
++                return endpoint
++        assert time.monotonic() < deadline, f"llama did not serve a new instance: {status}"
++        time.sleep(0.02)
++
++
+ async def _store_service(db_file: Path) -> None:
+     registry = SQLiteRegistry(str(db_file))
+     try:
+@@ -319,6 +339,36 @@ def test_deployments_recover_before_the_controller_starts_and_stop_after_it(
+     ]
+ 
+ 
++@pytest.mark.unit
++def test_the_controller_deploys_a_service_again_once_its_instance_exits(
++    tmp_path, monkeypatch
++) -> None:
++    """控制器每隔 FORGEMESH_INSTANCE_CHECK_INTERVAL_SECONDS 秒核对实例：实例在控制器背后停止
++    之后，服务以新的实例回到 Ready。"""
++    launchers: list[Any] = []
++    original = app_module.launcher_from_env
++
++    def recording_launcher_from_env(*args: Any, **kwargs: Any) -> Any:
++        launchers.append(original(*args, **kwargs))
++        return launchers[-1]
++
++    monkeypatch.setattr(app_module, "launcher_from_env", recording_launcher_from_env)
++    monkeypatch.setattr(app_module, "WORKFLOW_POLL_INTERVAL_SECONDS", 0.05)
++    monkeypatch.setenv(INVENTORY_FILE_ENV, str(_write_inventory(tmp_path)))
++    monkeypatch.setenv(launcher_config.RUNTIME_LAUNCHER_ENV, "fake")
++    monkeypatch.setenv(launcher_config.INSTANCE_CHECK_INTERVAL_ENV, "0.05")
++
++    with TestClient(create_app(db_path=str(tmp_path / "cp.db"))) as client:
++        created = client.post("/api/v1/inference-services", json=BODY, headers=HEADERS)
++        assert created.status_code == 201
++        first = _wait_for_instance(client)
++        [launcher] = launchers
++        client.portal.call(launcher.stop, first["instanceId"])
++
++        second = _wait_for_instance(client, other_than=first["instanceId"])
++        assert client.portal.call(launcher.is_running, second["instanceId"])
++
++
+ @pytest.mark.unit
+ @pytest.mark.parametrize(
+     ("settings", "with_inventory", "message"),
+@@ -341,6 +391,21 @@ def test_deployments_recover_before_the_controller_starts_and_stop_after_it(
+             "FORGEMESH_FAKE_LAUNCHER_ADVERTISE_HOST must be set",
+             id="no-advertise-host",
+         ),
++        pytest.param(
++            {
++                "FORGEMESH_RUNTIME_LAUNCHER": "fake",
++                "FORGEMESH_INSTANCE_CHECK_INTERVAL_SECONDS": "0",
++            },
++            True,
++            "FORGEMESH_INSTANCE_CHECK_INTERVAL_SECONDS='0' must be a positive number of seconds",
++            id="instance-check-interval",
++        ),
++        pytest.param(
++            {"FORGEMESH_INSTANCE_CHECK_INTERVAL_SECONDS": "soon"},
++            False,
++            "FORGEMESH_INSTANCE_CHECK_INTERVAL_SECONDS='soon' is not a number of seconds",
++            id="instance-check-interval-without-launcher",
++        ),
+     ],
+ )
+ def test_app_refuses_to_start_with_an_unusable_launcher_setting(
+diff --git a/tests/unit/controlplane/test_controller_manager.py b/tests/unit/controlplane/test_controller_manager.py
+index 84a9ae6..9798717 100644
+--- a/tests/unit/controlplane/test_controller_manager.py
++++ b/tests/unit/controlplane/test_controller_manager.py
+@@ -2,7 +2,8 @@
+ 
+ 覆盖改进计划 4.10 的验收项：新资源在有限时间内得到带原因的 status；重启后
+ 从注册中心重建工作队列；同一 generation 不重复产生副作用。另覆盖 status 回写
+-的 CAS 冲突处理、去重键的登记时机、受控删除、重新排队、失败退避与优雅停止。
++的 CAS 冲突处理、去重键的登记时机、受控删除、重新排队、失败退避、定期核对实例
++与优雅停止。
+ """
+ 
+ from __future__ import annotations
+@@ -177,8 +178,13 @@ class RecordingRelease:
+ class RecordingQueue(WorkQueue[ResourceKey]):
+     def __init__(self) -> None:
+         super().__init__()
++        self.added: list[ResourceKey] = []
+         self.delays: list[tuple[ResourceKey, float]] = []
+ 
++    def add(self, key: ResourceKey) -> None:
++        self.added.append(key)
++        super().add(key)
++
+     def add_after(self, key: ResourceKey, delay: float) -> None:
+         self.delays.append((key, delay))
+         super().add_after(key, delay)
+@@ -230,6 +236,18 @@ def test_manager_needs_a_reconciler_that_leaves_dedup_keys_to_it() -> None:
+         ControllerManager(registry, reconciler)
+ 
+ 
++@pytest.mark.unit
++@pytest.mark.parametrize("interval", [0.0, -1.0])
++def test_manager_needs_a_positive_instance_check_interval(interval: float) -> None:
++    registry = SQLiteRegistry()
++    reconciler = ReconciliationController(
++        registry=registry, policy_engine=AllowPolicy(), record_dedup_keys=False
++    )
++
++    with pytest.raises(ValueError, match="instance_check_interval must be > 0"):
++        ControllerManager(registry, reconciler, instance_check_interval=interval)
++
++
+ @pytest.mark.unit
+ def test_new_service_gets_a_reasoned_status_instead_of_staying_pending() -> None:
+     async def scenario() -> Resource:
+@@ -474,6 +492,65 @@ def test_failing_reconciles_back_off_per_resource() -> None:
+     assert _run(scenario()) >= 3
+ 
+ 
++@pytest.mark.unit
++def test_an_instance_check_queues_the_managed_resources_it_reports() -> None:
++    """核对实例报告的资源加入队列，其他 kind 的资源不加入。"""
++    widget = ResourceKey(TENANT, "Widget", NAMESPACE, "w")
++
++    async def check() -> list[ResourceKey]:
++        return [_key("a"), widget, _key("b")]
++
++    async def scenario() -> list[ResourceKey]:
++        registry = SQLiteRegistry()
++        queue = RecordingQueue()
++        manager = _manager(registry, queue=queue, instance_check=check)
++        await manager.check_instances()
++        await registry.close()
++        return queue.added
++
++    assert _run(scenario()) == [_key("a"), _key("b")]
++
++
++@pytest.mark.unit
++def test_a_running_manager_checks_instances_periodically_until_it_stops(caplog) -> None:
++    """控制器运行时每隔 ``instance_check_interval`` 秒核对一次实例：核对失败时记日志，之后照常
++    核对、把报告的资源加入队列；停止之后不再核对。"""
++    calls = 0
++
++    async def check() -> list[ResourceKey]:
++        nonlocal calls
++        calls += 1
++        if calls == 1:
++            raise RuntimeError("launcher unavailable")
++        return [_key()]
++
++    async def scenario() -> tuple[int, list[ResourceKey]]:
++        registry = SQLiteRegistry()
++        queue = RecordingQueue()
++        manager = _manager(
++            registry, queue=queue, instance_check=check, instance_check_interval=0.01
++        )
++        await manager.start()
++        try:
++
++            async def checked_again() -> bool:
++                return calls >= 3
++
++            await _eventually(checked_again)
++        finally:
++            await manager.stop()
++        stopped_after = calls
++        await asyncio.sleep(0.05)
++        await registry.close()
++        return stopped_after, queue.added
++
++    stopped_after, added = _run(scenario())
++    assert calls == stopped_after
++    assert added and set(added) == {_key()}
++    [failure] = [r for r in caplog.records if r.getMessage() == "controller instance check failed"]
++    assert str(failure.exc_info[1]) == "launcher unavailable"
++
++
+ @pytest.mark.unit
+ def test_stop_lets_an_in_flight_reconcile_finish() -> None:
+     async def scenario() -> list[str]:
+diff --git a/tests/unit/controlplane/test_deployment_lifecycle.py b/tests/unit/controlplane/test_deployment_lifecycle.py
+index c4afe0d..2f3a5e6 100644
+--- a/tests/unit/controlplane/test_deployment_lifecycle.py
++++ b/tests/unit/controlplane/test_deployment_lifecycle.py
+@@ -16,7 +16,7 @@
+ * ``Ready`` 的服务 spec 变化：经 ``Updating`` 停止旧实例、部署新的 spec 后回到 ``Ready``；
+   更新失败时进入 ``Failed``；策略拒绝更新时服务保持原样；
+ * 部署中途或 ``Ready`` 之后删除资源：取消运行、停止实例、释放分配、物理删除；
+-* 在后台运行的控制器自行完成部署与删除。
++* 在后台运行的控制器自行完成部署与删除，定期核对实例时发现实例退出，自行重新部署。
+ 
+ 测试以 ``asyncio.run`` 驱动异步方法，不依赖 pytest-asyncio。“重启”在同一个事件循环中
+ 关闭全部组件，再以同一数据库文件重新组装；启动器对象沿用，相当于实例在控制平面重启后
+@@ -26,6 +26,7 @@
+ from __future__ import annotations
+ 
+ import asyncio
++import functools
+ import json
+ import sqlite3
+ import time
+@@ -36,6 +37,7 @@ from typing import Any
+ import pytest
+ from forgemesh.controlplane.controller import ControllerManager
+ from forgemesh.controlplane.deployment import (
++    DEFAULT_INSTANCE_CHECK_INTERVAL_SECONDS,
+     DeploymentReleaser,
+     DeploymentSteps,
+     InMemoryLauncher,
+@@ -222,7 +224,8 @@ class _ControlPlane:
+ 
+     进入时调用 ``recover()`` 与 ``check_instances(after_restart=True)``（返回值存于
+     :attr:`recovered` 与 :attr:`lost`）；退出时按应用的顺序关闭：控制器 → 工作流运行时 →
+-    启动器 → 工作流存储 → 去重键存储 → 注册表。``clock`` 为协调器重新部署退避所用的时钟。
++    启动器 → 工作流存储 → 去重键存储 → 注册表。``clock`` 为协调器重新部署退避所用的时钟；
++    控制器管理器运行时每隔 ``instance_check_interval`` 秒核对一次实例。
+     """
+ 
+     def __init__(
+@@ -232,6 +235,7 @@ class _ControlPlane:
+         inventory: Inventory | None = None,
+         policy: PolicyEngine | None = None,
+         clock: Callable[[], float] = time.monotonic,
++        instance_check_interval: float = DEFAULT_INSTANCE_CHECK_INTERVAL_SECONDS,
+     ) -> None:
+         self.launcher = launcher
+         self.registry = SQLiteRegistry(db)
+@@ -254,7 +258,13 @@ class _ControlPlane:
+             launcher=launcher,
+             clock=clock,
+         )
+-        self.manager = ControllerManager(self.registry, reconciler, poll_interval=POLL_SECONDS)
++        self.manager = ControllerManager(
++            self.registry,
++            reconciler,
++            poll_interval=POLL_SECONDS,
++            instance_check=functools.partial(check_instances, self.registry, launcher),
++            instance_check_interval=instance_check_interval,
++        )
+         self.recovered: list[str] = []
+         self.lost: list[ResourceKey] = []
+ 
+@@ -1314,3 +1324,36 @@ def test_a_running_controller_deploys_and_deletes_a_service_on_its_own():
+             await _assert_gone(plane)
+ 
+     asyncio.run(scenario())
++
++
++@pytest.mark.unit
++def test_a_running_controller_deploys_a_service_again_once_its_instance_exits():
++    """控制器在后台运行、定期核对实例（测试既不逐轮驱动，也不自己核对）：实例退出之后，服务
++    以同一分配上的新实例回到 Ready，退出的实例被停止。"""
++    launcher = _ScriptedLauncher()
++
++    async def serving(plane: _ControlPlane) -> list[Endpoint]:
++        service = await plane.service()
++        return service.status.endpoints if service.status.phase.value == "Ready" else []
++
++    async def scenario() -> None:
++        async with _ControlPlane(
++            ":memory:", launcher, instance_check_interval=POLL_SECONDS
++        ) as plane:
++            await plane.manager.start()
++            await plane.registry.put(_service())
++            await _wait_for_phase(plane, "Ready")
++            [allocation] = await plane.registry.list_allocations(TENANT)
++            [first] = launcher.running.values()
++
++            launcher.down.add(first.instance_id)
++            async with asyncio.timeout(WAIT_SECONDS):
++                while (endpoints := await serving(plane)) in ([], [first.endpoint()]):
++                    await asyncio.sleep(POLL_SECONDS)
++
++            [second] = launcher.running.values()
++            assert endpoints == [second.endpoint()]
++            assert launcher.stops == [first.instance_id]
++            assert await plane.registry.list_allocations(TENANT) == [allocation]
++
++    asyncio.run(scenario())
+diff --git a/tests/unit/controlplane/test_launcher_config.py b/tests/unit/controlplane/test_launcher_config.py
+index d45cecd..4364c17 100644
+--- a/tests/unit/controlplane/test_launcher_config.py
++++ b/tests/unit/controlplane/test_launcher_config.py
+@@ -4,7 +4,9 @@
+   加速器清单都拒绝启动；
+ * ``fake``：监听地址与写进实例地址的主机；
+ * ``vllm-process``：命令（默认要求本解释器装有 ``vllm``）、地址与时限；清单必须恰好有一个
+-  节点，设备 id 都能写进 ``CUDA_VISIBLE_DEVICES`` 且不会选中同一块设备。
++  节点，设备 id 都能写进 ``CUDA_VISIBLE_DEVICES`` 且不会选中同一块设备；
++* 控制器核对实例的间隔 ``FORGEMESH_INSTANCE_CHECK_INTERVAL_SECONDS``：默认 10 秒，取值
++  必须是有限的正数秒。
+ """
+ 
+ from __future__ import annotations
+@@ -18,6 +20,7 @@ from forgemesh.controlplane.deployment import (
+     FakeLauncher,
+     LauncherConfigError,
+     VLLMProcessLauncher,
++    instance_check_interval_from_env,
+     launcher_from_env,
+ )
+ from forgemesh.controlplane.deployment import config as config_module
+@@ -313,6 +316,41 @@ def test_the_vllm_launcher_needs_an_inventory_of_this_host(
+     assert message in _refusal(inventory, dict(VLLM))
+ 
+ 
++# ---------------------------------------------------------------------- #
++# 核对实例的间隔
++# ---------------------------------------------------------------------- #
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize(
++    ("value", "interval"), [(None, 10.0), ("", 10.0), ("  ", 10.0), ("2.5", 2.5), (" 30 ", 30.0)]
++)
++def test_instances_are_checked_every_ten_seconds_unless_configured(
++    value: str | None, interval: float
++) -> None:
++    env = {} if value is None else {"FORGEMESH_INSTANCE_CHECK_INTERVAL_SECONDS": value}
++
++    assert instance_check_interval_from_env(env) == interval
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize(
++    ("value", "problem"),
++    [
++        ("soon", "is not a number of seconds"),
++        ("0", "must be a positive number of seconds"),
++        ("-5", "must be a positive number of seconds"),
++        ("nan", "must be a positive number of seconds"),
++        ("inf", "must be a positive number of seconds"),
++    ],
++)
++def test_an_invalid_instance_check_interval_is_refused(value: str, problem: str) -> None:
++    with pytest.raises(LauncherConfigError) as caught:
++        instance_check_interval_from_env({"FORGEMESH_INSTANCE_CHECK_INTERVAL_SECONDS": value})
++
++    assert str(caught.value) == f"FORGEMESH_INSTANCE_CHECK_INTERVAL_SECONDS={value!r} {problem}"
++
++
+ @pytest.mark.unit
+ def test_settings_are_read_from_the_process_environment_by_default(
+     monkeypatch: pytest.MonkeyPatch,
+@@ -320,8 +358,10 @@ def test_settings_are_read_from_the_process_environment_by_default(
+     monkeypatch.setenv("FORGEMESH_RUNTIME_LAUNCHER", "fake")
+     monkeypatch.setenv("FORGEMESH_FAKE_LAUNCHER_ADVERTISE_HOST", "127.0.0.2")
+     monkeypatch.delenv("FORGEMESH_FAKE_LAUNCHER_BIND_HOST", raising=False)
++    monkeypatch.setenv("FORGEMESH_INSTANCE_CHECK_INTERVAL_SECONDS", "3")
+ 
+     launcher = launcher_from_env(ONE_NODE)
+ 
+     assert isinstance(launcher, FakeLauncher)
+     assert launcher.advertise_host == "127.0.0.2"
++    assert instance_check_interval_from_env() == 3.0
+-- 
+2.43.0
+

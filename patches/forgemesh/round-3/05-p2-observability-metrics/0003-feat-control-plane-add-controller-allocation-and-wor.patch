@@ -1,7 +1,7 @@
-From bc65424f5cf3b3e165a0ef4b08db8ad7fbd126a5 Mon Sep 17 00:00:00 2001
+From 0e309b5cbabe2d9a6075bee70a2f7c59f5cc298a Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Tue, 13 Oct 2026 02:50:38 +0000
-Subject: [PATCH 03/11] feat(control-plane): add controller, allocation and
+Subject: [PATCH 03/17] feat(control-plane): add controller, allocation and
  workflow metrics
 
 Operators need to see whether the controller keeps up and what the
@@ -20,8 +20,11 @@ cluster looks like, so /metrics now also covers:
   forgemesh_accelerator_devices{accelerator_type,state} and
   forgemesh_workflow_runs{status}, read from the registry, the
   inventory and the workflow store at scrape time;
-- forgemesh_registry_lock_wait_seconds, the time registry operations
-  wait for the connection lock that serialises all database access.
+- forgemesh_database_lock_wait_seconds, the time database operations
+  wait for the connection lock that the registry, its outbox (and so
+  the event dispatcher) and the audit log share. Database.call and
+  Database.transaction report the wait to an observer that /metrics
+  registers on the registry's database.
 
 The hooks stay in the controller manager (a wrapper around the
 reconcile body and one line in the retry path), so the reconciler and
@@ -32,52 +35,51 @@ condition reasons; tenants, names and uids never become labels. The
 new registry and workflow store queries aggregate across tenants and
 are only used for /metrics.
 ---
- .../src/forgemesh/controlplane/app.py         |  11 +-
- .../controlplane/controller/manager.py        |  32 +-
+ .../src/forgemesh/controlplane/app.py         |  14 +-
+ .../controlplane/controller/manager.py        |  34 +-
  .../controlplane/controller/queue.py          |  11 +
- .../forgemesh/controlplane/registry/store.py  |  46 +++
- .../src/forgemesh/controlplane/telemetry.py   | 251 ++++++++++++
+ .../forgemesh/controlplane/registry/store.py  |  41 ++
+ .../src/forgemesh/controlplane/sqlite.py      |  20 +-
+ .../src/forgemesh/controlplane/telemetry.py   | 254 ++++++++++++
  .../src/forgemesh/workflowruntime/store.py    |  11 +
  .../controlplane/test_controller_queue.py     |  13 +
  .../controlplane/test_metrics_endpoint.py     |  53 +++
+ tests/unit/controlplane/test_sqlite.py        |  30 +-
  tests/unit/controlplane/test_telemetry.py     | 371 ++++++++++++++++++
  tests/unit/workflowruntime/test_store.py      |  12 +
- 10 files changed, 803 insertions(+), 8 deletions(-)
+ 12 files changed, 853 insertions(+), 11 deletions(-)
  create mode 100644 tests/unit/controlplane/test_telemetry.py
 
 diff --git a/packages/control-plane/src/forgemesh/controlplane/app.py b/packages/control-plane/src/forgemesh/controlplane/app.py
-index 4f8dc89..ae3f13a 100644
+index f9a9dc5..f1e29cc 100644
 --- a/packages/control-plane/src/forgemesh/controlplane/app.py
 +++ b/packages/control-plane/src/forgemesh/controlplane/app.py
-@@ -80,7 +80,7 @@ from .metrics import CONTENT_TYPE
+@@ -97,7 +97,7 @@ from .publishers import publisher_from_env
  from .reconciler import ProcessedKeyStore, ReconciliationController
  from .scheduler import INVENTORY_FILE_ENV, FirstFitScheduler, inventory_from_env
  from .sqlite import workflow_db_path
 -from .telemetry import ControlPlaneMetrics
 +from .telemetry import ControllerMetrics, ControlPlaneMetrics
+ from .version import CONTROL_PLANE_VERSION
  
  if TYPE_CHECKING:  # pragma: no cover - 仅静态类型检查使用
-     from .auth import Authenticator
-@@ -182,6 +182,7 @@ def _build_controller(
-     inventory: Inventory | None,
+@@ -201,6 +201,7 @@ def _build_controller(
      runtime: LocalWorkflowRuntime | None = None,
      launcher: RuntimeLauncher | None = None,
+     instance_check_interval: float = DEFAULT_INSTANCE_CHECK_INTERVAL_SECONDS,
 +    metrics: ControllerMetrics | None = None,
  ) -> ControllerManager:
      # 没有授权规则的 DefaultPolicyEngine 拒绝一切操作。资源的创建和删除已经由 API 的
      # 认证与 scope 把关，协调只是推进这些已被接受的期望状态，因此放行 reconcile。
-@@ -203,7 +204,9 @@ def _build_controller(
-         workflow_poll_interval=WORKFLOW_POLL_INTERVAL_SECONDS,
-         launcher=launcher,
+@@ -237,6 +238,7 @@ def _build_controller(
+         instance_check=instance_check,
+         instance_check_interval=instance_check_interval,
+         reclaim=reclaim,
++        metrics=metrics,
      )
--    return ControllerManager(registry, reconciler, poll_interval=CONTROLLER_POLL_INTERVAL_SECONDS)
-+    return ControllerManager(
-+        registry, reconciler, poll_interval=CONTROLLER_POLL_INTERVAL_SECONDS, metrics=metrics
-+    )
  
  
- if _FASTAPI_AVAILABLE:
-@@ -261,6 +264,7 @@ if _FASTAPI_AVAILABLE:
+@@ -310,6 +312,7 @@ if _FASTAPI_AVAILABLE:
                  processed_store = ProcessedKeyStore(path)
                  cleanup.push_async_callback(processed_store.close)
                  runtime: LocalWorkflowRuntime | None = None
@@ -85,12 +87,18 @@ index 4f8dc89..ae3f13a 100644
                  if launcher is not None:
                      workflow_path = workflow_db_path(path)
                      workflow_store = WorkflowStore(workflow_path)
-@@ -284,9 +288,10 @@ if _FASTAPI_AVAILABLE:
-                         len(lost),
+@@ -334,9 +337,16 @@ if _FASTAPI_AVAILABLE:
+                         len(checked),
                      )
                  controller = _build_controller(
--                    registry, processed_store, inventory, runtime, launcher
-+                    registry, processed_store, inventory, runtime, launcher, metrics.controller
+-                    registry, processed_store, inventory, runtime, launcher, instance_check_interval
++                    registry,
++                    processed_store,
++                    inventory,
++                    runtime,
++                    launcher,
++                    instance_check_interval,
++                    metrics.controller,
                  )
                  cleanup.push_async_callback(controller.stop)
 +                cleanup.callback(metrics.watch(registry, controller, inventory, workflow_store))
@@ -98,50 +106,50 @@ index 4f8dc89..ae3f13a 100644
                  yield
  
 diff --git a/packages/control-plane/src/forgemesh/controlplane/controller/manager.py b/packages/control-plane/src/forgemesh/controlplane/controller/manager.py
-index f37f0bf..04e3d69 100644
+index 8afdd51..f2076dd 100644
 --- a/packages/control-plane/src/forgemesh/controlplane/controller/manager.py
 +++ b/packages/control-plane/src/forgemesh/controlplane/controller/manager.py
-@@ -24,6 +24,7 @@ from __future__ import annotations
+@@ -34,6 +34,7 @@ from __future__ import annotations
  
  import asyncio
  import logging
 +import time
- from collections.abc import Collection
+ from collections.abc import Awaitable, Callable, Collection, Iterable
  from typing import Any
  from uuid import uuid4
-@@ -34,6 +35,7 @@ from forgemesh.core.reconciler import ReconcileContext
- 
+@@ -45,6 +46,7 @@ from forgemesh.core.reconciler import ReconcileContext
+ from ..deployment import DEFAULT_INSTANCE_CHECK_INTERVAL_SECONDS
  from ..reconciler import ReconciliationController, compute_dedup_key
  from ..registry import ChangeType, ResourceKey, SQLiteRegistry
 +from ..telemetry import ControllerMetrics, ReconcileOutcome
  from .queue import WorkQueue
  
  logger = logging.getLogger(__name__)
-@@ -68,6 +70,7 @@ class ControllerManager:
-         batch_size: 每次读取的变更记录条数上限。
-         status_write_attempts: status 写入遇到版本冲突时的最多尝试次数。
+@@ -97,6 +99,7 @@ class ControllerManager:
+         instance_check_interval: 两次核对实例之间的秒数。
+         reclaim: 可选，回收孤立分配的协程函数（返回值不使用）。
          queue: 工作队列；为空时新建（测试可注入）。
 +        metrics: 协调与队列的指标；为空时新建（不会被导出）。
      """
  
      def __init__(
-@@ -82,6 +85,7 @@ class ControllerManager:
-         batch_size: int = 500,
-         status_write_attempts: int = 3,
+@@ -114,6 +117,7 @@ class ControllerManager:
+         instance_check_interval: float = DEFAULT_INSTANCE_CHECK_INTERVAL_SECONDS,
+         reclaim: Callable[[], Awaitable[object]] | None = None,
          queue: WorkQueue[ResourceKey] | None = None,
 +        metrics: ControllerMetrics | None = None,
      ) -> None:
          if reconciler.records_dedup_keys:
              raise ValueError(
-@@ -101,6 +105,7 @@ class ControllerManager:
-         self._batch_size = batch_size
-         self._status_write_attempts = status_write_attempts
+@@ -136,6 +140,7 @@ class ControllerManager:
+         self._instance_check_interval = instance_check_interval
+         self._reclaim = reclaim
          self._queue: WorkQueue[ResourceKey] = queue if queue is not None else WorkQueue()
 +        self._metrics = metrics if metrics is not None else ControllerMetrics()
          self._cursor = 0
          self._started = False
          self._watchers: list[asyncio.Task[None]] = []
-@@ -168,6 +173,17 @@ class ControllerManager:
+@@ -231,6 +236,17 @@ class ControllerManager:
              self._queue.forget(key)
              return
          operation = _operation(phase)
@@ -159,17 +167,19 @@ index f37f0bf..04e3d69 100644
          meta = resource.metadata
          dedup_key = compute_dedup_key(
              key.kind, key.namespace, key.name, meta.uid, meta.generation, operation
-@@ -181,16 +197,21 @@ class ControllerManager:
+@@ -245,16 +261,23 @@ class ControllerManager:
                  dedup_key=dedup_key,
              )
          )
 -        if result.status_patch and not await self._write_status(
--            key, resource, operation, result.status_patch
+-            key, resource, operation, result.status_patch, correlation_id
 -        ):
 -            self._queue.add(key)
 -            return
 +        if result.status_patch:
-+            if not await self._write_status(key, resource, operation, result.status_patch):
++            if not await self._write_status(
++                key, resource, operation, result.status_patch, correlation_id
++            ):
 +                self._queue.add(key)
 +                return ReconcileOutcome.CONFLICT
 +            self._metrics.status_written(phase, result.status_patch)
@@ -186,7 +196,7 @@ index f37f0bf..04e3d69 100644
  
      async def _write_status(
          self,
-@@ -233,6 +254,7 @@ class ControllerManager:
+@@ -302,6 +325,7 @@ class ControllerManager:
              try:
                  await self.process(key)
              except Exception:  # noqa: BLE001 - 单个资源失败不得影响其他资源
@@ -217,10 +227,10 @@ index 43b324c..5653fcf 100644
          """加入键；已在队列中则忽略，正在处理则在 :meth:`done` 后重新排队。"""
          if self._shutting_down or key in self._dirty:
 diff --git a/packages/control-plane/src/forgemesh/controlplane/registry/store.py b/packages/control-plane/src/forgemesh/controlplane/registry/store.py
-index bb3954d..9df4b96 100644
+index 9ca88e8..1a5bd41 100644
 --- a/packages/control-plane/src/forgemesh/controlplane/registry/store.py
 +++ b/packages/control-plane/src/forgemesh/controlplane/registry/store.py
-@@ -66,6 +66,8 @@ Allocation 持久化
+@@ -91,6 +91,8 @@ Outbox，信封与事件类型见 :mod:`forgemesh.controlplane.events`）；API
  是例外：它们跨租户返回资源键，仅供控制平面内部的控制器使用，不得暴露给 API；
  :meth:`SQLiteRegistry.get_allocation` 与 :meth:`SQLiteRegistry.allocated_devices`
  同样跨租户读取，仅供调度器使用（设备由全部租户共享）。
@@ -229,45 +239,19 @@ index bb3954d..9df4b96 100644
  """
  
  from __future__ import annotations
-@@ -78,6 +80,7 @@ import json
- import logging
- import sqlite3
- import threading
-+import time
- from collections.abc import Callable, Collection, Iterator, Sequence
- from dataclasses import dataclass, field
- from datetime import UTC, datetime
-@@ -265,6 +268,7 @@ class SQLiteRegistry(ResourceRegistry):
-         self._conn = connect(db_path)
-         self._conn.row_factory = sqlite3.Row
-         self._lock = threading.RLock()
-+        self._lock_wait_observer: Callable[[float], None] | None = None
-         self._init_schema()
+@@ -341,6 +343,11 @@ class SQLiteRegistry(ResourceRegistry):
+         self._outbox = Outbox(database=self._db)
+         self._audit = AuditLog(database=self._db)
  
-     # ------------------------------------------------------------------ #
-@@ -273,13 +277,21 @@ class SQLiteRegistry(ResourceRegistry):
- 
-     async def _run(self, fn: Callable[[], _T]) -> _T:
-         """在工作线程中持锁执行一段同步数据库操作（读写均串行化）。"""
-+        observer = self._lock_wait_observer
- 
-         def _locked() -> _T:
-+            waiting = time.perf_counter()
-             with self._lock:
-+                if observer is not None:
-+                    observer(time.perf_counter() - waiting)
-                 return fn()
- 
-         return await asyncio.to_thread(_locked)
- 
-+    def set_lock_wait_observer(self, observer: Callable[[float], None] | None) -> None:
-+        """登记锁等待的观测函数：每次数据库操作取得连接锁后，以等待的秒数调用（指标使用）。"""
-+        self._lock_wait_observer = observer
++    @property
++    def database(self) -> Database:
++        """注册表的数据库（连接与锁），它的 Outbox 与审计记录共用同一个。"""
++        return self._db
 +
-     @staticmethod
-     def _record_change(
-         cur: sqlite3.Cursor,
-@@ -1424,6 +1436,40 @@ class SQLiteRegistry(ResourceRegistry):
+     @property
+     def outbox(self) -> Outbox:
+         """资源变更事件所在的 Outbox（与注册表共用连接），供事件分发器发布。"""
+@@ -1857,6 +1864,40 @@ class SQLiteRegistry(ResourceRegistry):
  
          return await self._run(_list_allocations)
  
@@ -308,16 +292,76 @@ index bb3954d..9df4b96 100644
      # ------------------------------------------------------------------ #
      # 生命周期
      # ------------------------------------------------------------------ #
+diff --git a/packages/control-plane/src/forgemesh/controlplane/sqlite.py b/packages/control-plane/src/forgemesh/controlplane/sqlite.py
+index bb5f578..8e878d6 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/sqlite.py
++++ b/packages/control-plane/src/forgemesh/controlplane/sqlite.py
+@@ -27,6 +27,7 @@ import asyncio
+ import contextlib
+ import sqlite3
+ import threading
++import time
+ from collections.abc import Callable, Iterator
+ from pathlib import Path
+ from typing import Any, TypeVar
+@@ -69,6 +70,12 @@ class Database:
+         self.conn = connect(db_path)
+         self.conn.row_factory = sqlite3.Row
+         self.lock = threading.RLock()
++        self._lock_wait_observer: Callable[[float], None] | None = None
++
++    def set_lock_wait_observer(self, observer: Callable[[float], None] | None) -> None:
++        """登记锁等待的观测函数：:meth:`call` 与 :meth:`transaction` 每次取得锁后，以等待的
++        秒数调用它（指标使用）；``None`` 取消登记。"""
++        self._lock_wait_observer = observer
+ 
+     def call(self, fn: Callable[..., _T], /, *args: Any, **kwargs: Any) -> _T:
+         """持锁执行 ``fn``，由 ``fn`` 自行提交；``fn`` 抛出异常时回滚它未提交的写入。
+@@ -76,7 +83,7 @@ class Database:
+         Raises:
+             RuntimeError: ``fn`` 正常返回，却留下了它开启的未提交事务（已回滚）。
+         """
+-        with self.lock:
++        with self._locked():
+             already_open = self.conn.in_transaction
+             try:
+                 result = fn(*args, **kwargs)
+@@ -102,7 +109,7 @@ class Database:
+         Raises:
+             RuntimeError: 进入时连接上已有未提交的事务。
+         """
+-        with self.lock:
++        with self._locked():
+             if self.conn.in_transaction:
+                 raise RuntimeError("a transaction is already open on this connection")
+             self.conn.execute("BEGIN IMMEDIATE")
+@@ -118,6 +125,15 @@ class Database:
+         with self.lock:
+             self.conn.close()
+ 
++    @contextlib.contextmanager
++    def _locked(self) -> Iterator[None]:
++        observer = self._lock_wait_observer
++        waiting = time.perf_counter()
++        with self.lock:
++            if observer is not None:
++                observer(time.perf_counter() - waiting)
++            yield
++
+     def _rollback(self) -> None:
+         with contextlib.suppress(sqlite3.ProgrammingError):  # 连接已关闭
+             if self.conn.in_transaction:
 diff --git a/packages/control-plane/src/forgemesh/controlplane/telemetry.py b/packages/control-plane/src/forgemesh/controlplane/telemetry.py
-index 09dad88..7089bd2 100644
+index 09dad88..f51539a 100644
 --- a/packages/control-plane/src/forgemesh/controlplane/telemetry.py
 +++ b/packages/control-plane/src/forgemesh/controlplane/telemetry.py
-@@ -6,6 +6,29 @@
+@@ -6,6 +6,31 @@
    模板（如 ``/api/v1/inference-services/{name}``），没有匹配任何路由的请求记为
    ``unmatched``；``method`` 不是常见方法时记为 ``OTHER``。
  * ``forgemesh_http_request_duration_seconds{method,route}``：处理 HTTP 请求的耗时。
 +* ``forgemesh_reconcile_total{operation,outcome}``：控制器的协调次数。``operation`` 为
-+  ``reconcile`` / ``terminate``；``outcome`` 见 :class:`ReconcileOutcome`。
++  ``reconcile`` / ``recover``（``Degraded``）/ ``reclaim``（``Failed``）/ ``terminate``
++  （``Terminating``）；``outcome`` 见 :class:`ReconcileOutcome`。
 +* ``forgemesh_reconcile_duration_seconds{operation}``：一次协调的耗时，含 status 回写。
 +* ``forgemesh_controller_retries_total``：协调抛出异常、按退避重新排队的次数。
 +* ``forgemesh_controller_queue_depth{state}``：工作队列中的键数，``state`` 为 ``ready``
@@ -333,8 +377,9 @@ index 09dad88..7089bd2 100644
 +  ``free`` / ``allocated``；未配置清单时没有样本。
 +* ``forgemesh_workflow_runs{status}``：各状态的部署工作流运行数，每个状态都输出；未配置启动器
 +  时没有样本。
-+* ``forgemesh_registry_lock_wait_seconds``：注册中心的一次数据库操作等待连接锁的时间（不含
-+  SQLite 内部的忙等待）。
++* ``forgemesh_database_lock_wait_seconds``：一次数据库操作等待控制平面数据库连接锁的时间。
++  资源注册表、Outbox（含事件发布）与审计记录共用这个连接与锁（见
++  :class:`~forgemesh.controlplane.sqlite.Database`）；不含 SQLite 内部的忙等待。
 +
 +仪表盘（队列深度、服务、分配、设备与工作流运行数）在抓取时从控制器、注册中心、加速器清单与
 +工作流存储读取（见 :meth:`ControlPlaneMetrics.watch`），跨租户聚合；锁等待时间在每次数据库操作
@@ -342,7 +387,7 @@ index 09dad88..7089bd2 100644
  
  ``/metrics`` 与探针一样不要求认证，只输出聚合数据；它不在 ``/api/v1`` 之下，网关不会
  转发它（见 README「可观测性」）。
-@@ -13,14 +36,75 @@
+@@ -13,14 +38,75 @@
  
  from __future__ import annotations
  
@@ -376,7 +421,7 @@ index 09dad88..7089bd2 100644
 +UNKNOWN_ACCELERATOR_TYPE = "unknown"
 +#: 没有设备的分配的 ``accelerator_type``。
 +NO_ACCELERATOR_TYPE = "none"
-+#: 注册中心锁等待的直方图桶上界（秒）。
++#: 数据库锁等待的直方图桶上界（秒）。
 +LOCK_WAIT_BUCKETS = (0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5)
 +
 +_INFERENCE_SERVICE = "InferenceService"
@@ -418,7 +463,7 @@ index 09dad88..7089bd2 100644
  
  class HTTPMetrics:
      """HTTP 请求的计数与耗时。"""
-@@ -45,18 +129,185 @@ class HTTPMetrics:
+@@ -45,18 +131,186 @@ class HTTPMetrics:
          self._duration.observe(seconds, method, route)
  
  
@@ -502,8 +547,9 @@ index 09dad88..7089bd2 100644
 +            ("status",),
 +        )
 +        self._lock_wait = self.registry.histogram(
-+            "forgemesh_registry_lock_wait_seconds",
-+            "Time registry database operations waited for the registry connection lock.",
++            "forgemesh_database_lock_wait_seconds",
++            "Time database operations of the registry, the outbox and the audit log waited "
++            "for their shared connection lock.",
 +            buckets=LOCK_WAIT_BUCKETS,
 +        )
 +
@@ -514,7 +560,7 @@ index 09dad88..7089bd2 100644
 +        inventory: Inventory | None = None,
 +        workflow_store: WorkflowStore | None = None,
 +    ) -> Callable[[], None]:
-+        """在抓取时从这些组件读取状态类指标，并观测注册中心的锁等待。
++        """在抓取时从这些组件读取状态类指标，并观测注册中心所在数据库的锁等待。
 +
 +        返回注销函数：之后不再读取这些组件，状态类指标没有样本。
 +        """
@@ -573,10 +619,10 @@ index 09dad88..7089bd2 100644
 +                )
 +
 +            removers.append(self.registry.add_collector(workflow_runs, [self._workflow_runs]))
-+        registry.set_lock_wait_observer(self._lock_wait.observe)
++        registry.database.set_lock_wait_observer(self._lock_wait.observe)
 +
 +        def unwatch() -> None:
-+            registry.set_lock_wait_observer(None)
++            registry.database.set_lock_wait_observer(None)
 +            for remove in removers:
 +                remove()
 +            for gauge in (
@@ -605,10 +651,10 @@ index 09dad88..7089bd2 100644
 +    "ReconcileOutcome",
  ]
 diff --git a/packages/workflow-runtime/src/forgemesh/workflowruntime/store.py b/packages/workflow-runtime/src/forgemesh/workflowruntime/store.py
-index f817272..3a719c9 100644
+index 9f69142..7132cc2 100644
 --- a/packages/workflow-runtime/src/forgemesh/workflowruntime/store.py
 +++ b/packages/workflow-runtime/src/forgemesh/workflowruntime/store.py
-@@ -361,6 +361,13 @@ class WorkflowStore:
+@@ -379,6 +379,13 @@ class WorkflowStore:
                  raise NotFoundError(f"run not found: {run_id}")
          return {r["step_id"]: StepStatus(r["status"]) for r in rows}
  
@@ -622,7 +668,7 @@ index f817272..3a719c9 100644
      def _close_sync(self) -> None:
          """同步关闭连接。"""
          self._conn.close()
-@@ -443,6 +450,10 @@ class WorkflowStore:
+@@ -465,6 +472,10 @@ class WorkflowStore:
          """
          return await self._call(self._get_step_statuses_sync, run_id)
  
@@ -655,7 +701,7 @@ index 5e4600a..fb9a20e 100644
 +
 +    assert _run(scenario()) == {"ready": 1, "delayed": 1, "processing": 1}
 diff --git a/tests/unit/controlplane/test_metrics_endpoint.py b/tests/unit/controlplane/test_metrics_endpoint.py
-index ae2026d..922319c 100644
+index 76b084d..c0c70b6 100644
 --- a/tests/unit/controlplane/test_metrics_endpoint.py
 +++ b/tests/unit/controlplane/test_metrics_endpoint.py
 @@ -2,8 +2,12 @@
@@ -721,8 +767,8 @@ index ae2026d..922319c 100644
 +    assert families["forgemesh_workflow_runs"].value(status="Succeeded") == 1
 +    deployments = families["forgemesh_deployments_total"]
 +    assert deployments.value(outcome="ready", reason="Reconciled") == 1
-+    lock_wait = families["forgemesh_registry_lock_wait_seconds"]
-+    assert lock_wait.value("forgemesh_registry_lock_wait_seconds_count") > 0
++    lock_wait = families["forgemesh_database_lock_wait_seconds"]
++    assert lock_wait.value("forgemesh_database_lock_wait_seconds_count") > 0
 +    assert {s.labels["state"] for s in families["forgemesh_controller_queue_depth"].samples} == {
 +        "ready",
 +        "delayed",
@@ -731,9 +777,64 @@ index ae2026d..922319c 100644
 +    endpoint = service["status"]["endpoints"][0]["url"]
 +    for tenant_data in (TENANT, NAMESPACE, "secret-llama", "node-hidden", "gpu-", endpoint):
 +        assert tenant_data not in text
+diff --git a/tests/unit/controlplane/test_sqlite.py b/tests/unit/controlplane/test_sqlite.py
+index ba63954..7a0419c 100644
+--- a/tests/unit/controlplane/test_sqlite.py
++++ b/tests/unit/controlplane/test_sqlite.py
+@@ -6,8 +6,8 @@
+ * 控制平面的各个存储都以 WAL 模式打开数据库文件；
+ * 同一文件上一个连接的读事务不阻塞另一个存储写入；
+ * 工作流存储使用同目录的独立文件，控制平面库被写锁占用时照常写入；
+-* :class:`Database`：异常时回滚、拒绝遗留未提交的事务、事务整体提交或回滚，
+-  共用它的存储不会丢失彼此的写入。
++* :class:`Database`：异常时回滚、拒绝遗留未提交的事务、事务整体提交或回滚，报告取得锁之前
++  等待的时间，共用它的存储不会丢失彼此的写入。
+ """
+ 
+ from __future__ import annotations
+@@ -16,6 +16,7 @@ import asyncio
+ import functools
+ import inspect
+ import sqlite3
++import threading
+ import time
+ 
+ import pytest
+@@ -211,6 +212,31 @@ def test_database_transaction_commits_or_rolls_back_as_a_unit(tmp_path) -> None:
+         db.close()
+ 
+ 
++@pytest.mark.unit
++def test_database_reports_how_long_call_and_transaction_waited_for_the_lock() -> None:
++    db = Database()
++    waits: list[float] = []
++    try:
++        db.set_lock_wait_observer(waits.append)
++        db.call(lambda: None)
++        with db.transaction():
++            pass
++        waiter = threading.Thread(target=db.call, args=(lambda: None,))
++        with db.lock:
++            waiter.start()
++            time.sleep(0.05)
++        waiter.join()
++        db.set_lock_wait_observer(None)
++        db.call(lambda: None)
++    finally:
++        db.close()
++
++    uncontended_call, uncontended_transaction, contended = waits
++    assert 0 <= uncontended_call < contended
++    assert 0 <= uncontended_transaction < contended
++    assert contended >= 0.03
++
++
+ @pytest.mark.unit
+ def test_stores_sharing_a_database_do_not_lose_each_others_writes(tmp_path) -> None:
+     """任务存储与 Outbox 共用一个连接：一方的回滚不会连带丢弃另一方尚未提交的写入。"""
 diff --git a/tests/unit/controlplane/test_telemetry.py b/tests/unit/controlplane/test_telemetry.py
 new file mode 100644
-index 0000000..f665232
+index 0000000..17c0485
 --- /dev/null
 +++ b/tests/unit/controlplane/test_telemetry.py
 @@ -0,0 +1,371 @@
@@ -1045,8 +1146,8 @@ index 0000000..f665232
 +        "delayed": 0,
 +        "processing": 0,
 +    }
-+    lock_wait_count = "forgemesh_registry_lock_wait_seconds_count"
-+    assert families["forgemesh_registry_lock_wait_seconds"].value(lock_wait_count) == 2
++    lock_wait_count = "forgemesh_database_lock_wait_seconds_count"
++    assert families["forgemesh_database_lock_wait_seconds"].value(lock_wait_count) == 2
 +    for hidden in ("tenant-", NAMESPACE, "svc-", "uid-", "node-", "gpu-", "run-"):
 +        assert hidden not in watched
 +
@@ -1059,7 +1160,7 @@ index 0000000..f665232
 +        "forgemesh_controller_queue_depth",
 +    ):
 +        assert after[name].samples == []
-+    assert after["forgemesh_registry_lock_wait_seconds"].value(lock_wait_count) == 2
++    assert after["forgemesh_database_lock_wait_seconds"].value(lock_wait_count) == 2
 +
 +
 +@pytest.mark.unit
@@ -1087,32 +1188,32 @@ index 0000000..f665232
 +
 +
 +@pytest.mark.unit
-+def test_lock_wait_is_the_time_spent_waiting_for_the_registry_lock() -> None:
-+    async def scenario() -> list[float]:
++def test_lock_wait_covers_every_store_sharing_the_registry_database() -> None:
++    async def scenario() -> tuple[str, str]:
 +        registry = SQLiteRegistry()
-+        waits: list[float] = []
-+        registry.set_lock_wait_observer(waits.append)
++        metrics = ControlPlaneMetrics()
++        manager = ControllerManager(registry, StubReconciler(), metrics=metrics.controller)
++        unwatch = metrics.watch(registry, manager)
 +        await registry.ping()
-+        registry._lock.acquire()
-+        try:
-+            contended = asyncio.ensure_future(registry.ping())
-+            await asyncio.sleep(0.05)
-+        finally:
-+            registry._lock.release()
-+        await contended
-+        registry.set_lock_wait_observer(None)
++        await asyncio.to_thread(registry.outbox.get_stats)
++        await asyncio.to_thread(registry.audit_log.list_page, TENANT)
++        watched = metrics.registry.render()
++        unwatch()
 +        await registry.ping()
++        await asyncio.to_thread(registry.outbox.get_stats)
++        unwatched = metrics.registry.render()
 +        await registry.close()
-+        return waits
++        return watched, unwatched
 +
-+    uncontended, contended = _run(scenario())
-+    assert 0 <= uncontended < contended
-+    assert contended >= 0.03
++    watched, unwatched = _run(scenario())
++    count = "forgemesh_database_lock_wait_seconds_count"
++    assert parse(watched)["forgemesh_database_lock_wait_seconds"].value(count) == 3
++    assert parse(unwatched)["forgemesh_database_lock_wait_seconds"].value(count) == 3
 diff --git a/tests/unit/workflowruntime/test_store.py b/tests/unit/workflowruntime/test_store.py
-index cf65053..7fe569d 100644
+index 0c880a4..4364e60 100644
 --- a/tests/unit/workflowruntime/test_store.py
 +++ b/tests/unit/workflowruntime/test_store.py
-@@ -337,6 +337,18 @@ def test_file_database_uses_wal_and_old_files_gain_the_error_column(tmp_path) ->
+@@ -362,6 +362,18 @@ def test_file_database_uses_wal_and_old_files_gain_the_error_column(tmp_path) ->
      check.close()
  
  

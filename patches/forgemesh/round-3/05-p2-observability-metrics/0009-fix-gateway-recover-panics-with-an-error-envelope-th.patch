@@ -1,7 +1,7 @@
-From 9e51c69d731532c52387b7554ebac0bdda1c9b2c Mon Sep 17 00:00:00 2001
+From 0be83912974c2aaec9b029985e264550cc1934f6 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Tue, 13 Oct 2026 05:05:43 +0000
-Subject: [PATCH 09/11] fix(gateway): recover panics with an error envelope
+Subject: [PATCH 09/17] fix(gateway): recover panics with an error envelope
  that carries ids
 
 Recovery is the outermost middleware, so it never saw the correlation

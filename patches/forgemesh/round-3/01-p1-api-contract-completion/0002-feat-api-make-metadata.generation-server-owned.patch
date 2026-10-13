@@ -1,7 +1,7 @@
 From 4f48f19d11a1984d1dee778a81f9ce3eb7ea3025 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Tue, 13 Oct 2026 02:43:48 +0000
-Subject: [PATCH 02/10] feat(api): make metadata.generation server-owned
+Subject: [PATCH 02/11] feat(api): make metadata.generation server-owned
 
 The create endpoint copied metadata.generation and observedGeneration
 from the request body, so a client could create a resource that

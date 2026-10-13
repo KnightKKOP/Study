@@ -1,0 +1,103 @@
+From 1e0e7a718215527bd3ea423c80f5029565e708e2 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 13 Oct 2026 12:38:39 +0000
+Subject: [PATCH 12/14] docs(deploy): cover tgi-process and instance records on
+ Kubernetes
+
+The Kubernetes section only described vllm-process; it predates the
+tgi-process launcher and the instance record file.
+
+It now covers both process launchers: an image with vLLM or
+text-generation-launcher, the FORGEMESH_VLLM_* / FORGEMESH_TGI_* bind
+and advertise settings, model downloads, and a memory-backed /dev/shm
+for instances that span several GPUs, since NCCL and PyTorch may need
+more shared memory than the 64 MiB a container gets by default.
+
+It also explains the record file on Kubernetes. The file sits next to
+the database on the data volume, which has to stay writable because a
+failed write fails the instance start. The records never stop anything
+after a container restart there: the control plane is PID 1 of its
+container, so the kernel ends the instances even when it is killed,
+and the restarted control plane finds none of the recorded processes
+(it only signals a process whose pid and start time both match) and
+drops the records. The text does not rely on the PID namespace check:
+on kind the restarted container got the same pid:[...] identifier as
+the killed one, so the records were dropped by the pid and start time
+check rather than ignored as a whole.
+
+The manifest notes the files kept next to FORGEMESH_DB_PATH, and the
+launcher policy header names tgi-process.
+---
+ CHANGELOG.md                                    |  2 +-
+ README.md                                       | 12 +++++++-----
+ deploy/kubernetes/control-plane-deployment.yaml |  3 +++
+ deploy/kubernetes/launcher/network-policy.yaml  |  2 +-
+ 4 files changed, 12 insertions(+), 7 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 2d17358..154722b 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -72,7 +72,7 @@
+ - CI 新增 `package-imports` job 与 `scripts/check_package_imports.py`：为 `packages/` 下的每个包新建一个虚拟环境，只安装这个包（含它的全部 extras）与它声明的依赖（`forgemesh-*` 依赖用本仓库的源码构建），以隔离模式导入根模块，再用 `pkgutil.walk_packages` 导入全部子模块，任一模块导入失败（例如漏声明依赖）即失败。此前 `python` job 把全部包装进同一个环境，漏声明的依赖会被兄弟包或开发依赖掩盖。本地运行 `.venv/bin/python scripts/check_package_imports.py [包目录名...]`（需要网络）。
+ - CI 新增 `dependency-audit` job：`pip-audit` 2.10.1 审计 `make install` 装进 `.venv` 的全部第三方包（以 editable 方式安装的本仓库 `forgemesh-*` 包不审计），`govulncheck` v1.9.0 检查网关代码实际调用到的已知漏洞（含标准库）；本地为 `make audit` 与 `make -C gateway vulncheck`。尚无修复或经评估不适用的 Python 漏洞以 `--ignore-vuln` 记入根 `Makefile` 的 `PIP_AUDIT_IGNORE`（目前为空），govulncheck 没有忽略机制；处理规则见 `SECURITY.md` 3.1（同步改写，删去「依赖版本在 CI 中固定」这一并不属实的说法）。
+ - pytest 总覆盖率下限：根 `pyproject.toml` 的 `[tool.coverage.report]` 设 `fail_under = 97`（引入时实测 97.20%）与 `precision = 2`（默认取整到整数，96.5% 会被当作 97% 而通过）；CI `python` job 改以 `pytest --cov` 运行，本地为 `make coverage`。下限只升不降。
+-- Kubernetes 网关清单 `deploy/kubernetes/gateway-deployment.yaml`（ServiceAccount、Deployment 与 Service `forgemesh-gateway`，8081 端口）：与控制平面共用 Secret `forgemesh-api-keys`，经 Service `forgemesh-control-plane` 访问控制平面；探针为 `/readyz`（控制平面就绪之后才通过）与 `/healthz`；安全上下文与控制平面一致（非 root、只读根文件系统、去掉全部 capability、`RuntimeDefault` seccomp）；宽限期 35 秒，长于网关排空在途请求的 30 秒。启用启动器时使用 `deploy/kubernetes/launcher/`：`network-policy.yaml` 允许网关访问控制平面 Pod 上推理实例的临时端口（32768–60999），`fake-runtime-patch.yaml` 为控制平面加上来自 ConfigMap `forgemesh-inventory` 的加速器清单与 `fake` 启动器（实例监听全部地址，写进 `status.endpoints` 的主机是 Pod IP；与 compose 的叠加文件一样每秒核对一次实例）。用法见 README「Kubernetes 部署」，包括 `vllm-process` 在 Kubernetes 上的前提与单节点限制。
++- Kubernetes 网关清单 `deploy/kubernetes/gateway-deployment.yaml`（ServiceAccount、Deployment 与 Service `forgemesh-gateway`，8081 端口）：与控制平面共用 Secret `forgemesh-api-keys`，经 Service `forgemesh-control-plane` 访问控制平面；探针为 `/readyz`（控制平面就绪之后才通过）与 `/healthz`；安全上下文与控制平面一致（非 root、只读根文件系统、去掉全部 capability、`RuntimeDefault` seccomp）；宽限期 35 秒，长于网关排空在途请求的 30 秒。启用启动器时使用 `deploy/kubernetes/launcher/`：`network-policy.yaml` 允许网关访问控制平面 Pod 上推理实例的临时端口（32768–60999），`fake-runtime-patch.yaml` 为控制平面加上来自 ConfigMap `forgemesh-inventory` 的加速器清单与 `fake` 启动器（实例监听全部地址，写进 `status.endpoints` 的主机是 Pod IP；与 compose 的叠加文件一样每秒核对一次实例）。用法见 README「Kubernetes 部署」，包括 `vllm-process` / `tgi-process` 在 Kubernetes 上的前提（含多卡时的 `/dev/shm`）、实例记录文件在数据卷上，以及单节点限制。
+ - Kubernetes 可选的网络策略 `deploy/kubernetes/monitoring/network-policy.yaml`：允许 Prometheus 的 Pod（默认为命名空间 `monitoring` 中带有 `app.kubernetes.io/name: prometheus` 标签的 Pod，按部署修改）访问控制平面的 8080 与网关的 8081 端口，抓取两边的 `/metrics`。默认的策略下从 Pod 网络抓取不到控制平面的 `/metrics`；它与网关的 `/metrics` 一样不要求认证，只输出跨租户聚合的指标。说明与抓取配置示例见 README「Kubernetes 部署」的「指标抓取」。
+ - Kubernetes 上把资源变更事件发往 webhook：`deploy/kubernetes/event-webhook/patch.yaml` 为控制平面设置 `FORGEMESH_EVENT_WEBHOOK_URL`、`FORGEMESH_EVENT_WEBHOOK_TOKEN`（取自 Secret `forgemesh-event-webhook` 的键 `token`，Secret 不存在时不设置）与 `FORGEMESH_EVENT_WEBHOOK_TIMEOUT_SECONDS`；`network-policy.yaml` 允许控制平面出站访问接收方（集群内按命名空间与 Pod 标签，集群外按 IP 地址段，按部署修改）。默认的策略只允许控制平面访问集群 DNS，没有这条出站规则时每次发送都超时。用法见 README「Kubernetes 部署」。
+ 
+diff --git a/README.md b/README.md
+index 08fe6ec..ec8cc23 100644
+--- a/README.md
++++ b/README.md
+@@ -467,13 +467,15 @@ kubectl -n forgemesh exec deployment/forgemesh-control-plane -- python -c \
+   "import urllib.request as r; r.urlopen(r.Request('http://127.0.0.1:<端口>/fake/exit', method='POST'))"
+ ```
+ 
+-`vllm-process` 启动器在控制平面的容器内以子进程运行 vLLM。仓库没有为它提供清单，也没有在 Kubernetes 上验证过；使用它需要：
++`vllm-process` 与 `tgi-process` 启动器在控制平面的容器内以子进程运行 vLLM / TGI。仓库没有为它们提供清单，也没有在 Kubernetes 上验证过；使用它们需要：
+ 
+-- 装有 vLLM 的控制平面镜像，或用 `FORGEMESH_VLLM_COMMAND` 指向镜像中另一个装有 vLLM 的环境；
++- 装有 vLLM 或 TGI（`text-generation-launcher`）的控制平面镜像，或用 `FORGEMESH_VLLM_COMMAND` / `FORGEMESH_TGI_COMMAND` 指向镜像中另一个装有它们的环境；
+ - 为控制平面的容器申请 GPU（例如 NVIDIA device plugin 的 `nvidia.com/gpu`）；加速器清单恰好一个节点，设备 id 是容器内可见的 CUDA 设备序号或 UUID；
+-- 根文件系统只读：模型缓存目录（如 `HF_HOME`）挂载可写的卷；按模型调大内存限制；`terminationGracePeriodSeconds` 调到 45 秒以上（默认 30 秒，停止全部实例连同收尾最长约 40 秒）；
+-- 按上文设置 `FORGEMESH_VLLM_BIND_HOST=0.0.0.0`、以 Pod IP 作为 `FORGEMESH_VLLM_ADVERTISE_HOST`，并应用 `launcher/network-policy.yaml`；
+-- 网络策略不允许控制平面访问外网：vLLM 启动时下载模型，需要为控制平面另加出站策略，或者预先把模型放进挂载的卷、以本地路径作为 `spec.model.reference`。
++- 根文件系统只读：模型缓存目录（如 `HF_HOME`）挂载可写的卷；一个实例使用多块 GPU 时在 `/dev/shm` 挂载 `medium: Memory` 的 emptyDir（容器默认的 `/dev/shm` 只有 64 MiB，vLLM 与 TGI 的多卡通信需要更多共享内存，用量计入内存限制）；按模型调大内存限制；`terminationGracePeriodSeconds` 调到 45 秒以上（默认 30 秒，停止全部实例连同收尾最长约 40 秒）；
++- 按上文把所选启动器的监听地址（`FORGEMESH_VLLM_BIND_HOST` / `FORGEMESH_TGI_BIND_HOST`）设为 `0.0.0.0`、以 Pod IP 作为写进 `status.endpoints` 的主机（`FORGEMESH_VLLM_ADVERTISE_HOST` / `FORGEMESH_TGI_ADVERTISE_HOST`），并应用 `launcher/network-policy.yaml`；
++- 网络策略不允许控制平面访问外网：vLLM 与 TGI 启动时下载模型，需要为控制平面另加出站策略，或者预先把模型放进挂载的卷、以本地路径作为 `spec.model.reference`。
++
++两个启动器把实例进程记在数据库旁的 `forgemesh.instances.json` 中（见「部署推理服务」的「vLLM」），在清单中就是数据卷上的 `/var/lib/forgemesh/forgemesh.instances.json`。写不进这个文件时实例启动失败，`FORGEMESH_DB_PATH` 因此要留在可写的卷上。清单的 Pod 中控制平面是容器的 1 号进程（镜像以 exec 形式启动它），即使它被杀死，内核也会随之结束容器中的实例进程；容器重启之后启动器找不到记录中的进程（只认 pid 与启动时间都一致的进程），不向任何进程发送信号，直接丢弃这些记录。TGI 实例的私有目录建在临时目录下（默认 `/tmp`，清单中是 emptyDir）。
+ 
+ 控制平面只有一个副本，所有实例都运行在这一个 Pod 里：只能使用分配给这个 Pod 的 GPU，也就是单个节点上的 GPU，不能把实例调度到其他节点。
+ 
+diff --git a/deploy/kubernetes/control-plane-deployment.yaml b/deploy/kubernetes/control-plane-deployment.yaml
+index f7d574b..8aee80d 100644
+--- a/deploy/kubernetes/control-plane-deployment.yaml
++++ b/deploy/kubernetes/control-plane-deployment.yaml
+@@ -80,6 +80,9 @@ spec:
+           env:
+             - name: FORGEMESH_HOST
+               value: "0.0.0.0"
++            # 设置了启动器时，同目录（数据卷）中还有工作流存储 forgemesh.workflows.db；
++            # vllm-process / tgi-process 还在这里记录实例进程（forgemesh.instances.json），
++            # 写不进时实例启动失败。
+             - name: FORGEMESH_DB_PATH
+               value: /var/lib/forgemesh/forgemesh.db
+             - name: FORGEMESH_API_KEYS_FILE
+diff --git a/deploy/kubernetes/launcher/network-policy.yaml b/deploy/kubernetes/launcher/network-policy.yaml
+index 19a259f..4d95f7a 100644
+--- a/deploy/kubernetes/launcher/network-policy.yaml
++++ b/deploy/kubernetes/launcher/network-policy.yaml
+@@ -1,6 +1,6 @@
+ # 启用启动器（FORGEMESH_RUNTIME_LAUNCHER）时与 ../network-policies.yaml 一起应用。
+ #
+-# fake 与 vllm-process 的推理实例都运行在控制平面的 Pod 内，监听内核挑选的临时端口
++# fake、vllm-process 与 tgi-process 的推理实例都运行在控制平面的 Pod 内，监听内核挑选的临时端口
+ # （Pod 网络命名空间的 net.ipv4.ip_local_port_range，Linux 默认 32768-60999）；网关按
+ # status.endpoints 直接连接 Pod IP 上的这些端口。这里只允许网关访问它们；控制平面对实例的
+ # 健康检查走 Pod 内的回环地址，不受网络策略限制。
+-- 
+2.43.0
+

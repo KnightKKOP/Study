@@ -1,7 +1,7 @@
-From 2077a6762fb324a44af4b62297be7e8bef7cb84b Mon Sep 17 00:00:00 2001
+From 83214929338ac82ab458b9466282de1f86b691c2 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Tue, 13 Oct 2026 03:52:08 +0000
-Subject: [PATCH 07/11] test(compose): scrape both /metrics endpoints and
+Subject: [PATCH 07/17] test(compose): scrape both /metrics endpoints and
  follow a trace
 
 The closed-loop smoke only exercised the API. It now scrapes the
@@ -18,13 +18,15 @@ traceparent and checks that the control plane's 404 envelope, the
 control plane's logs and the gateway access log all carry the same
 trace id, which the unit tests on each side cannot show on their own.
 The log checks retry briefly because a container's output can reach
-docker compose logs a moment after the response.
+docker compose logs a moment after the response. Like the smoke's
+other requests, the scrapes and the traced request give up after 30
+seconds.
 ---
  scripts/compose_smoke.sh | 67 ++++++++++++++++++++++++++++++++++++++++
  1 file changed, 67 insertions(+)
 
 diff --git a/scripts/compose_smoke.sh b/scripts/compose_smoke.sh
-index 49b23c7..c3fbc4a 100755
+index 794259f..8e82e7b 100755
 --- a/scripts/compose_smoke.sh
 +++ b/scripts/compose_smoke.sh
 @@ -3,6 +3,7 @@
@@ -33,10 +35,10 @@ index 49b23c7..c3fbc4a 100755
  #   创建 → Ready（status.endpoints 指向假实例）→ 经网关流式对话（SSE，以 [DONE] 结束）→
 +#   抓取控制平面与网关的 /metrics（不带凭证，不含租户数据）→ traceparent 经网关到达控制平面 →
  #   删除 → 资源消失、实例停止 → 同名重新创建（只有一块设备，可见分配已释放）→ 再次对话 →
- #   重启控制平面：资源仍在，实例随旧进程结束，服务转为 Degraded（Ready=False，
- #   InstanceLost），网关不再转发（503）→ 删除。
-@@ -167,6 +168,37 @@ sys.exit(1)
- EOF
+ #   PUT 修改 spec → Updating → 以新实例回到 Ready（旧实例已停止）→ 再次对话 →
+ #   假实例退出（POST /fake/exit）→ Degraded（InstanceLost）→ 重新部署，以新实例回到 Ready →
+@@ -175,6 +176,37 @@ endpoint_port() {
+   jq -r '.status.endpoints[0].url | split(":") | last' "$resource"
  }
  
 +# scrape <说明> <URL> <模式...>：不带凭证抓取一次 /metrics 写入 $metrics。每个模式（基本正则）
@@ -44,7 +46,7 @@ index 49b23c7..c3fbc4a 100755
 +scrape() {
 +  local description=$1 url=$2 pattern content_type
 +  shift 2
-+  content_type=$(curl -sf -o "$metrics" -w '%{content_type}' "$url") \
++  content_type=$(curl -sf --max-time 30 -o "$metrics" -w '%{content_type}' "$url") \
 +    || fail "$description: GET $url failed"
 +  [[ "$content_type" == "text/plain; version=0.0.4"* ]] \
 +    || fail "$description: unexpected content type $content_type"
@@ -73,15 +75,15 @@ index 49b23c7..c3fbc4a 100755
  "${compose[@]}" build
  
  # keygen 输出的第 2 行是 key，最后一行是 key 文件条目。
-@@ -187,6 +219,7 @@ chat_url="$gateway/api/v1/namespaces/default/inference/smoke-svc/chat"
- resource="$work/resource.json"
+@@ -196,6 +228,7 @@ resource="$work/resource.json"
+ update="$work/update.json"
  headers="$work/headers.txt"
  stream="$work/stream.txt"
 +metrics="$work/metrics.txt"
  body='{"kind": "InferenceService", "metadata": {"name": "smoke-svc", "namespace": "default"},
    "spec": {"model": {"reference": "models/llama"}, "runtime": {"provider": "vllm"},
    "resources": {"accelerator": {"type": "nvidia-gpu", "minMemoryGiB": 16}}}}'
-@@ -213,6 +246,40 @@ expect_reply "$first_instance"
+@@ -222,6 +255,40 @@ expect_reply "$first_instance"
    || fail "the workflow store is not next to the registry"
  echo "ok: the workflow store lives next to the registry"
  
@@ -107,7 +109,7 @@ index 49b23c7..c3fbc4a 100755
 +# 合法的 traceparent 经网关原样转发：控制平面的错误信封与日志、网关的访问日志都带其中的
 +# trace-id。
 +trace_id=4bf92f3577b34da6a3ce929d0e0e4736
-+code=$(curl -s -o "$resource" -w '%{http_code}' "${auth[@]}" \
++code=$(curl -s --max-time 30 -o "$resource" -w '%{http_code}' "${auth[@]}" \
 +  -H "traceparent: 00-$trace_id-00f067aa0ba902b7-01" "$services/no-such-svc?namespace=default")
 +[[ "$code" == 404 ]] || fail "read a missing service: expected HTTP 404, got $code"
 +# shellcheck disable=SC2016 # $id 是 jq 变量

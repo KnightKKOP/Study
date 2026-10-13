@@ -1,7 +1,7 @@
 From 9fc21a43604b6a7cac3ccb6cb2b95d064f38e062 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Tue, 13 Oct 2026 03:21:53 +0000
-Subject: [PATCH 07/10] feat(api): derive the decision risk level on the server
+Subject: [PATCH 07/11] feat(api): derive the decision risk level on the server
 
 The decisions endpoint never passed a risk level, so every request ran
 with the internal default "low" and the router's high-risk protection

@@ -1,0 +1,365 @@
+From d948ac5c6ca4b2156d4850150f9d3e224dc50f70 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 13 Oct 2026 11:28:59 +0000
+Subject: [PATCH 13/17] fix(control-plane): answer unknown routes with
+ ROUTE_NOT_FOUND
+
+The control plane rendered the router's 404 for a path that no route
+matches with the default NOT_FOUND code, the code it also uses for a
+missing resource. The CLI reads NOT_FOUND as "the resource does not
+exist", so a CLI pointed straight at the control plane with a wrong
+--api-url prefix reported a missing resource (exit 3), and
+"forgemesh wait --for delete" succeeded at once. The gateway already
+answers unknown paths with ROUTE_NOT_FOUND for this reason.
+
+Replace the router's default app, which runs only when no route
+matches the path (a matching path with another method is still a 405
+and a missing or extra trailing slash still redirects), with one that
+raises ROUTE_NOT_FOUND "route not found", the gateway's code and
+message. Missing resources keep NOT_FOUND. Paths under the gateway's
+forwarded prefixes that the control plane does not serve, such as
+/api/v1/inference-services/{name}/status, get ROUTE_NOT_FOUND through
+the gateway too.
+
+OpenAPI documents the RouteNotFound response next to NotFound, and
+the contract test checks that unmatched paths answer it and leave the
+resource alone. The CLI needs no code change: a 404 with another code
+already exits 1 with the "check --api-url" hint. An e2e test now runs
+get and wait --for delete against the real control plane with a wrong
+prefix, the CLI fakes answer unknown paths like the control plane, and
+--help, the README and the CLI comments name the codes.
+
+Not marked breaking: 1.0.x answered unknown routes with FastAPI's
+{"detail": "Not Found"}, so no release returned NOT_FOUND for them;
+the CHANGELOG entry that introduced the envelope now names the codes.
+---
+ CHANGELOG.md                                  |  4 +-
+ README.md                                     |  4 +-
+ api/openapi/openapi.yaml                      | 14 ++++++-
+ gateway/README.md                             |  2 +-
+ packages/cli/src/forgemesh/cli/errors.py      |  6 +--
+ packages/cli/src/forgemesh/cli/main.py        |  2 +-
+ .../src/forgemesh/controlplane/api/errors.py  | 15 ++++++-
+ tests/contract/test_openapi_contract.py       | 42 ++++++++++++++++++-
+ tests/e2e/test_cli.py                         | 15 ++++++-
+ tests/unit/cli/fakes.py                       |  2 +-
+ tests/unit/controlplane/test_app.py           | 11 +++++
+ 11 files changed, 100 insertions(+), 17 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 6679153..c666f40 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -53,7 +53,7 @@
+ - Registry 期望状态写入 `SQLiteRegistry.update_spec(kind, namespace, name, tenant_id, spec, *, labels, annotations, expected_version=None, expected_uid=None)`：整体替换 `spec`、labels 与 annotations，只支持登记了强类型模型的 kind（目前只有 `InferenceService`），结果须满足该模型；status、条件、finalizer、uid 与 `observedGeneration` 原样保留。`spec` 按模型规范化后比较，变化时 `generation` 加 1；有变化时 `resource_version` 加 1 并追加 `updated` 变更记录（控制器据此重新协调），没有变化时不写库。检查与写入在同一个 `BEGIN IMMEDIATE` 事务中：资源处于 `Terminating`（先于其他检查）、uid 或版本与预期不同时抛出 `ConflictError`，`details["reason"]` 为 `ConflictReason` 的取值（`Terminating` / `UidMismatch` / `ResourceVersionMismatch`）。
+ - 列表分页：`GET /api/v1/inference-services` 与 `GET /api/v1/resources` 接受 `pageToken`，还有更多结果时响应带 `nextPageToken`（最后一页不带），`count` 为本页条数；结果按 `(namespace, name)` 升序，不带命名空间的资源在最前。游标不透明，绑定签发它的租户与过滤条件（`namespace`，`/resources` 还有 `kind`），`limit` 可以逐页变化；格式不对、被修改或用于其他租户 / 过滤条件的游标返回 `400`，空的 `pageToken` 等同于省略。Registry 新增 `list_page(kind, tenant_id, namespace=None, labels=None, page_token=None, limit=100)`，返回 `ResourcePage`（`items` / `next_page_token`），无效的游标抛出 `InvalidPageTokenError`（`ValueError` 的子类）。游标形如 `<载荷>.<签名>`，签名是覆盖载荷与租户、kind、`namespace`、标签选择器的 HMAC-SHA256，密钥在首次打开数据库时随机生成、保存在新表 `registry_meta` 中，控制平面重启后游标仍然有效。游标记录位置而不是快照：翻页期间新建或删除的资源可能出现也可能缺席，全程存在的资源恰好出现一次。
+ - 决策风险等级（改进计划 5.10）：`POST /api/v1/decisions` 的风险等级由服务端按 `question` 推导（`forgemesh.controlplane.api.risk`）。`question` 是形如 `<域>.<动作>` 的操作标识，只看第一个 `.` 之前的域（忽略大小写与首尾空白）：`driver`、`node`、`mig`、`gpu`、`device`、`plugin`、`model`、`quota`、`tenant`、`policy`、`system`、`platform` 为 `high`（architecture.md 14.2 节列出的高风险操作所在的域），`inference` 为 `low`，其他（含自由文本）为 `medium`；请求中的 `riskLevel` 只能调高，低于推导值时被忽略。实际采用的等级在响应的 `riskLevel` 中返回（`503 DECISION_NO_CANDIDATE` / `DECISION_FALLBACK_REQUIRED` 的错误信封在 `details.riskLevel` 中）。高风险请求的候选来自备用 Provider 时返回 `503 DECISION_FALLBACK_REQUIRED`，候选在 `details.candidates` 中供人工审批，不自动采用。
+-- 新增 `tests/contract/test_openapi_contract.py`（随 pytest 在 CI 中运行）：双向核对应用提供的路由与 `api/openapi/openapi.yaml`（探针除外），路径与方法、每个操作的参数（位置、名称、是否必填、是否弃用，查询与路径参数还有类型）与请求体的媒体类型都必须一致；再逐一调用每个操作，响应的状态码必须列在契约中，响应体与响应头符合契约，错误信封回显关联 ID，契约列出的每个状态码都至少被调用到一次。只使用已有的开发依赖 `jsonschema` 与 PyYAML。
++- 新增 `tests/contract/test_openapi_contract.py`（随 pytest 在 CI 中运行）：双向核对应用提供的路由与 `api/openapi/openapi.yaml`（探针除外），路径与方法、每个操作的参数（位置、名称、是否必填、是否弃用，查询与路径参数还有类型）与请求体的媒体类型都必须一致；再逐一调用每个操作，响应的状态码必须列在契约中，响应体与响应头符合契约，错误信封回显关联 ID，契约列出的每个状态码都至少被调用到一次；不对应任何操作的路径返回契约中的 `RouteNotFound`。只使用已有的开发依赖 `jsonschema` 与 PyYAML。
+ - 命令行工具 `forgemesh` 改为 REST API 的客户端（改进计划 5.11，用法见 README「命令行工具」）：`apply -f`（资源不存在就创建，存在就以读到的 `resourceVersion` 与 `uid` 为前置条件整体替换，遇到并发修改时重新读取再试，最多 5 次；同一份文档再次提交不产生写入，输出 `created` / `configured` / `unchanged`；接受多文档 YAML、JSON 对象或数组与标准输入 `-`，`-f` 可以重复）、`get`（`-o yaml|json`）、`describe`、`list`（跟随 `nextPageToken` 读取全部页，`-o table|yaml|json`，`--page-size`）、`delete`（受控删除，区分 `204` 已删除与 `202` 进入 `Terminating`），以及新命令 `wait`（`--for ready` 等到服务以当前的 `spec` 就绪，即 `Ready`、`Ready=True` 且 `observedGeneration` 等于 `generation`，经过 `Updating` 与重新部署中的 `Degraded` 继续等待，资源正在删除或在当前的 `spec` 下进入 `Failed` 时立即失败，被拦下的更新在超时消息中指明更新没有开始；`--for delete` 等到资源消失；`--timeout` 默认 300 秒）。默认经网关访问 `http://127.0.0.1:8081`，`--api-url` / `FORGEMESH_API_URL` 指向其他地址（如控制平面 `http://127.0.0.1:8080`）；API key 取自 `--api-key-file` 指向的文件或 `FORGEMESH_API_KEY`，只放在 `Authorization` 请求头中，不出现在任何输出中；`--tenant` 作为 `X-Tenant-Id` 发送。错误信封（含网关自己的错误）与不是错误信封的错误响应都转换为带关联 ID 的错误消息，退出码按原因区分（`0`–`12` 与 `130`，`forgemesh --help` 列出）。HTTP 只用标准库 `urllib`，不跟随重定向。
+ - 新增 `tests/e2e/test_cli.py`：在后台线程中以 uvicorn 运行控制平面应用（API key 认证、一块设备的加速器清单与假启动器），CLI 经真实的 HTTP 连接走完 `apply` → `wait` 就绪 → 再次 `apply`（`unchanged` / `configured`）→ 修改 `spec` 后再次 `apply` 与 `wait`（以新的实例部署第 2 代 `spec`）→ `get` → 逐页 `list` → `delete`（`204` / `202`）→ `wait --for delete`，并核对 `401` / `403` / `400` / `404` 的退出码与消息，key 不出现在任何输出中。
+ - 资源变更事件（事务性 Outbox，ADR-008）：`SQLiteRegistry` 对资源对象的每次写入（创建、更新（含 `PUT` / `PATCH` 所用的 `update_spec`）、status 写入、请求删除、删除）在写入资源的同一个事务中，经共用连接的 Outbox 写入一条领域事件，任何一步失败都一起回滚；分配记录（`allocations`）的写入（含回收孤立的分配）不产生事件。信封符合 `api/schemas/event.schema.json`（`forgemesh.controlplane.events`）：`eventId` 即 Outbox 事件 id；`eventType` 为 `<kind>.<change>`，kind 按单词拆成小写并以点连接（`inference.service.created` / `.updated` / `.status_updated` / `.terminating` / `.deleted`）；`data` 含资源身份、`phase` 与写入之后的资源表示（`deleted` 为删除前最后的状态）；同一资源（`resourceUid`）的事件以 `resourceVersion` 判断新旧。API 写入使用请求的 `X-Correlation-Id`（缺省时生成），控制器同一轮协调的 status 写入与移除 finalizer 共用一个 correlation id；核对实例时把服务转为 `Degraded` 的 status 写入同样产生事件，它不属于哪一轮协调，correlation id 是生成的。
+@@ -80,7 +80,7 @@
+ - **破坏性**：网关与控制平面默认使用 `apikey` 认证模式，未配置 key 文件时拒绝启动；`dev` 模式（直接信任租户请求头）只允许监听回环地址。
+ - **破坏性**：缺少凭证的请求由 `400`（缺少 `X-Tenant-Id`）改为 `401 UNAUTHENTICATED`，并携带 `WWW-Authenticate: Bearer realm="forgemesh"`；`X-Tenant-Id` 与凭证绑定的租户不一致返回 `403 FORBIDDEN`；读接口要求 `read` scope，写接口（含启动工作流与请求决策）要求 `write` scope。
+ - **破坏性**：网关的 `401` 响应体由纯文本改为统一错误信封 `{"error": {"code", "message", "correlationId"}}`（新增的 `403` 同样使用信封）；推理实例不再收到调用方的 `Authorization` / `Cookie`。
+-- 控制平面全部错误响应统一为错误信封：框架层 404 / 405 不再返回 `{"detail": ...}`，请求校验失败由 `422` 改为 `400`，未捕获异常返回不含内部细节的 `500 INTERNAL_ERROR`（细节写入日志）。
++- 控制平面全部错误响应统一为错误信封：框架层 404 / 405 不再返回 `{"detail": ...}`，请求校验失败由 `422` 改为 `400`，未捕获异常返回不含内部细节的 `500 INTERNAL_ERROR`（细节写入日志）。路径不匹配任何端点的 `404` 错误码为 `ROUTE_NOT_FOUND`（与网关相同，OpenAPI 的 `RouteNotFound`），资源不存在的 `404` 为 `NOT_FOUND`，`405` 为 `METHOD_NOT_ALLOWED`：命令行工具 `forgemesh` 直连控制平面而 `--api-url` 多了一段路径时以 `1` 退出并提示检查 `--api-url`，不会报告资源不存在，`wait --for delete` 也不会因此成功。
+ - 网关接受任意大小写的 `Bearer` scheme（如 `bearer`）。
+ - **破坏性**：网关消费的 `status.endpoints` 由字符串数组改为对象数组（见 Added），只使用 `ready` 且协议已知的实例；JSON Schema 中资源模型从未实现的单数 `status.endpoint` 一并移除。
+ - **破坏性**：网关默认不连接回环、链路本地、未指定、组播地址与已知云元数据服务地址上的推理实例（见 Security）；实例运行在本机时需设置 `GATEWAY_INSTANCE_ALLOWED_CIDRS`（`make run-dev` 已允许 `127.0.0.0/8,::1/128`）。
+diff --git a/README.md b/README.md
+index 0a8064a..a072a00 100644
+--- a/README.md
++++ b/README.md
+@@ -199,7 +199,7 @@ curl -s -H "Authorization: Bearer fmk_…" http://127.0.0.1:8080/api/v1/inferenc
+ 
+ ### REST API
+ 
+-控制平面的 REST API 以 `/api/v1` 为前缀，契约是 [api/openapi/openapi.yaml](api/openapi/openapi.yaml)。契约测试 `tests/contract/test_openapi_contract.py` 双向核对应用提供的路由、参数、请求体与状态码（探针除外），并逐一调用每个操作、校验响应符合契约：修改路由时须同步修改契约。网关把 `/api/v1/inference-services`、`/api/v1/resources`、`/api/v1/audit-events`、`/api/v1/workflows`、`/api/v1/decisions` 及其子路径的请求（任意方法，连同查询串、请求头与请求体）转发给控制平面。错误响应都是错误信封 `{"error": {"code", "message", "correlationId", "traceId", "details"}}`，`correlationId` 回显请求头 `X-Correlation-Id`（经网关访问时由网关补上），`traceId` 是这个请求的 trace-id（见「可观测性」）。
++控制平面的 REST API 以 `/api/v1` 为前缀，契约是 [api/openapi/openapi.yaml](api/openapi/openapi.yaml)。契约测试 `tests/contract/test_openapi_contract.py` 双向核对应用提供的路由、参数、请求体与状态码（探针除外），并逐一调用每个操作、校验响应符合契约：修改路由时须同步修改契约。网关把 `/api/v1/inference-services`、`/api/v1/resources`、`/api/v1/audit-events`、`/api/v1/workflows`、`/api/v1/decisions` 及其子路径的请求（任意方法，连同查询串、请求头与请求体）转发给控制平面。错误响应都是错误信封 `{"error": {"code", "message", "correlationId", "traceId", "details"}}`，`correlationId` 回显请求头 `X-Correlation-Id`（经网关访问时由网关补上），`traceId` 是这个请求的 trace-id（见「可观测性」）。资源不存在的 `404` 错误码为 `NOT_FOUND`；路径不匹配任何端点（如多了一段前缀）的 `404` 错误码为 `ROUTE_NOT_FOUND`，与网关相同，客户端据此区分资源不存在与地址错误。
+ 
+ | 端点 | 说明 |
+ | --- | --- |
+@@ -288,7 +288,7 @@ CLI 只管理 `InferenceService`（写作 `inferenceservice` 或 `inferenceservi
+ | 退出码 | 含义 |
+ | --- | --- |
+ | `0` | 成功 |
+-| `1` | 其他错误，如地址不提供 ForgeMesh API（错误码不是 `NOT_FOUND` 的 `404`，如网关的 `ROUTE_NOT_FOUND`；重定向）或响应无法解析 |
++| `1` | 其他错误，如地址不提供 ForgeMesh API（错误码不是 `NOT_FOUND` 的 `404`，如网关与控制平面对没有匹配路由的路径返回的 `ROUTE_NOT_FOUND`；重定向）或响应无法解析 |
+ | `2` | 参数、配置或资源文档不合法，没有发出请求 |
+ | `3` | 资源不存在（`404 NOT_FOUND`）；`wait --for delete` 此时以 `0` 成功 |
+ | `4` | 冲突（`409`），如资源正在删除，或 `apply` 的 5 次尝试都遇到并发修改 |
+diff --git a/api/openapi/openapi.yaml b/api/openapi/openapi.yaml
+index bc19ef9..15c82ab 100644
+--- a/api/openapi/openapi.yaml
++++ b/api/openapi/openapi.yaml
+@@ -12,7 +12,8 @@ info:
+     租户取自 key 绑定的租户；X-Tenant-Id 请求头可以省略，携带时必须与之一致，
+     否则返回 403。读接口要求 read scope，写接口要求 write scope。
+     任何端点遇到未预期的内部错误都返回 500（错误码 INTERNAL_ERROR，不含内部细节），
+-    各操作只列出设计中的响应。
++    各操作只列出设计中的响应。路径不匹配任何端点时返回 RouteNotFound（404，错误码
++    ROUTE_NOT_FOUND，与网关相同），有别于资源不存在的 NotFound（404，错误码 NOT_FOUND）。
+   x-stability: beta
+   x-deprecation-policy: >-
+     端点或字段弃用时使用 x-deprecated: true 扩展字段标记，并附带 x-deprecated-since
+@@ -929,7 +930,16 @@ components:
+           schema:
+             $ref: "#/components/schemas/Error"
+     NotFound:
+-      description: 资源不存在
++      description: 资源不存在（错误码 NOT_FOUND）
++      content:
++        application/json:
++          schema:
++            $ref: "#/components/schemas/Error"
++    RouteNotFound:
++      description: >-
++        路径不匹配任何端点（错误码 ROUTE_NOT_FOUND，与网关相同），如前缀写错或没有这个子路径；
++        与某个端点只差结尾的 / 时不返回此响应，而是以 307 重定向到该端点。适用于本文件之外的任何
++        路径，因此不在各操作中列出。客户端据错误码区分地址错误与资源不存在（NotFound）。
+       content:
+         application/json:
+           schema:
+diff --git a/gateway/README.md b/gateway/README.md
+index ff3856c..8cc27be 100644
+--- a/gateway/README.md
++++ b/gateway/README.md
+@@ -109,7 +109,7 @@ panic 兜底的 `500`）没有这两个字段。客户端按状态码与 `error.
+ | --- | --- | --- |
+ | `401` | `UNAUTHENTICATED` | 缺少或无效凭证（`dev` 模式下为缺少租户头），带 `WWW-Authenticate` |
+ | `403` | `FORBIDDEN` | 租户头与 key 绑定的租户不一致；推理路由缺少 `read` scope；控制平面拒绝 Resolver 的查询 |
+-| `404` | `ROUTE_NOT_FOUND` | 没有匹配的路由（有别于控制平面表示资源不存在的 `NOT_FOUND`：客户端据此区分地址错误与资源不存在） |
++| `404` | `ROUTE_NOT_FOUND` | 没有匹配的路由（有别于控制平面表示资源不存在的 `NOT_FOUND`：客户端据此区分地址错误与资源不存在）；反代给控制平面的路径下没有匹配的端点时，控制平面同样返回 `ROUTE_NOT_FOUND` |
+ | `405` | `METHOD_NOT_ALLOWED` | `/metrics` 收到 `GET` / `HEAD` 之外的方法（带 `Allow: GET, HEAD`） |
+ | `413` | `REQUEST_TOO_LARGE` | 请求体超过 `GATEWAY_MAX_REQUEST_BODY_BYTES` |
+ | `429` | `RATE_LIMITED` | 超过租户的限流（带 `Retry-After`：攒够一个令牌所需的秒数，向上取整，至少为 `1`） |
+diff --git a/packages/cli/src/forgemesh/cli/errors.py b/packages/cli/src/forgemesh/cli/errors.py
+index 7ca260d..6f30d9d 100644
+--- a/packages/cli/src/forgemesh/cli/errors.py
++++ b/packages/cli/src/forgemesh/cli/errors.py
+@@ -103,7 +103,7 @@ class ApiError(CliError):
+     ) -> None:
+         exit_code = exit_code_for_status(status)
+         if exit_code is ExitCode.NOT_FOUND and code != "NOT_FOUND":
+-            # 不是 API 的 404（如网关没有路由的路径）：地址错了，不能让脚本以为资源不存在
++            # 不是 API 的 404（如网关或控制平面没有路由的路径）：地址错了，不能让脚本以为资源不存在
+             exit_code = ExitCode.ERROR
+         super().__init__(message, exit_code)
+         self.status = status
+@@ -113,8 +113,8 @@ class ApiError(CliError):
+ 
+     @property
+     def not_found(self) -> bool:
+-        """资源不存在：错误码为 ``NOT_FOUND`` 的 ``404``，而不是网关对没有路由的路径返回的
+-        ``ROUTE_NOT_FOUND`` 或不提供 API 的地址返回的 ``404``。"""
++        """资源不存在：错误码为 ``NOT_FOUND`` 的 ``404``，而不是网关与控制平面对没有路由的路径
++        返回的 ``ROUTE_NOT_FOUND`` 或不提供 API 的地址返回的 ``404``。"""
+         return self.status == 404 and self.code == "NOT_FOUND"
+ 
+     @property
+diff --git a/packages/cli/src/forgemesh/cli/main.py b/packages/cli/src/forgemesh/cli/main.py
+index d10c10f..676c0dc 100644
+--- a/packages/cli/src/forgemesh/cli/main.py
++++ b/packages/cli/src/forgemesh/cli/main.py
+@@ -54,7 +54,7 @@ exit codes:
+   0    success
+   1    other errors, e.g. the URL does not serve the ForgeMesh API
+   2    invalid arguments, configuration or resource documents (nothing sent)
+-  3    not found (HTTP 404); wait --for delete exits 0 instead
++  3    not found (HTTP 404 NOT_FOUND); wait --for delete exits 0 instead
+   4    conflict (HTTP 409), e.g. the service is being deleted
+   5    request rejected (HTTP 400, 405, 413, 415 and other 4xx)
+   6    authentication or authorization failed (HTTP 401, 403)
+diff --git a/packages/control-plane/src/forgemesh/controlplane/api/errors.py b/packages/control-plane/src/forgemesh/controlplane/api/errors.py
+index 685cd8a..a1aea09 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/api/errors.py
++++ b/packages/control-plane/src/forgemesh/controlplane/api/errors.py
+@@ -3,6 +3,7 @@
+ 所有错误响应都使用 ``{"error": {"code", "message", "correlationId", "traceId", "details"}}``
+ 信封（对齐 OpenAPI ``Error`` schema），包括框架层面的 404/405、请求校验失败
+ （FastAPI 默认的 422 统一改为 400）以及未捕获的异常（500，不向客户端暴露内部细节）。
++没有匹配路由的 404 与网关一样使用 ``ROUTE_NOT_FOUND``，有别于资源不存在的 ``NOT_FOUND``。
+ 
+ 关联 ID 与 trace-id 取自请求头：
+ :class:`~forgemesh.controlplane.api.middleware.RequestContextMiddleware` 已把确定的取值写回
+@@ -21,6 +22,7 @@ from fastapi.exceptions import RequestValidationError
+ from fastapi.responses import JSONResponse
+ from pydantic import ValidationError
+ from starlette.exceptions import HTTPException as StarletteHTTPException
++from starlette.types import Receive, Scope, Send
+ 
+ from ..app import error_envelope
+ from ..tracecontext import TRACEPARENT_HEADER, parse_traceparent
+@@ -146,8 +148,19 @@ async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSON
+     )
+ 
+ 
++async def _route_not_found(scope: Scope, receive: Receive, send: Send) -> None:
++    """路由器在路径不匹配任何路由时调用（路径匹配而方法不匹配时是 ``405``）。
++
++    客户端据错误码区分地址错误与资源不存在：例如 CLI 的 ``--api-url`` 多了一段路径时，
++    ``wait --for delete`` 不能因为 ``NOT_FOUND`` 而认为资源已删除。
++    """
++    raise ApiError(404, "ROUTE_NOT_FOUND", "route not found")
++
++
+ def install_exception_handlers(app: FastAPI) -> None:
+-    """为应用注册全局异常处理器，使所有错误响应都符合错误信封。"""
++    """为应用注册全局异常处理器，使所有错误响应都符合错误信封；没有匹配路由的请求以
++    ``404 ROUTE_NOT_FOUND`` 响应。"""
+     app.add_exception_handler(StarletteHTTPException, _http_exception_handler)
+     app.add_exception_handler(RequestValidationError, _validation_exception_handler)
+     app.add_exception_handler(Exception, _unhandled_exception_handler)
++    app.router.default = _route_not_found
+diff --git a/tests/contract/test_openapi_contract.py b/tests/contract/test_openapi_contract.py
+index 694fb29..8595a7d 100644
+--- a/tests/contract/test_openapi_contract.py
++++ b/tests/contract/test_openapi_contract.py
+@@ -8,7 +8,9 @@
+ * 动态：按场景表调用每个操作（方法与路径取自契约），响应的状态码必须是契约为该操作声明的，
+   响应体符合声明的 Schema（声明无正文时必须为空），声明的响应头存在，错误信封回显请求的
+   ``X-Correlation-Id`` 与 ``traceparent`` 中的 trace-id，成功请求的请求体符合声明的请求体
+-  Schema；契约为每个操作声明的每个状态码都至少有一个场景。
++  Schema；契约为每个操作声明的每个状态码都至少有一个场景；
++* 不对应任何操作的路径返回契约的 ``RouteNotFound``（``404 ROUTE_NOT_FOUND``），不会被当作
++  资源不存在的 ``NOT_FOUND``。
+ 
+ 响应只做动态检查：FastAPI 生成的响应声明不含错误响应，比较它没有意义。
+ """
+@@ -657,7 +659,11 @@ def _check_response(operation: Operation, response: httpx.Response) -> None:
+     assert status in operation.spec["responses"], (
+         f"{operation.operation_id} does not document {status}"
+     )
+-    documented = _resolve(CONTRACT, operation.spec["responses"][status])
++    _check_documented_response(operation.spec["responses"][status], response)
++
++
++def _check_documented_response(documented: dict[str, Any], response: httpx.Response) -> None:
++    documented = _resolve(CONTRACT, documented)
+     for header in documented.get("headers", {}):
+         assert header in response.headers, f"response header {header} is missing"
+     content = documented.get("content")
+@@ -699,6 +705,38 @@ def test_responses_match_the_contract(case: Scenario, harness: Harness) -> None:
+         _check_request(api.operation, response.request)
+ 
+ 
++#: 不对应任何操作的路径：多了一段前缀（如 CLI 的 ``--api-url`` 写错），集合名写错，或网关会转发的
++#: 前缀下没有的子路径。
++UNMATCHED_PATHS = (
++    "/forgemesh/api/v1/inference-services/svc-1",
++    "/api/v1/inference-service/svc-1",
++    "/api/v1/inference-services/svc-1/status",
++)
++
++
++@pytest.mark.contract
++@pytest.mark.parametrize("method", ["GET", "DELETE"])
++@pytest.mark.parametrize("path", UNMATCHED_PATHS)
++def test_unmatched_paths_answer_route_not_found(harness: Harness, path: str, method: str) -> None:
++    api = Api(harness, "getInferenceService")
++    api.create("svc-1")
++
++    response = harness.client.request(
++        method,
++        path,
++        headers={
++            "X-Correlation-Id": CORRELATION_ID,
++            "traceparent": TRACEPARENT,
++            "Authorization": f"Bearer {API_KEY}",
++        },
++    )
++
++    assert response.status_code == 404, response.text
++    assert response.json()["error"]["code"] == "ROUTE_NOT_FOUND"
++    _check_documented_response(CONTRACT["components"]["responses"]["RouteNotFound"], response)
++    assert api(params=NAMESPACE).status_code == 200
++
++
+ @pytest.mark.contract
+ @pytest.mark.parametrize("operation_id", sorted(OPERATIONS_BY_ID))
+ def test_every_documented_status_code_is_exercised(operation_id: str) -> None:
+diff --git a/tests/e2e/test_cli.py b/tests/e2e/test_cli.py
+index be39afc..aa993e6 100644
+--- a/tests/e2e/test_cli.py
++++ b/tests/e2e/test_cli.py
+@@ -6,7 +6,8 @@
+ * 无法调度的第二个服务；``list`` 逐页读取；``get``；
+ * ``delete``：无法调度的服务直接删除（``204``），就绪的服务先进入 ``Terminating``（``202``），
+   ``wait --for delete`` 等它消失；
+-* API 的错误：没有 key（``401``）、文档的租户与 key 不符（``403``）、文档不合法（``400``）。
++* API 的错误：没有 key（``401``）、文档的租户与 key 不符（``403``）、文档不合法（``400``）；
++  ``--api-url`` 多了一段路径时控制平面返回 ``404 ROUTE_NOT_FOUND``，不被当作资源不存在。
+ """
+ 
+ from __future__ import annotations
+@@ -206,6 +207,11 @@ def test_api_errors_are_reported_with_their_exit_codes(
+     other_tenant = cli("apply", "-f", _write(tmp_path / "a.yaml", service("a", tenantId="other")))
+     rejected = cli("apply", "-f", _write(tmp_path / "llama.yaml", invalid))
+     missing = cli("get", "inferenceservice", "llama", "-n", "default")
++    wrong_url = ("--api-url", control_plane + "/forgemesh")
++    misrouted = cli("get", "inferenceservice", "llama", "-n", "default", *wrong_url)
++    misrouted_wait = cli(
++        "wait", "inferenceservice", "llama", "-n", "default", "--for", "delete", *wrong_url
++    )
+ 
+     assert without_key.code == ExitCode.AUTH
+     assert without_key.err.startswith("Error: missing bearer credentials (HTTP 401 UNAUTHENTICATED")
+@@ -222,5 +228,10 @@ def test_api_errors_are_reported_with_their_exit_codes(
+     assert "(HTTP 400 BAD_REQUEST" in rejected.err
+     assert "\n  " in rejected.err
+     assert missing.code == ExitCode.NOT_FOUND
+-    assert KEY not in "".join(r.out + r.err for r in (without_key, other_tenant, rejected, missing))
++    for result in (misrouted, misrouted_wait):
++        assert (result.code, result.out) == (ExitCode.ERROR, "")
++        assert result.err.startswith("Error: route not found (HTTP 404 ROUTE_NOT_FOUND, ")
++        assert result.err.endswith("); check --api-url\n")
++    results = (without_key, other_tenant, rejected, missing, misrouted, misrouted_wait)
++    assert KEY not in "".join(r.out + r.err for r in results)
+     assert _errors(caplog) == []
+diff --git a/tests/unit/cli/fakes.py b/tests/unit/cli/fakes.py
+index b2df539..3d2c654 100644
+--- a/tests/unit/cli/fakes.py
++++ b/tests/unit/cli/fakes.py
+@@ -227,7 +227,7 @@ class FakeApi:
+             if call.method == "PUT":
+                 return self._replace(call, key, current)
+             return self._delete(key, current)
+-        return self._error(call, 404, "NOT_FOUND", "Not Found")
++        return self._error(call, 404, "ROUTE_NOT_FOUND", "route not found")
+ 
+     def _create(self, call: Call) -> Reply:
+         metadata = call.body["metadata"]
+diff --git a/tests/unit/controlplane/test_app.py b/tests/unit/controlplane/test_app.py
+index 7c202b1..2090bd9 100644
+--- a/tests/unit/controlplane/test_app.py
++++ b/tests/unit/controlplane/test_app.py
+@@ -224,6 +224,10 @@ def test_framework_errors_use_the_error_envelope(tmp_path) -> None:
+             "/api/v1/inference-services/nope",
+             headers={**HEADERS, "X-Correlation-Id": "corr-1"},
+         )
++        no_route = client.get(
++            "/prefix/api/v1/inference-services/nope",
++            headers={**HEADERS, "X-Correlation-Id": "corr-2"},
++        )
+         not_object = client.post("/api/v1/inference-services", json=[1, 2], headers=HEADERS)
+         bad_limit = client.get(
+             "/api/v1/inference-services", params={"limit": "many"}, headers=HEADERS
+@@ -233,6 +237,13 @@ def test_framework_errors_use_the_error_envelope(tmp_path) -> None:
+     assert missing.status_code == 404
+     assert missing.json()["error"]["code"] == "NOT_FOUND"
+     assert missing.json()["error"]["correlationId"] == "corr-1"
++    assert no_route.status_code == 404
++    error = no_route.json()["error"]
++    assert (error["code"], error["message"], error["correlationId"]) == (
++        "ROUTE_NOT_FOUND",
++        "route not found",
++        "corr-2",
++    )
+     assert not_object.status_code == 400
+     assert not_object.json()["error"]["code"] == "BAD_REQUEST"
+     assert not_object.json()["error"]["details"]["errors"]
+-- 
+2.43.0
+

@@ -1,0 +1,675 @@
+From 369db41b57201cea3364da67ab0b8ebda5b929ed Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 13 Oct 2026 09:49:01 +0000
+Subject: [PATCH 12/17] feat(control-plane): export outbox backlog and publish
+ attempt metrics
+
+The outbox dispatcher now runs inside the control plane, so a webhook
+outage is visible only as WARNING and ERROR log lines until events go
+dead. Export two metrics with bounded labels so operators can alert on
+event delivery:
+
+- forgemesh_outbox_events{state}: unpublished events, read at scrape
+  time and split into pending (never failed), retrying (failed and
+  waiting for the backoff) and dead. Outbox.backlog() reads only the
+  pending and dead rows through the status index, so the published
+  events kept for the retention period do not slow scrapes down.
+- forgemesh_outbox_publish_attempts_total{outcome}: published, failed
+  (will be retried) or dead (the last attempt). All three series start
+  at zero so that increase() also sees the first failure.
+
+The Dispatcher reports an attempt through a new on_attempt callback
+only after its outcome is recorded in the database. An attempt whose
+outcome could not be recorded is published again and counted then, so
+the published count matches the events marked published.
+
+Label values are fixed enums; event ids, event types and tenants are
+not labels. The age of the oldest pending event is left out for now.
+---
+ CHANGELOG.md                                  |  1 +
+ README.md                                     |  2 +
+ docs/operations/backup-restore.md             |  2 +-
+ .../src/forgemesh/controlplane/app.py         |  5 +-
+ .../src/forgemesh/controlplane/outbox.py      | 54 ++++++++++++
+ .../src/forgemesh/controlplane/telemetry.py   | 60 +++++++++++++-
+ scripts/compose_smoke.sh                      |  8 +-
+ .../controlplane/test_metrics_endpoint.py     | 38 +++++++++
+ tests/unit/controlplane/test_outbox.py        | 82 ++++++++++++++++++-
+ tests/unit/controlplane/test_telemetry.py     | 77 ++++++++++++++++-
+ 10 files changed, 317 insertions(+), 12 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 7d7f35d..6679153 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -63,6 +63,7 @@
+ - 审计查询 `GET /api/v1/audit-events`：返回凭证所属租户的审计记录，最新的在前，需要 `read` scope；参数 `limit`（1–1000，默认 100，与列表接口一致）、`pageToken` 与可选的 `correlationId`，响应为 `{items, count, nextPageToken}`，还有下一页时才有 `nextPageToken`。按位置（时间戳、记录 id）分页（`AuditLog.list_page`），翻页期间写入的新记录不会使后面的页重复或遗漏。游标与资源列表的游标一样签名，使用同一个 `registry_meta` 密钥（签发与校验移到 `forgemesh.controlplane.pagetokens`，资源列表的游标格式不变），绑定租户与 `correlationId`：格式不对、被修改、为其他租户或条件签发或取自资源列表的游标返回 `400`，控制平面重启后仍然有效。OpenAPI 新增该操作与 `AuditEvent` / `AuditEventList`，契约测试覆盖该操作。Go 网关转发这个路径，与其他资源路由相同：校验 API key、按已验证租户限流、透传关联 ID 与查询串，`read` scope 由控制平面检查。
+ - `forgemesh.controlplane.sqlite.Database`：一个 SQLite 连接加一把可重入锁。Registry、Outbox 与审计日志共用一个实例，资源写入与它的事件、审计记录在同一个事务中提交或回滚（ADR-008 的工作单元）：`transaction()` 以 `BEGIN IMMEDIATE` 开始，`call()` / `run()` 在函数抛出异常时回滚它未提交的写入，并拒绝留下未结束的事务。`TaskStore`、`AuditLog` 与 `IdempotentConsumer` 都可以经 `database=` 共用连接。
+ - 控制平面 `GET /metrics`：以 Prometheus 文本格式 0.0.4 输出聚合指标，不引入新依赖（`forgemesh.controlplane.metrics`：计数器、仪表盘与直方图，每个指标最多 200 个标签组合，超出的计入标签全为 `overflow` 的一个序列）。指标定义在 `forgemesh.controlplane.telemetry`：`forgemesh_http_requests_total{method,route,status}` 与 `forgemesh_http_request_duration_seconds{method,route}`（`route` 为路由模板，未匹配路由的请求记为 `unmatched`）、`forgemesh_reconcile_total{operation,outcome}` 与 `forgemesh_reconcile_duration_seconds{operation}`、`forgemesh_controller_retries_total`、`forgemesh_controller_queue_depth{state}`、`forgemesh_deployments_total{outcome,reason}`（推理服务进入 `Ready` / `Failed` 的次数）、`forgemesh_inference_services{phase}`、`forgemesh_allocations_active{accelerator_type}`、`forgemesh_accelerator_devices{accelerator_type,state}`、`forgemesh_workflow_runs{status}` 与 `forgemesh_database_lock_wait_seconds`（控制平面数据库的操作等待连接锁的时间，注册中心、Outbox 与审计记录共用这个连接与锁），状态类指标在抓取时读取。`/metrics` 与探针一样不要求认证，只输出跨租户聚合的数据，标签不含租户、名称、命名空间、uid 或地址；它不在 `/api/v1` 之下，网关不转发。OpenAPI 新增 `/metrics`（`security: []`）。为此 `ControllerManager` 新增可选参数 `metrics` 与 `queue_depth()`（工作队列新增 `depth()`），`SQLiteRegistry` 新增 `count_by_phase`、`active_allocation_devices` 与 `database` 属性，`Database` 新增 `set_lock_wait_observer`，`WorkflowStore` 新增 `count_runs_by_status`。指标说明见 README「可观测性」。
++- 控制平面的 Outbox 指标：`forgemesh_outbox_events{state}`（抓取时读取的未发布事件数，`state` 为 `pending`（尚未发布失败过）/ `retrying`（发布失败过、等待重试）/ `dead`）与 `forgemesh_outbox_publish_attempts_total{outcome}`（Dispatcher 发布事件的尝试次数，在结果写入数据库之后计数，`outcome` 为 `published` / `failed`（将重试）/ `dead`（最后一次失败），三个取值都从 0 开始输出）。为此 `Outbox` 新增 `backlog()`（返回 `OutboxBacklog`，只读取 `pending` 与 `dead` 的行），`Dispatcher` 新增仅限关键字参数 `on_attempt`（每次发布尝试的结果写入数据库之后以 `PublishOutcome` 调用，未能写入时不调用）。
+ - 网关 `GET /metrics`（`internal/metrics`，只用标准库，文本格式与标签上限同上）：`forgemesh_gateway_http_requests_total{route,status}` 与 `forgemesh_gateway_http_request_duration_seconds{route}`（`route` 为按路由表确定的路由类别 `probe` / `metrics` / `control_plane` / `inference` / `unmatched`，不取请求路径；含 Recovery 兜底的 `500`）、`forgemesh_gateway_stream_first_byte_seconds`（流式代理从开始处理请求到写出实例的第一个响应字节，只统计实例返回 2xx 的流）、`forgemesh_gateway_upstream_errors_total{upstream,kind}`（`control_plane` / `instance`；`connect` / `status`（5xx）/ `body` / `address_not_allowed` / `invalid_endpoint`，客户端已断开的请求不计）、`forgemesh_gateway_rate_limited_total`、`forgemesh_gateway_resolver_lookups_total{result}`（`hit` / `miss` / `coalesced`）与 `forgemesh_gateway_instances{state}`（Resolver 缓存中 `healthy` / `unhealthy` 的实例数）。与探针一样不经过认证与限流，只输出聚合数据，见网关 README「可观测性」。
+ - W3C Trace Context：网关的 `TraceContext` 中间件沿用请求中恰好一个合法的 `traceparent`（连同 `tracestate`），否则（缺失、不合法或多个）生成新的 `traceparent`（版本 `00`，flags `00`）并丢弃 `tracestate`；确定的 `traceparent` 随请求转发给控制平面（资源反代与 Resolver 的查询）与推理实例，响应不回写。控制平面的 `RequestContextMiddleware` 按同样的规则确定 trace-id，沿用 `X-Correlation-Id`（缺失时生成一次并写回请求头，路由回显的、审计记录与资源变更事件中的关联 ID 因此与日志一致），在请求处理期间绑定两者，这个请求的日志与错误信封都带上它们。两边都不记录 span、不导出追踪，OTLP 导出留待后续。错误信封新增可选字段 `traceId`（OpenAPI `Error.traceId`，32 个小写十六进制字符），网关与控制平面一致。
+ - 网关访问日志：每个 `/api/v1` 请求与没有匹配路由的请求输出一行 `access method=… path="…" status=… duration=… corr=<关联 ID> trace=<trace-id>`（路径加引号转义、不含查询串；流式请求的 `duration` 是整个流的时长；处理器在写出响应头之前 panic 时记 `500`），位于认证与限流之前，被拒绝的请求同样记录；探针与 `/metrics` 不记录。反代与流式代理的错误日志、Recovery 的 panic 日志同样带 `trace=`。
+diff --git a/README.md b/README.md
+index 360699f..0a8064a 100644
+--- a/README.md
++++ b/README.md
+@@ -423,6 +423,8 @@ curl -s http://127.0.0.1:8081/metrics   # 网关
+ | `forgemesh_allocations_active{accelerator_type}` | gauge | Active 分配数，按其设备在清单中的类型 |
+ | `forgemesh_accelerator_devices{accelerator_type,state}` | gauge | 清单中的设备数，`state` 为 `free` / `allocated`；未配置清单时没有样本 |
+ | `forgemesh_workflow_runs{status}` | gauge | 各状态的部署工作流运行数；未设置启动器时没有样本 |
++| `forgemesh_outbox_events{state}` | gauge | 未发布的资源变更事件数：`pending`（尚未发布失败过）/ `retrying`（发布失败过，等待重试）/ `dead`（失败次数达到上限，不再自动重试，重新投递见[备份与恢复](docs/operations/backup-restore.md)第 5 节） |
++| `forgemesh_outbox_publish_attempts_total{outcome}` | counter | 发布事件的尝试次数，在结果写入数据库之后计数：`published` / `failed`（将重试）/ `dead`（最后一次失败）；三个取值都从 0 开始输出 |
+ | `forgemesh_database_lock_wait_seconds` | histogram | 控制平面数据库的一次操作等待连接锁的时间：注册中心、Outbox（含事件发布）与审计记录共用这个连接与锁（不含 SQLite 内部的忙等待） |
+ 
+ **追踪上下文与日志**：网关沿用请求中合法的 W3C `traceparent`，否则生成一个，随请求转发给控制平面与推理实例。控制平面按同样的规则读取 `traceparent`（直连控制平面的请求同样适用），并沿用 `X-Correlation-Id`（缺失时生成，审计记录与资源变更事件使用同一个关联 ID），这个请求的日志与错误信封（`{"error": {"code", "message", "correlationId", "traceId", …}}`）都带上 trace-id 与关联 ID，一次请求在网关与控制平面的日志里可以按 trace-id 对上。控制平面的日志写到标准错误，默认每行一个 JSON 对象，uvicorn 的访问日志也是如此：
+diff --git a/docs/operations/backup-restore.md b/docs/operations/backup-restore.md
+index 3ecb6d6..10ccc9a 100644
+--- a/docs/operations/backup-restore.md
++++ b/docs/operations/backup-restore.md
+@@ -445,7 +445,7 @@ Kubernetes 上先 `kubectl -n forgemesh scale deploy/forgemesh-control-plane --r
+ | 误删资源 | 用户报告 / 审计日志确认 | 从误删前备份恢复（需停服） |
+ | 注册表与工作流存储来自不同的备份 | 恢复后仍在部署的服务进入 `Failed`（`WorkflowRunNotFound`），或设备被注册表之外的实例占用（2.6 节） | 停止控制平面，从同一组备份重新恢复两个文件 |
+ | 租户数据串扰 | 安全测试失败 | 立即从备份恢复 + 排查隔离边界缺陷 |
+-| 事件接收方（webhook）长时间不可用 | ERROR 日志 `outbox event … is dead after 10 failed attempts` | 修复接收方后重新投递 `dead` 事件（见下） |
++| 事件接收方（webhook）长时间不可用 | ERROR 日志 `outbox event … is dead after 10 failed attempts`；`/metrics` 的 `forgemesh_outbox_events{state="dead"}` 大于 0（接收方不可用期间 `state="retrying"` 持续大于 0） | 修复接收方后重新投递 `dead` 事件（见下） |
+ 
+ `dead` 事件不再自动发送。下面的命令只改动 `outbox_events` 中的 `dead` 行（一次短事务），可以在控制平面运行时执行，Dispatcher 在下一轮发布放回队列的事件。路径须与 `FORGEMESH_DB_PATH` 一致（路径写错时会新建一个空库）：
+ 
+diff --git a/packages/control-plane/src/forgemesh/controlplane/app.py b/packages/control-plane/src/forgemesh/controlplane/app.py
+index a509cf3..7e1fa17 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/app.py
++++ b/packages/control-plane/src/forgemesh/controlplane/app.py
+@@ -315,7 +315,10 @@ if _FASTAPI_AVAILABLE:
+                 cleanup.callback(reset_registry)
+                 logger.info("control plane registry opened: %s", path)
+                 dispatcher = Dispatcher(
+-                    registry.outbox, publisher, poll_interval=EVENT_POLL_INTERVAL_SECONDS
++                    registry.outbox,
++                    publisher,
++                    poll_interval=EVENT_POLL_INTERVAL_SECONDS,
++                    on_attempt=metrics.outbox.attempted,
+                 )
+                 dispatcher.start()
+                 cleanup.push_async_callback(dispatcher.shutdown)
+diff --git a/packages/control-plane/src/forgemesh/controlplane/outbox.py b/packages/control-plane/src/forgemesh/controlplane/outbox.py
+index 952e65c..8d40c27 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/outbox.py
++++ b/packages/control-plane/src/forgemesh/controlplane/outbox.py
+@@ -90,6 +90,32 @@ class OutboxStatus(StrEnum):
+     DEAD = "dead"
+ 
+ 
++class PublishOutcome(StrEnum):
++    """一次发布尝试的结果（:class:`Dispatcher` 的 ``on_attempt`` 收到的参数）。"""
++
++    #: 发布成功，事件已标记 ``published``。
++    PUBLISHED = "published"
++    #: 发布失败，事件仍为 ``pending``，按 :class:`RetryPolicy` 退避后重试。
++    FAILED = "failed"
++    #: 发布失败且失败次数达到上限，事件进入 ``dead``。
++    DEAD = "dead"
++
++
++@dataclass(frozen=True)
++class OutboxBacklog:
++    """未发布的事件数（:meth:`Outbox.backlog`）。
++
++    Attributes:
++        pending: 尚未发布失败过的 ``pending`` 事件，含经 :meth:`Outbox.redrive` 放回的。
++        retrying: 发布失败过、等待重试的 ``pending`` 事件。
++        dead: ``dead`` 事件。
++    """
++
++    pending: int = 0
++    retrying: int = 0
++    dead: int = 0
++
++
+ class OutboxEvent(BaseModel):
+     """Outbox 事件模型。
+ 
+@@ -398,6 +424,21 @@ class Outbox:
+         rows = self._query("SELECT status, COUNT(*) as cnt FROM outbox_events GROUP BY status")
+         return {row["status"]: row["cnt"] for row in rows}
+ 
++    def backlog(self) -> OutboxBacklog:
++        """统计未发布的事件：``pending`` 事件按是否发布失败过分为两类，以及 ``dead`` 事件。
++
++        只读取这两个状态的行（经 ``status`` 索引），保留期内的已发布事件不影响查询的开销。
++        """
++        pending, dead = OutboxStatus.PENDING.value, OutboxStatus.DEAD.value
++        [row] = self._query(
++            "SELECT COALESCE(SUM(status = ? AND attempts = 0), 0) AS pending, "
++            "COALESCE(SUM(status = ? AND attempts > 0), 0) AS retrying, "
++            "COALESCE(SUM(status = ?), 0) AS dead "
++            "FROM outbox_events WHERE status IN (?, ?)",
++            (pending, pending, dead, pending, dead),
++        )
++        return OutboxBacklog(pending=row["pending"], retrying=row["retrying"], dead=row["dead"])
++
+     @staticmethod
+     def _row_to_event(row: sqlite3.Row) -> OutboxEvent:
+         """将数据库行反序列化为 OutboxEvent。"""
+@@ -444,6 +485,8 @@ class Dispatcher:
+         retention: 已发布事件的保留秒数，:meth:`run` 每小时删除更早的事件；
+             ``None`` 表示不删除。
+         clock: 当前时间（Unix 秒），供测试注入。
++        on_attempt: 每次发布尝试的结果写入数据库之后调用（如计入指标），参数为
++            :class:`PublishOutcome`；结果未能写入时不调用，事件之后再次发布时才调用。
+ 
+     Raises:
+         ValueError: ``poll_interval`` 不大于 0，或 ``batch_size`` 小于 1。
+@@ -459,6 +502,7 @@ class Dispatcher:
+         retry: RetryPolicy | None = None,
+         retention: float | None = DEFAULT_RETENTION_SECONDS,
+         clock: Callable[[], float] = time.time,
++        on_attempt: Callable[[PublishOutcome], None] | None = None,
+     ) -> None:
+         if poll_interval <= 0:
+             raise ValueError(f"poll_interval must be > 0, got {poll_interval}")
+@@ -471,6 +515,7 @@ class Dispatcher:
+         self._retry = retry or RetryPolicy()
+         self._retention = retention
+         self._clock = clock
++        self._on_attempt = on_attempt
+         self._stopped = False
+         self._wakeup: asyncio.Event | None = None
+         self._task: asyncio.Task[None] | None = None
+@@ -495,11 +540,18 @@ class Dispatcher:
+                     now=self._clock(),
+                 )
+                 self._log_failure(failed)
++                dead = failed.status == OutboxStatus.DEAD
++                self._attempted(PublishOutcome.DEAD if dead else PublishOutcome.FAILED)
+                 break
+             await asyncio.to_thread(self._outbox.mark_published, event.event_id, self._clock())
++            self._attempted(PublishOutcome.PUBLISHED)
+             published += 1
+         return published
+ 
++    def _attempted(self, outcome: PublishOutcome) -> None:
++        if self._on_attempt is not None:
++            self._on_attempt(outcome)
++
+     def _log_failure(self, event: OutboxEvent) -> None:
+         if event.status == OutboxStatus.DEAD:
+             logger.error(
+@@ -665,7 +717,9 @@ __all__ = [
+     "Dispatcher",
+     "IdempotentConsumer",
+     "Outbox",
++    "OutboxBacklog",
+     "OutboxEvent",
+     "OutboxStatus",
++    "PublishOutcome",
+     "RetryPolicy",
+ ]
+diff --git a/packages/control-plane/src/forgemesh/controlplane/telemetry.py b/packages/control-plane/src/forgemesh/controlplane/telemetry.py
+index f51539a..d7f9323 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/telemetry.py
++++ b/packages/control-plane/src/forgemesh/controlplane/telemetry.py
+@@ -24,13 +24,19 @@
+   ``free`` / ``allocated``；未配置清单时没有样本。
+ * ``forgemesh_workflow_runs{status}``：各状态的部署工作流运行数，每个状态都输出；未配置启动器
+   时没有样本。
++* ``forgemesh_outbox_events{state}``：未发布的资源变更事件数，``state`` 为 ``pending``（尚未
++  发布失败过）、``retrying``（发布失败过、等待重试）、``dead``（失败次数达到上限，不再自动
++  重试），每个状态都输出（见 :class:`~forgemesh.controlplane.outbox.OutboxBacklog`）。
++* ``forgemesh_outbox_publish_attempts_total{outcome}``：Dispatcher 发布事件的尝试次数，在结果
++  写入数据库之后计数；``outcome`` 见 :class:`~forgemesh.controlplane.outbox.PublishOutcome`，
++  每个取值都从 0 开始输出。
+ * ``forgemesh_database_lock_wait_seconds``：一次数据库操作等待控制平面数据库连接锁的时间。
+   资源注册表、Outbox（含事件发布）与审计记录共用这个连接与锁（见
+   :class:`~forgemesh.controlplane.sqlite.Database`）；不含 SQLite 内部的忙等待。
+ 
+-仪表盘（队列深度、服务、分配、设备与工作流运行数）在抓取时从控制器、注册中心、加速器清单与
+-工作流存储读取（见 :meth:`ControlPlaneMetrics.watch`），跨租户聚合；锁等待时间在每次数据库操作
+-时记录。加速器类型取自运维配置的清单，不是租户数据。
++仪表盘（队列深度、服务、分配、设备、工作流运行与 Outbox 事件数）在抓取时从控制器、注册中心
++（含其 Outbox）、加速器清单与工作流存储读取（见 :meth:`ControlPlaneMetrics.watch`），跨租户
++聚合；锁等待时间在每次数据库操作时记录。加速器类型取自运维配置的清单，不是租户数据。
+ 
+ ``/metrics`` 与探针一样不要求认证，只输出聚合数据；它不在 ``/api/v1`` 之下，网关不会
+ 转发它（见 README「可观测性」）。
+@@ -38,6 +44,7 @@
+ 
+ from __future__ import annotations
+ 
++import asyncio
+ import re
+ from collections.abc import Callable, Mapping
+ from enum import StrEnum
+@@ -47,6 +54,7 @@ from forgemesh.resource.inference import InferencePhase
+ from forgemesh.workflow.states import WorkflowStatus
+ 
+ from .metrics import MetricsRegistry
++from .outbox import PublishOutcome
+ 
+ if TYPE_CHECKING:  # pragma: no cover - 仅静态类型检查使用
+     from forgemesh.core.reconciler import ReconcileResult
+@@ -183,6 +191,35 @@ class ControllerMetrics:
+             self._deployments.inc(outcome, _ready_reason(patch))
+ 
+ 
++class OutboxMetrics:
++    """Outbox 事件的发布尝试与未发布的事件数。
++
++    Args:
++        registry: 指标所在的注册中心；为空时新建（指标不会被导出）。
++    """
++
++    def __init__(self, registry: MetricsRegistry | None = None) -> None:
++        registry = registry if registry is not None else MetricsRegistry()
++        self._attempts = registry.counter(
++            "forgemesh_outbox_publish_attempts_total",
++            "Outbox event publish attempts by outcome, counted once the outcome is recorded.",
++            ("outcome",),
++        )
++        for outcome in PublishOutcome:
++            self._attempts.inc(outcome.value, amount=0)
++        #: 由 :meth:`ControlPlaneMetrics.watch` 登记的采集器在抓取时更新。
++        self.events = registry.gauge(
++            "forgemesh_outbox_events",
++            "Unpublished outbox events by state (pending, retrying or dead).",
++            ("state",),
++        )
++
++    def attempted(self, outcome: PublishOutcome) -> None:
++        """记录一次结果已写入数据库的发布尝试；用作
++        :class:`~forgemesh.controlplane.outbox.Dispatcher` 的 ``on_attempt``。"""
++        self._attempts.inc(outcome.value)
++
++
+ class ControlPlaneMetrics:
+     """控制平面的指标注册中心及各组件的指标。"""
+ 
+@@ -190,6 +227,7 @@ class ControlPlaneMetrics:
+         self.registry = MetricsRegistry()
+         self.http = HTTPMetrics(self.registry)
+         self.controller = ControllerMetrics(self.registry)
++        self.outbox = OutboxMetrics(self.registry)
+         self._services = self.registry.gauge(
+             "forgemesh_inference_services",
+             "Inference services by phase.",
+@@ -224,7 +262,8 @@ class ControlPlaneMetrics:
+         inventory: Inventory | None = None,
+         workflow_store: WorkflowStore | None = None,
+     ) -> Callable[[], None]:
+-        """在抓取时从这些组件读取状态类指标，并观测注册中心所在数据库的锁等待。
++        """在抓取时从这些组件（含注册中心的 Outbox）读取状态类指标，并观测注册中心所在数据库的
++        锁等待。
+ 
+         返回注销函数：之后不再读取这些组件，状态类指标没有样本。
+         """
+@@ -268,10 +307,21 @@ class ControlPlaneMetrics:
+             self._allocations.replace(by_type)
+             self._devices.replace(by_state)
+ 
++        async def outbox() -> None:
++            backlog = await asyncio.to_thread(registry.outbox.backlog)
++            self.outbox.events.replace(
++                {
++                    ("pending",): backlog.pending,
++                    ("retrying",): backlog.retrying,
++                    ("dead",): backlog.dead,
++                }
++            )
++
+         removers = [
+             self.registry.add_collector(queue, [self.controller.queue_depth]),
+             self.registry.add_collector(services, [self._services]),
+             self.registry.add_collector(allocations, [self._allocations, self._devices]),
++            self.registry.add_collector(outbox, [self.outbox.events]),
+         ]
+         if workflow_store is not None:
+             store = workflow_store
+@@ -295,6 +345,7 @@ class ControlPlaneMetrics:
+                 self._allocations,
+                 self._devices,
+                 self._workflow_runs,
++                self.outbox.events,
+             ):
+                 gauge.replace({})
+ 
+@@ -312,5 +363,6 @@ __all__ = [
+     "ControlPlaneMetrics",
+     "ControllerMetrics",
+     "HTTPMetrics",
++    "OutboxMetrics",
+     "ReconcileOutcome",
+ ]
+diff --git a/scripts/compose_smoke.sh b/scripts/compose_smoke.sh
+index 8e82e7b..9419994 100755
+--- a/scripts/compose_smoke.sh
++++ b/scripts/compose_smoke.sh
+@@ -255,7 +255,7 @@ expect_reply "$first_instance"
+   || fail "the workflow store is not next to the registry"
+ echo "ok: the workflow store lives next to the registry"
+ 
+-# 此时只有 smoke-svc：Ready，占用清单中唯一的设备，部署工作流已成功。
++# 此时只有 smoke-svc：Ready，占用清单中唯一的设备，部署工作流已成功。事件写日志，不会发布失败。
+ scrape "control plane /metrics" http://127.0.0.1:8080/metrics \
+   'forgemesh_http_requests_total{method="POST",route="/api/v1/inference-services",status="201"} ' \
+   'forgemesh_reconcile_total{operation="reconcile",outcome="done"} ' \
+@@ -265,7 +265,11 @@ scrape "control plane /metrics" http://127.0.0.1:8080/metrics \
+   'forgemesh_inference_services{phase="Ready"} 1$' \
+   'forgemesh_allocations_active{accelerator_type="nvidia-gpu"} 1$' \
+   'forgemesh_accelerator_devices{accelerator_type="nvidia-gpu",state="free"} 0$' \
+-  'forgemesh_workflow_runs{status="Succeeded"} 1$'
++  'forgemesh_workflow_runs{status="Succeeded"} 1$' \
++  'forgemesh_outbox_publish_attempts_total{outcome="published"} [1-9]' \
++  'forgemesh_outbox_publish_attempts_total{outcome="failed"} 0$' \
++  'forgemesh_outbox_events{state="retrying"} 0$' \
++  'forgemesh_outbox_events{state="dead"} 0$'
+ scrape "gateway /metrics" "$gateway/metrics" \
+   'forgemesh_gateway_http_requests_total{route="control_plane",status="401"} 1$' \
+   'forgemesh_gateway_http_requests_total{route="inference",status="200"} ' \
+diff --git a/tests/unit/controlplane/test_metrics_endpoint.py b/tests/unit/controlplane/test_metrics_endpoint.py
+index c0c70b6..379d299 100644
+--- a/tests/unit/controlplane/test_metrics_endpoint.py
++++ b/tests/unit/controlplane/test_metrics_endpoint.py
+@@ -19,6 +19,7 @@ from forgemesh.controlplane.auth import (
+ from forgemesh.controlplane.deployment import RUNTIME_LAUNCHER_ENV
+ from forgemesh.controlplane.deployment.config import FAKE_ADVERTISE_HOST_ENV, FAKE_BIND_HOST_ENV
+ from forgemesh.controlplane.metrics import CONTENT_TYPE
++from forgemesh.controlplane.outbox import OutboxEvent
+ from forgemesh.controlplane.scheduler import INVENTORY_FILE_ENV
+ 
+ from .exposition import parse
+@@ -117,6 +118,43 @@ def test_unhandled_errors_are_counted_as_500(tmp_path, monkeypatch) -> None:
+     assert requests.value(method="GET", route="/api/v1/inference-services", status="500") == 1
+ 
+ 
++@pytest.mark.unit
++def test_outbox_metrics_follow_the_event_dispatcher(tmp_path, monkeypatch) -> None:
++    """创建事件发布成功、status 写入的事件发布失败：发布尝试按结果计数，失败的事件计为 retrying。"""
++    monkeypatch.setattr(app_module, "CONTROLLER_POLL_INTERVAL_SECONDS", 0.05)
++    monkeypatch.setattr(app_module, "EVENT_POLL_INTERVAL_SECONDS", 0.05)
++
++    def publisher(event: OutboxEvent) -> None:
++        if event.event_type.endswith(".status_updated"):
++            raise ConnectionError("webhook unreachable")
++
++    app = create_app(
++        db_path=str(tmp_path / "cp.db"),
++        authenticator=HeaderAuthenticator(),
++        event_publisher=publisher,
++    )
++    with TestClient(app) as client:
++        created = client.post("/api/v1/inference-services", json=BODY, headers=HEADERS)
++        assert created.status_code == 201
++        deadline = time.monotonic() + 10
++        while True:
++            families = parse(client.get("/metrics").text)
++            attempts = families["forgemesh_outbox_publish_attempts_total"]
++            events = families["forgemesh_outbox_events"]
++            if (
++                attempts.value(outcome="published") >= 1
++                and attempts.value(outcome="failed") >= 1
++                and events.value(state="retrying") >= 1
++            ):
++                break
++            assert time.monotonic() < deadline, "no event was both published and retried"
++            time.sleep(0.02)
++
++    assert attempts.value(outcome="dead") == 0
++    assert {s.labels["state"] for s in events.samples} == {"pending", "retrying", "dead"}
++    assert events.value(state="dead") == 0
++
++
+ @pytest.mark.unit
+ def test_a_deployment_shows_up_in_the_controller_and_state_metrics(tmp_path, monkeypatch) -> None:
+     inventory = tmp_path / "inventory.json"
+diff --git a/tests/unit/controlplane/test_outbox.py b/tests/unit/controlplane/test_outbox.py
+index 810cd30..57fdba6 100644
+--- a/tests/unit/controlplane/test_outbox.py
++++ b/tests/unit/controlplane/test_outbox.py
+@@ -6,9 +6,10 @@
+ * 标记已发布（mark_published）与重复标记抛错；
+ * 发布失败：指数退避（RetryPolicy）、到期查询（due）、达到上限进入 dead、
+   重新投递（redrive）、错误截断；
+-* 统计信息（get_stats）与已发布事件清理（purge_published）；
++* 统计信息（get_stats、backlog）与已发布事件清理（purge_published）；
+ * 存量库迁移（补列、旧 failed 改为 dead）；
+ * Dispatcher 单轮分发（dispatch_once）、遇到失败结束本轮；
++* Dispatcher 在发布尝试的结果写入数据库之后才报告它（on_attempt）；
+ * Dispatcher 幂等（重复 dispatch 不重复处理）；
+ * Dispatcher 异步 publisher 回调；
+ * Dispatcher 后台运行：持续发布、数据库错误后继续、停止与超时取消；
+@@ -28,8 +29,10 @@ from forgemesh.controlplane.outbox import (
+     Dispatcher,
+     IdempotentConsumer,
+     Outbox,
++    OutboxBacklog,
+     OutboxEvent,
+     OutboxStatus,
++    PublishOutcome,
+     RetryPolicy,
+ )
+ 
+@@ -164,6 +167,20 @@ def test_get_stats() -> None:
+     assert stats.get("dead") == 1
+ 
+ 
++@pytest.mark.unit
++def test_backlog_splits_pending_events_by_past_failures_and_counts_dead_ones() -> None:
++    outbox = Outbox()
++    assert outbox.backlog() == OutboxBacklog(pending=0, retrying=0, dead=0)
++    _put(outbox, *(_make_event(f"evt-{n}") for n in range(1, 6)))
++    outbox.mark_published("evt-1")
++    outbox.mark_failed("evt-2", "boom", now=10.0)
++    outbox.mark_failed("evt-3", "boom", policy=RetryPolicy(max_attempts=1))
++
++    assert outbox.backlog() == OutboxBacklog(pending=2, retrying=1, dead=1)
++    assert outbox.redrive(["evt-3"], now=20.0) == 1
++    assert outbox.backlog() == OutboxBacklog(pending=3, retrying=1, dead=0)
++
++
+ @pytest.mark.unit
+ def test_retry_delay_grows_exponentially_and_is_capped() -> None:
+     default = RetryPolicy()
+@@ -401,6 +418,69 @@ def test_dispatcher_ends_the_round_at_the_first_failure() -> None:
+     assert failed.last_error == "ConnectionError: refused"
+ 
+ 
++@pytest.mark.unit
++def test_dispatcher_reports_each_attempt_after_recording_its_outcome() -> None:
++    """on_attempt 收到每次尝试的结果时，结果已经写入数据库。"""
++    outbox = Outbox()
++    _put(
++        outbox,
++        _make_event("evt-ok").model_copy(update={"created_at": 1.0}),
++        _make_event("evt-bad").model_copy(update={"created_at": 2.0}),
++    )
++    now = 100.0
++    seen: list[tuple[PublishOutcome, OutboxBacklog]] = []
++
++    def publisher(event: OutboxEvent) -> None:
++        if event.event_id == "evt-bad":
++            raise ConnectionError("refused")
++
++    dispatcher = Dispatcher(
++        outbox,
++        publisher,
++        retry=RetryPolicy(max_attempts=2, base_delay=1.0),
++        clock=lambda: now,
++        on_attempt=lambda outcome: seen.append((outcome, outbox.backlog())),
++    )
++    assert _run(dispatcher.dispatch_once()) == 1
++    now = 101.0
++    assert _run(dispatcher.dispatch_once()) == 0
++
++    assert seen == [
++        (PublishOutcome.PUBLISHED, OutboxBacklog(pending=1, retrying=0, dead=0)),
++        (PublishOutcome.FAILED, OutboxBacklog(pending=0, retrying=1, dead=0)),
++        (PublishOutcome.DEAD, OutboxBacklog(pending=0, retrying=0, dead=1)),
++    ]
++
++
++@pytest.mark.unit
++def test_dispatcher_does_not_report_an_attempt_whose_outcome_was_not_recorded(
++    monkeypatch,
++) -> None:
++    """发布成功但未能标记的事件不报告；它仍待发布，再次发布并标记之后才报告一次。"""
++    outbox = Outbox()
++    _put(outbox, _make_event("evt-1"))
++    real_mark_published = outbox.mark_published
++    calls = 0
++
++    def flaky_mark_published(*args, **kwargs):
++        nonlocal calls
++        calls += 1
++        if calls == 1:
++            raise sqlite3.OperationalError("database is locked")
++        return real_mark_published(*args, **kwargs)
++
++    monkeypatch.setattr(outbox, "mark_published", flaky_mark_published)
++    outcomes: list[PublishOutcome] = []
++    dispatcher = Dispatcher(outbox, lambda event: None, on_attempt=outcomes.append)
++
++    with pytest.raises(sqlite3.OperationalError):
++        _run(dispatcher.dispatch_once())
++    assert outcomes == []
++    assert outbox.get("evt-1").status == OutboxStatus.PENDING
++    assert _run(dispatcher.dispatch_once()) == 1
++    assert outcomes == [PublishOutcome.PUBLISHED]
++
++
+ @pytest.mark.unit
+ @pytest.mark.parametrize("kwargs", [{"poll_interval": 0}, {"batch_size": 0}])
+ def test_dispatcher_rejects_invalid_settings(kwargs) -> None:
+diff --git a/tests/unit/controlplane/test_telemetry.py b/tests/unit/controlplane/test_telemetry.py
+index 17c0485..1fd9551 100644
+--- a/tests/unit/controlplane/test_telemetry.py
++++ b/tests/unit/controlplane/test_telemetry.py
+@@ -1,4 +1,4 @@
+-"""控制平面的指标：协调结果与耗时、重试、部署结果，以及抓取时读取的状态类指标。"""
++"""控制平面的指标：协调结果与耗时、重试、部署结果、Outbox 的发布尝试，以及抓取时读取的状态类指标。"""
+ 
+ from __future__ import annotations
+ 
+@@ -12,6 +12,7 @@ from typing import Any
+ import pytest
+ from forgemesh.controlplane.controller import ControllerManager, WorkQueue
+ from forgemesh.controlplane.metrics import MetricsRegistry
++from forgemesh.controlplane.outbox import PublishOutcome, RetryPolicy
+ from forgemesh.controlplane.registry import ResourceKey, SQLiteRegistry
+ from forgemesh.controlplane.scheduler import Inventory
+ from forgemesh.controlplane.telemetry import ControllerMetrics, ControlPlaneMetrics
+@@ -226,6 +227,28 @@ def test_deployments_count_transitions_into_ready_or_failed_with_bounded_reasons
+     }
+ 
+ 
++@pytest.mark.unit
++def test_publish_attempts_are_counted_by_outcome_starting_from_zero() -> None:
++    metrics = ControlPlaneMetrics()
++    name = "forgemesh_outbox_publish_attempts_total"
++    initial = parse(metrics.registry.render())[name]
++    for outcome in (PublishOutcome.PUBLISHED, PublishOutcome.PUBLISHED, PublishOutcome.FAILED):
++        metrics.outbox.attempted(outcome)
++    attempts = parse(metrics.registry.render())[name]
++
++    assert initial.type == "counter"
++    assert {s.labels["outcome"]: s.value for s in initial.samples} == {
++        "published": 0,
++        "failed": 0,
++        "dead": 0,
++    }
++    assert {s.labels["outcome"]: s.value for s in attempts.samples} == {
++        "published": 2,
++        "failed": 1,
++        "dead": 0,
++    }
++
++
+ @pytest.mark.unit
+ def test_state_metrics_are_read_at_scrape_time_without_tenant_data() -> None:
+     definition = WorkflowDefinition(name="deploy", steps=[Step(id="launch", uses="launch")])
+@@ -306,8 +329,14 @@ def test_state_metrics_are_read_at_scrape_time_without_tenant_data() -> None:
+         "delayed": 0,
+         "processing": 0,
+     }
++    events = families["forgemesh_outbox_events"]
++    assert {s.labels["state"]: s.value for s in events.samples} == {
++        "pending": 5,
++        "retrying": 0,
++        "dead": 0,
++    }
+     lock_wait_count = "forgemesh_database_lock_wait_seconds_count"
+-    assert families["forgemesh_database_lock_wait_seconds"].value(lock_wait_count) == 2
++    assert families["forgemesh_database_lock_wait_seconds"].value(lock_wait_count) == 3
+     for hidden in ("tenant-", NAMESPACE, "svc-", "uid-", "node-", "gpu-", "run-"):
+         assert hidden not in watched
+ 
+@@ -318,9 +347,10 @@ def test_state_metrics_are_read_at_scrape_time_without_tenant_data() -> None:
+         "forgemesh_accelerator_devices",
+         "forgemesh_workflow_runs",
+         "forgemesh_controller_queue_depth",
++        "forgemesh_outbox_events",
+     ):
+         assert after[name].samples == []
+-    assert after["forgemesh_database_lock_wait_seconds"].value(lock_wait_count) == 2
++    assert after["forgemesh_database_lock_wait_seconds"].value(lock_wait_count) == 3
+ 
+ 
+ @pytest.mark.unit
+@@ -339,14 +369,55 @@ def test_state_metrics_from_an_unavailable_registry_are_dropped(caplog) -> None:
+         available, unavailable = _run(scenario())
+ 
+     assert parse(available)["forgemesh_inference_services"].value(phase="Pending") == 1
++    assert parse(available)["forgemesh_outbox_events"].value(state="pending") == 1
+     families = parse(unavailable)
+     assert families["forgemesh_inference_services"].samples == []
+     assert families["forgemesh_allocations_active"].samples == []
+     assert families["forgemesh_workflow_runs"].samples == []
++    assert families["forgemesh_outbox_events"].samples == []
+     assert families["forgemesh_controller_queue_depth"].value(state="ready") == 0
+     assert "metrics collector" in caplog.text
+ 
+ 
++@pytest.mark.unit
++def test_the_outbox_backlog_is_read_by_state_at_scrape_time() -> None:
++    async def scenario() -> tuple[str, str]:
++        registry = SQLiteRegistry()
++        metrics = ControlPlaneMetrics()
++        manager = ControllerManager(registry, StubReconciler(), metrics=metrics.controller)
++        for name in ("svc-a", "svc-b", "svc-c"):
++            await registry.put(_service(name))
++        unwatch = metrics.watch(registry, manager)
++        before = await metrics.registry.scrape()
++        retried, dead, _ = await asyncio.to_thread(registry.outbox.get_pending)
++        await asyncio.to_thread(registry.outbox.mark_failed, retried.event_id, "refused")
++        await asyncio.to_thread(
++            registry.outbox.mark_failed,
++            dead.event_id,
++            "refused",
++            policy=RetryPolicy(max_attempts=1),
++        )
++        after = await metrics.registry.scrape()
++        unwatch()
++        await registry.close()
++        return before, after
++
++    before, after = _run(scenario())
++    initial = parse(before)["forgemesh_outbox_events"]
++    events = parse(after)["forgemesh_outbox_events"]
++    assert initial.type == "gauge"
++    assert {s.labels["state"]: s.value for s in initial.samples} == {
++        "pending": 3,
++        "retrying": 0,
++        "dead": 0,
++    }
++    assert {s.labels["state"]: s.value for s in events.samples} == {
++        "pending": 1,
++        "retrying": 1,
++        "dead": 1,
++    }
++
++
+ @pytest.mark.unit
+ def test_lock_wait_covers_every_store_sharing_the_registry_database() -> None:
+     async def scenario() -> tuple[str, str]:
+-- 
+2.43.0
+

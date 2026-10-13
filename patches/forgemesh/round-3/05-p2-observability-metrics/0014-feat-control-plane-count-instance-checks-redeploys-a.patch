@@ -1,0 +1,1169 @@
+From e91ce746c96abb8736dea5a12a74c65118338a47 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 13 Oct 2026 11:51:20 +0000
+Subject: [PATCH 14/17] feat(control-plane): count instance checks, redeploys
+ and reclaims
+
+The runtime health work checks deployed instances at startup and
+periodically, redeploys services whose instance is gone with a backoff
+and reclaims allocations whose owner no longer exists, but none of it
+showed up in /metrics: how often instances are lost, whether the
+periodic check keeps failing or whether orphaned allocations cannot be
+reclaimed could only be read from the logs.
+
+Add four counters with fixed enum labels only, every label combination
+starting at zero:
+
+- forgemesh_instance_checks_total{outcome}: periodic checks by the
+  controller, completed or failed (the startup check is not counted,
+  the control plane does not start when it fails);
+- forgemesh_instance_check_results_total{check,result}: services a
+  check reached a result for (lost, back or conflict), at startup or
+  periodically;
+- forgemesh_lost_instance_redeploys_total: redeployment runs started
+  for services whose instance is gone; rounds deferred by the backoff
+  are not counted;
+- forgemesh_orphaned_allocation_reclaims_total{outcome}: reclaimed, or
+  failed and kept for the next resync.
+
+check_instances and reclaim_orphaned_allocations report through a new
+keyword-only on_result callback and ReconciliationController takes an
+on_redeploy callback, so the deployment and reconciler modules stay
+free of metrics; the app wires them to ControllerMetrics. Nothing
+changes when the callbacks are not given.
+---
+ CHANGELOG.md                                  |   1 +
+ README.md                                     |   6 +
+ .../src/forgemesh/controlplane/app.py         |  26 +++-
+ .../controlplane/controller/manager.py        |   7 +-
+ .../controlplane/deployment/__init__.py       |   4 +
+ .../controlplane/deployment/recovery.py       |  57 ++++++++-
+ .../forgemesh/controlplane/reconciler/core.py |   6 +
+ .../src/forgemesh/controlplane/telemetry.py   |  86 ++++++++++++-
+ .../controlplane/test_controller_manager.py   |  24 +++-
+ .../controlplane/test_deployment_lifecycle.py | 120 +++++++++++++++---
+ .../controlplane/test_metrics_endpoint.py     | 100 +++++++++++++--
+ tests/unit/controlplane/test_telemetry.py     |  57 ++++++++-
+ 12 files changed, 447 insertions(+), 47 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index c666f40..3687f6a 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -64,6 +64,7 @@
+ - `forgemesh.controlplane.sqlite.Database`：一个 SQLite 连接加一把可重入锁。Registry、Outbox 与审计日志共用一个实例，资源写入与它的事件、审计记录在同一个事务中提交或回滚（ADR-008 的工作单元）：`transaction()` 以 `BEGIN IMMEDIATE` 开始，`call()` / `run()` 在函数抛出异常时回滚它未提交的写入，并拒绝留下未结束的事务。`TaskStore`、`AuditLog` 与 `IdempotentConsumer` 都可以经 `database=` 共用连接。
+ - 控制平面 `GET /metrics`：以 Prometheus 文本格式 0.0.4 输出聚合指标，不引入新依赖（`forgemesh.controlplane.metrics`：计数器、仪表盘与直方图，每个指标最多 200 个标签组合，超出的计入标签全为 `overflow` 的一个序列）。指标定义在 `forgemesh.controlplane.telemetry`：`forgemesh_http_requests_total{method,route,status}` 与 `forgemesh_http_request_duration_seconds{method,route}`（`route` 为路由模板，未匹配路由的请求记为 `unmatched`）、`forgemesh_reconcile_total{operation,outcome}` 与 `forgemesh_reconcile_duration_seconds{operation}`、`forgemesh_controller_retries_total`、`forgemesh_controller_queue_depth{state}`、`forgemesh_deployments_total{outcome,reason}`（推理服务进入 `Ready` / `Failed` 的次数）、`forgemesh_inference_services{phase}`、`forgemesh_allocations_active{accelerator_type}`、`forgemesh_accelerator_devices{accelerator_type,state}`、`forgemesh_workflow_runs{status}` 与 `forgemesh_database_lock_wait_seconds`（控制平面数据库的操作等待连接锁的时间，注册中心、Outbox 与审计记录共用这个连接与锁），状态类指标在抓取时读取。`/metrics` 与探针一样不要求认证，只输出跨租户聚合的数据，标签不含租户、名称、命名空间、uid 或地址；它不在 `/api/v1` 之下，网关不转发。OpenAPI 新增 `/metrics`（`security: []`）。为此 `ControllerManager` 新增可选参数 `metrics` 与 `queue_depth()`（工作队列新增 `depth()`），`SQLiteRegistry` 新增 `count_by_phase`、`active_allocation_devices` 与 `database` 属性，`Database` 新增 `set_lock_wait_observer`，`WorkflowStore` 新增 `count_runs_by_status`。指标说明见 README「可观测性」。
+ - 控制平面的 Outbox 指标：`forgemesh_outbox_events{state}`（抓取时读取的未发布事件数，`state` 为 `pending`（尚未发布失败过）/ `retrying`（发布失败过、等待重试）/ `dead`）与 `forgemesh_outbox_publish_attempts_total{outcome}`（Dispatcher 发布事件的尝试次数，在结果写入数据库之后计数，`outcome` 为 `published` / `failed`（将重试）/ `dead`（最后一次失败），三个取值都从 0 开始输出）。为此 `Outbox` 新增 `backlog()`（返回 `OutboxBacklog`，只读取 `pending` 与 `dead` 的行），`Dispatcher` 新增仅限关键字参数 `on_attempt`（每次发布尝试的结果写入数据库之后以 `PublishOutcome` 调用，未能写入时不调用）。
++- 控制平面核对实例、重新部署与回收孤立分配的指标：`forgemesh_instance_checks_total{outcome}`（控制器定期核对实例的次数，`completed` / `failed`；启动时的核对不计入，它失败时控制平面不会启动）、`forgemesh_instance_check_results_total{check,result}`（核对实例得出结论的服务数，`check` 为 `startup` / `periodic`，`result` 为 `lost`（服务转为 `Degraded`）/ `back`（`Degraded` 服务的实例全部又在运行）/ `conflict`（服务在核对期间被修改或删除，没有报告））、`forgemesh_lost_instance_redeploys_total`（为实例已不在运行的服务启动重新部署运行的次数，退避期间推迟的协调不计入）与 `forgemesh_orphaned_allocation_reclaims_total{outcome}`（`reclaimed` / `failed`：没能停止实例，分配保留，下一次全量同步之后重试）；每个标签组合都从 0 开始输出，未设置启动器时保持为 0。为此 `check_instances` 与 `reclaim_orphaned_allocations` 新增仅限关键字参数 `on_result`（以每个服务的 `InstanceCheckResult` / 每个分配的 `ReclaimOutcome` 调用），`ReconciliationController` 新增参数 `on_redeploy`（启动重新部署运行之后调用）。
+ - 网关 `GET /metrics`（`internal/metrics`，只用标准库，文本格式与标签上限同上）：`forgemesh_gateway_http_requests_total{route,status}` 与 `forgemesh_gateway_http_request_duration_seconds{route}`（`route` 为按路由表确定的路由类别 `probe` / `metrics` / `control_plane` / `inference` / `unmatched`，不取请求路径；含 Recovery 兜底的 `500`）、`forgemesh_gateway_stream_first_byte_seconds`（流式代理从开始处理请求到写出实例的第一个响应字节，只统计实例返回 2xx 的流）、`forgemesh_gateway_upstream_errors_total{upstream,kind}`（`control_plane` / `instance`；`connect` / `status`（5xx）/ `body` / `address_not_allowed` / `invalid_endpoint`，客户端已断开的请求不计）、`forgemesh_gateway_rate_limited_total`、`forgemesh_gateway_resolver_lookups_total{result}`（`hit` / `miss` / `coalesced`）与 `forgemesh_gateway_instances{state}`（Resolver 缓存中 `healthy` / `unhealthy` 的实例数）。与探针一样不经过认证与限流，只输出聚合数据，见网关 README「可观测性」。
+ - W3C Trace Context：网关的 `TraceContext` 中间件沿用请求中恰好一个合法的 `traceparent`（连同 `tracestate`），否则（缺失、不合法或多个）生成新的 `traceparent`（版本 `00`，flags `00`）并丢弃 `tracestate`；确定的 `traceparent` 随请求转发给控制平面（资源反代与 Resolver 的查询）与推理实例，响应不回写。控制平面的 `RequestContextMiddleware` 按同样的规则确定 trace-id，沿用 `X-Correlation-Id`（缺失时生成一次并写回请求头，路由回显的、审计记录与资源变更事件中的关联 ID 因此与日志一致），在请求处理期间绑定两者，这个请求的日志与错误信封都带上它们。两边都不记录 span、不导出追踪，OTLP 导出留待后续。错误信封新增可选字段 `traceId`（OpenAPI `Error.traceId`，32 个小写十六进制字符），网关与控制平面一致。
+ - 网关访问日志：每个 `/api/v1` 请求与没有匹配路由的请求输出一行 `access method=… path="…" status=… duration=… corr=<关联 ID> trace=<trace-id>`（路径加引号转义、不含查询串；流式请求的 `duration` 是整个流的时长；处理器在写出响应头之前 panic 时记 `500`），位于认证与限流之前，被拒绝的请求同样记录；探针与 `/metrics` 不记录。反代与流式代理的错误日志、Recovery 的 panic 日志同样带 `trace=`。
+diff --git a/README.md b/README.md
+index a072a00..7ba9c84 100644
+--- a/README.md
++++ b/README.md
+@@ -419,6 +419,10 @@ curl -s http://127.0.0.1:8081/metrics   # 网关
+ | `forgemesh_controller_retries_total` | counter | 协调抛出异常、按退避重新排队的次数 |
+ | `forgemesh_controller_queue_depth{state}` | gauge | 工作队列中的键数：`ready`（可立即处理）/ `delayed`（等待延迟到期）/ `processing` |
+ | `forgemesh_deployments_total{outcome,reason}` | counter | 推理服务进入 `Ready`（`outcome="ready"`）或 `Failed`（`outcome="failed"`）的次数，`reason` 为 `Ready` 条件的原因 |
++| `forgemesh_instance_checks_total{outcome}` | counter | 控制器定期核对实例的次数：`completed` / `failed`（下一个周期重试）；启动时的核对不计入（它失败时控制平面不会启动） |
++| `forgemesh_instance_check_results_total{check,result}` | counter | 核对实例得出结论的服务数：`check` 为 `startup`（启动时）/ `periodic`（定期）；`result` 为 `lost`（实例已不在运行，服务转为 `Degraded`）/ `back`（`Degraded` 服务的实例全部又在运行，交给协调器转回 `Ready`，转回之前每次核对都计入）/ `conflict`（服务在核对期间被修改或删除，没有报告） |
++| `forgemesh_lost_instance_redeploys_total` | counter | 为实例已不在运行的服务启动重新部署运行的次数；退避期间推迟的协调不计入 |
++| `forgemesh_orphaned_allocation_reclaims_total{outcome}` | counter | 回收孤立分配的次数：`reclaimed`（实例已停止，分配已过期）/ `failed`（没能停止实例，分配保留，下一次全量同步之后重试） |
+ | `forgemesh_inference_services{phase}` | gauge | 各阶段的推理服务数 |
+ | `forgemesh_allocations_active{accelerator_type}` | gauge | Active 分配数，按其设备在清单中的类型 |
+ | `forgemesh_accelerator_devices{accelerator_type,state}` | gauge | 清单中的设备数，`state` 为 `free` / `allocated`；未配置清单时没有样本 |
+@@ -427,6 +431,8 @@ curl -s http://127.0.0.1:8081/metrics   # 网关
+ | `forgemesh_outbox_publish_attempts_total{outcome}` | counter | 发布事件的尝试次数，在结果写入数据库之后计数：`published` / `failed`（将重试）/ `dead`（最后一次失败）；三个取值都从 0 开始输出 |
+ | `forgemesh_database_lock_wait_seconds` | histogram | 控制平面数据库的一次操作等待连接锁的时间：注册中心、Outbox（含事件发布）与审计记录共用这个连接与锁（不含 SQLite 内部的忙等待） |
+ 
++核对实例、重新部署与回收孤立分配的四个计数器的每个标签组合都从 0 开始输出，未设置启动器时保持为 0。
++
+ **追踪上下文与日志**：网关沿用请求中合法的 W3C `traceparent`，否则生成一个，随请求转发给控制平面与推理实例。控制平面按同样的规则读取 `traceparent`（直连控制平面的请求同样适用），并沿用 `X-Correlation-Id`（缺失时生成，审计记录与资源变更事件使用同一个关联 ID），这个请求的日志与错误信封（`{"error": {"code", "message", "correlationId", "traceId", …}}`）都带上 trace-id 与关联 ID，一次请求在网关与控制平面的日志里可以按 trace-id 对上。控制平面的日志写到标准错误，默认每行一个 JSON 对象，uvicorn 的访问日志也是如此：
+ 
+ ```json
+diff --git a/packages/control-plane/src/forgemesh/controlplane/app.py b/packages/control-plane/src/forgemesh/controlplane/app.py
+index 7e1fa17..364e32c 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/app.py
++++ b/packages/control-plane/src/forgemesh/controlplane/app.py
+@@ -101,7 +101,7 @@ from .publishers import publisher_from_env
+ from .reconciler import ProcessedKeyStore, ReconciliationController
+ from .scheduler import INVENTORY_FILE_ENV, FirstFitScheduler, inventory_from_env
+ from .sqlite import workflow_db_path
+-from .telemetry import ControllerMetrics, ControlPlaneMetrics
++from .telemetry import ControllerMetrics, ControlPlaneMetrics, InstanceCheck
+ from .tracecontext import current_correlation_id, current_trace_id
+ from .version import CONTROL_PLANE_VERSION
+ 
+@@ -225,6 +225,7 @@ def _build_controller(
+         if runtime is not None and launcher is not None
+         else None
+     )
++    metrics = metrics if metrics is not None else ControllerMetrics()
+     reconciler = ReconciliationController(
+         registry,
+         policy,
+@@ -235,12 +236,22 @@ def _build_controller(
+         record_dedup_keys=False,
+         workflow_poll_interval=WORKFLOW_POLL_INTERVAL_SECONDS,
+         launcher=launcher,
++        on_redeploy=metrics.lost_instance_redeployed,
+     )
+     instance_check = (
+-        functools.partial(check_instances, registry, launcher) if launcher is not None else None
++        functools.partial(
++            check_instances,
++            registry,
++            launcher,
++            on_result=functools.partial(metrics.instance_check_result, InstanceCheck.PERIODIC),
++        )
++        if launcher is not None
++        else None
+     )
+     reclaim = (
+-        functools.partial(reclaim_orphaned_allocations, registry, release)
++        functools.partial(
++            reclaim_orphaned_allocations, registry, release, on_result=metrics.reclaim_attempted
++        )
+         if release is not None
+         else None
+     )
+@@ -345,7 +356,14 @@ if _FASTAPI_AVAILABLE:
+                     )
+                     await launcher.start()
+                     resumed = await runtime.recover()
+-                    checked = await check_instances(registry, launcher, after_restart=True)
++                    checked = await check_instances(
++                        registry,
++                        launcher,
++                        after_restart=True,
++                        on_result=functools.partial(
++                            metrics.controller.instance_check_result, InstanceCheck.STARTUP
++                        ),
++                    )
+                     logger.info(
+                         "deployments recovered: %d unfinished run(s) resumed, %d service(s) "
+                         "whose instance is gone or back handed to the controller",
+diff --git a/packages/control-plane/src/forgemesh/controlplane/controller/manager.py b/packages/control-plane/src/forgemesh/controlplane/controller/manager.py
+index f2076dd..41ca739 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/controller/manager.py
++++ b/packages/control-plane/src/forgemesh/controlplane/controller/manager.py
+@@ -46,7 +46,7 @@ from forgemesh.core.reconciler import ReconcileContext
+ from ..deployment import DEFAULT_INSTANCE_CHECK_INTERVAL_SECONDS
+ from ..reconciler import ReconciliationController, compute_dedup_key
+ from ..registry import ChangeType, ResourceKey, SQLiteRegistry
+-from ..telemetry import ControllerMetrics, ReconcileOutcome
++from ..telemetry import ControllerMetrics, InstanceCheckOutcome, ReconcileOutcome
+ from .queue import WorkQueue
+ 
+ logger = logging.getLogger(__name__)
+@@ -99,7 +99,7 @@ class ControllerManager:
+         instance_check_interval: 两次核对实例之间的秒数。
+         reclaim: 可选，回收孤立分配的协程函数（返回值不使用）。
+         queue: 工作队列；为空时新建（测试可注入）。
+-        metrics: 协调与队列的指标；为空时新建（不会被导出）。
++        metrics: 协调、队列与定期核对实例的指标；为空时新建（不会被导出）。
+     """
+ 
+     def __init__(
+@@ -364,7 +364,10 @@ class ControllerManager:
+             try:
+                 await self.check_instances()
+             except Exception:  # noqa: BLE001 - 下一个周期重试
++                self._metrics.instance_check_finished(InstanceCheckOutcome.FAILED)
+                 logger.exception("controller instance check failed")
++            else:
++                self._metrics.instance_check_finished(InstanceCheckOutcome.COMPLETED)
+ 
+ 
+ __all__ = ["DEFAULT_KINDS", "ControllerManager"]
+diff --git a/packages/control-plane/src/forgemesh/controlplane/deployment/__init__.py b/packages/control-plane/src/forgemesh/controlplane/deployment/__init__.py
+index ace52b1..64c466e 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/deployment/__init__.py
++++ b/packages/control-plane/src/forgemesh/controlplane/deployment/__init__.py
+@@ -39,6 +39,8 @@ from .process_records import record_file_path
+ from .recovery import (
+     DEFAULT_INSTANCE_CHECK_INTERVAL_SECONDS,
+     INSTANCE_LOST_REASON,
++    InstanceCheckResult,
++    ReclaimOutcome,
+     check_instances,
+     reclaim_orphaned_allocations,
+ )
+@@ -74,9 +76,11 @@ __all__ = [
+     "DeploymentSteps",
+     "FakeLauncher",
+     "InMemoryLauncher",
++    "InstanceCheckResult",
+     "LaunchRequest",
+     "LaunchedInstance",
+     "LauncherConfigError",
++    "ReclaimOutcome",
+     "RuntimeLauncher",
+     "StepCallable",
+     "TGIProcessLauncher",
+diff --git a/packages/control-plane/src/forgemesh/controlplane/deployment/recovery.py b/packages/control-plane/src/forgemesh/controlplane/deployment/recovery.py
+index cd139aa..eba5036 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/deployment/recovery.py
++++ b/packages/control-plane/src/forgemesh/controlplane/deployment/recovery.py
+@@ -26,6 +26,8 @@
+ from __future__ import annotations
+ 
+ import logging
++from collections.abc import Callable
++from enum import StrEnum
+ from typing import TYPE_CHECKING
+ 
+ from forgemesh.core.errors import ConflictError, NotFoundError
+@@ -47,6 +49,27 @@ DEFAULT_INSTANCE_CHECK_INTERVAL_SECONDS = 10.0
+ _KIND = "InferenceService"
+ 
+ 
++class InstanceCheckResult(StrEnum):
++    """:func:`check_instances` 对一个服务的结论（``on_result`` 收到的参数）。"""
++
++    #: ``Ready`` 服务的实例已不在运行，服务已转为 ``Degraded``。
++    LOST = "lost"
++    #: ``Degraded`` 服务的实例全部在运行（实例回来了），交给协调器转回 ``Ready``。
++    BACK = "back"
++    #: 实例已不在运行，但服务在核对期间被修改或删除，没有报告。
++    CONFLICT = "conflict"
++
++
++class ReclaimOutcome(StrEnum):
++    """:func:`reclaim_orphaned_allocations` 对一个孤立分配的处理结果（``on_result`` 收到的
++    参数）。"""
++
++    #: 停止了所属 uid 的部署，分配已过期。
++    RECLAIMED = "reclaimed"
++    #: 没能停止所属 uid 的部署，分配保留，下次回收时重试。
++    FAILED = "failed"
++
++
+ def _describe(endpoint: Endpoint) -> str:
+     if endpoint.instanceId is None:
+         return f"the instance at {endpoint.url}"
+@@ -58,7 +81,11 @@ async def _running(launcher: RuntimeLauncher, endpoint: Endpoint) -> bool:
+ 
+ 
+ async def check_instances(
+-    registry: SQLiteRegistry, launcher: RuntimeLauncher, *, after_restart: bool = False
++    registry: SQLiteRegistry,
++    launcher: RuntimeLauncher,
++    *,
++    after_restart: bool = False,
++    on_result: Callable[[InstanceCheckResult], None] | None = None,
+ ) -> list[ResourceKey]:
+     """核对 ``Ready`` / ``Degraded`` 服务的实例，返回要交给协调器处理的服务。
+ 
+@@ -70,8 +97,14 @@ async def check_instances(
+       协调器转回 ``Ready``。
+ 
+     写入以读到的版本做 CAS，资源在此期间被修改或删除时跳过它；不修改
+-    ``observedGeneration``。
++    ``observedGeneration``。``on_result`` 以每个服务的结论调用（如计入指标），实例都在运行的
++    服务没有结论。
+     """
++
++    def report(result: InstanceCheckResult) -> None:
++        if on_result is not None:
++            on_result(result)
++
+     found: list[ResourceKey] = []
+     for key in await registry.list_resource_keys([_KIND]):
+         try:
+@@ -85,6 +118,7 @@ async def check_instances(
+         endpoints = resource.status.endpoints
+         if phase == InferencePhase.DEGRADED:
+             if endpoints and all([await _running(launcher, endpoint) for endpoint in endpoints]):
++                report(InstanceCheckResult.BACK)
+                 found.append(key)
+             continue
+         if phase != InferencePhase.READY:
+@@ -135,6 +169,7 @@ async def check_instances(
+                 key.tenant_id,
+                 exc,
+             )
++            report(InstanceCheckResult.CONFLICT)
+             continue
+         logger.warning(
+             "service degraded, its instance is gone: %s; kind=%s namespace=%s name=%s uid=%s "
+@@ -146,20 +181,30 @@ async def check_instances(
+             meta.uid,
+             key.tenant_id,
+         )
++        report(InstanceCheckResult.LOST)
+         found.append(key)
+     return found
+ 
+ 
+ async def reclaim_orphaned_allocations(
+-    registry: SQLiteRegistry, releaser: DeploymentReleaser
++    registry: SQLiteRegistry,
++    releaser: DeploymentReleaser,
++    *,
++    on_result: Callable[[ReclaimOutcome], None] | None = None,
+ ) -> list[str]:
+     """回收归属资源（同租户、同 uid）已不存在的 Active 分配，返回回收的分配 id。
+ 
+     逐个分配：先经 ``releaser`` 取消这个 uid 的部署运行、停止实例，再把分配标记为
+     ``Expired``，设备随之空闲。停止失败时保留分配，下次回收时重试；uid 的部署运行也已不在
+     （如工作流数据库被重置）时无从停止实例，分配照样回收。标记与再次确认归属资源不存在在同一
+-    条语句中完成。
++    条语句中完成。``on_result`` 以每个分配的处理结果调用（如计入指标），分配在此期间已不是
++    Active 时没有结果。
+     """
++
++    def report(outcome: ReclaimOutcome) -> None:
++        if on_result is not None:
++            on_result(outcome)
++
+     reclaimed: list[str] = []
+     for allocation in await registry.list_orphaned_allocations():
+         allocation_id = allocation["id"]
+@@ -176,6 +221,7 @@ async def reclaim_orphaned_allocations(
+                 uid,
+                 exc,
+             )
++            report(ReclaimOutcome.FAILED)
+             continue
+         if not await registry.expire_orphaned_allocation(allocation_id):
+             continue
+@@ -188,6 +234,7 @@ async def reclaim_orphaned_allocations(
+             uid,
+             devices or "none",
+         )
++        report(ReclaimOutcome.RECLAIMED)
+         reclaimed.append(allocation_id)
+     return reclaimed
+ 
+@@ -195,6 +242,8 @@ async def reclaim_orphaned_allocations(
+ __all__ = [
+     "DEFAULT_INSTANCE_CHECK_INTERVAL_SECONDS",
+     "INSTANCE_LOST_REASON",
++    "InstanceCheckResult",
++    "ReclaimOutcome",
+     "check_instances",
+     "reclaim_orphaned_allocations",
+ ]
+diff --git a/packages/control-plane/src/forgemesh/controlplane/reconciler/core.py b/packages/control-plane/src/forgemesh/controlplane/reconciler/core.py
+index eafb3ee..85f8ad1 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/reconciler/core.py
++++ b/packages/control-plane/src/forgemesh/controlplane/reconciler/core.py
+@@ -312,6 +312,8 @@ class ReconciliationController(Reconciler):
+             :meth:`~forgemesh.controlplane.deployment.RuntimeLauncher.is_running` 确认实例
+             仍在运行，否则重新部署（未注入时视为实例在运行）。
+         clock: 单调时钟（秒），用于重新部署的退避；默认 :func:`time.monotonic`。
++        on_redeploy: 可选，为实例已不在运行的服务启动重新部署运行之后调用（如计入指标）；
++            退避期间推迟的协调不调用。
+ 
+     Raises:
+         ValueError: 注入了工作流运行时却没有 ``release_provider``，或
+@@ -331,6 +333,7 @@ class ReconciliationController(Reconciler):
+         workflow_poll_interval: float = 2.0,
+         launcher: RuntimeLauncher | None = None,
+         clock: Callable[[], float] = time.monotonic,
++        on_redeploy: Callable[[], None] | None = None,
+     ) -> None:
+         if workflow_runtime is not None and release_provider is None:
+             raise ValueError(
+@@ -350,6 +353,7 @@ class ReconciliationController(Reconciler):
+         self._poll_interval = workflow_poll_interval
+         self._launcher = launcher
+         self._clock = clock
++        self._on_redeploy = on_redeploy
+         # 已处理的去重键（内存级回退路径；processed_store 注入时以 SQLite
+         # 持久化为准——architecture §5.5 不依赖单进程内存状态）。
+         self._processed_keys: set[str] = set()
+@@ -872,6 +876,8 @@ class ReconciliationController(Reconciler):
+         if isinstance(started, ReconcileResult):
+             return started
+         self._record_redeploy(meta.uid, meta.generation)
++        if self._on_redeploy is not None:
++            self._on_redeploy()
+         logger.warning(
+             "redeploying a service whose instance is gone: run_id=%s attempt=%d kind=%s "
+             "namespace=%s name=%s uid=%s generation=%s tenant_id=%s correlation_id=%s",
+diff --git a/packages/control-plane/src/forgemesh/controlplane/telemetry.py b/packages/control-plane/src/forgemesh/controlplane/telemetry.py
+index d7f9323..d4fac72 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/telemetry.py
++++ b/packages/control-plane/src/forgemesh/controlplane/telemetry.py
+@@ -17,6 +17,19 @@
+   （``outcome="ready"``）或 ``Failed``（``outcome="failed"``）的次数，在 status 写入成功后
+   计数；``reason`` 为 ``Ready`` 条件的原因（如 ``Reconciled`` / ``WorkflowFailed``），不是
+   标识符形式时记为 ``Unknown``。
++* ``forgemesh_instance_checks_total{outcome}``：控制器定期核对实例的次数，``outcome`` 见
++  :class:`InstanceCheckOutcome`，每个取值都从 0 开始输出；启动时的核对不计入（它失败时
++  控制平面不会启动）。
++* ``forgemesh_instance_check_results_total{check,result}``：核对实例得出结论的服务数，
++  ``check`` 见 :class:`InstanceCheck`，``result`` 见
++  :class:`~forgemesh.controlplane.deployment.InstanceCheckResult`，每个组合都从 0 开始输出；
++  实例回来了的服务在协调器把它转回 ``Ready`` 之前，每次核对都会计入。
++* ``forgemesh_lost_instance_redeploys_total``：为实例已不在运行的服务（``Degraded``，以及
++  运行成功之后实例丢失的 ``Verifying`` / ``Updating``）启动重新部署运行的次数，从 0 开始
++  输出；退避期间推迟的协调不计入。
++* ``forgemesh_orphaned_allocation_reclaims_total{outcome}``：回收孤立分配的次数，``outcome``
++  见 :class:`~forgemesh.controlplane.deployment.ReclaimOutcome`（``failed`` 的分配保留，
++  下一次全量同步之后重试），每个取值都从 0 开始输出。
+ * ``forgemesh_inference_services{phase}``：各阶段的推理服务数，每个阶段都输出。
+ * ``forgemesh_allocations_active{accelerator_type}``：Active 分配数，按其设备在加速器清单中的
+   类型；设备不在清单中（或类型不一）时记为 ``unknown``，没有设备的分配记为 ``none``。
+@@ -53,6 +66,7 @@ from typing import TYPE_CHECKING, Any
+ from forgemesh.resource.inference import InferencePhase
+ from forgemesh.workflow.states import WorkflowStatus
+ 
++from .deployment import InstanceCheckResult, ReclaimOutcome
+ from .metrics import MetricsRegistry
+ from .outbox import PublishOutcome
+ 
+@@ -107,6 +121,25 @@ class ReconcileOutcome(StrEnum):
+         return cls.REQUEUE if result.requeue_after is not None else cls.WAIT
+ 
+ 
++class InstanceCheck(StrEnum):
++    """哪一次核对实例（``forgemesh_instance_check_results_total`` 的 ``check`` 标签）。"""
++
++    #: 应用启动时、启动控制器之前的核对。
++    STARTUP = "startup"
++    #: 控制器的定期核对。
++    PERIODIC = "periodic"
++
++
++class InstanceCheckOutcome(StrEnum):
++    """控制器一次定期核对实例的结果（``forgemesh_instance_checks_total`` 的 ``outcome``
++    标签）。"""
++
++    #: 核对完成，得出结论的服务已加入工作队列。
++    COMPLETED = "completed"
++    #: 核对抛出异常（下一个周期重试）。
++    FAILED = "failed"
++
++
+ def _ready_reason(patch: Mapping[str, Any]) -> str:
+     for condition in patch.get("conditions") or ():
+         if isinstance(condition, Mapping) and condition.get("type") == "Ready":
+@@ -140,7 +173,8 @@ class HTTPMetrics:
+ 
+ 
+ class ControllerMetrics:
+-    """控制器的协调次数与耗时、重试、部署结果与工作队列深度。
++    """控制器的协调次数与耗时、重试、部署结果与工作队列深度，以及核对实例、重新部署实例已
++    不在运行的服务与回收孤立分配的次数。
+ 
+     Args:
+         registry: 指标所在的注册中心；为空时新建（指标不会被导出）。
+@@ -167,6 +201,33 @@ class ControllerMetrics:
+             "Inference services that entered Ready or Failed, by outcome and Ready reason.",
+             ("outcome", "reason"),
+         )
++        self._instance_checks = registry.counter(
++            "forgemesh_instance_checks_total",
++            "Periodic instance checks by the controller, by outcome.",
++            ("outcome",),
++        )
++        self._instance_check_results = registry.counter(
++            "forgemesh_instance_check_results_total",
++            "Services an instance check reached a result for, by check and result.",
++            ("check", "result"),
++        )
++        self._redeploys = registry.counter(
++            "forgemesh_lost_instance_redeploys_total",
++            "Deployment runs started to redeploy services whose instance was gone.",
++        )
++        self._reclaims = registry.counter(
++            "forgemesh_orphaned_allocation_reclaims_total",
++            "Orphaned allocations the controller tried to reclaim, by outcome.",
++            ("outcome",),
++        )
++        for check_outcome in InstanceCheckOutcome:
++            self._instance_checks.inc(check_outcome.value, amount=0)
++        for check in InstanceCheck:
++            for result in InstanceCheckResult:
++                self._instance_check_results.inc(check.value, result.value, amount=0)
++        self._redeploys.inc(amount=0)
++        for reclaim_outcome in ReclaimOutcome:
++            self._reclaims.inc(reclaim_outcome.value, amount=0)
+         #: 由 :meth:`ControlPlaneMetrics.watch` 登记的采集器在抓取时更新。
+         self.queue_depth = registry.gauge(
+             "forgemesh_controller_queue_depth",
+@@ -190,6 +251,27 @@ class ControllerMetrics:
+         if outcome is not None and target != phase:
+             self._deployments.inc(outcome, _ready_reason(patch))
+ 
++    def instance_check_finished(self, outcome: InstanceCheckOutcome) -> None:
++        """记录控制器的一次定期核对实例。"""
++        self._instance_checks.inc(outcome.value)
++
++    def instance_check_result(self, check: InstanceCheck, result: InstanceCheckResult) -> None:
++        """记录核对实例对一个服务的结论；绑定 ``check`` 之后用作
++        :func:`~forgemesh.controlplane.deployment.check_instances` 的 ``on_result``。"""
++        self._instance_check_results.inc(check.value, result.value)
++
++    def lost_instance_redeployed(self) -> None:
++        """记录一次为实例已不在运行的服务启动的重新部署运行；用作
++        :class:`~forgemesh.controlplane.reconciler.ReconciliationController` 的
++        ``on_redeploy``。"""
++        self._redeploys.inc()
++
++    def reclaim_attempted(self, outcome: ReclaimOutcome) -> None:
++        """记录一个孤立分配的回收结果；用作
++        :func:`~forgemesh.controlplane.deployment.reclaim_orphaned_allocations` 的
++        ``on_result``。"""
++        self._reclaims.inc(outcome.value)
++
+ 
+ class OutboxMetrics:
+     """Outbox 事件的发布尝试与未发布的事件数。
+@@ -363,6 +445,8 @@ __all__ = [
+     "ControlPlaneMetrics",
+     "ControllerMetrics",
+     "HTTPMetrics",
++    "InstanceCheck",
++    "InstanceCheckOutcome",
+     "OutboxMetrics",
+     "ReconcileOutcome",
+ ]
+diff --git a/tests/unit/controlplane/test_controller_manager.py b/tests/unit/controlplane/test_controller_manager.py
+index 4032024..9ea6374 100644
+--- a/tests/unit/controlplane/test_controller_manager.py
++++ b/tests/unit/controlplane/test_controller_manager.py
+@@ -16,6 +16,7 @@ from typing import Any
+ import pytest
+ from forgemesh.controlplane.controller import ControllerManager, WorkQueue
+ from forgemesh.controlplane.deployment import LAUNCH_INSTANCE, LaunchedInstance
++from forgemesh.controlplane.metrics import MetricsRegistry
+ from forgemesh.controlplane.outbox import OutboxEvent
+ from forgemesh.controlplane.reconciler import (
+     ProcessedKeyStore,
+@@ -27,6 +28,7 @@ from forgemesh.controlplane.registry import (
+     ResourceKey,
+     SQLiteRegistry,
+ )
++from forgemesh.controlplane.telemetry import ControllerMetrics
+ from forgemesh.core.errors import NotFoundError
+ from forgemesh.core.objects import Condition, ObjectMeta, Resource
+ from forgemesh.core.scheduler import AllocationRef, ScheduleRequest
+@@ -45,6 +47,8 @@ from forgemesh.resource.inference import (
+ from forgemesh.workflow.runtime import RunInfo, RunRef
+ from forgemesh.workflow.states import StepStatus, WorkflowStatus
+ 
++from .exposition import parse
++
+ KIND = "InferenceService"
+ TENANT = "tenant-a"
+ NAMESPACE = "default"
+@@ -577,7 +581,7 @@ def test_an_instance_check_queues_the_managed_resources_it_reports() -> None:
+ @pytest.mark.unit
+ def test_a_running_manager_checks_instances_periodically_until_it_stops(caplog) -> None:
+     """控制器运行时每隔 ``instance_check_interval`` 秒核对一次实例：核对失败时记日志，之后照常
+-    核对、把报告的资源加入队列；停止之后不再核对。"""
++    核对、把报告的资源加入队列；停止之后不再核对。每次核对按结果计数。"""
+     calls = 0
+ 
+     async def check() -> list[ResourceKey]:
+@@ -587,11 +591,16 @@ def test_a_running_manager_checks_instances_periodically_until_it_stops(caplog)
+             raise RuntimeError("launcher unavailable")
+         return [_key()]
+ 
+-    async def scenario() -> tuple[int, list[ResourceKey]]:
++    async def scenario() -> tuple[int, list[ResourceKey], str]:
+         registry = SQLiteRegistry()
+         queue = RecordingQueue()
++        metrics = MetricsRegistry()
+         manager = _manager(
+-            registry, queue=queue, instance_check=check, instance_check_interval=0.01
++            registry,
++            queue=queue,
++            instance_check=check,
++            instance_check_interval=0.01,
++            metrics=ControllerMetrics(metrics),
+         )
+         await manager.start()
+         try:
+@@ -605,13 +614,18 @@ def test_a_running_manager_checks_instances_periodically_until_it_stops(caplog)
+         stopped_after = calls
+         await asyncio.sleep(0.05)
+         await registry.close()
+-        return stopped_after, queue.added
++        return stopped_after, queue.added, metrics.render()
+ 
+-    stopped_after, added = _run(scenario())
++    stopped_after, added, text = _run(scenario())
+     assert calls == stopped_after
+     assert added and set(added) == {_key()}
+     [failure] = [r for r in caplog.records if r.getMessage() == "controller instance check failed"]
+     assert str(failure.exc_info[1]) == "launcher unavailable"
++    checks = parse(text)["forgemesh_instance_checks_total"]
++    assert {s.labels["outcome"]: s.value for s in checks.samples} == {
++        "completed": stopped_after - 1,
++        "failed": 1,
++    }
+ 
+ 
+ @pytest.mark.unit
+diff --git a/tests/unit/controlplane/test_deployment_lifecycle.py b/tests/unit/controlplane/test_deployment_lifecycle.py
+index fe7ee3c..f39373b 100644
+--- a/tests/unit/controlplane/test_deployment_lifecycle.py
++++ b/tests/unit/controlplane/test_deployment_lifecycle.py
+@@ -7,7 +7,8 @@
+   不会再分配；
+ * 实例丢失（没有活过重启，或自行退出）：``Ready`` 的服务转为 ``Degraded``（endpoint 标记
+   为未就绪），在同一分配上重新部署后回到 ``Ready``，运行成功却还没写入 ``Ready`` 的服务
+-  同样重新部署；重新部署按退避，失败时说明原因；实例回来了的服务直接回到 ``Ready``；
++  同样重新部署；重新部署按退避，失败时说明原因；实例回来了的服务直接回到 ``Ready``；核对的
++  结论与启动的重新部署计入指标，退避期间推迟的协调不计入；
+ * 部署工作流没能启动时保留分配并重试；部署失败时实例被停止、分配释放，资源停在
+   ``Failed``，修改 spec 之后从 ``Pending`` 重新部署；补偿没能停止的实例在之后的一轮停止
+   （然后释放分配），或在删除资源、重新部署时停止；
+@@ -16,7 +17,7 @@
+ * ``Ready`` 的服务 spec 变化：经 ``Updating`` 停止旧实例、部署新的 spec 后回到 ``Ready``；
+   更新失败时进入 ``Failed``；策略拒绝更新时服务保持原样；
+ * 部署中途或 ``Ready`` 之后删除资源：取消运行、停止实例、释放分配、物理删除；绕过受控
+-  删除的资源，回收时停止它的实例、让分配过期；
++  删除的资源，回收时停止它的实例、让分配过期（按结果计数）；
+ * 在后台运行的控制器自行完成部署与删除，定期核对实例时发现实例退出，自行重新部署。
+ 
+ 测试以 ``asyncio.run`` 驱动异步方法，不依赖 pytest-asyncio。“重启”在同一个事件循环中
+@@ -42,6 +43,7 @@ from forgemesh.controlplane.deployment import (
+     DeploymentReleaser,
+     DeploymentSteps,
+     InMemoryLauncher,
++    InstanceCheckResult,
+     LaunchedInstance,
+     LaunchRequest,
+     RuntimeLauncher,
+@@ -51,6 +53,7 @@ from forgemesh.controlplane.deployment import (
+     launched_instance,
+     reclaim_orphaned_allocations,
+ )
++from forgemesh.controlplane.metrics import MetricsRegistry
+ from forgemesh.controlplane.reconciler import (
+     REDEPLOY_BACKOFF_RESET_SECONDS,
+     ProcessedKeyStore,
+@@ -60,6 +63,7 @@ from forgemesh.controlplane.reconciler import (
+ from forgemesh.controlplane.registry import ResourceKey, SQLiteRegistry
+ from forgemesh.controlplane.scheduler import FirstFitScheduler, Inventory
+ from forgemesh.controlplane.sqlite import workflow_db_path
++from forgemesh.controlplane.telemetry import ControllerMetrics, InstanceCheck
+ from forgemesh.core.errors import ConflictError, NotFoundError
+ from forgemesh.core.objects import ObjectMeta
+ from forgemesh.core.scheduler import AllocatedDevice
+@@ -83,6 +87,8 @@ from forgemesh.workflowruntime.exec import StepExecutor, WorkflowExecutor
+ from forgemesh.workflowruntime.runtime import LocalWorkflowRuntime
+ from forgemesh.workflowruntime.store import WorkflowStore
+ 
++from .exposition import parse
++
+ KIND = "InferenceService"
+ TENANT = "tenant-a"
+ NAMESPACE = "team-a"
+@@ -100,6 +106,13 @@ POLL_SECONDS = 0.01
+ MAX_PASSES = 10
+ #: 等待后台任务到达某一点的上限（秒）：出错时测试失败而不是挂起。
+ WAIT_SECONDS = 5.0
++#: 核对实例、重新部署与回收孤立分配的计数器（见 :mod:`forgemesh.controlplane.telemetry`）。
++RUNTIME_COUNTERS = (
++    "forgemesh_instance_checks_total",
++    "forgemesh_instance_check_results_total",
++    "forgemesh_lost_instance_redeploys_total",
++    "forgemesh_orphaned_allocation_reclaims_total",
++)
+ 
+ 
+ def _inventory() -> Inventory:
+@@ -227,7 +240,8 @@ class _ControlPlane:
+     进入时调用 ``recover()`` 与 ``check_instances(after_restart=True)``（返回值存于
+     :attr:`recovered` 与 :attr:`lost`）；退出时按应用的顺序关闭：控制器 → 工作流运行时 →
+     启动器 → 工作流存储 → 去重键存储 → 注册表。``clock`` 为协调器重新部署退避所用的时钟；
+-    控制器管理器运行时每隔 ``instance_check_interval`` 秒核对一次实例。
++    控制器管理器运行时每隔 ``instance_check_interval`` 秒核对一次实例。核对实例、重新部署与
++    回收与应用一样计入 :attr:`metrics`（见 :meth:`counted`）。
+     """
+ 
+     def __init__(
+@@ -249,6 +263,8 @@ class _ControlPlane:
+                 authz_rules=[AuthzRule(action="reconcile", effect="allow")]
+             )
+         release = DeploymentReleaser(self.runtime, launcher)
++        self.metrics = MetricsRegistry()
++        self._controller_metrics = metrics = ControllerMetrics(self.metrics)
+         reconciler = ReconciliationController(
+             self.registry,
+             policy,
+@@ -260,21 +276,40 @@ class _ControlPlane:
+             workflow_poll_interval=POLL_SECONDS,
+             launcher=launcher,
+             clock=clock,
++            on_redeploy=metrics.lost_instance_redeployed,
+         )
+         self.manager = ControllerManager(
+             self.registry,
+             reconciler,
+             poll_interval=POLL_SECONDS,
+-            instance_check=functools.partial(check_instances, self.registry, launcher),
++            instance_check=functools.partial(
++                check_instances,
++                self.registry,
++                launcher,
++                on_result=functools.partial(metrics.instance_check_result, InstanceCheck.PERIODIC),
++            ),
+             instance_check_interval=instance_check_interval,
+-            reclaim=functools.partial(reclaim_orphaned_allocations, self.registry, release),
++            reclaim=functools.partial(
++                reclaim_orphaned_allocations,
++                self.registry,
++                release,
++                on_result=metrics.reclaim_attempted,
++            ),
++            metrics=metrics,
+         )
+         self.recovered: list[str] = []
+         self.lost: list[ResourceKey] = []
+ 
+     async def __aenter__(self) -> _ControlPlane:
+         self.recovered = await self.runtime.recover()
+-        self.lost = await check_instances(self.registry, self.launcher, after_restart=True)
++        self.lost = await check_instances(
++            self.registry,
++            self.launcher,
++            after_restart=True,
++            on_result=functools.partial(
++                self._controller_metrics.instance_check_result, InstanceCheck.STARTUP
++            ),
++        )
+         return self
+ 
+     async def __aexit__(self, *exc_info: object) -> None:
+@@ -288,6 +323,18 @@ class _ControlPlane:
+     async def service(self) -> InferenceService:
+         return await self.registry.get(KIND, NAMESPACE, NAME, TENANT)
+ 
++    def counted(self) -> dict[tuple[str, ...], float]:
++        """:data:`RUNTIME_COUNTERS` 中不为 0 的序列：``(指标名, 标签值...)`` → 取值，指标名去掉
++        ``forgemesh_`` 前缀与 ``_total`` 后缀。"""
++        families = parse(self.metrics.render())
++        counted: dict[tuple[str, ...], float] = {}
++        for name in RUNTIME_COUNTERS:
++            short = name.removeprefix("forgemesh_").removesuffix("_total")
++            for sample in families[name].samples:
++                if sample.value:
++                    counted[(short, *sample.labels.values())] = sample.value
++        return counted
++
+     async def phase(self) -> str | None:
+         """资源的 phase；资源已删除时为 ``None``。"""
+         try:
+@@ -1018,6 +1065,7 @@ def test_an_instance_lost_between_a_successful_run_and_ready_is_deployed_again(t
+             assert (await plane.service()).status.endpoints == [instance.endpoint()]
+             assert await plane.registry.list_allocations(TENANT) == [allocation]
+             assert await plane.processed.seen(DEDUP_KEY)
++            assert plane.counted() == {("lost_instance_redeploys",): 1}
+         return lost
+ 
+     lost = asyncio.run(scenario())
+@@ -1039,6 +1087,7 @@ def test_a_ready_service_whose_instance_did_not_survive_a_restart_is_deployed_ag
+             await plane.deploy()
+             [endpoint] = (await plane.service()).status.endpoints
+             [allocation] = await plane.registry.list_allocations(TENANT)
++            assert plane.counted() == {}
+ 
+         async with _ControlPlane(db, fresh) as plane:
+             assert plane.lost == [KEY]
+@@ -1055,6 +1104,10 @@ def test_a_ready_service_whose_instance_did_not_survive_a_restart_is_deployed_ag
+             assert await plane.deploy() == ["Degraded", "Ready"]
+             [redeployed] = (await plane.service()).status.endpoints
+             assert await plane.registry.list_allocations(TENANT) == [allocation]
++            assert plane.counted() == {
++                ("instance_check_results", "startup", "lost"): 1,
++                ("lost_instance_redeploys",): 1,
++            }
+         return endpoint, redeployed
+ 
+     endpoint, redeployed = asyncio.run(scenario())
+@@ -1100,7 +1153,8 @@ def test_only_the_endpoints_whose_instance_is_gone_are_marked_not_ready():
+ 
+ @pytest.mark.unit
+ def test_a_service_changed_while_its_instances_are_checked_is_left_alone(monkeypatch):
+-    """检查期间资源被修改（CAS 冲突）：跳过它，不覆盖新的状态。"""
++    """检查期间资源被修改（CAS 冲突）：跳过它，不覆盖新的状态，结论为 ``conflict``。"""
++    results: list[InstanceCheckResult] = []
+ 
+     async def scenario() -> None:
+         async with _ControlPlane(":memory:", _ScriptedLauncher()) as plane:
+@@ -1111,11 +1165,15 @@ def test_a_service_changed_while_its_instances_are_checked_is_left_alone(monkeyp
+                 raise ConflictError("changed meanwhile")
+ 
+             monkeypatch.setattr(plane.registry, "update_status", conflict)
+-            assert await check_instances(plane.registry, _ScriptedLauncher()) == []
++            lost = await check_instances(
++                plane.registry, _ScriptedLauncher(), on_result=results.append
++            )
++            assert lost == []
+             monkeypatch.undo()
+             assert await plane.phase() == "Ready"
+ 
+     asyncio.run(scenario())
++    assert results == [InstanceCheckResult.CONFLICT]
+ 
+ 
+ # ---------------------------------------------------------------------- #
+@@ -1184,19 +1242,24 @@ def test_a_service_whose_instance_exits_is_degraded_and_deployed_again_on_its_al
+ 
+ @pytest.mark.unit
+ def test_a_degraded_service_whose_instance_is_back_returns_to_ready_without_a_redeployment():
+-    """实例回来了（启动器又报告它在运行）：检查实例时交给控制器，服务以原来的实例回到
+-    Ready，不停止、不启动实例；实例仍不在运行时检查不再报告这个服务。"""
++    """实例回来了（启动器又报告它在运行）：检查实例时交给控制器（结论为 ``back``），服务以
++    原来的实例回到 Ready，不停止、不启动实例；实例仍不在运行时检查不再报告这个服务，也没有
++    结论。"""
+     launcher = _ScriptedLauncher()
++    results: list[InstanceCheckResult] = []
+ 
+     async def scenario() -> None:
+         async with _ControlPlane(":memory:", launcher) as plane:
+             await plane.registry.put(_service())
+             await plane.deploy()
+             instance = await _lose_the_instance(plane, launcher)
+-            assert await check_instances(plane.registry, launcher) == []
++            check = functools.partial(
++                check_instances, plane.registry, launcher, on_result=results.append
++            )
++            assert await check() == []
+ 
+             launcher.down.clear()
+-            assert await check_instances(plane.registry, launcher) == [KEY]
++            assert await check() == [KEY]
+             assert await plane.phase() == "Degraded"
+             await plane.manager.process(KEY)
+ 
+@@ -1204,18 +1267,21 @@ def test_a_degraded_service_whose_instance_is_back_returns_to_ready_without_a_re
+             assert service.status.phase.value == "Ready"
+             assert service.status.endpoints == [instance.endpoint()]
+             assert (len(launcher.launches), launcher.stops) == (1, [])
++            assert plane.counted() == {}
+ 
+     asyncio.run(scenario())
++    assert results == [InstanceCheckResult.BACK]
+ 
+ 
+ @pytest.mark.unit
+ def test_redeployments_back_off_up_to_a_bound_and_start_over_after_a_quiet_period():
+     """同一代 spec 反复丢失实例：第一次立即重新部署，之后与上一次开始至少相隔 10 秒、每次
+-    翻倍、最多 300 秒，等待期间不启动运行；上一次开始已过 600 秒时再丢失实例立即重新部署。"""
++    翻倍、最多 300 秒，等待期间不启动运行（也不计入重新部署）；上一次开始已过 600 秒时再丢失
++    实例立即重新部署。"""
+     launcher = _ScriptedLauncher()
+     clock = _Clock()
+ 
+-    async def scenario() -> list[int]:
++    async def scenario() -> tuple[list[int], dict[tuple[str, ...], float]]:
+         async with _ControlPlane(":memory:", launcher, clock=clock) as plane:
+             await plane.registry.put(_service())
+             await plane.deploy()
+@@ -1233,9 +1299,11 @@ def test_redeployments_back_off_up_to_a_bound_and_start_over_after_a_quiet_perio
+             await _lose_the_instance(plane, launcher)
+             assert await plane.deploy() == ["Degraded", "Ready"]
+             runs = await find_deployment_runs(plane.runtime, UID)
+-            return [deployment.attempt for deployment in runs]
++            return [deployment.attempt for deployment in runs], plane.counted()
+ 
+-    assert asyncio.run(scenario()) == list(range(1, 11))
++    attempts, counted = asyncio.run(scenario())
++    assert attempts == list(range(1, 11))
++    assert counted == {("lost_instance_redeploys",): 9}
+ 
+ 
+ @pytest.mark.unit
+@@ -1276,6 +1344,7 @@ def test_a_failed_redeployment_reports_why_and_is_retried_after_the_backoff():
+             assert (await plane.service()).status.endpoints == [instance.endpoint()]
+             assert [d.attempt for d in await find_deployment_runs(plane.runtime, UID)] == [1, 2, 3]
+             assert await plane.registry.list_allocations(TENANT) == [allocation]
++            assert plane.counted() == {("lost_instance_redeploys",): 2}
+ 
+     asyncio.run(scenario())
+ 
+@@ -1344,7 +1413,8 @@ def test_deleting_a_ready_service_stops_its_instance_and_releases_its_allocation
+ @pytest.mark.parametrize("stop_failures", [0, 1])
+ def test_the_allocation_of_a_service_removed_without_its_release_is_reclaimed(stop_failures):
+     """资源绕过受控删除被物理删除（``delete()``）：回收孤立的分配先停止它的实例，再让分配
+-    过期（设备空闲）；停止失败时保留分配，下一次回收重试。资源仍存在时回收不触碰它的分配。"""
++    过期（设备空闲）；停止失败时保留分配，下一次回收重试。资源仍存在时回收不触碰它的分配。
++    每个孤立分配的每次回收按结果计数。"""
+     launcher = _ScriptedLauncher()
+ 
+     async def scenario() -> None:
+@@ -1356,6 +1426,7 @@ def test_the_allocation_of_a_service_removed_without_its_release_is_reclaimed(st
+             await plane.manager.reclaim()
+             assert launcher.running == {instance.instance_id: instance}
+             assert await plane.registry.list_allocations(TENANT) == [allocation]
++            assert plane.counted() == {}
+ 
+             await plane.registry.delete(KIND, NAMESPACE, NAME, TENANT)
+             launcher.stop_failures = stop_failures
+@@ -1368,6 +1439,12 @@ def test_the_allocation_of_a_service_removed_without_its_release_is_reclaimed(st
+             assert launcher.running == {}
+             assert (await plane.registry.get_allocation(allocation["id"]))["status"] == "Expired"
+             assert await plane.registry.allocated_devices() == frozenset()
++            reclaims = {"reclaimed": 1, "failed": stop_failures}
++            assert plane.counted() == {
++                ("orphaned_allocation_reclaims", outcome): count
++                for outcome, count in reclaims.items()
++                if count
++            }
+ 
+     asyncio.run(scenario())
+ 
+@@ -1397,7 +1474,8 @@ def test_a_running_controller_deploys_and_deletes_a_service_on_its_own():
+ @pytest.mark.unit
+ def test_a_running_controller_deploys_a_service_again_once_its_instance_exits():
+     """控制器在后台运行、定期核对实例（测试既不逐轮驱动，也不自己核对）：实例退出之后，服务
+-    以同一分配上的新实例回到 Ready，退出的实例被停止。"""
++    以同一分配上的新实例回到 Ready，退出的实例被停止。定期核对按次数计数，丢失的实例与
++    重新部署各计一次。"""
+     launcher = _ScriptedLauncher()
+ 
+     async def serving(plane: _ControlPlane) -> list[Endpoint]:
+@@ -1423,5 +1501,11 @@ def test_a_running_controller_deploys_a_service_again_once_its_instance_exits():
+             assert endpoints == [second.endpoint()]
+             assert launcher.stops == [first.instance_id]
+             assert await plane.registry.list_allocations(TENANT) == [allocation]
++            counted = plane.counted()
++            assert counted.pop(("instance_checks", "completed")) >= 1
++            assert counted == {
++                ("instance_check_results", "periodic", "lost"): 1,
++                ("lost_instance_redeploys",): 1,
++            }
+ 
+     asyncio.run(scenario())
+diff --git a/tests/unit/controlplane/test_metrics_endpoint.py b/tests/unit/controlplane/test_metrics_endpoint.py
+index 379d299..6860629 100644
+--- a/tests/unit/controlplane/test_metrics_endpoint.py
++++ b/tests/unit/controlplane/test_metrics_endpoint.py
+@@ -1,10 +1,13 @@
+-"""控制平面 ``GET /metrics``：文本格式合法、不要求认证、HTTP 指标按路由模板计数且不含租户数据。"""
++"""控制平面 ``GET /metrics``：文本格式合法、不要求认证、HTTP 指标按路由模板计数且不含租户数据；
++应用把核对实例、重新部署与回收计入指标。"""
+ 
+ from __future__ import annotations
+ 
+ import json
+ import time
++from typing import Any
+ 
++import httpx
+ import pytest
+ from fastapi.testclient import TestClient
+ from forgemesh.controlplane import app as app_module
+@@ -16,7 +19,7 @@ from forgemesh.controlplane.auth import (
+     HeaderAuthenticator,
+     hash_api_key,
+ )
+-from forgemesh.controlplane.deployment import RUNTIME_LAUNCHER_ENV
++from forgemesh.controlplane.deployment import INSTANCE_CHECK_INTERVAL_ENV, RUNTIME_LAUNCHER_ENV
+ from forgemesh.controlplane.deployment.config import FAKE_ADVERTISE_HOST_ENV, FAKE_BIND_HOST_ENV
+ from forgemesh.controlplane.metrics import CONTENT_TYPE
+ from forgemesh.controlplane.outbox import OutboxEvent
+@@ -43,6 +46,7 @@ ITEM_ROUTE = "/api/v1/inference-services/{name}"
+ def _reset_components(monkeypatch):
+     monkeypatch.delenv(INVENTORY_FILE_ENV, raising=False)
+     monkeypatch.delenv(RUNTIME_LAUNCHER_ENV, raising=False)
++    monkeypatch.delenv(INSTANCE_CHECK_INTERVAL_ENV, raising=False)
+     yield
+     reset_runtime_components()
+ 
+@@ -51,6 +55,35 @@ def _dev_app(tmp_path):
+     return create_app(db_path=str(tmp_path / "cp.db"), authenticator=HeaderAuthenticator())
+ 
+ 
++def _enable_fake_deployments(tmp_path, monkeypatch) -> None:
++    """两张卡的清单与假启动器（实例监听回环地址）；控制器与部署运行的轮询间隔为 0.05 秒。"""
++    inventory = tmp_path / "inventory.json"
++    gpus = [{"id": f"gpu-{index}", "type": "nvidia-gpu", "memoryGiB": 80} for index in range(2)]
++    inventory.write_text(json.dumps({"nodes": [{"id": "node-hidden", "devices": gpus}]}))
++    monkeypatch.setenv(INVENTORY_FILE_ENV, str(inventory))
++    monkeypatch.setenv(RUNTIME_LAUNCHER_ENV, "fake")
++    monkeypatch.delenv(FAKE_BIND_HOST_ENV, raising=False)
++    monkeypatch.delenv(FAKE_ADVERTISE_HOST_ENV, raising=False)
++    monkeypatch.setattr(app_module, "CONTROLLER_POLL_INTERVAL_SECONDS", 0.05)
++    monkeypatch.setattr(app_module, "WORKFLOW_POLL_INTERVAL_SECONDS", 0.05)
++
++
++def _serving(
++    client: TestClient, name: str = "secret-llama", other_than: str | None = None
++) -> dict[str, Any]:
++    """轮询直到 ``name`` 为 Ready 且实例不是 ``other_than``，返回它的 endpoint。"""
++    deadline = time.monotonic() + 10
++    while True:
++        response = client.get(
++            f"/api/v1/inference-services/{name}", params={"namespace": NAMESPACE}, headers=HEADERS
++        )
++        status = response.json()["status"]
++        if status["phase"] == "Ready" and status["endpoints"][0]["instanceId"] != other_than:
++            return status["endpoints"][0]
++        assert time.monotonic() < deadline, f"{name} did not serve a new instance: {status}"
++        time.sleep(0.02)
++
++
+ @pytest.mark.unit
+ def test_metrics_are_served_without_credentials_in_the_exposition_format(tmp_path) -> None:
+     key = "fmk_metrics-test-key"
+@@ -157,15 +190,7 @@ def test_outbox_metrics_follow_the_event_dispatcher(tmp_path, monkeypatch) -> No
+ 
+ @pytest.mark.unit
+ def test_a_deployment_shows_up_in_the_controller_and_state_metrics(tmp_path, monkeypatch) -> None:
+-    inventory = tmp_path / "inventory.json"
+-    gpus = [{"id": f"gpu-{index}", "type": "nvidia-gpu", "memoryGiB": 80} for index in range(2)]
+-    inventory.write_text(json.dumps({"nodes": [{"id": "node-hidden", "devices": gpus}]}))
+-    monkeypatch.setenv(INVENTORY_FILE_ENV, str(inventory))
+-    monkeypatch.setenv(RUNTIME_LAUNCHER_ENV, "fake")
+-    monkeypatch.delenv(FAKE_BIND_HOST_ENV, raising=False)
+-    monkeypatch.delenv(FAKE_ADVERTISE_HOST_ENV, raising=False)
+-    monkeypatch.setattr(app_module, "CONTROLLER_POLL_INTERVAL_SECONDS", 0.05)
+-    monkeypatch.setattr(app_module, "WORKFLOW_POLL_INTERVAL_SECONDS", 0.05)
++    _enable_fake_deployments(tmp_path, monkeypatch)
+ 
+     done = 'forgemesh_reconcile_total{operation="reconcile",outcome="done"}'
+     with TestClient(_dev_app(tmp_path)) as client:
+@@ -201,3 +226,56 @@ def test_a_deployment_shows_up_in_the_controller_and_state_metrics(tmp_path, mon
+     endpoint = service["status"]["endpoints"][0]["url"]
+     for tenant_data in (TENANT, NAMESPACE, "secret-llama", "node-hidden", "gpu-", endpoint):
+         assert tenant_data not in text
++
++
++@pytest.mark.unit
++def test_an_instance_that_exits_is_counted_by_the_periodic_check_and_redeployed(
++    tmp_path, monkeypatch
++) -> None:
++    """实例在运行中退出：定期核对得出 ``lost``，控制器重新部署一次；启动时的核对没有结论。"""
++    _enable_fake_deployments(tmp_path, monkeypatch)
++    monkeypatch.setenv(INSTANCE_CHECK_INTERVAL_ENV, "0.05")
++    with TestClient(_dev_app(tmp_path)) as client:
++        created = client.post("/api/v1/inference-services", json=BODY, headers=HEADERS)
++        assert created.status_code == 201
++        first = _serving(client)
++        assert httpx.post(f"{first['url']}/fake/exit", timeout=5).status_code == 202
++        _serving(client, other_than=first["instanceId"])
++        families = parse(client.get("/metrics").text)
++
++    results = families["forgemesh_instance_check_results_total"]
++    assert results.value(check="periodic", result="lost") == 1
++    assert results.value(check="startup", result="lost") == 0
++    assert families["forgemesh_lost_instance_redeploys_total"].value() == 1
++    checks = families["forgemesh_instance_checks_total"]
++    assert checks.value(outcome="completed") >= 1
++    assert checks.value(outcome="failed") == 0
++
++
++@pytest.mark.unit
++def test_the_startup_check_and_the_reclaim_are_counted_after_a_restart(
++    tmp_path, monkeypatch
++) -> None:
++    """重启之后：实例没能活过重启的服务计入启动时核对的 ``lost`` 并重新部署一次；绕过受控
++    删除的服务留下的分配被回收。"""
++    _enable_fake_deployments(tmp_path, monkeypatch)
++    orphan = {**BODY, "metadata": {**BODY["metadata"], "name": "orphan"}}
++    with TestClient(_dev_app(tmp_path)) as client:
++        for body in (BODY, orphan):
++            created = client.post("/api/v1/inference-services", json=body, headers=HEADERS)
++            assert created.status_code == 201
++        first = _serving(client)
++        _serving(client, "orphan")
++        registry = get_registry()
++        client.portal.call(registry.delete, "InferenceService", NAMESPACE, "orphan", TENANT)
++
++    with TestClient(_dev_app(tmp_path)) as client:
++        _serving(client, other_than=first["instanceId"])
++        families = parse(client.get("/metrics").text)
++
++    results = families["forgemesh_instance_check_results_total"]
++    assert results.value(check="startup", result="lost") == 1
++    assert results.value(check="periodic", result="lost") == 0
++    assert families["forgemesh_lost_instance_redeploys_total"].value() == 1
++    reclaims = families["forgemesh_orphaned_allocation_reclaims_total"]
++    assert (reclaims.value(outcome="reclaimed"), reclaims.value(outcome="failed")) == (1, 0)
+diff --git a/tests/unit/controlplane/test_telemetry.py b/tests/unit/controlplane/test_telemetry.py
+index 1fd9551..b2e33b5 100644
+--- a/tests/unit/controlplane/test_telemetry.py
++++ b/tests/unit/controlplane/test_telemetry.py
+@@ -1,4 +1,5 @@
+-"""控制平面的指标：协调结果与耗时、重试、部署结果、Outbox 的发布尝试，以及抓取时读取的状态类指标。"""
++"""控制平面的指标：协调结果与耗时、重试、部署结果、核对实例、重新部署与回收、Outbox 的发布
++尝试，以及抓取时读取的状态类指标。"""
+ 
+ from __future__ import annotations
+ 
+@@ -11,11 +12,17 @@ from typing import Any
+ 
+ import pytest
+ from forgemesh.controlplane.controller import ControllerManager, WorkQueue
++from forgemesh.controlplane.deployment import InstanceCheckResult, ReclaimOutcome
+ from forgemesh.controlplane.metrics import MetricsRegistry
+ from forgemesh.controlplane.outbox import PublishOutcome, RetryPolicy
+ from forgemesh.controlplane.registry import ResourceKey, SQLiteRegistry
+ from forgemesh.controlplane.scheduler import Inventory
+-from forgemesh.controlplane.telemetry import ControllerMetrics, ControlPlaneMetrics
++from forgemesh.controlplane.telemetry import (
++    ControllerMetrics,
++    ControlPlaneMetrics,
++    InstanceCheck,
++    InstanceCheckOutcome,
++)
+ from forgemesh.core.objects import ObjectMeta
+ from forgemesh.core.reconciler import ReconcileResult
+ from forgemesh.core.scheduler import AllocatedDevice, ResourceRef
+@@ -227,6 +234,52 @@ def test_deployments_count_transitions_into_ready_or_failed_with_bounded_reasons
+     }
+ 
+ 
++@pytest.mark.unit
++def test_instance_checks_redeploys_and_reclaims_are_counted_from_zero() -> None:
++    """核对实例、重新部署与回收孤立分配的计数器只有固定的标签组合，全部从 0 开始输出。"""
++    registry = MetricsRegistry()
++    metrics = ControllerMetrics(registry)
++    initial = parse(registry.render())
++    metrics.instance_check_finished(InstanceCheckOutcome.COMPLETED)
++    metrics.instance_check_finished(InstanceCheckOutcome.FAILED)
++    metrics.instance_check_finished(InstanceCheckOutcome.COMPLETED)
++    metrics.instance_check_result(InstanceCheck.STARTUP, InstanceCheckResult.LOST)
++    metrics.instance_check_result(InstanceCheck.PERIODIC, InstanceCheckResult.BACK)
++    metrics.instance_check_result(InstanceCheck.PERIODIC, InstanceCheckResult.CONFLICT)
++    metrics.lost_instance_redeployed()
++    metrics.lost_instance_redeployed()
++    metrics.reclaim_attempted(ReclaimOutcome.FAILED)
++    metrics.reclaim_attempted(ReclaimOutcome.RECLAIMED)
++    counted = parse(registry.render())
++
++    def series(families: dict[str, Any], name: str) -> dict[tuple[str, ...], float]:
++        assert families[name].type == "counter"
++        return {tuple(s.labels.values()): s.value for s in families[name].samples}
++
++    checks = "forgemesh_instance_checks_total"
++    results = "forgemesh_instance_check_results_total"
++    redeploys = "forgemesh_lost_instance_redeploys_total"
++    reclaims = "forgemesh_orphaned_allocation_reclaims_total"
++    every_result = {
++        (check, result): 0
++        for check in ("startup", "periodic")
++        for result in ("lost", "back", "conflict")
++    }
++    assert series(initial, checks) == {("completed",): 0, ("failed",): 0}
++    assert series(initial, results) == every_result
++    assert series(initial, redeploys) == {(): 0}
++    assert series(initial, reclaims) == {("reclaimed",): 0, ("failed",): 0}
++    assert series(counted, checks) == {("completed",): 2, ("failed",): 1}
++    assert series(counted, results) == {
++        **every_result,
++        ("startup", "lost"): 1,
++        ("periodic", "back"): 1,
++        ("periodic", "conflict"): 1,
++    }
++    assert series(counted, redeploys) == {(): 2}
++    assert series(counted, reclaims) == {("reclaimed",): 1, ("failed",): 1}
++
++
+ @pytest.mark.unit
+ def test_publish_attempts_are_counted_by_outcome_starting_from_zero() -> None:
+     metrics = ControlPlaneMetrics()
+-- 
+2.43.0
+
