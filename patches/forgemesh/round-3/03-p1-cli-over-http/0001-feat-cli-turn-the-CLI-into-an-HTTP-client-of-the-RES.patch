@@ -1,0 +1,3737 @@
+From 186fae165e9714eafe8974768dd2bd56efb44a8f Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 13 Oct 2026 05:43:13 +0000
+Subject: [PATCH 1/3] feat(cli): turn the CLI into an HTTP client of the REST
+ API
+
+Every command used to open a fresh in-memory SQLiteRegistry, so nothing
+it wrote survived the command: apply could only create (and dropped the
+spec), get, describe and list never found anything, delete called the
+physical delete and bypassed the controlled one, and --api-url was
+parsed but never used. The package imported yaml and
+forgemesh.controlplane without declaring either.
+
+The commands now call /api/v1/inference-services with the standard
+library's urllib, through the gateway by default (http://127.0.0.1:8081;
+--api-url or FORGEMESH_API_URL reaches the control plane directly):
+
+- apply GETs each document's service, POSTs it when it does not exist
+  and otherwise PUTs it with the resourceVersion and uid just read,
+  re-reading on 409 up to 5 times. It reports created, configured or
+  unchanged, accepts multi-document YAML, JSON objects or arrays and
+  stdin, and checks every document before sending anything.
+- get and describe read one service; list follows nextPageToken and
+  prints a table, a YAML stream or a JSON array.
+- delete tells 204 (deleted) and 202 (Terminating) apart.
+- wait polls until the service is Ready and the controller has observed
+  the current generation, fails at once on Failed or Terminating, rides
+  out 429 (honouring Retry-After), 502-504 and dropped connections, and
+  gives up after --timeout; --for delete waits for the 404.
+
+The API key comes from --api-key-file or FORGEMESH_API_KEY and is only
+sent in the Authorization header; no message includes it, and redirects
+are not followed, so it is never sent to another address. Error
+envelopes and the gateway's plain-text 429 and 502 become messages with
+the correlation id the CLI sends on every request, and the exit code
+tells failure classes apart (usage 2, not found 3, conflict 4, rejected
+5, auth 6, rate limited 7, server error 8, unavailable 9, no response
+10, wait timeout 11, wait failed 12). A 404 that is not an API envelope
+exits 1, so a wrong URL is not mistaken for a missing service.
+
+Breaking: the output formats change, --tenant no longer defaults to
+"default" and must match a document's tenantId instead of overriding
+it, and failures no longer all exit 1. The old CLI kept nothing between
+commands, so there is no data to migrate.
+
+The package now declares only pyyaml, the one third-party distribution
+it imports; it no longer depends on forgemesh-core and does not need the
+control plane package. A packaging test compares the distributions the
+CLI imports with the declared ones. The other unit tests run the
+commands against a local HTTP server that mimics the API. The Makefile
+comment that used the CLI as its --no-deps example now names
+control-plane, which still depends on forgemesh-core.
+---
+ Makefile                                    |   2 +-
+ packages/cli/pyproject.toml                 |   6 +-
+ packages/cli/src/forgemesh/cli/client.py    | 335 ++++++++
+ packages/cli/src/forgemesh/cli/commands.py  | 314 ++++++--
+ packages/cli/src/forgemesh/cli/config.py    | 110 +++
+ packages/cli/src/forgemesh/cli/documents.py | 181 +++++
+ packages/cli/src/forgemesh/cli/errors.py    | 121 +++
+ packages/cli/src/forgemesh/cli/main.py      | 277 +++++--
+ packages/cli/src/forgemesh/cli/output.py    | 162 ++++
+ tests/unit/cli/conftest.py                  |  44 ++
+ tests/unit/cli/fakes.py                     | 356 +++++++++
+ tests/unit/cli/test_client.py               | 309 ++++++++
+ tests/unit/cli/test_commands.py             | 806 ++++++++++++++++++--
+ tests/unit/cli/test_config.py               | 183 +++++
+ tests/unit/cli/test_documents.py            | 195 +++++
+ tests/unit/cli/test_packaging.py            |  71 ++
+ 16 files changed, 3285 insertions(+), 187 deletions(-)
+ create mode 100644 packages/cli/src/forgemesh/cli/client.py
+ create mode 100644 packages/cli/src/forgemesh/cli/config.py
+ create mode 100644 packages/cli/src/forgemesh/cli/documents.py
+ create mode 100644 packages/cli/src/forgemesh/cli/errors.py
+ create mode 100644 packages/cli/src/forgemesh/cli/output.py
+ create mode 100644 tests/unit/cli/conftest.py
+ create mode 100644 tests/unit/cli/fakes.py
+ create mode 100644 tests/unit/cli/test_client.py
+ create mode 100644 tests/unit/cli/test_config.py
+ create mode 100644 tests/unit/cli/test_documents.py
+ create mode 100644 tests/unit/cli/test_packaging.py
+
+diff --git a/Makefile b/Makefile
+index f5640a7..6c1bcd4 100644
+--- a/Makefile
++++ b/Makefile
+@@ -43,7 +43,7 @@ $(VENV_PY):
+ # 注意（--no-deps）：子包之间通过 `forgemesh-*` 名称互相依赖（如 forgemesh-core、
+ # forgemesh-workflow-api），但它们都是本仓库内的本地包。若按目录字母序逐个做
+ # 依赖解析式 editable 安装，pip 会在兄弟包尚未安装时误向 PyPI 查询（例如先装
+-# packages/cli 时解析 forgemesh-core），因私有包不在 PyPI 而失败。故统一加
++# packages/control-plane 时解析 forgemesh-core），因私有包不在 PyPI 而失败。故统一加
+ # --no-deps：
+ #   * 外部第三方依赖（pydantic）已由上面的 requirements-dev.txt 统一提供；
+ #   * 跨包依赖由本循环内的 editable 安装逐一登记，安装完成后即可互相 import。
+diff --git a/packages/cli/pyproject.toml b/packages/cli/pyproject.toml
+index 7a251ec..ab360ef 100644
+--- a/packages/cli/pyproject.toml
++++ b/packages/cli/pyproject.toml
+@@ -5,10 +5,10 @@ build-backend = "setuptools.build_meta"
+ [project]
+ name = "forgemesh-cli"
+ version = "0.0.1"
+-description = "ForgeMesh command line interface (apply/get/describe/version)"
++description = "ForgeMesh command line client of the REST API (apply/get/describe/list/delete/wait)"
+ requires-python = ">=3.12"
+ dependencies = [
+-    "forgemesh-core",
++    "pyyaml>=6.0.1",
+ ]
+ 
+ [project.scripts]
+@@ -19,4 +19,4 @@ package-dir = { "" = "src" }
+ 
+ [tool.setuptools.packages.find]
+ where = ["src"]
+-namespaces = true
+\ No newline at end of file
++namespaces = true
+diff --git a/packages/cli/src/forgemesh/cli/client.py b/packages/cli/src/forgemesh/cli/client.py
+new file mode 100644
+index 0000000..24b87a9
+--- /dev/null
++++ b/packages/cli/src/forgemesh/cli/client.py
+@@ -0,0 +1,335 @@
++"""ForgeMesh REST API 的 HTTP 客户端，只用标准库（:mod:`urllib.request`）。
++
++网关与控制平面提供同一套 ``/api/v1`` API。一次命令行调用的全部请求带同一个
++``X-Correlation-Id``，错误消息中显示它，便于在网关与控制平面的日志中找到这次调用。
++错误响应是控制平面与网关的错误信封，或网关自己的纯文本响应（限流 ``429``、连不上控制
++平面 ``502``）；两者都转换为 :class:`~.errors.ApiError`。客户端不跟随重定向，
++``Authorization`` 只发给配置的地址。
++"""
++
++from __future__ import annotations
++
++import copy
++import http.client
++import json
++import urllib.error
++import urllib.request
++from collections.abc import Iterator, Mapping
++from dataclasses import dataclass
++from email.message import Message
++from http import HTTPStatus
++from typing import IO, Any
++from urllib.parse import quote, urlencode
++
++from .config import API_KEY_ENV, API_URL_ENV
++from .errors import ApiError, CliError, ConnectionFailure
++from .output import printable
++
++SERVICES_PATH = "/api/v1/inference-services"
++CORRELATION_HEADER = "X-Correlation-Id"
++TENANT_HEADER = "X-Tenant-Id"
++USER_AGENT = "forgemesh-cli"
++#: 单个请求的超时（秒）。网关等待控制平面的响应头最多 30 秒，超过时返回 ``502``。
++REQUEST_TIMEOUT_SECONDS = 60.0
++#: 错误消息引用非错误信封的响应正文时最多保留的字符数。
++_QUOTE_LIMIT = 200
++
++
++@dataclass(frozen=True)
++class Response:
++    """成功（2xx）的响应。
++
++    Attributes:
++        status: HTTP 状态码。
++        body: 解析后的 JSON 正文；没有正文（如 ``204``）时为 ``None``。
++    """
++
++    status: int
++    body: Any
++
++
++class _NoRedirect(urllib.request.HTTPRedirectHandler):
++    """3xx 作为错误返回，不跟随：请求头中的凭证不会被发到其他地址。"""
++
++    def redirect_request(
++        self,
++        req: urllib.request.Request,
++        fp: IO[bytes],
++        code: int,
++        msg: str,
++        headers: Message,
++        newurl: str,
++    ) -> urllib.request.Request | None:
++        return None
++
++
++class ApiClient:
++    """``/api/v1`` 的客户端。
++
++    Args:
++        base_url: 网关或控制平面的基地址（见 :func:`~.config.resolve_api_url`）。
++        api_key: ``Authorization: Bearer`` 的 key；为 ``None`` 时不发送该请求头。
++        tenant: ``X-Tenant-Id`` 请求头；为 ``None`` 时不发送。
++        correlation_id: 每个请求的 ``X-Correlation-Id``。
++    """
++
++    def __init__(
++        self,
++        base_url: str,
++        *,
++        api_key: str | None,
++        tenant: str | None,
++        correlation_id: str,
++    ) -> None:
++        self.base_url = base_url
++        self.tenant = tenant
++        self.correlation_id = correlation_id
++        self._api_key = api_key
++        self._opener = urllib.request.build_opener(_NoRedirect)
++
++    def with_tenant(self, tenant: str | None) -> ApiClient:
++        """配置相同、``X-Tenant-Id`` 为 ``tenant`` 的客户端。"""
++        client = copy.copy(self)
++        client.tenant = tenant
++        return client
++
++    def request(
++        self,
++        method: str,
++        path: str,
++        *,
++        query: Mapping[str, str | int] | None = None,
++        body: Any = None,
++        timeout: float = REQUEST_TIMEOUT_SECONDS,
++    ) -> Response:
++        """发送一个请求，返回成功的响应。
++
++        Raises:
++            ApiError: 响应的状态码不是 2xx（包括没有跟随的重定向）。
++            ConnectionFailure: 没有收到 HTTP 响应。
++            CliError: 成功响应的正文不是 JSON。
++        """
++        url = self.base_url + path
++        if query:
++            url += "?" + urlencode(query)
++        headers = {
++            "Accept": "application/json",
++            "User-Agent": USER_AGENT,
++            CORRELATION_HEADER: self.correlation_id,
++        }
++        if self._api_key is not None:
++            headers["Authorization"] = f"Bearer {self._api_key}"
++        if self.tenant is not None:
++            headers[TENANT_HEADER] = self.tenant
++        data = None
++        if body is not None:
++            data = json.dumps(body, ensure_ascii=False).encode("utf-8")
++            headers["Content-Type"] = "application/json"
++        request = urllib.request.Request(url, data=data, headers=headers, method=method)
++        try:
++            with self._opener.open(request, timeout=timeout) as response:
++                status, raw = response.status, response.read()
++        except urllib.error.HTTPError as exc:
++            try:
++                raw = exc.read()
++            except (OSError, http.client.HTTPException):
++                raw = b""
++            finally:
++                exc.close()
++            raise self._error(exc.code, exc.headers, raw) from exc
++        except (urllib.error.URLError, http.client.HTTPException, OSError) as exc:
++            reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
++            cause = printable(reason) or type(reason).__name__
++            raise ConnectionFailure(
++                f"cannot reach the API at {self.base_url}: {cause} (check --api-url or "
++                f"{API_URL_ENV}, and that the gateway or control plane is running)"
++            ) from exc
++        if not raw:
++            return Response(status, None)
++        try:
++            return Response(status, json.loads(raw))
++        except ValueError as exc:
++            raise CliError(
++                f"{method} {path} at {self.base_url} answered HTTP {status} with a body that "
++                "is not JSON; check --api-url"
++            ) from exc
++
++    def get_service(
++        self, name: str, namespace: str | None, *, timeout: float = REQUEST_TIMEOUT_SECONDS
++    ) -> dict[str, Any]:
++        """读取一个推理服务。"""
++        response = self.request(
++            "GET", _service_path(name), query=_namespace_query(namespace), timeout=timeout
++        )
++        return self._resource(response)
++
++    def create_service(self, document: dict[str, Any]) -> dict[str, Any]:
++        """创建推理服务（``201``）。"""
++        return self._resource(self.request("POST", SERVICES_PATH, body=document))
++
++    def replace_service(
++        self, name: str, namespace: str | None, document: dict[str, Any]
++    ) -> dict[str, Any]:
++        """整体替换推理服务（``PUT``）。"""
++        response = self.request(
++            "PUT", _service_path(name), query=_namespace_query(namespace), body=document
++        )
++        return self._resource(response)
++
++    def delete_service(self, name: str, namespace: str | None) -> int:
++        """受控删除，返回状态码：``204`` 已删除，``202`` 进入 ``Terminating``。"""
++        return self.request("DELETE", _service_path(name), query=_namespace_query(namespace)).status
++
++    def list_services(self, namespace: str | None, *, page_size: int) -> Iterator[dict[str, Any]]:
++        """逐页列出推理服务：以相同的过滤条件把 ``nextPageToken`` 作为 ``pageToken`` 传回，
++        直到响应不再带它。
++
++        Args:
++            namespace: 只列出这个命名空间；``None`` 时列出全部。
++            page_size: 每页条数（``limit``，1–1000）。
++        """
++        query: dict[str, str | int] = {"limit": page_size}
++        if namespace is not None:
++            query["namespace"] = namespace
++        token: str | None = None
++        while True:
++            page = self.request(
++                "GET",
++                SERVICES_PATH,
++                query=query if token is None else {**query, "pageToken": token},
++            ).body
++            items = page.get("items") if isinstance(page, dict) else None
++            next_token = page.get("nextPageToken") if isinstance(page, dict) else None
++            if (
++                not isinstance(items, list)
++                or not all(isinstance(item, dict) for item in items)
++                or (next_token is not None and (not isinstance(next_token, str) or not next_token))
++            ):
++                raise self._unexpected("list")
++            yield from items
++            if next_token is None:
++                return
++            if next_token == token:
++                raise CliError(
++                    "the API returned the same nextPageToken twice; the list is incomplete"
++                )
++            token = next_token
++
++    def _resource(self, response: Response) -> dict[str, Any]:
++        body = response.body
++        if not isinstance(body, dict) or not isinstance(body.get("metadata"), dict):
++            raise self._unexpected("resource")
++        return body
++
++    def _unexpected(self, what: str) -> CliError:
++        return CliError(
++            f"the API at {self.base_url} returned an unexpected {what} response; check --api-url"
++        )
++
++    def _error(self, status: int, headers: Message, raw: bytes) -> ApiError:
++        retry_after = _retry_after(headers.get("Retry-After"))
++        error = _envelope(raw)
++        code = reason = None
++        if error is not None:
++            code = error["code"]
++            details = error.get("details")
++            if isinstance(details, dict) and isinstance(details.get("reason"), str):
++                reason = details["reason"]
++            correlation_id = error.get("correlationId")
++            if not isinstance(correlation_id, str) or not correlation_id:
++                correlation_id = self.correlation_id
++            summary = f"HTTP {status} {code}" + (f", reason {reason}" if reason else "")
++            lines = [
++                f"{printable(error['message'])} ({printable(summary)}, "
++                f"correlation id {printable(correlation_id)})",
++                *_validation_errors(details),
++            ]
++        else:
++            lines = [
++                f"{_plain_message(status, headers, raw)} (correlation id {self.correlation_id})"
++            ]
++        if retry_after is not None:
++            lines[0] += f"; retry after {retry_after} s"
++        if status == 401 and self._api_key is None:
++            lines.append(
++                f"no API key is configured: set {API_KEY_ENV} or pass --api-key-file "
++                "(a control plane in dev mode needs --tenant instead)"
++            )
++        return ApiError(status, "\n".join(lines), code=code, reason=reason, retry_after=retry_after)
++
++
++def _service_path(name: str) -> str:
++    return f"{SERVICES_PATH}/{quote(name, safe='')}"
++
++
++def _namespace_query(namespace: str | None) -> dict[str, str] | None:
++    return None if namespace is None else {"namespace": namespace}
++
++
++def _envelope(raw: bytes) -> dict[str, Any] | None:
++    """错误信封中的 ``error`` 对象；正文不是错误信封时返回 ``None``。"""
++    try:
++        body = json.loads(raw)
++    except ValueError:
++        return None
++    error = body.get("error") if isinstance(body, dict) else None
++    if (
++        isinstance(error, dict)
++        and isinstance(error.get("code"), str)
++        and isinstance(error.get("message"), str)
++    ):
++        return error
++    return None
++
++
++def _validation_errors(details: Any) -> list[str]:
++    """``details.errors``（请求校验失败）逐条列出，如 ``  spec.resources: Field required``。"""
++    errors = details.get("errors") if isinstance(details, dict) else None
++    lines = []
++    for error in errors if isinstance(errors, list) else []:
++        if not isinstance(error, dict):
++            continue
++        loc = error.get("loc")
++        where = ".".join(str(part) for part in loc) if isinstance(loc, list) and loc else "-"
++        lines.append(f"  {printable(where)}: {printable(error.get('msg', ''))}")
++    return lines
++
++
++def _plain_message(status: int, headers: Message, raw: bytes) -> str:
++    """不是错误信封的错误响应（网关的纯文本响应，或不提供 API 的地址）的说明。"""
++    status_line = f"HTTP {status} {_phrase(status)}".rstrip()
++    if status == 429:
++        return f"rate limited by the gateway ({status_line})"
++    if status == 502:
++        return f"the gateway could not reach the control plane ({status_line})"
++    if 300 <= status < 400:
++        location = headers.get("Location")
++        target = f" to {printable(location)}" if location else ""
++        return (
++            f"{status_line}: redirected{target}; the CLI does not follow redirects, set "
++            "--api-url to the address that serves the API"
++        )
++    text = _quote(raw)
++    message = f"{status_line}: {text}" if text else status_line
++    if 400 <= status < 500:
++        message += "; the response is not from the ForgeMesh API, check --api-url"
++    return message
++
++
++def _phrase(status: int) -> str:
++    try:
++        return HTTPStatus(status).phrase
++    except ValueError:
++        return ""
++
++
++def _quote(raw: bytes) -> str:
++    lines = raw.decode("utf-8", errors="replace").strip().splitlines()
++    text = printable(lines[0].strip()) if lines else ""
++    return text if len(text) <= _QUOTE_LIMIT else text[:_QUOTE_LIMIT] + "..."
++
++
++def _retry_after(value: str | None) -> int | None:
++    """``Retry-After`` 的秒数；不是秒数（如 HTTP 日期）时返回 ``None``。"""
++    text = (value or "").strip()
++    return int(text) if text.isascii() and text.isdigit() else None
+diff --git a/packages/cli/src/forgemesh/cli/commands.py b/packages/cli/src/forgemesh/cli/commands.py
+index 8cbfa16..ba454fc 100644
+--- a/packages/cli/src/forgemesh/cli/commands.py
++++ b/packages/cli/src/forgemesh/cli/commands.py
+@@ -1,105 +1,275 @@
+-"""CLI 命令实现：直接调用 :class:`SQLiteRegistry`。
++"""CLI 命令：经 :class:`~.client.ApiClient` 调用 API，成功时返回退出码，失败时抛出
++:class:`~.errors.CliError`。
+ 
+-P1 简化：每个命令使用独立的内存 SQLite 库（``:memory:``），
+-不跨命令持久化。后续阶段将切换为 HTTP 客户端模式，通过 ``--api-url``
+-连接控制平面。
++命令只管理 ``InferenceService``。单个资源的命令不带 ``--namespace`` 时指不带命名空间的资源，
++``list`` 不带 ``--namespace`` 时列出全部命名空间，与 API 的规则一致。
+ """
+ 
+ from __future__ import annotations
+ 
+-import json
++import argparse
+ import sys
+-from pathlib import Path
++import time
+ from typing import Any
+ 
+-import yaml
+-from forgemesh.controlplane.registry import SQLiteRegistry
+-from forgemesh.core.errors import ConflictError, NotFoundError
+-from forgemesh.core.objects import ObjectMeta, Resource
++from .client import REQUEST_TIMEOUT_SECONDS, ApiClient
++from .documents import KIND, Document, load_documents
++from .errors import ApiError, CliError, ConnectionFailure, ExitCode
++from .output import (
++    NONE,
++    describe_service,
++    printable,
++    ready_condition,
++    resource_ref,
++    service_table,
++    to_json,
++    to_yaml,
++    to_yaml_stream,
++)
+ 
++#: ``apply`` 处理一个文档的尝试次数：读取之后资源被并发修改（``409``）、创建或删除时
++#: 重新读取再试。
++APPLY_ATTEMPTS = 5
++#: ``wait`` 两次读取之间的秒数。
++POLL_INTERVAL_SECONDS = 1.0
+ 
+-def _get_registry() -> SQLiteRegistry:
+-    """获取 Registry 实例（CLI 使用本地 SQLite 内存库）。"""
+-    return SQLiteRegistry(":memory:")  # P1 简化：每次新建内存库
++_READY = "Ready"
++_FAILED = "Failed"
++_TERMINATING = "Terminating"
+ 
+ 
+-def _build_resource(data: dict[str, Any], tenant_id: str) -> Resource:
+-    """从 YAML 解析结果构造 :class:`Resource`，注入租户上下文。
++def cmd_apply(args: argparse.Namespace, client: ApiClient) -> int:
++    """``apply -f FILE``：资源不存在就创建，存在就以读到的版本整体替换。
+ 
+-    ``--tenant`` 为租户权威来源，覆盖 YAML metadata 中可能存在的
+-    ``tenant_id`` / ``tenantId`` 字段。
++    某个资源失败时报告错误、继续处理其余的资源，返回第一个失败的退出码。
+     """
+-    meta_dict = dict(data.get("metadata", {}))
+-    meta_dict.pop("tenant_id", None)
+-    meta_dict.pop("tenantId", None)
+-    meta = ObjectMeta(**meta_dict, tenant_id=tenant_id)
+-    return Resource(kind=data.get("kind", "InferenceService"), metadata=meta)
++    documents = load_documents(
++        args.files, namespace=args.namespace, tenant=args.tenant, stdin=sys.stdin
++    )
++    result = ExitCode.OK
++    for document in documents:
++        ref = f"{KIND} {resource_ref(document.namespace, document.name)}"
++        try:
++            outcome = _apply(client.with_tenant(document.tenant), document)
++        except CliError as exc:
++            print(f"Error: {ref} ({document.source}): {exc.message}", file=sys.stderr)
++            if result is ExitCode.OK:
++                result = exc.exit_code
++            continue
++        print(f"{ref} {outcome}")
++    return result
+ 
+ 
+-async def cmd_apply(args: Any) -> int:
+-    """``apply -f <file.yaml>``：创建/更新资源。"""
+-    file_path = Path(args.file)
+-    if not file_path.exists():
+-        print(f"Error: file not found: {file_path}", file=sys.stderr)
+-        return 1
++def _apply(client: ApiClient, document: Document) -> str:
++    """创建或更新一个资源，返回 ``created`` / ``configured`` / ``unchanged``。"""
++    for _ in range(APPLY_ATTEMPTS):
++        try:
++            current = client.get_service(document.name, document.namespace)
++        except ApiError as exc:
++            if not exc.not_found:
++                raise
++            try:
++                client.create_service(document.body)
++            except ApiError as create_error:
++                if create_error.status == 409:  # 刚被并发创建：下一轮读取后更新它
++                    continue
++                raise
++            return "created"
++        try:
++            updated = client.replace_service(
++                document.name, document.namespace, _versioned(document.body, current)
++            )
++        except ApiError as exc:
++            if exc.status == 409 and exc.reason == _TERMINATING:
++                raise CliError(
++                    f"{exc.message}\nwait until it is deleted ("
++                    f"{_command('wait', document.name, document.namespace)} --for delete) "
++                    "and apply again",
++                    exc.exit_code,
++                ) from exc
++            if exc.status == 409 or exc.not_found:
++                continue
++            raise
++        same = updated["metadata"].get("resourceVersion") == current["metadata"].get(
++            "resourceVersion"
++        )
++        return "unchanged" if same else "configured"
++    raise CliError(
++        f"the resource kept changing while it was applied ({APPLY_ATTEMPTS} attempts); try again",
++        ExitCode.CONFLICT,
++    )
++
++
++def _versioned(body: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
++    """以读到的 ``resourceVersion`` 与 ``uid`` 作为 ``PUT`` 的前置条件，替换文档中的值。
++
++    文档中的版本多半已经过时（控制器每次写 ``status`` 都会递增版本），``apply`` 总是更新
++    读到的版本；读取之后资源又被修改时 ``PUT`` 返回 ``409``，由调用方重新读取。
++    """
++    metadata = {
++        **body["metadata"],
++        "resourceVersion": current["metadata"].get("resourceVersion"),
++        "uid": current["metadata"].get("uid"),
++    }
++    return {**body, "metadata": metadata}
+ 
+-    with file_path.open("r", encoding="utf-8") as f:
+-        data: dict[str, Any] = yaml.safe_load(f) or {}
+ 
+-    registry = _get_registry()
+-    resource = _build_resource(data, args.tenant)
++def cmd_get(args: argparse.Namespace, client: ApiClient) -> int:
++    """``get KIND NAME``：输出资源（YAML 或 JSON）。"""
++    service = _get(client, args.name, args.namespace)
++    sys.stdout.write(to_json(service) + "\n" if args.output == "json" else to_yaml(service))
++    return ExitCode.OK
+ 
++
++def cmd_describe(args: argparse.Namespace, client: ApiClient) -> int:
++    """``describe KIND NAME``：便于阅读的详情，含条件与实例地址。"""
++    print(describe_service(_get(client, args.name, args.namespace)))
++    return ExitCode.OK
++
++
++def cmd_list(args: argparse.Namespace, client: ApiClient) -> int:
++    """``list KIND``：取全部页，输出表格、JSON 数组或以 ``---`` 分隔的 YAML 文档。"""
++    services = list(client.list_services(args.namespace, page_size=args.page_size))
++    if args.output == "json":
++        print(to_json(services))
++    elif args.output == "yaml":
++        sys.stdout.write(to_yaml_stream(services))
++    elif services:
++        print(service_table(services))
++    else:
++        where = "" if args.namespace is None else f" in namespace {args.namespace}"
++        print(f"No {KIND} resources found{where}.", file=sys.stderr)
++    return ExitCode.OK
++
++
++def cmd_delete(args: argparse.Namespace, client: ApiClient) -> int:
++    """``delete KIND NAME``：受控删除，区分已删除（``204``）与进入 ``Terminating``（``202``）。"""
++    ref = f"{KIND} {resource_ref(args.namespace, args.name)}"
+     try:
+-        created = await registry.put(resource)
++        status = client.delete_service(args.name, args.namespace)
++    except ApiError as exc:
++        raise _not_found_hint(exc, args.namespace) from exc
++    if status == 202:
+         print(
+-            f"Created: {created.kind}/{created.metadata.name} "
+-            f"(version={created.metadata.resourceVersion})"
++            f"{ref} is terminating: the controller stops its instance and releases its "
++            "accelerators, then deletes it"
+         )
+-        return 0
+-    except ConflictError as exc:
+-        print(f"Error: {exc}", file=sys.stderr)
+-        return 1
++    else:
++        print(f"{ref} deleted")
++    return ExitCode.OK
+ 
+ 
+-async def cmd_get(args: Any) -> int:
+-    """``get <kind> <name>``：查询资源。"""
+-    registry = _get_registry()
+-    try:
+-        resource = await registry.get(args.kind, args.namespace, args.name, args.tenant)
+-        print(
+-            json.dumps(
+-                resource.model_dump(by_alias=True), indent=2, ensure_ascii=False
++def cmd_wait(args: argparse.Namespace, client: ApiClient) -> int:
++    """``wait KIND NAME``：等资源就绪（``--for ready``）或被删除（``--for delete``）。
++
++    就绪指 ``status.phase`` 为 ``Ready``、``Ready`` 条件为 ``True``，且控制器已处理当前的
++    ``spec``（``observedGeneration`` 不小于 ``generation``）。资源正在删除，或控制器处理当前的
++    ``spec`` 之后进入 ``Failed`` 时立即失败。API 应答过一次之后，限流、``502`` - ``504`` 与连接
++    失败视为暂时故障，继续等待。
++    """
++    ref = f"{KIND} {resource_ref(args.namespace, args.name)}"
++    goal = "become Ready" if args.condition == "ready" else "be deleted"
++    deadline = time.monotonic() + args.timeout
++    answered = False
++    seen = False
++    last = "no response"
++    while True:
++        delay = POLL_INTERVAL_SECONDS
++        try:
++            service = client.get_service(args.name, args.namespace, timeout=_timeout(deadline))
++        except ApiError as exc:
++            answered = True
++            if exc.not_found and args.condition == "delete":
++                print(f"{ref} deleted" if seen else f"{ref} not found")
++                return ExitCode.OK
++            if not exc.transient:
++                raise _not_found_hint(exc, args.namespace) from exc
++            last = exc.message
++            delay = max(delay, exc.retry_after or 0)
++        except ConnectionFailure as exc:
++            if not answered:
++                raise
++            last = exc.message
++        else:
++            answered = seen = True
++            if args.condition == "ready":
++                outcome, last = _readiness(service)
++                if outcome is True:
++                    print(f"{ref} is Ready")
++                    return ExitCode.OK
++                if outcome is False:
++                    raise CliError(f"{ref} will not become Ready: {last}", ExitCode.WAIT_FAILED)
++            else:
++                last = printable(f"phase {_status(service).get('phase') or NONE}")
++        remaining = deadline - time.monotonic()
++        if remaining <= 0:
++            raise CliError(
++                f"timed out after {args.timeout:g} s waiting for {ref} to {goal}; "
++                f"last seen: {last}",
++                ExitCode.WAIT_TIMEOUT,
+             )
++        time.sleep(min(delay, remaining))
++
++
++def _readiness(service: dict[str, Any]) -> tuple[bool | None, str]:
++    """``(结论, 说明)``：``True`` 已就绪，``False`` 不会再就绪，``None`` 继续等待。"""
++    metadata = service["metadata"]
++    status = _status(service)
++    phase = status.get("phase")
++    generation = metadata.get("generation")
++    observed = metadata.get("observedGeneration", status.get("observedGeneration"))
++    current = not isinstance(generation, int) or (
++        isinstance(observed, int) and observed >= generation
++    )
++    condition = ready_condition(service)
++    description = f"phase {phase or NONE}"
++    if condition is not None:
++        description += f", Ready={condition.get('status')}"
++        parts = (condition.get("reason"), condition.get("message"))
++        detail = ": ".join(str(part) for part in parts if part)
++        if detail:
++            description += f" ({detail})"
++    if not current:
++        description += (
++            f"; the controller has not processed generation {generation} yet (observed {observed})"
+         )
+-        return 0
+-    except NotFoundError:
+-        print(f"Error: {args.kind}/{args.name} not found", file=sys.stderr)
+-        return 1
++    description = printable(description)
++    if phase == _TERMINATING or (phase == _FAILED and current):
++        return False, description
++    ready = condition is not None and condition.get("status") == "True"
++    if phase == _READY and ready and current:
++        return True, description
++    return None, description
+ 
+ 
+-async def cmd_describe(args: Any) -> int:
+-    """``describe <kind> <name>``：查询资源详情（P1 等同 get）。"""
+-    return await cmd_get(args)
++def _status(service: dict[str, Any]) -> dict[str, Any]:
++    status = service.get("status")
++    return status if isinstance(status, dict) else {}
+ 
+ 
+-async def cmd_list(args: Any) -> int:
+-    """``list <kind>``：列出资源。"""
+-    registry = _get_registry()
+-    items = await registry.list(args.kind, args.tenant, namespace=args.namespace)
+-    for item in items:
+-        print(
+-            f"{item.kind}\t{item.metadata.namespace or 'default'}\t{item.metadata.name}"
+-        )
+-    return 0
++def _timeout(deadline: float) -> float:
++    """一次读取的超时：不超过剩余的等待时间，但至少 1 秒，最后一次读取也有机会完成。"""
++    return max(1.0, min(REQUEST_TIMEOUT_SECONDS, deadline - time.monotonic()))
+ 
+ 
+-async def cmd_delete(args: Any) -> int:
+-    """``delete <kind> <name>``：删除资源。"""
+-    registry = _get_registry()
++def _get(client: ApiClient, name: str, namespace: str | None) -> dict[str, Any]:
+     try:
+-        await registry.delete(args.kind, args.namespace, args.name, args.tenant)
+-        print(f"Deleted: {args.kind}/{args.name}")
+-        return 0
+-    except NotFoundError:
+-        print(f"Error: {args.kind}/{args.name} not found", file=sys.stderr)
+-        return 1
++        return client.get_service(name, namespace)
++    except ApiError as exc:
++        raise _not_found_hint(exc, namespace) from exc
++
++
++def _not_found_hint(exc: ApiError, namespace: str | None) -> CliError:
++    """没有给出 ``--namespace`` 而资源不存在时，提示请求指的是不带命名空间的资源。"""
++    if not (exc.not_found and namespace is None):
++        return exc
++    return CliError(
++        f"{exc.message}\nno --namespace was given, so this looked for an {KIND} "
++        "without a namespace",
++        exc.exit_code,
++    )
++
++
++def _command(verb: str, name: str, namespace: str | None) -> str:
++    option = "" if namespace is None else f" -n {namespace}"
++    return f"forgemesh {verb} {KIND.lower()} {name}{option}"
+diff --git a/packages/cli/src/forgemesh/cli/config.py b/packages/cli/src/forgemesh/cli/config.py
+new file mode 100644
+index 0000000..8bff438
+--- /dev/null
++++ b/packages/cli/src/forgemesh/cli/config.py
+@@ -0,0 +1,110 @@
++"""CLI 配置：API 地址、API key、租户与命名空间。
++
++* API 地址：``--api-url``，其次 ``FORGEMESH_API_URL``，默认经网关访问
++  :data:`DEFAULT_API_URL`；直连控制平面时指向它的地址（默认 ``http://127.0.0.1:8080``）。
++  地址是网关或控制平面的基地址（可以带反向代理的路径前缀），不含 ``/api/v1``。
++* API key：``--api-key-file`` 指向的文件（只含 key 一行），其次 ``FORGEMESH_API_KEY``；
++  都没有时不发送 ``Authorization``。key 只出现在请求头中，任何消息都不包含它。
++* 租户：``--tenant`` 作为 ``X-Tenant-Id`` 发送。``dev`` 模式的控制平面以它确定租户；
++  带 key 时可以省略，给出就必须与 key 绑定的租户一致。
++"""
++
++from __future__ import annotations
++
++import re
++from collections.abc import Mapping
++from pathlib import Path
++from urllib.parse import urlsplit
++
++from .errors import UsageError
++
++API_URL_ENV = "FORGEMESH_API_URL"
++API_KEY_ENV = "FORGEMESH_API_KEY"
++DEFAULT_API_URL = "http://127.0.0.1:8081"
++
++#: RFC 6750 的 ``b64token``：``Authorization: Bearer`` 中允许出现的字符。
++_TOKEN = re.compile(r"[A-Za-z0-9\-._~+/]+=*")
++#: 租户放在请求头中，只接受可见的 ASCII 字符。
++_VISIBLE_ASCII = re.compile(r"[\x21-\x7e]+")
++
++
++def resolve_api_url(option: str | None, environ: Mapping[str, str]) -> str:
++    """API 基地址（不带结尾的 ``/``）。
++
++    Raises:
++        UsageError: 不是 http / https 地址，或带有凭证、查询串、片段或 ``/api/v1``。
++            消息不包含地址本身（其中可能有凭证）。
++    """
++    source = "--api-url"
++    value = option
++    if value is None:
++        source = API_URL_ENV
++        value = environ.get(API_URL_ENV, "").strip() or DEFAULT_API_URL
++    parts = urlsplit(value)
++    if parts.scheme not in ("http", "https") or not parts.hostname:
++        raise UsageError(f"{source} must be an http or https URL such as {DEFAULT_API_URL}")
++    if parts.username is not None or parts.password is not None:
++        raise UsageError(f"{source} must not contain credentials; use --api-key-file")
++    if parts.query or parts.fragment:
++        raise UsageError(f"{source} must not contain a query or a fragment")
++    try:
++        _ = parts.port  # 端口非法时抛 ValueError
++    except ValueError as exc:
++        raise UsageError(f"{source} has an invalid port") from exc
++    if parts.path.rstrip("/").endswith("/api/v1"):
++        raise UsageError(f"{source} is the base URL of the API; remove the trailing /api/v1")
++    return value.rstrip("/")
++
++
++def resolve_api_key(key_file: str | None, environ: Mapping[str, str]) -> str | None:
++    """API key：``key_file`` 优先，其次 ``FORGEMESH_API_KEY``（空白值视同未设置）。
++
++    Raises:
++        UsageError: 文件不可读，或内容不是一个 key。消息不包含文件内容。
++    """
++    if key_file is not None:
++        source = f"the API key file {key_file}"
++        try:
++            key = Path(key_file).read_text(encoding="utf-8").strip()
++        except UnicodeDecodeError as exc:
++            raise UsageError(f"{source} is not UTF-8 text") from exc
++        except OSError as exc:
++            raise UsageError(f"cannot read {source}: {exc.strerror or exc}") from exc
++        if not key:
++            raise UsageError(f"{source} is empty")
++    else:
++        source = API_KEY_ENV
++        key = environ.get(API_KEY_ENV, "").strip()
++        if not key:
++            return None
++    if not _TOKEN.fullmatch(key):
++        raise UsageError(
++            f"{source} does not hold a single API key: expected one line with the key "
++            "printed by `python -m forgemesh.controlplane.keygen`"
++        )
++    return key
++
++
++def check_tenant(value: str, source: str) -> str:
++    """校验作为 ``X-Tenant-Id`` 发送的租户。
++
++    Raises:
++        UsageError: 为空，或含有空白、控制字符或非 ASCII 字符。
++    """
++    if not _VISIBLE_ASCII.fullmatch(value):
++        raise UsageError(f"{source} must be a non-empty string of visible ASCII characters")
++    return value
++
++
++def check_namespace(value: str, source: str) -> str:
++    """校验命名空间。
++
++    API 把空字符串当作一个命名空间，与不带命名空间（省略）不是同一个；空字符串几乎总是
++    笔误，因此拒绝。
++
++    Raises:
++        UsageError: 为空字符串。
++    """
++    if not value:
++        raise UsageError(f"{source} must not be empty; omit it for resources without a namespace")
++    return value
+diff --git a/packages/cli/src/forgemesh/cli/documents.py b/packages/cli/src/forgemesh/cli/documents.py
+new file mode 100644
+index 0000000..e80abc5
+--- /dev/null
++++ b/packages/cli/src/forgemesh/cli/documents.py
+@@ -0,0 +1,181 @@
++"""``apply -f`` 的资源文档。
++
++文件是 YAML（可以有多个以 ``---`` 分隔的文档）或 JSON（一个对象，或对象的数组），``-``
++读取标准输入；顶层为数组（YAML 序列）时每一项是一个文档，``list -o json`` 的输出因此
++可以直接再次提交。全部文档在发出任何请求之前读取并检查。
++"""
++
++from __future__ import annotations
++
++import json
++import math
++from collections.abc import Sequence
++from dataclasses import dataclass
++from pathlib import Path
++from typing import Any, TextIO
++
++import yaml
++
++from .config import check_namespace, check_tenant
++from .errors import UsageError
++
++KIND = "InferenceService"
++STDIN = "-"
++
++
++@dataclass(frozen=True)
++class Document:
++    """一个待提交的推理服务文档。
++
++    Attributes:
++        source: 消息中的来源：文件名，文件中有多个文档时附带序号。
++        body: 请求体；文档没有命名空间而给出了 ``--namespace`` 时已填入它。
++        name: ``metadata.name``。
++        namespace: 命名空间；``None`` 指不带命名空间的资源。
++        tenant: 作为 ``X-Tenant-Id`` 发送的租户：文档的 ``metadata.tenantId``，其次
++            ``--tenant``。API 以凭证确定租户，文档中的租户与 key 不符时请求被拒绝（``403``），
++            而不是写进 key 的租户。
++    """
++
++    source: str
++    body: dict[str, Any]
++    name: str
++    namespace: str | None
++    tenant: str | None
++
++
++def load_documents(
++    paths: Sequence[str], *, namespace: str | None, tenant: str | None, stdin: TextIO
++) -> list[Document]:
++    """读取并检查 ``paths`` 中的全部文档。
++
++    Args:
++        paths: 文件路径，``-`` 为标准输入（最多一次）。
++        namespace: ``--namespace``：文档没有命名空间时使用，有时必须与之相同。
++        tenant: ``--tenant``：文档没有租户时使用，有时必须与之相同。
++        stdin: 标准输入。
++
++    Raises:
++        UsageError: 文件不可读、不是合法的 YAML / JSON，或某个文档不是推理服务。
++    """
++    if sum(path == STDIN for path in paths) > 1:
++        raise UsageError("standard input ('-') can be read only once")
++    documents: list[Document] = []
++    for path in paths:
++        label = "<stdin>" if path == STDIN else path
++        values = _parse(stdin.read() if path == STDIN else _read(path), label)
++        if not values:
++            raise UsageError(f"{label}: no documents found")
++        for index, value in enumerate(values, start=1):
++            source = label if len(values) == 1 else f"{label} (document {index})"
++            documents.append(_document(value, source, namespace, tenant))
++    return documents
++
++
++def _read(path: str) -> str:
++    try:
++        return Path(path).read_text(encoding="utf-8-sig")
++    except UnicodeDecodeError as exc:
++        raise UsageError(f"{path} is not UTF-8 text") from exc
++    except OSError as exc:
++        raise UsageError(f"cannot read {path}: {exc.strerror or exc}") from exc
++
++
++def _parse(text: str, label: str) -> list[Any]:
++    try:
++        return _load(text)
++    except yaml.YAMLError as exc:
++        raise UsageError(f"{label} is not valid YAML or JSON: {exc}") from exc
++    except RecursionError as exc:
++        raise UsageError(f"{label} is nested too deeply") from exc
++
++
++def _load(text: str) -> list[Any]:
++    if text.lstrip().startswith(("{", "[")):
++        try:
++            value = json.loads(text)
++        except ValueError:
++            pass  # YAML 的流式写法同样以 { 或 [ 开头，交给 YAML 解析
++        else:
++            return value if isinstance(value, list) else [value]
++    values = [value for value in yaml.safe_load_all(text) if value is not None]
++    if len(values) == 1 and isinstance(values[0], list):
++        return values[0]
++    return values
++
++
++def _document(value: Any, source: str, namespace: str | None, tenant: str | None) -> Document:
++    if not isinstance(value, dict):
++        raise UsageError(f"{source}: a resource document must be a mapping")
++    try:
++        _check_json(value, "")
++    except RecursionError as exc:
++        raise UsageError(f"{source}: the document is nested too deeply") from exc
++    except ValueError as exc:
++        raise UsageError(f"{source}: {exc}") from exc
++    kind = value.get("kind", KIND)
++    if kind != KIND:
++        raise UsageError(f"{source}: kind {kind!r} is not supported; the CLI applies {KIND}")
++    metadata = value.get("metadata")
++    if not isinstance(metadata, dict):
++        raise UsageError(f"{source}: metadata must be a mapping")
++    name = metadata.get("name")
++    if not isinstance(name, str) or not name:
++        raise UsageError(f"{source}: metadata.name must be a non-empty string")
++
++    own_namespace = metadata.get("namespace")
++    if own_namespace is None:
++        own_namespace = namespace
++        if namespace is not None:
++            value = {**value, "metadata": {**metadata, "namespace": namespace}}
++    elif not isinstance(own_namespace, str):
++        raise UsageError(f"{source}: metadata.namespace must be a string")
++    else:
++        check_namespace(own_namespace, f"{source}: metadata.namespace")
++        if namespace is not None and namespace != own_namespace:
++            raise UsageError(
++                f"{source}: metadata.namespace {own_namespace!r} does not match "
++                f"--namespace {namespace!r}"
++            )
++
++    claims = [metadata[key] for key in ("tenantId", "tenant_id") if metadata.get(key) is not None]
++    if any(not isinstance(claim, str) for claim in claims) or len(set(claims)) > 1:
++        raise UsageError(f"{source}: metadata.tenantId must be a single string")
++    own_tenant = claims[0] if claims else None
++    if own_tenant is not None:
++        check_tenant(own_tenant, f"{source}: metadata.tenantId")
++        if tenant is not None and tenant != own_tenant:
++            raise UsageError(
++                f"{source}: metadata.tenantId {own_tenant!r} does not match --tenant {tenant!r}"
++            )
++    return Document(
++        source=source,
++        body=value,
++        name=name,
++        namespace=own_namespace,
++        tenant=own_tenant if own_tenant is not None else tenant,
++    )
++
++
++def _check_json(value: Any, path: str) -> None:
++    """检查 YAML 解析结果能否表示为 JSON（请求体是 JSON）。
++
++    Raises:
++        ValueError: 含有非字符串的键，或 JSON 无法表示的值（如未加引号的日期、``.nan``）。
++    """
++    where = path or "the document"
++    if isinstance(value, dict):
++        for key, item in value.items():
++            if not isinstance(key, str):
++                raise ValueError(f"{where} has a key that is not a string: {key!r}")
++            _check_json(item, f"{path}.{key}" if path else key)
++    elif isinstance(value, list):
++        for index, item in enumerate(value):
++            _check_json(item, f"{path}[{index}]")
++    elif isinstance(value, float) and not math.isfinite(value):
++        raise ValueError(f"{where} is {value}, which JSON cannot represent")
++    elif value is not None and not isinstance(value, str | int | float):
++        raise ValueError(
++            f"{where} is a {type(value).__name__} value, which JSON cannot represent; "
++            "quote it to make it a string"
++        )
+diff --git a/packages/cli/src/forgemesh/cli/errors.py b/packages/cli/src/forgemesh/cli/errors.py
+new file mode 100644
+index 0000000..a0f8337
+--- /dev/null
++++ b/packages/cli/src/forgemesh/cli/errors.py
+@@ -0,0 +1,121 @@
++"""CLI 的错误与退出码。
++
++命令以异常报告失败：:class:`CliError` 的 ``message`` 写到标准错误，``exit_code`` 是进程的
++退出码。退出码按失败原因区分，脚本可以据此决定是否重试（见 :class:`ExitCode`）。
++"""
++
++from __future__ import annotations
++
++from enum import IntEnum
++
++
++class ExitCode(IntEnum):
++    """进程退出码，``forgemesh --help`` 列出同一张表。"""
++
++    OK = 0
++    ERROR = 1
++    """其他错误，如响应不是来自 ForgeMesh API（地址配置错误）或无法解析。"""
++    USAGE = 2
++    """参数、配置或资源文档不合法，没有发出请求（与 argparse 的用法错误相同）。"""
++    NOT_FOUND = 3
++    """API 报告资源不存在（``404`` 错误信封）。"""
++    CONFLICT = 4
++    REJECTED = 5
++    """API 拒绝了请求：``400``、``405``、``413``、``415`` 等其他 4xx。"""
++    AUTH = 6
++    """``401`` / ``403``：key 缺失或无效，或者无权执行请求。"""
++    RATE_LIMITED = 7
++    SERVER_ERROR = 8
++    """``500`` 等其他 5xx。"""
++    UNAVAILABLE = 9
++    """``502`` / ``503`` / ``504``：网关连不上控制平面，或控制平面的组件尚未就绪。"""
++    CONNECTION_FAILED = 10
++    """没有收到 HTTP 响应：连接被拒绝、主机名无法解析、TLS 失败或超时。"""
++    WAIT_TIMEOUT = 11
++    WAIT_FAILED = 12
++    """等待的条件不会再满足：服务进入 ``Failed`` 或正在删除。"""
++    INTERRUPTED = 130
++    """被 Ctrl-C 中断（128 + SIGINT，与 shell 的约定相同）。"""
++
++
++def exit_code_for_status(status: int) -> ExitCode:
++    """错误状态码对应的退出码。"""
++    if status in (401, 403):
++        return ExitCode.AUTH
++    if status == 404:
++        return ExitCode.NOT_FOUND
++    if status == 409:
++        return ExitCode.CONFLICT
++    if status == 429:
++        return ExitCode.RATE_LIMITED
++    if status in (502, 503, 504):
++        return ExitCode.UNAVAILABLE
++    if 400 <= status < 500:
++        return ExitCode.REJECTED
++    if status >= 500:
++        return ExitCode.SERVER_ERROR
++    return ExitCode.ERROR
++
++
++class CliError(Exception):
++    """命令失败：``message`` 写到标准错误，进程以 ``exit_code`` 退出。"""
++
++    def __init__(self, message: str, exit_code: ExitCode = ExitCode.ERROR) -> None:
++        super().__init__(message)
++        self.message = message
++        self.exit_code = exit_code
++
++
++class UsageError(CliError):
++    """参数、配置或资源文档不合法。"""
++
++    def __init__(self, message: str) -> None:
++        super().__init__(message, ExitCode.USAGE)
++
++
++class ConnectionFailure(CliError):
++    """没有收到 HTTP 响应。"""
++
++    def __init__(self, message: str) -> None:
++        super().__init__(message, ExitCode.CONNECTION_FAILED)
++
++
++class ApiError(CliError):
++    """API 以错误状态码响应。
++
++    Attributes:
++        status: HTTP 状态码。
++        code: 错误信封的 ``error.code``；响应不是错误信封（如网关的纯文本 ``429`` / ``502``）
++            时为 ``None``。
++        reason: 错误信封的 ``details.reason``（如 ``409`` 的 ``ResourceVersionMismatch``）。
++        retry_after: ``Retry-After`` 响应头给出的秒数。
++    """
++
++    def __init__(
++        self,
++        status: int,
++        message: str,
++        *,
++        code: str | None = None,
++        reason: str | None = None,
++        retry_after: int | None = None,
++    ) -> None:
++        exit_code = exit_code_for_status(status)
++        if exit_code is ExitCode.NOT_FOUND and code != "NOT_FOUND":
++            # 不是 API 的 404（如网关没有路由的路径）：地址错了，不能让脚本以为资源不存在
++            exit_code = ExitCode.ERROR
++        super().__init__(message, exit_code)
++        self.status = status
++        self.code = code
++        self.reason = reason
++        self.retry_after = retry_after
++
++    @property
++    def not_found(self) -> bool:
++        """资源不存在：``404`` 错误信封，而不是不提供 API 的地址返回的 ``404``。"""
++        return self.status == 404 and self.code == "NOT_FOUND"
++
++    @property
++    def transient(self) -> bool:
++        """稍后重试可能成功：限流，或网关、控制平面暂时不可用。"""
++        return self.exit_code in (ExitCode.RATE_LIMITED, ExitCode.UNAVAILABLE)
+diff --git a/packages/cli/src/forgemesh/cli/main.py b/packages/cli/src/forgemesh/cli/main.py
+index f054b7f..4bcdd77 100644
+--- a/packages/cli/src/forgemesh/cli/main.py
++++ b/packages/cli/src/forgemesh/cli/main.py
+@@ -1,87 +1,244 @@
+-"""ForgeMesh CLI — 声明式资源管理工具。
++"""ForgeMesh 命令行工具：经 REST API 管理推理服务（``InferenceService``）。
+ 
+ 命令::
+ 
+-  forgemesh apply -f <file.yaml>    创建/更新资源
+-  forgemesh get <kind> <name>       查询资源
+-  forgemesh describe <kind> <name>  查询资源详情
+-  forgemesh list <kind>             列出资源
+-  forgemesh delete <kind> <name>    删除资源
++  forgemesh apply -f FILE [-f FILE ...]       资源不存在就创建，存在就更新
++  forgemesh get inferenceservice NAME [-o yaml|json]
++  forgemesh describe inferenceservice NAME
++  forgemesh list inferenceservices [-o table|yaml|json] [--page-size N]
++  forgemesh delete inferenceservice NAME      受控删除
++  forgemesh wait inferenceservice NAME [--for ready|delete] [--timeout SECONDS]
+ 
+-全局选项::
+-
+-  --tenant <id>       租户 ID（默认 ``default``）
+-  --namespace <ns>    命名空间（可选）
+-  --api-url <url>     API 地址（默认 ``http://localhost:8080``，P1 直连 Registry）
+-
+-P1 简化：CLI 直接调用 :class:`SQLiteRegistry`（内存库），不走 HTTP。
+-后续阶段将切换为 HTTP 客户端模式。
++公共选项 ``--api-url``、``--api-key-file``、``--tenant`` 与 ``-n`` / ``--namespace`` 可以写在子命令
++之前或之后（之后的优先）。默认经网关访问 API；地址、key 与租户的来源见 :mod:`.config`，
++退出码见 :class:`~.errors.ExitCode`。
+ """
+ 
+ from __future__ import annotations
+ 
+ import argparse
+-import asyncio
++import math
++import os
+ import sys
++import uuid
++from collections.abc import Callable
++
++from .client import ApiClient
++from .commands import cmd_apply, cmd_delete, cmd_describe, cmd_get, cmd_list, cmd_wait
++from .config import (
++    API_KEY_ENV,
++    API_URL_ENV,
++    DEFAULT_API_URL,
++    check_namespace,
++    check_tenant,
++    resolve_api_key,
++    resolve_api_url,
++)
++from .documents import KIND
++from .errors import CliError, ExitCode
++
++DEFAULT_PAGE_SIZE = 100
++MAX_PAGE_SIZE = 1000
++DEFAULT_WAIT_TIMEOUT_SECONDS = 300.0
++
++_KIND_NAMES = frozenset({"inferenceservice", "inferenceservices"})
++
++_EPILOG = f"""\
++environment variables:
++  {API_URL_ENV}  base URL of the API if --api-url is not given (default
++                     {DEFAULT_API_URL}, the gateway; the control plane
++                     itself listens on http://127.0.0.1:8080 by default)
++  {API_KEY_ENV}  API key if --api-key-file is not given
++
++exit codes:
++  0    success
++  1    other errors, e.g. the URL does not serve the ForgeMesh API
++  2    invalid arguments, configuration or resource documents (nothing sent)
++  3    not found (HTTP 404)
++  4    conflict (HTTP 409), e.g. the service is being deleted
++  5    request rejected (HTTP 400, 405, 413, 415 and other 4xx)
++  6    authentication or authorization failed (HTTP 401, 403)
++  7    rate limited (HTTP 429)
++  8    server error (HTTP 500 and other 5xx)
++  9    API unavailable (HTTP 502, 503, 504)
++  10   no HTTP response: connection refused, unknown host, TLS error, timeout
++  11   wait timed out
++  12   wait failed: the service became Failed or is being deleted
++  130  interrupted
++"""
+ 
+-from .commands import cmd_apply, cmd_delete, cmd_describe, cmd_get, cmd_list
+-
+-
+-def main(argv: list[str] | None = None) -> int:
+-    """CLI 主入口。
++Handler = Callable[[argparse.Namespace, ApiClient], int]
+ 
+-    Args:
+-        argv: 参数列表；``None`` 时读取 ``sys.argv[1:]``。
+ 
+-    Returns:
+-        进程退出码（``0`` 成功，``1`` 业务错误）。
+-    """
++def build_parser() -> argparse.ArgumentParser:
++    """命令行解析器。"""
+     parser = argparse.ArgumentParser(
+-        prog="forgemesh", description="ForgeMesh CLI — 声明式资源管理工具"
+-    )
+-    parser.add_argument("--tenant", default="default", help="租户 ID")
+-    parser.add_argument("--namespace", default=None, help="命名空间")
+-    parser.add_argument(
+-        "--api-url", default="http://localhost:8080", help="API 地址"
++        prog="forgemesh",
++        description="Manage ForgeMesh inference services through the REST API.",
++        epilog=_EPILOG,
++        formatter_class=argparse.RawDescriptionHelpFormatter,
+     )
++    _add_common_options(parser, None)
++    commands = parser.add_subparsers(dest="command", metavar="COMMAND", required=True)
+ 
+-    subparsers = parser.add_subparsers(dest="command", required=True)
++    apply = _add_command(
++        commands, "apply", cmd_apply, "create the services that do not exist, update the others"
++    )
++    apply.add_argument(
++        "-f",
++        "--file",
++        dest="files",
++        action="append",
++        required=True,
++        metavar="FILE",
++        help="YAML (several documents allowed) or JSON file, - for standard input; repeatable",
++    )
+ 
+-    # apply
+-    p_apply = subparsers.add_parser("apply", help="创建/更新资源")
+-    p_apply.add_argument("-f", "--file", required=True, help="YAML 文件路径")
++    get = _add_command(commands, "get", cmd_get, "print a service")
++    _add_target(get)
++    get.add_argument(
++        "-o", "--output", choices=("yaml", "json"), default="yaml", help="default: yaml"
++    )
+ 
+-    # get
+-    p_get = subparsers.add_parser("get", help="查询资源")
+-    p_get.add_argument("kind", help="资源类型")
+-    p_get.add_argument("name", help="资源名称")
++    describe = _add_command(
++        commands, "describe", cmd_describe, "show a service with its conditions and endpoints"
++    )
++    _add_target(describe)
+ 
+-    # describe
+-    p_describe = subparsers.add_parser("describe", help="查询资源详情")
+-    p_describe.add_argument("kind", help="资源类型")
+-    p_describe.add_argument("name", help="资源名称")
++    listing = _add_command(commands, "list", cmd_list, "list services, reading every page")
++    listing.add_argument("kind", type=_kind, metavar="KIND", help="inferenceservices")
++    listing.add_argument(
++        "-o", "--output", choices=("table", "yaml", "json"), default="table", help="default: table"
++    )
++    listing.add_argument(
++        "--page-size",
++        type=_page_size,
++        default=DEFAULT_PAGE_SIZE,
++        metavar="N",
++        help=f"services per request, 1 to {MAX_PAGE_SIZE} (default: {DEFAULT_PAGE_SIZE})",
++    )
+ 
+-    # list
+-    p_list = subparsers.add_parser("list", help="列出资源")
+-    p_list.add_argument("kind", help="资源类型")
++    delete = _add_command(
++        commands, "delete", cmd_delete, "delete a service; its instance is stopped first"
++    )
++    _add_target(delete)
++
++    wait = _add_command(commands, "wait", cmd_wait, "wait until a service is Ready or deleted")
++    _add_target(wait)
++    wait.add_argument(
++        "--for",
++        dest="condition",
++        choices=("ready", "delete"),
++        default="ready",
++        help="default: ready; fails at once if the service becomes Failed or is being deleted",
++    )
++    wait.add_argument(
++        "--timeout",
++        type=_seconds,
++        default=DEFAULT_WAIT_TIMEOUT_SECONDS,
++        metavar="SECONDS",
++        help=f"give up after this many seconds (default: {DEFAULT_WAIT_TIMEOUT_SECONDS:g})",
++    )
++    return parser
+ 
+-    # delete
+-    p_delete = subparsers.add_parser("delete", help="删除资源")
+-    p_delete.add_argument("kind", help="资源类型")
+-    p_delete.add_argument("name", help="资源名称")
+ 
+-    args = parser.parse_args(argv)
++def main(argv: list[str] | None = None) -> int:
++    """命令行入口，返回退出码（见 :class:`~.errors.ExitCode`）；参数非法时 argparse 以 2 退出。"""
++    args = build_parser().parse_args(argv)
++    try:
++        if args.tenant is not None:
++            check_tenant(args.tenant, "--tenant")
++        if args.namespace is not None:
++            check_namespace(args.namespace, "--namespace")
++        client = ApiClient(
++            resolve_api_url(args.api_url, os.environ),
++            api_key=resolve_api_key(args.api_key_file, os.environ),
++            tenant=args.tenant,
++            correlation_id=uuid.uuid4().hex,
++        )
++        handler: Handler = args.handler
++        return handler(args, client)
++    except CliError as exc:
++        print(f"Error: {exc.message}", file=sys.stderr)
++        return exc.exit_code
++    except KeyboardInterrupt:
++        return ExitCode.INTERRUPTED
++
++
++def _add_common_options(parser: argparse.ArgumentParser, default: str | None) -> None:
++    """公共选项。子命令以 ``SUPPRESS`` 为默认值：子命令的默认值会覆盖写在子命令之前的选项。"""
++    parser.add_argument(
++        "--api-url",
++        metavar="URL",
++        default=default,
++        help=f"base URL of the gateway or the control plane, without /api/v1 "
++        f"(default: ${API_URL_ENV}, else {DEFAULT_API_URL})",
++    )
++    parser.add_argument(
++        "--api-key-file",
++        metavar="PATH",
++        default=default,
++        help=f"file that holds the API key (default: ${API_KEY_ENV}; "
++        "without a key no Authorization header is sent)",
++    )
++    parser.add_argument(
++        "--tenant",
++        default=default,
++        help="tenant sent as X-Tenant-Id: required by a control plane in dev mode; "
++        "with an API key it must be the tenant of the key",
++    )
++    parser.add_argument(
++        "-n",
++        "--namespace",
++        default=default,
++        help="namespace of the service; without it the command addresses a service "
++        "without a namespace (list: every namespace)",
++    )
+ 
+-    commands = {
+-        "apply": cmd_apply,
+-        "get": cmd_get,
+-        "describe": cmd_describe,
+-        "list": cmd_list,
+-        "delete": cmd_delete,
+-    }
+ 
+-    handler = commands[args.command]
+-    return asyncio.run(handler(args))
++def _add_command(
++    commands: argparse._SubParsersAction[argparse.ArgumentParser],
++    name: str,
++    handler: Handler,
++    summary: str,
++) -> argparse.ArgumentParser:
++    parser = commands.add_parser(name, help=summary, description=summary[:1].upper() + summary[1:])
++    _add_common_options(parser, argparse.SUPPRESS)
++    parser.set_defaults(handler=handler)
++    return parser
++
++
++def _add_target(parser: argparse.ArgumentParser) -> None:
++    parser.add_argument("kind", type=_kind, metavar="KIND", help="inferenceservice")
++    parser.add_argument("name", metavar="NAME")
++
++
++def _kind(value: str) -> str:
++    if value.lower() not in _KIND_NAMES:
++        raise argparse.ArgumentTypeError(
++            f"unsupported kind {value!r}; the CLI manages {KIND} (inferenceservice)"
++        )
++    return KIND
++
++
++def _page_size(value: str) -> int:
++    try:
++        size = int(value)
++    except ValueError:
++        size = 0
++    if not 1 <= size <= MAX_PAGE_SIZE:
++        raise argparse.ArgumentTypeError(f"must be an integer from 1 to {MAX_PAGE_SIZE}")
++    return size
++
++
++def _seconds(value: str) -> float:
++    try:
++        seconds = float(value)
++    except ValueError:
++        seconds = math.nan
++    if not (math.isfinite(seconds) and seconds >= 0):
++        raise argparse.ArgumentTypeError("must be a number of seconds, 0 or more")
++    return seconds
+ 
+ 
+ if __name__ == "__main__":  # pragma: no cover - 直接执行入口
+diff --git a/packages/cli/src/forgemesh/cli/output.py b/packages/cli/src/forgemesh/cli/output.py
+new file mode 100644
+index 0000000..a37ea43
+--- /dev/null
++++ b/packages/cli/src/forgemesh/cli/output.py
+@@ -0,0 +1,162 @@
++"""输出：JSON、YAML、推理服务表格与 ``describe`` 的详情。
++
++表格、详情与错误消息中的字符串来自 API（资源名、条件消息等），写到终端之前替换其中的
++控制字符，避免转义序列改动终端。JSON 与 YAML 输出由序列化器转义。
++"""
++
++from __future__ import annotations
++
++import json
++from collections.abc import Iterable, Sequence
++from typing import Any
++
++import yaml
++
++#: 表格与详情中缺失或为空的值。
++NONE = "<none>"
++
++
++def printable(value: object) -> str:
++    """``value`` 的字符串形式，不可打印的字符（如 ESC）替换为 ``?``。"""
++    return "".join(char if char.isprintable() else "?" for char in str(value))
++
++
++def resource_ref(namespace: str | None, name: str) -> str:
++    """消息中的资源名：``<namespace>/<name>``，不带命名空间时只有名称。"""
++    return name if namespace is None else f"{namespace}/{name}"
++
++
++def to_json(value: Any) -> str:
++    """缩进两格的 JSON（保留非 ASCII 字符）。"""
++    return json.dumps(value, indent=2, ensure_ascii=False)
++
++
++def to_yaml(value: Any) -> str:
++    """一个 YAML 文档，键按 API 返回的顺序排列。"""
++    return yaml.safe_dump(value, sort_keys=False, allow_unicode=True)
++
++
++def to_yaml_stream(values: Sequence[Any]) -> str:
++    """以 ``---`` 分隔的多个 YAML 文档，可以直接交给 ``apply -f -``。"""
++    return yaml.safe_dump_all(values, sort_keys=False, allow_unicode=True, explicit_start=True)
++
++
++def ready_condition(service: dict[str, Any]) -> dict[str, Any] | None:
++    """``status.conditions`` 中 ``type`` 为 ``Ready`` 的条件；没有时返回 ``None``。"""
++    conditions = _list(_mapping(service.get("status")).get("conditions"))
++    return next((c for c in conditions if isinstance(c, dict) and c.get("type") == "Ready"), None)
++
++
++def service_table(services: Iterable[dict[str, Any]]) -> str:
++    """推理服务的表格：命名空间、名称、phase、``Ready`` 条件及其原因、模型。"""
++    rows = [("NAMESPACE", "NAME", "PHASE", "READY", "REASON", "MODEL")]
++    for service in services:
++        metadata = _mapping(service.get("metadata"))
++        ready = ready_condition(service) or {}
++        values = (
++            metadata.get("namespace"),
++            metadata.get("name"),
++            _mapping(service.get("status")).get("phase"),
++            ready.get("status"),
++            ready.get("reason"),
++            _mapping(_mapping(service.get("spec")).get("model")).get("reference"),
++        )
++        rows.append(tuple(_cell(value) for value in values))
++    return _columns(rows)
++
++
++def describe_service(service: dict[str, Any]) -> str:
++    """便于阅读的推理服务详情：元数据、期望状态的要点、phase、条件与实例地址。"""
++    metadata = _mapping(service.get("metadata"))
++    spec = _mapping(service.get("spec"))
++    status = _mapping(service.get("status"))
++    model = _mapping(spec.get("model"))
++    runtime = _mapping(spec.get("runtime"))
++    generation = f"{metadata.get('generation')} (observed {metadata.get('observedGeneration')})"
++    fields = [
++        ("Name", metadata.get("name")),
++        ("Namespace", metadata.get("namespace")),
++        ("UID", metadata.get("uid")),
++        ("Tenant", metadata.get("tenantId")),
++        ("Labels", _pairs(metadata.get("labels"))),
++        ("Annotations", _pairs(metadata.get("annotations"))),
++        ("Resource version", metadata.get("resourceVersion")),
++        ("Generation", generation),
++        ("Model", _joined("@", model.get("reference"), model.get("digest"))),
++        ("Runtime", _joined(" ", runtime.get("provider"), runtime.get("version"))),
++        ("Accelerator", _accelerator(spec)),
++        ("Phase", status.get("phase")),
++    ]
++    width = max(len(label) for label, _ in fields) + 2
++    lines = [f"{label + ':':<{width}}{_cell(value)}" for label, value in fields]
++    conditions = [c for c in _list(status.get("conditions")) if isinstance(c, dict)]
++    lines += _section(
++        "Conditions",
++        ("TYPE", "STATUS", "REASON", "LAST TRANSITION", "MESSAGE"),
++        [
++            (
++                c.get("type"),
++                c.get("status"),
++                c.get("reason"),
++                c.get("lastTransitionTime"),
++                c.get("message"),
++            )
++            for c in conditions
++        ],
++    )
++    endpoints = [e for e in _list(status.get("endpoints")) if isinstance(e, dict)]
++    lines += _section(
++        "Endpoints",
++        ("URL", "READY", "PROTOCOL", "INSTANCE"),
++        [(e.get("url"), e.get("ready"), e.get("protocol"), e.get("instanceId")) for e in endpoints],
++    )
++    return "\n".join(lines)
++
++
++def _mapping(value: Any) -> dict[str, Any]:
++    return value if isinstance(value, dict) else {}
++
++
++def _list(value: Any) -> list[Any]:
++    return value if isinstance(value, list) else []
++
++
++def _cell(value: Any) -> str:
++    if value is None or value == "":
++        return NONE
++    if isinstance(value, bool):
++        return "true" if value else "false"
++    return printable(value)
++
++
++def _joined(separator: str, *parts: Any) -> str | None:
++    return separator.join(str(part) for part in parts if part is not None and part != "") or None
++
++
++def _pairs(value: Any) -> str | None:
++    return ", ".join(f"{key}={item}" for key, item in _mapping(value).items()) or None
++
++
++def _accelerator(spec: dict[str, Any]) -> str | None:
++    accelerator = _mapping(_mapping(spec.get("resources")).get("accelerator"))
++    if not accelerator:
++        return None
++    return (
++        f"{accelerator.get('count')} x {accelerator.get('type')}, "
++        f"at least {accelerator.get('minMemoryGiB')} GiB each"
++    )
++
++
++def _section(title: str, header: tuple[str, ...], rows: list[tuple[Any, ...]]) -> list[str]:
++    if not rows:
++        return [f"{title}:  {NONE}"]
++    table = _columns([header, *(tuple(_cell(value) for value in row) for row in rows)])
++    return [f"{title}:", *(f"  {line}" for line in table.splitlines())]
++
++
++def _columns(rows: list[tuple[str, ...]]) -> str:
++    widths = [max(len(row[index]) for row in rows) for index in range(len(rows[0]))]
++    return "\n".join(
++        "   ".join(cell.ljust(width) for cell, width in zip(row, widths, strict=True)).rstrip()
++        for row in rows
++    )
+diff --git a/tests/unit/cli/conftest.py b/tests/unit/cli/conftest.py
+new file mode 100644
+index 0000000..cf9f3d7
+--- /dev/null
++++ b/tests/unit/cli/conftest.py
+@@ -0,0 +1,44 @@
++"""CLI 单元测试的公共夹具：假 API 服务器、命令行运行器与虚拟时钟。"""
++
++from __future__ import annotations
++
++from collections.abc import Callable, Iterator
++
++import pytest
++from forgemesh.cli import commands
++from forgemesh.cli.config import API_KEY_ENV, API_URL_ENV
++from forgemesh.cli.main import main
++
++from .fakes import FakeApi, FakeClock, Result
++
++
++@pytest.fixture
++def api(monkeypatch: pytest.MonkeyPatch) -> Iterator[FakeApi]:
++    """运行中的假 API；``FORGEMESH_API_URL`` 指向它，没有配置 key。"""
++    server = FakeApi()
++    monkeypatch.setenv(API_URL_ENV, server.url)
++    monkeypatch.delenv(API_KEY_ENV, raising=False)
++    # 环境中的 http_proxy 等变量不能把发往本机测试服务器的请求转给代理
++    monkeypatch.setenv("no_proxy", "*")
++    yield server
++    server.close()
++
++
++@pytest.fixture
++def cli(capsys: pytest.CaptureFixture[str]) -> Callable[..., Result]:
++    """以给定参数运行 ``forgemesh``，返回退出码与输出。"""
++
++    def run(*args: str) -> Result:
++        code = main(list(args))
++        captured = capsys.readouterr()
++        return Result(code, captured.out, captured.err)
++
++    return run
++
++
++@pytest.fixture
++def clock(monkeypatch: pytest.MonkeyPatch) -> FakeClock:
++    """``wait`` 的虚拟时钟：等待不耗时，测试可以检查每次等待的秒数。"""
++    fake = FakeClock()
++    monkeypatch.setattr(commands, "time", fake)
++    return fake
+diff --git a/tests/unit/cli/fakes.py b/tests/unit/cli/fakes.py
+new file mode 100644
+index 0000000..b5f2c20
+--- /dev/null
++++ b/tests/unit/cli/fakes.py
+@@ -0,0 +1,356 @@
++"""CLI 测试的替身：本机上的假 API 服务器、资源构造函数与虚拟时钟。"""
++
++from __future__ import annotations
++
++import copy
++import json
++import socket
++import threading
++from dataclasses import dataclass, field
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++from typing import Any
++from urllib.parse import parse_qsl, unquote, urlsplit
++
++SERVICES = "/api/v1/inference-services"
++TENANT = "acme"
++#: :class:`Reply` 的 ``status`` 为它时，服务器不响应、直接关闭连接。
++DROP = 0
++
++
++def unused_url() -> str:
++    """本机上没有服务监听的地址：连接被拒绝。"""
++    with socket.socket() as probe:
++        probe.bind(("127.0.0.1", 0))
++        port = probe.getsockname()[1]
++    return f"http://127.0.0.1:{port}"
++
++
++def document(
++    name: str = "llama", namespace: str | None = "default", **metadata: Any
++) -> dict[str, Any]:
++    """``apply`` 的资源文档；``namespace`` 为 ``None`` 时不带命名空间。"""
++    meta: dict[str, Any] = {"name": name, **metadata}
++    if namespace is not None:
++        meta["namespace"] = namespace
++    return {
++        "apiVersion": "forgemesh.io/v1alpha1",
++        "kind": "InferenceService",
++        "metadata": meta,
++        "spec": {
++            "model": {"reference": "models/llama"},
++            "runtime": {"provider": "vllm", "version": "0.6.3"},
++            "resources": {"accelerator": {"type": "nvidia-gpu", "count": 1, "minMemoryGiB": 16}},
++        },
++    }
++
++
++def resource(
++    doc: dict[str, Any],
++    *,
++    phase: str = "Pending",
++    ready: tuple[str, str] | None = None,
++    message: str = "",
++    generation: int = 1,
++    observed: int = 0,
++    uid: str = "uid-1",
++    version: str = "0",
++    tenant: str = TENANT,
++) -> dict[str, Any]:
++    """服务端保存的资源：``doc`` 加上服务端维护的元数据与 ``status``。
++
++    Args:
++        ready: ``Ready`` 条件的 ``(status, reason)``；为 ``None`` 时没有条件。
++        observed: ``observedGeneration``（``metadata`` 与 ``status`` 中都写入）。
++    """
++    metadata = doc["metadata"]
++    conditions = []
++    if ready is not None:
++        conditions.append(
++            {
++                "type": "Ready",
++                "status": ready[0],
++                "reason": ready[1],
++                "message": message,
++                "lastTransitionTime": "2026-01-01T00:00:00Z",
++            }
++        )
++    return {
++        "apiVersion": doc.get("apiVersion", "forgemesh.io/v1alpha1"),
++        "kind": "InferenceService",
++        "metadata": {
++            **metadata,
++            "uid": uid,
++            "tenantId": tenant,
++            "resourceVersion": version,
++            "generation": generation,
++            "observedGeneration": observed,
++            "labels": metadata.get("labels") or {},
++            "annotations": metadata.get("annotations") or {},
++        },
++        "spec": copy.deepcopy(doc["spec"]),
++        "status": {
++            "phase": phase,
++            "observedGeneration": observed,
++            "conditions": conditions,
++            "endpoints": [],
++        },
++    }
++
++
++def error_body(
++    code: str,
++    message: str,
++    correlation_id: str = "cid-server",
++    details: dict[str, Any] | None = None,
++) -> dict[str, Any]:
++    """控制平面的错误信封。"""
++    error: dict[str, Any] = {"code": code, "message": message, "correlationId": correlation_id}
++    if details is not None:
++        error["details"] = details
++    return {"error": error}
++
++
++@dataclass(frozen=True)
++class Call:
++    """服务器收到的一个请求；请求头名称为小写。"""
++
++    method: str
++    target: str
++    path: str
++    query: dict[str, str]
++    headers: dict[str, str]
++    body: Any
++
++
++@dataclass(frozen=True)
++class Reply:
++    """一个响应：``body`` 编码为 JSON，为 ``None`` 时发送纯文本 ``raw``。"""
++
++    status: int
++    body: Any = None
++    raw: bytes = b""
++    headers: dict[str, str] = field(default_factory=dict)
++
++
++@dataclass(frozen=True)
++class Result:
++    """一次 ``forgemesh`` 调用的退出码与输出。"""
++
++    code: int
++    out: str
++    err: str
++
++
++class FakeApi:
++    """``/api/v1/inference-services`` 的假实现，规则与控制平面相同：
++
++    * ``POST`` 创建（``201``），同名资源已存在时 ``409``；
++    * 单个资源的 ``GET`` / ``PUT`` / ``DELETE``，不存在时 ``404``；``PUT`` 依次检查
++      ``Terminating``、``uid`` 与 ``resourceVersion``（``409`` 带 ``details.reason``），内容
++      不变时不递增版本，``spec`` 变化时递增 ``generation``；
++    * ``DELETE`` 按 :attr:`delete_status` 直接删除（``204``）或进入 ``Terminating``（``202``）；
++    * 列表按 ``(namespace, name)`` 排序、按 ``limit`` 分页，``nextPageToken`` 是下一页的起点。
++
++    :meth:`reply` 预设的响应按顺序优先于这些规则。
++    """
++
++    def __init__(self) -> None:
++        self.services: dict[tuple[str | None, str], dict[str, Any]] = {}
++        self.calls: list[Call] = []
++        self.delete_status = 204
++        self._replies: list[tuple[str, str, Reply]] = []
++        self._created = 0
++        self._lock = threading.Lock()
++        self._server = ThreadingHTTPServer(("127.0.0.1", 0), _handler_for(self))
++        self.url = f"http://127.0.0.1:{self._server.server_address[1]}"
++        # shutdown() 要等 serve_forever 的下一次轮询，默认的 0.5 秒会拖慢每个测试
++        self._thread = threading.Thread(
++            target=self._server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
++        )
++        self._thread.start()
++
++    def close(self) -> None:
++        self._server.shutdown()
++        self._server.server_close()
++        self._thread.join()
++
++    def reply(
++        self,
++        method: str,
++        path: str,
++        status: int,
++        body: Any = None,
++        *,
++        raw: bytes = b"",
++        headers: dict[str, str] | None = None,
++    ) -> None:
++        """预设 ``method path``（不含查询串）的下一个响应。"""
++        with self._lock:
++            self._replies.append((method, path, Reply(status, body, raw, headers or {})))
++
++    def add(self, doc: dict[str, Any], **fields: Any) -> dict[str, Any]:
++        """放入一个资源（参数见 :func:`resource`），返回它。"""
++        service = resource(doc, **fields)
++        metadata = service["metadata"]
++        with self._lock:
++            self.services[(metadata.get("namespace"), metadata["name"])] = service
++        return service
++
++    def log(self) -> list[str]:
++        """收到的请求，形如 ``"GET /api/v1/inference-services?limit=100"``。"""
++        with self._lock:
++            return [f"{call.method} {call.target}" for call in self.calls]
++
++    def handle(self, call: Call) -> Reply:
++        with self._lock:
++            self.calls.append(call)
++            for index, (method, path, reply) in enumerate(self._replies):
++                if (method, path) == (call.method, call.path):
++                    del self._replies[index]
++                    return reply
++            return self._default(call)
++
++    def _default(self, call: Call) -> Reply:
++        if call.path == SERVICES and call.method == "GET":
++            return self._list(call)
++        if call.path == SERVICES and call.method == "POST":
++            return self._create(call)
++        prefix = SERVICES + "/"
++        if call.path.startswith(prefix) and call.method in ("GET", "PUT", "DELETE"):
++            name = unquote(call.path.removeprefix(prefix))
++            key = (call.query.get("namespace"), name)
++            current = self.services.get(key)
++            if current is None:
++                return self._error(call, 404, "NOT_FOUND", f"InferenceService '{name}' not found")
++            if call.method == "GET":
++                return Reply(200, current)
++            if call.method == "PUT":
++                return self._replace(call, key, current)
++            return self._delete(key, current)
++        return self._error(call, 404, "NOT_FOUND", "Not Found")
++
++    def _create(self, call: Call) -> Reply:
++        metadata = call.body["metadata"]
++        key = (metadata.get("namespace"), metadata["name"])
++        if key in self.services:
++            message = f"InferenceService '{metadata['name']}' already exists"
++            return self._error(call, 409, "CONFLICT", message)
++        self._created += 1
++        service = resource(
++            call.body, uid=f"uid-{self._created}", tenant=call.headers.get("x-tenant-id", TENANT)
++        )
++        self.services[key] = service
++        return Reply(201, service)
++
++    def _replace(self, call: Call, key: tuple[str | None, str], current: dict[str, Any]) -> Reply:
++        metadata = call.body["metadata"]
++        old = current["metadata"]
++        reason = None
++        if current["status"]["phase"] == "Terminating":
++            reason = "Terminating"
++        elif metadata.get("uid") not in (None, old["uid"]):
++            reason = "UidMismatch"
++        elif metadata.get("resourceVersion") not in (None, old["resourceVersion"]):
++            reason = "ResourceVersionMismatch"
++        if reason is not None:
++            message = f"InferenceService '{key[1]}' was not updated: {reason}"
++            return self._error(call, 409, "CONFLICT", message, {"reason": reason})
++        spec = call.body.get("spec")
++        labels = metadata.get("labels") or {}
++        annotations = metadata.get("annotations") or {}
++        if (spec, labels, annotations) == (current["spec"], old["labels"], old["annotations"]):
++            return Reply(200, current)
++        updated = copy.deepcopy(current)
++        updated["metadata"].update(
++            labels=labels,
++            annotations=annotations,
++            resourceVersion=str(int(old["resourceVersion"]) + 1),
++        )
++        if spec != current["spec"]:
++            updated["spec"] = copy.deepcopy(spec)
++            updated["metadata"]["generation"] = old["generation"] + 1
++        self.services[key] = updated
++        return Reply(200, updated)
++
++    def _delete(self, key: tuple[str | None, str], current: dict[str, Any]) -> Reply:
++        if self.delete_status == 202:
++            current["status"]["phase"] = "Terminating"
++            return Reply(202, {"name": key[1], "phase": "Terminating"})
++        del self.services[key]
++        return Reply(204)
++
++    def _list(self, call: Call) -> Reply:
++        namespace = call.query.get("namespace")
++        limit = int(call.query.get("limit", "100"))
++        start = int(call.query.get("pageToken") or "0")
++        items = sorted(
++            (s for (ns, _), s in self.services.items() if namespace is None or ns == namespace),
++            key=lambda s: (s["metadata"].get("namespace") or "", s["metadata"]["name"]),
++        )
++        page = items[start : start + limit]
++        body: dict[str, Any] = {"items": page, "count": len(page)}
++        if start + limit < len(items):
++            body["nextPageToken"] = str(start + limit)
++        return Reply(200, body)
++
++    def _error(
++        self,
++        call: Call,
++        status: int,
++        code: str,
++        message: str,
++        details: dict[str, Any] | None = None,
++    ) -> Reply:
++        correlation_id = call.headers.get("x-correlation-id", "cid-server")
++        return Reply(status, error_body(code, message, correlation_id, details))
++
++
++def _handler_for(api: FakeApi) -> type[BaseHTTPRequestHandler]:
++    class Handler(BaseHTTPRequestHandler):
++        def _serve(self) -> None:
++            parts = urlsplit(self.path)
++            raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
++            call = Call(
++                method=self.command,
++                target=self.path,
++                path=parts.path,
++                query=dict(parse_qsl(parts.query, keep_blank_values=True)),
++                headers={name.lower(): value for name, value in self.headers.items()},
++                body=json.loads(raw) if raw else None,
++            )
++            reply = api.handle(call)
++            if reply.status == DROP:
++                self.close_connection = True
++                return
++            payload = reply.raw if reply.body is None else json.dumps(reply.body).encode()
++            content_type = "text/plain; charset=utf-8" if reply.body is None else "application/json"
++            self.send_response(reply.status)
++            for name, value in {"Content-Type": content_type, **reply.headers}.items():
++                self.send_header(name, value)
++            if reply.status != 204:
++                self.send_header("Content-Length", str(len(payload)))
++            self.end_headers()
++            if reply.status != 204:
++                self.wfile.write(payload)
++
++        do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = _serve
++
++        def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
++            return
++
++    return Handler
++
++
++class FakeClock:
++    """代替 ``commands`` 模块中的 :mod:`time`：``sleep`` 不等待，只推进 ``monotonic``。"""
++
++    def __init__(self) -> None:
++        self.now = 100.0
++        self.sleeps: list[float] = []
++
++    def monotonic(self) -> float:
++        return self.now
++
++    def sleep(self, seconds: float) -> None:
++        self.sleeps.append(seconds)
++        self.now += seconds
+diff --git a/tests/unit/cli/test_client.py b/tests/unit/cli/test_client.py
+new file mode 100644
+index 0000000..91ea844
+--- /dev/null
++++ b/tests/unit/cli/test_client.py
+@@ -0,0 +1,309 @@
++"""HTTP 客户端单元测试：请求头、错误响应到消息与退出码的映射、重定向、连接失败与翻页。
++
++错误响应有两种：控制平面与网关的错误信封，以及网关自己的纯文本 ``429`` / ``502``（和
++不提供 API 的地址返回的任何内容）。
++"""
++
++from __future__ import annotations
++
++import pytest
++from forgemesh.cli.client import ApiClient
++from forgemesh.cli.errors import ApiError, CliError, ConnectionFailure, ExitCode
++
++from .fakes import SERVICES, FakeApi, document, error_body, unused_url
++
++PATH = f"{SERVICES}/llama"
++
++
++def client_for(url: str, *, api_key: str | None = None, tenant: str | None = None) -> ApiClient:
++    return ApiClient(url, api_key=api_key, tenant=tenant, correlation_id="cid-cli")
++
++
++def get_error(api: FakeApi, *, api_key: str | None = "fmk_key") -> ApiError:
++    with pytest.raises(ApiError) as raised:
++        client_for(api.url, api_key=api_key).get_service("llama", "default")
++    return raised.value
++
++
++def test_requests_carry_the_key_the_tenant_and_the_correlation_id(api: FakeApi) -> None:
++    api.add(document())
++
++    client_for(api.url, api_key="fmk_key", tenant="acme").get_service("llama", "default")
++    client_for(api.url).get_service("llama", "default")
++
++    with_key, without = (call.headers for call in api.calls)
++    assert with_key["authorization"] == "Bearer fmk_key"
++    assert with_key["x-tenant-id"] == "acme"
++    assert with_key["x-correlation-id"] == "cid-cli"
++    assert with_key["accept"] == "application/json"
++    assert with_key["user-agent"] == "forgemesh-cli"
++    assert "authorization" not in without
++    assert "x-tenant-id" not in without
++
++
++def test_names_cannot_change_the_path_or_the_query(api: FakeApi) -> None:
++    with pytest.raises(ApiError):
++        client_for(api.url).get_service("a/b?namespace=other", None)
++
++    assert api.log() == [f"GET {SERVICES}/a%2Fb%3Fnamespace%3Dother"]
++
++
++def test_an_error_envelope_keeps_its_message_code_reason_and_correlation_id(api: FakeApi) -> None:
++    details = {"reason": "ResourceVersionMismatch"}
++    api.reply("GET", PATH, 409, error_body("CONFLICT", "version mismatch", "cid-1", details))
++
++    error = get_error(api)
++
++    assert (error.status, error.code, error.reason, error.exit_code) == (
++        409,
++        "CONFLICT",
++        "ResourceVersionMismatch",
++        ExitCode.CONFLICT,
++    )
++    assert error.message == (
++        "version mismatch (HTTP 409 CONFLICT, reason ResourceVersionMismatch, correlation id cid-1)"
++    )
++
++
++def test_validation_errors_are_listed_one_per_line(api: FakeApi) -> None:
++    errors = [
++        {"loc": ["body", "spec", "resources"], "msg": "Field required", "type": "missing"},
++        {"loc": [], "msg": "Input should be an object", "type": "model_type"},
++    ]
++    api.reply(
++        "GET",
++        PATH,
++        400,
++        error_body("BAD_REQUEST", "request validation failed", "c", {"errors": errors}),
++    )
++
++    error = get_error(api)
++
++    assert error.exit_code == ExitCode.REJECTED
++    assert error.message == (
++        "request validation failed (HTTP 400 BAD_REQUEST, correlation id c)\n"
++        "  body.spec.resources: Field required\n"
++        "  -: Input should be an object"
++    )
++
++
++def test_an_envelope_without_a_correlation_id_shows_the_one_the_cli_sent(api: FakeApi) -> None:
++    api.reply("GET", PATH, 403, {"error": {"code": "FORBIDDEN", "message": "write scope required"}})
++
++    error = get_error(api)
++
++    assert (error.exit_code, error.message) == (
++        ExitCode.AUTH,
++        "write scope required (HTTP 403 FORBIDDEN, correlation id cid-cli)",
++    )
++
++
++def test_the_gateway_rate_limit_is_plain_text_with_retry_after(api: FakeApi) -> None:
++    api.reply("GET", PATH, 429, raw=b"Too Many Requests\n", headers={"Retry-After": "2"})
++
++    error = get_error(api)
++
++    assert (error.exit_code, error.code, error.retry_after, error.transient) == (
++        ExitCode.RATE_LIMITED,
++        None,
++        2,
++        True,
++    )
++    assert error.message == (
++        "rate limited by the gateway (HTTP 429 Too Many Requests) (correlation id cid-cli); "
++        "retry after 2 s"
++    )
++
++
++def test_a_retry_after_that_is_not_a_number_of_seconds_is_ignored(api: FakeApi) -> None:
++    api.reply("GET", PATH, 429, raw=b"", headers={"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"})
++
++    error = get_error(api)
++
++    assert error.retry_after is None
++    assert "retry after" not in error.message
++
++
++def test_the_gateway_bad_gateway_is_plain_text(api: FakeApi) -> None:
++    api.reply("GET", PATH, 502, raw=b"Bad Gateway\n")
++
++    error = get_error(api)
++
++    assert (error.exit_code, error.transient) == (ExitCode.UNAVAILABLE, True)
++    assert error.message == (
++        "the gateway could not reach the control plane (HTTP 502 Bad Gateway) "
++        "(correlation id cid-cli)"
++    )
++
++
++def test_a_control_plane_that_is_not_ready_is_unavailable(api: FakeApi) -> None:
++    api.reply("GET", PATH, 503, error_body("REGISTRY_UNAVAILABLE", "registry is not ready", "c"))
++
++    error = get_error(api)
++
++    assert (error.exit_code, error.transient) == (ExitCode.UNAVAILABLE, True)
++
++
++def test_a_404_that_is_not_from_the_api_does_not_mean_the_service_is_missing(
++    api: FakeApi,
++) -> None:
++    """网关对没有路由的路径返回纯文本 404：地址错了，退出码不能是"资源不存在"。"""
++    api.reply("GET", PATH, 404, raw=b"404 page not found\n")
++
++    error = get_error(api)
++
++    assert (error.exit_code, error.not_found) == (ExitCode.ERROR, False)
++    assert error.message == (
++        "HTTP 404 Not Found: 404 page not found; the response is not from the ForgeMesh API, "
++        "check --api-url (correlation id cid-cli)"
++    )
++
++
++def test_a_plain_server_error_quotes_the_first_line_of_the_body(api: FakeApi) -> None:
++    api.reply("GET", PATH, 500, raw=b"Internal Server Error\ngoroutine 1 [running]:\n")
++
++    error = get_error(api)
++
++    assert (error.exit_code, error.message) == (
++        ExitCode.SERVER_ERROR,
++        "HTTP 500 Internal Server Error: Internal Server Error (correlation id cid-cli)",
++    )
++
++
++def test_a_long_plain_body_is_shortened(api: FakeApi) -> None:
++    api.reply("GET", PATH, 500, raw=b"x" * 500)
++
++    error = get_error(api)
++
++    assert error.message == (
++        f"HTTP 500 Internal Server Error: {'x' * 200}... (correlation id cid-cli)"
++    )
++
++
++def test_control_characters_from_the_server_do_not_reach_the_terminal(api: FakeApi) -> None:
++    api.reply("GET", PATH, 400, error_body("BAD_REQUEST", "bad\x1b]0;owned\x07 name", "c\x1b"))
++
++    error = get_error(api)
++
++    assert error.message == "bad?]0;owned? name (HTTP 400 BAD_REQUEST, correlation id c?)"
++
++
++def test_redirects_are_not_followed_so_the_key_stays_with_the_configured_url(
++    api: FakeApi,
++) -> None:
++    elsewhere = FakeApi()
++    try:
++        api.reply("GET", PATH, 307, raw=b"", headers={"Location": f"{elsewhere.url}{PATH}"})
++
++        error = get_error(api)
++    finally:
++        elsewhere.close()
++
++    assert elsewhere.calls == []
++    assert (error.status, error.exit_code) == (307, ExitCode.ERROR)
++    assert error.message == (
++        f"HTTP 307 Temporary Redirect: redirected to {elsewhere.url}{PATH}; the CLI does not "
++        "follow redirects, set --api-url to the address that serves the API "
++        "(correlation id cid-cli)"
++    )
++
++
++def test_a_missing_key_is_explained_only_when_no_key_was_sent(api: FakeApi) -> None:
++    unauthenticated = error_body("UNAUTHENTICATED", "missing bearer credentials", "c")
++    api.reply("GET", PATH, 401, unauthenticated)
++    api.reply("GET", PATH, 401, unauthenticated)
++
++    without_key = get_error(api, api_key=None)
++    with_key = get_error(api, api_key="fmk_key")
++
++    assert without_key.message.splitlines()[1:] == [
++        "no API key is configured: set FORGEMESH_API_KEY or pass --api-key-file (a control "
++        "plane in dev mode needs --tenant instead)"
++    ]
++    assert with_key.message == (
++        "missing bearer credentials (HTTP 401 UNAUTHENTICATED, correlation id c)"
++    )
++
++
++def test_a_refused_connection_is_a_connection_failure() -> None:
++    url = unused_url()
++
++    with pytest.raises(ConnectionFailure) as raised:
++        client_for(url).get_service("llama", "default")
++
++    assert raised.value.exit_code == ExitCode.CONNECTION_FAILED
++    assert raised.value.message.startswith(f"cannot reach the API at {url}: ")
++    assert raised.value.message.endswith(
++        "(check --api-url or FORGEMESH_API_URL, and that the gateway or control plane is running)"
++    )
++
++
++def test_a_success_response_that_is_not_json_is_an_error(api: FakeApi) -> None:
++    api.reply("GET", PATH, 200, raw=b"<html>proxy login</html>")
++
++    with pytest.raises(CliError) as raised:
++        client_for(api.url).get_service("llama", "default")
++
++    assert raised.value.exit_code == ExitCode.ERROR
++    assert raised.value.message == (
++        f"GET {PATH} at {api.url} answered HTTP 200 with a body that is not JSON; check --api-url"
++    )
++
++
++def test_a_resource_response_without_metadata_is_an_error(api: FakeApi) -> None:
++    api.reply("GET", PATH, 200, {"items": []})
++
++    with pytest.raises(CliError) as raised:
++        client_for(api.url).get_service("llama", "default")
++
++    assert raised.value.message == (
++        f"the API at {api.url} returned an unexpected resource response; check --api-url"
++    )
++
++
++def test_list_follows_next_page_tokens_with_the_same_filter(api: FakeApi) -> None:
++    for name in "abcde":
++        api.add(document(name))
++
++    items = list(client_for(api.url).list_services("default", page_size=2))
++
++    assert [item["metadata"]["name"] for item in items] == list("abcde")
++    assert api.log() == [
++        f"GET {SERVICES}?limit=2&namespace=default",
++        f"GET {SERVICES}?limit=2&namespace=default&pageToken=2",
++        f"GET {SERVICES}?limit=2&namespace=default&pageToken=4",
++    ]
++
++
++def test_list_stops_when_the_api_repeats_a_page_token(api: FakeApi) -> None:
++    api.reply("GET", SERVICES, 200, {"items": [], "count": 0, "nextPageToken": "t1"})
++    api.reply("GET", SERVICES, 200, {"items": [], "count": 0, "nextPageToken": "t1"})
++
++    with pytest.raises(CliError) as raised:
++        list(client_for(api.url).list_services(None, page_size=10))
++
++    assert raised.value.message == (
++        "the API returned the same nextPageToken twice; the list is incomplete"
++    )
++
++
++@pytest.mark.parametrize(
++    "page",
++    [
++        [],
++        {"count": 0},
++        {"items": "a"},
++        {"items": [1]},
++        {"items": [], "nextPageToken": ""},
++        {"items": [], "nextPageToken": 2},
++    ],
++)
++def test_list_rejects_a_page_of_another_shape(api: FakeApi, page: object) -> None:
++    api.reply("GET", SERVICES, 200, page)
++
++    with pytest.raises(CliError) as raised:
++        list(client_for(api.url).list_services(None, page_size=10))
++
++    assert raised.value.message == (
++        f"the API at {api.url} returned an unexpected list response; check --api-url"
++    )
+diff --git a/tests/unit/cli/test_commands.py b/tests/unit/cli/test_commands.py
+index c857e94..762efcf 100644
+--- a/tests/unit/cli/test_commands.py
++++ b/tests/unit/cli/test_commands.py
+@@ -1,61 +1,765 @@
+-"""CLI 命令单元测试。
++"""CLI 命令单元测试：经 :func:`forgemesh.cli.main.main` 调用本机上的假 API（见 ``fakes.py``）。
+ 
+-覆盖 apply/get/list 命令的核心路径：
+-
+-* apply 临时 YAML 文件 → 返回 0 且输出含 ``Created``；
+-* get 不存在资源 → 返回 1；
+-* list 空库 → 返回 0。
+-
+-以 ``asyncio.run`` 驱动异步命令，不依赖 pytest-asyncio。
++覆盖 ``apply``（创建、以读到的版本更新、不变、冲突重试与放弃、正在删除、并发创建、多文档、
++租户与命名空间、标准输入、``list`` 输出的再次提交）、``get`` / ``describe`` / ``list``（输出格式、
++翻页、命名空间规则）、``delete``（``204`` / ``202``）、``wait``（就绪、``Failed`` 立即失败、
++observedGeneration、超时、暂时故障、``--for delete``、Ctrl-C），以及 key、公共选项与参数校验。
+ """
+ 
+ from __future__ import annotations
+ 
+-import asyncio
++import io
++import json
++import re
++from collections.abc import Callable
+ from pathlib import Path
+-from types import SimpleNamespace
++from typing import Any
+ 
+ import pytest
+ import yaml
+-from forgemesh.cli.commands import cmd_apply, cmd_get, cmd_list
+-
+-
+-def test_apply_yaml_file(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+-    """写一个临时 YAML → apply → 返回 0。"""
+-    yaml_path = tmp_path / "svc.yaml"
+-    yaml_path.write_text(
+-        yaml.dump(
+-            {
+-                "apiVersion": "forgemesh.io/v1alpha1",
+-                "kind": "InferenceService",
+-                "metadata": {"name": "svc-1", "namespace": "default"},
+-            }
++from forgemesh.cli.commands import APPLY_ATTEMPTS
++from forgemesh.cli.config import API_KEY_ENV, API_URL_ENV
++from forgemesh.cli.errors import ExitCode
++from forgemesh.cli.main import build_parser, main
++
++from .fakes import (
++    DROP,
++    SERVICES,
++    FakeApi,
++    FakeClock,
++    Result,
++    document,
++    error_body,
++    resource,
++    unused_url,
++)
++
++Cli = Callable[..., Result]
++PATH = f"{SERVICES}/llama"
++KEY = "fmk_" + "k" * 43
++CONFLICT = error_body(
++    "CONFLICT", "resourceVersion mismatch", details={"reason": "ResourceVersionMismatch"}
++)
++READY = {"phase": "Ready", "ready": ("True", "Reconciled"), "observed": 1}
++
++
++def write_yaml(path: Path, *docs: dict[str, Any]) -> str:
++    path.write_text(yaml.safe_dump_all(docs, sort_keys=False), encoding="utf-8")
++    return str(path)
++
++
++def correlation_id(api: FakeApi) -> str:
++    return api.calls[-1].headers["x-correlation-id"]
++
++
++def test_apply_creates_a_missing_service_and_leaves_it_unchanged_the_second_time(
++    api: FakeApi, cli: Cli, tmp_path: Path
++) -> None:
++    path = write_yaml(tmp_path / "svc.yaml", document())
++
++    first = cli("apply", "-f", path)
++    second = cli("apply", "-f", path)
++
++    assert (first.code, first.out, first.err) == (0, "InferenceService default/llama created\n", "")
++    assert (second.code, second.out, second.err) == (
++        0,
++        "InferenceService default/llama unchanged\n",
++        "",
++    )
++    assert api.log() == [
++        f"GET {PATH}?namespace=default",
++        f"POST {SERVICES}",
++        f"GET {PATH}?namespace=default",
++        f"PUT {PATH}?namespace=default",
++    ]
++    assert api.calls[1].body == document()
++    assert api.services[("default", "llama")]["metadata"]["resourceVersion"] == "0"
++
++
++def test_apply_replaces_the_service_with_the_version_it_read(
++    api: FakeApi, cli: Cli, tmp_path: Path
++) -> None:
++    """文件中的 resourceVersion 早已过时（控制器每次写 status 都递增版本），以读到的为准。"""
++    api.add(document(), version="7", uid="uid-1", **READY)
++    stale = document(labels={"zone": "b"}, resourceVersion="3")
++
++    result = cli("apply", "-f", write_yaml(tmp_path / "svc.yaml", stale))
++
++    assert (result.code, result.out) == (0, "InferenceService default/llama configured\n")
++    put = api.calls[-1]
++    assert (put.method, put.body["metadata"]) == (
++        "PUT",
++        {
++            "name": "llama",
++            "namespace": "default",
++            "labels": {"zone": "b"},
++            "resourceVersion": "7",
++            "uid": "uid-1",
++        },
++    )
++    stored = api.services[("default", "llama")]["metadata"]
++    assert (stored["labels"], stored["resourceVersion"], stored["generation"]) == (
++        {"zone": "b"},
++        "8",
++        1,
++    )
++
++
++def test_apply_reads_the_service_again_after_a_conflicting_write(
++    api: FakeApi, cli: Cli, tmp_path: Path
++) -> None:
++    api.add(document(), version="1")
++    api.reply("PUT", PATH, 409, CONFLICT)
++
++    result = cli("apply", "-f", write_yaml(tmp_path / "svc.yaml", document(labels={"zone": "b"})))
++
++    assert (result.code, result.out, result.err) == (
++        0,
++        "InferenceService default/llama configured\n",
++        "",
++    )
++    assert [call.method for call in api.calls] == ["GET", "PUT", "GET", "PUT"]
++
++
++def test_apply_gives_up_when_the_service_keeps_changing(
++    api: FakeApi, cli: Cli, tmp_path: Path
++) -> None:
++    api.add(document())
++    for _ in range(APPLY_ATTEMPTS):
++        api.reply("PUT", PATH, 409, CONFLICT)
++    path = write_yaml(tmp_path / "svc.yaml", document(labels={"zone": "b"}))
++
++    result = cli("apply", "-f", path)
++
++    assert result.code == ExitCode.CONFLICT
++    assert result.err == (
++        f"Error: InferenceService default/llama ({path}): the resource kept changing while it "
++        f"was applied ({APPLY_ATTEMPTS} attempts); try again\n"
++    )
++    assert [call.method for call in api.calls] == ["GET", "PUT"] * APPLY_ATTEMPTS
++
++
++def test_apply_to_a_service_that_is_being_deleted_says_what_to_do(
++    api: FakeApi, cli: Cli, tmp_path: Path
++) -> None:
++    api.add(document(), phase="Terminating")
++    path = write_yaml(tmp_path / "svc.yaml", document(labels={"zone": "b"}))
++
++    result = cli("apply", "-f", path)
++
++    assert result.code == ExitCode.CONFLICT
++    assert result.err == (
++        f"Error: InferenceService default/llama ({path}): InferenceService 'llama' was not "
++        "updated: Terminating (HTTP 409 CONFLICT, reason Terminating, correlation id "
++        f"{correlation_id(api)})\n"
++        "wait until it is deleted (forgemesh wait inferenceservice llama -n default --for delete) "
++        "and apply again\n"
++    )
++
++
++def test_apply_updates_a_service_that_was_created_concurrently(
++    api: FakeApi, cli: Cli, tmp_path: Path
++) -> None:
++    """读取时还不存在，创建时已经存在（409）：重新读取后更新它。"""
++    api.add(document())
++    api.reply("GET", PATH, 404, error_body("NOT_FOUND", "InferenceService 'llama' not found"))
++
++    result = cli("apply", "-f", write_yaml(tmp_path / "svc.yaml", document(labels={"zone": "b"})))
++
++    assert (result.code, result.out) == (0, "InferenceService default/llama configured\n")
++    assert [call.method for call in api.calls] == ["GET", "POST", "GET", "PUT"]
++
++
++def test_apply_reports_a_failed_document_and_applies_the_others(
++    api: FakeApi, cli: Cli, tmp_path: Path
++) -> None:
++    path = write_yaml(tmp_path / "svcs.yaml", document("a"), document("b"), document("c"))
++    invalid = {"loc": ["body", "spec", "resources"], "msg": "Field required", "type": "missing"}
++    api.reply(
++        "POST",
++        SERVICES,
++        400,
++        error_body("BAD_REQUEST", "request validation failed", details={"errors": [invalid]}),
++    )
++
++    result = cli("apply", "-f", path)
++
++    assert result.code == ExitCode.REJECTED
++    assert result.out == "InferenceService default/b created\nInferenceService default/c created\n"
++    assert result.err == (
++        f"Error: InferenceService default/a ({path} (document 1)): request validation failed "
++        "(HTTP 400 BAD_REQUEST, correlation id cid-server)\n"
++        "  body.spec.resources: Field required\n"
++    )
++
++
++def test_apply_sends_the_tenant_of_each_document(api: FakeApi, cli: Cli, tmp_path: Path) -> None:
++    """文档中的租户作为 X-Tenant-Id 发送：与 key 的租户不符时 API 拒绝（403），而不是写进
++    key 的租户。"""
++    path = write_yaml(tmp_path / "svcs.yaml", document("a", tenantId="team-a"), document("b"))
++
++    result = cli("apply", "-f", path)
++    mismatch = cli("apply", "-f", path, "--tenant", "team-b")
++
++    assert result.code == 0
++    assert [(call.method, call.headers.get("x-tenant-id")) for call in api.calls] == [
++        ("GET", "team-a"),
++        ("POST", "team-a"),
++        ("GET", None),
++        ("POST", None),
++    ]
++    assert (mismatch.code, mismatch.err) == (
++        ExitCode.USAGE,
++        f"Error: {path} (document 1): metadata.tenantId 'team-a' does not match --tenant "
++        "'team-b'\n",
++    )
++    assert len(api.calls) == 4
++
++
++def test_apply_reads_json_from_standard_input_and_fills_in_the_namespace(
++    api: FakeApi, cli: Cli, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    docs = [document("a", namespace=None), document("b", namespace=None)]
++    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(docs)))
++
++    result = cli("apply", "-f", "-", "-n", "team-a")
++
++    assert (result.code, result.out) == (
++        0,
++        "InferenceService team-a/a created\nInferenceService team-a/b created\n",
++    )
++    posted = [call.body["metadata"] for call in api.calls if call.method == "POST"]
++    assert posted == [
++        {"name": "a", "namespace": "team-a"},
++        {"name": "b", "namespace": "team-a"},
++    ]
++
++
++@pytest.mark.parametrize("output", ["yaml", "json"])
++def test_the_output_of_list_can_be_applied_again(
++    api: FakeApi, cli: Cli, monkeypatch: pytest.MonkeyPatch, output: str
++) -> None:
++    api.add(document("a"), version="4", **READY)
++    api.add(document("b", labels={"zone": "b"}), uid="uid-2", version="2")
++    listed = cli("list", "inferenceservices", "-o", output)
++    monkeypatch.setattr("sys.stdin", io.StringIO(listed.out))
++
++    result = cli("apply", "-f", "-")
++
++    assert (result.code, result.out, result.err) == (
++        0,
++        "InferenceService default/a unchanged\nInferenceService default/b unchanged\n",
++        "",
++    )
++
++
++def test_apply_checks_every_document_before_sending_anything(
++    api: FakeApi, cli: Cli, tmp_path: Path
++) -> None:
++    path = write_yaml(tmp_path / "svcs.yaml", document("a"), {**document("b"), "kind": "Workflow"})
++
++    result = cli("apply", "-f", path)
++
++    assert (result.code, result.out) == (ExitCode.USAGE, "")
++    assert result.err == (
++        f"Error: {path} (document 2): kind 'Workflow' is not supported; the CLI applies "
++        "InferenceService\n"
++    )
++    assert api.calls == []
++
++
++def test_get_prints_the_service_as_yaml_or_json(api: FakeApi, cli: Cli) -> None:
++    service = api.add(document(), **READY)
++
++    as_yaml = cli("get", "inferenceservice", "llama", "-n", "default")
++    as_json = cli("get", "InferenceService", "llama", "-n", "default", "-o", "json")
++
++    assert yaml.safe_load(as_yaml.out) == service
++    assert json.loads(as_json.out) == service
++    assert as_yaml.out.startswith("apiVersion: forgemesh.io/v1alpha1\nkind: InferenceService\n")
++
++
++def test_get_without_a_namespace_looks_for_a_service_without_one(api: FakeApi, cli: Cli) -> None:
++    api.add(document())
++
++    result = cli("get", "inferenceservice", "llama")
++    elsewhere = cli("get", "inferenceservice", "llama", "-n", "other")
++
++    assert result.code == ExitCode.NOT_FOUND
++    assert result.err == (
++        f"Error: InferenceService 'llama' not found (HTTP 404 NOT_FOUND, correlation id "
++        f"{api.calls[0].headers['x-correlation-id']})\n"
++        "no --namespace was given, so this looked for an InferenceService without a namespace\n"
++    )
++    assert elsewhere.code == ExitCode.NOT_FOUND
++    assert elsewhere.err == (
++        f"Error: InferenceService 'llama' not found (HTTP 404 NOT_FOUND, correlation id "
++        f"{correlation_id(api)})\n"
++    )
++    assert api.log() == [f"GET {PATH}", f"GET {PATH}?namespace=other"]
++
++
++def test_describe_shows_the_state_of_a_service(api: FakeApi, cli: Cli) -> None:
++    service = api.add(
++        document(labels={"zone": "b"}),
++        phase="Ready",
++        ready=("True", "Reconciled"),
++        message="instance fake-1 is serving at http://127.0.0.1:9000",
++        generation=2,
++        observed=2,
++        version="5",
++    )
++    service["status"]["endpoints"] = [
++        {
++            "url": "http://127.0.0.1:9000",
++            "ready": True,
++            "protocol": "openai-chat",
++            "instanceId": "fake-1",
++        }
++    ]
++
++    result = cli("describe", "inferenceservice", "llama", "-n", "default")
++
++    assert result.out == (
++        "Name:             llama\n"
++        "Namespace:        default\n"
++        "UID:              uid-1\n"
++        "Tenant:           acme\n"
++        "Labels:           zone=b\n"
++        "Annotations:      <none>\n"
++        "Resource version: 5\n"
++        "Generation:       2 (observed 2)\n"
++        "Model:            models/llama\n"
++        "Runtime:          vllm 0.6.3\n"
++        "Accelerator:      1 x nvidia-gpu, at least 16 GiB each\n"
++        "Phase:            Ready\n"
++        "Conditions:\n"
++        "  TYPE    STATUS   REASON       LAST TRANSITION        MESSAGE\n"
++        "  Ready   True     Reconciled   2026-01-01T00:00:00Z   "
++        "instance fake-1 is serving at http://127.0.0.1:9000\n"
++        "Endpoints:\n"
++        "  URL                     READY   PROTOCOL      INSTANCE\n"
++        "  http://127.0.0.1:9000   true    openai-chat   fake-1\n"
++    )
++
++
++def test_describe_of_a_new_service_marks_what_is_missing(api: FakeApi, cli: Cli) -> None:
++    api.add(document())
++
++    result = cli("describe", "inferenceservice", "llama", "-n", "default")
++
++    assert result.out.splitlines()[-3:] == [
++        "Phase:            Pending",
++        "Conditions:  <none>",
++        "Endpoints:  <none>",
++    ]
++
++
++def test_list_reads_every_page_and_prints_a_table(api: FakeApi, cli: Cli) -> None:
++    api.add(document("a"), **READY)
++    api.add(document("b"), phase="Scheduling", ready=("False", "AllocationFailed"))
++    api.add(document("c", namespace=None))
++    api.add(document("d", namespace="other"))
++
++    result = cli("list", "inferenceservices", "--page-size", "2")
++
++    assert (result.code, result.err) == (0, "")
++    assert result.out == (
++        "NAMESPACE   NAME   PHASE        READY    REASON             MODEL\n"
++        "<none>      c      Pending      <none>   <none>             models/llama\n"
++        "default     a      Ready        True     Reconciled         models/llama\n"
++        "default     b      Scheduling   False    AllocationFailed   models/llama\n"
++        "other       d      Pending      <none>   <none>             models/llama\n"
++    )
++    assert api.log() == [
++        f"GET {SERVICES}?limit=2",
++        f"GET {SERVICES}?limit=2&pageToken=2",
++    ]
++
++
++def test_list_keeps_the_namespace_filter_on_every_page(api: FakeApi, cli: Cli) -> None:
++    for name in ("a", "b", "c"):
++        api.add(document(name))
++    api.add(document("d", namespace="other"))
++
++    result = cli("list", "inferenceservices", "-n", "default", "--page-size", "2", "-o", "json")
++
++    assert [service["metadata"]["name"] for service in json.loads(result.out)] == ["a", "b", "c"]
++    assert api.log() == [
++        f"GET {SERVICES}?limit=2&namespace=default",
++        f"GET {SERVICES}?limit=2&namespace=default&pageToken=2",
++    ]
++
++
++def test_list_prints_yaml_documents(api: FakeApi, cli: Cli) -> None:
++    first = api.add(document("a"))
++    second = api.add(document("b"))
++
++    result = cli("list", "inferenceservices", "-o", "yaml")
++
++    assert result.out.startswith("---\n")
++    assert list(yaml.safe_load_all(result.out)) == [first, second]
++
++
++def test_an_empty_list_is_reported_on_standard_error(api: FakeApi, cli: Cli) -> None:
++    table = cli("list", "inferenceservices", "-n", "default")
++    everywhere = cli("list", "inferenceservices")
++    as_json = cli("list", "inferenceservices", "-o", "json")
++    as_yaml = cli("list", "inferenceservices", "-o", "yaml")
++
++    assert (table.code, table.out, table.err) == (
++        0,
++        "",
++        "No InferenceService resources found in namespace default.\n",
++    )
++    assert everywhere.err == "No InferenceService resources found.\n"
++    assert (as_json.out, as_json.err) == ("[]\n", "")
++    assert (as_yaml.out, as_yaml.err) == ("", "")
++
++
++def test_delete_reports_whether_the_service_is_gone_or_terminating(api: FakeApi, cli: Cli) -> None:
++    api.add(document("a"))
++    api.add(document("b"))
++
++    gone = cli("delete", "inferenceservice", "a", "-n", "default")
++    api.delete_status = 202
++    terminating = cli("delete", "inferenceservice", "b", "-n", "default")
++
++    assert (gone.code, gone.out) == (0, "InferenceService default/a deleted\n")
++    assert (terminating.code, terminating.out) == (
++        0,
++        "InferenceService default/b is terminating: the controller stops its instance and "
++        "releases its accelerators, then deletes it\n",
++    )
++    assert ("default", "a") not in api.services
++    assert api.services[("default", "b")]["status"]["phase"] == "Terminating"
++    assert api.log() == [
++        f"DELETE {SERVICES}/a?namespace=default",
++        f"DELETE {SERVICES}/b?namespace=default",
++    ]
++
++
++def test_delete_of_a_missing_service_fails_with_not_found(api: FakeApi, cli: Cli) -> None:
++    result = cli("delete", "inferenceservice", "llama")
++
++    assert result.code == ExitCode.NOT_FOUND
++    assert result.err.endswith(
++        "no --namespace was given, so this looked for an InferenceService without a namespace\n"
++    )
++
++
++def test_wait_returns_once_the_service_is_ready(api: FakeApi, cli: Cli, clock: FakeClock) -> None:
++    api.reply("GET", PATH, 200, resource(document(), phase="Scheduling"))
++    api.reply(
++        "GET", PATH, 200, resource(document(), phase="Deploying", ready=("False", "Deploying"))
++    )
++    api.add(document(), **READY)
++
++    result = cli("wait", "inferenceservice", "llama", "-n", "default")
++
++    assert (result.code, result.out, result.err) == (
++        0,
++        "InferenceService default/llama is Ready\n",
++        "",
++    )
++    assert clock.sleeps == [1.0, 1.0]
++    assert len(api.calls) == 3
++
++
++def test_wait_fails_at_once_when_the_service_failed(
++    api: FakeApi, cli: Cli, clock: FakeClock
++) -> None:
++    api.add(
++        document(),
++        phase="Failed",
++        ready=("False", "WorkflowFailed"),
++        message="model download failed\x1b[2J",
++        observed=1,
++    )
++
++    result = cli("wait", "inferenceservice", "llama", "-n", "default")
++
++    assert result.code == ExitCode.WAIT_FAILED
++    assert result.err == (
++        "Error: InferenceService default/llama will not become Ready: phase Failed, "
++        "Ready=False (WorkflowFailed: model download failed?[2J)\n"
++    )
++    assert clock.sleeps == []
++
++
++def test_wait_fails_when_the_service_is_being_deleted(
++    api: FakeApi, cli: Cli, clock: FakeClock
++) -> None:
++    api.add(document(), phase="Terminating", observed=1)
++
++    result = cli("wait", "inferenceservice", "llama", "-n", "default")
++
++    assert (result.code, result.err) == (
++        ExitCode.WAIT_FAILED,
++        "Error: InferenceService default/llama will not become Ready: phase Terminating\n",
++    )
++
++
++@pytest.mark.parametrize(
++    ("phase", "ready"), [("Ready", ("True", "Reconciled")), ("Failed", ("False", "WorkflowFailed"))]
++)
++def test_wait_ignores_the_outcome_of_an_older_spec(
++    api: FakeApi, cli: Cli, clock: FakeClock, phase: str, ready: tuple[str, str]
++) -> None:
++    """spec 更新之后（generation 2），控制器处理它之前的 Ready 或 Failed 都不是结论。"""
++    api.reply(
++        "GET", PATH, 200, resource(document(), phase=phase, ready=ready, generation=2, observed=1)
++    )
++    api.add(document(), phase="Ready", ready=("True", "Reconciled"), generation=2, observed=2)
++
++    result = cli("wait", "inferenceservice", "llama", "-n", "default")
++
++    assert (result.code, result.out) == (0, "InferenceService default/llama is Ready\n")
++    assert clock.sleeps == [1.0]
++
++
++def test_wait_times_out_with_the_last_state_it_saw(
++    api: FakeApi, cli: Cli, clock: FakeClock
++) -> None:
++    api.add(document(), phase="Ready", ready=("True", "Reconciled"), generation=2, observed=1)
++
++    result = cli("wait", "inferenceservice", "llama", "-n", "default", "--timeout", "2.5")
++
++    assert result.code == ExitCode.WAIT_TIMEOUT
++    assert result.err == (
++        "Error: timed out after 2.5 s waiting for InferenceService default/llama to become "
++        "Ready; last seen: phase Ready, Ready=True (Reconciled); the controller has not "
++        "processed generation 2 yet (observed 1)\n"
++    )
++    assert clock.sleeps == [1.0, 1.0, 0.5]
++    assert len(api.calls) == 4
++
++
++def test_wait_rides_out_rate_limiting_and_an_unreachable_control_plane(
++    api: FakeApi, cli: Cli, clock: FakeClock
++) -> None:
++    api.reply("GET", PATH, 429, raw=b"Too Many Requests\n", headers={"Retry-After": "4"})
++    api.reply("GET", PATH, 502, raw=b"Bad Gateway\n")
++    api.reply("GET", PATH, DROP)
++    api.add(document(), **READY)
++
++    result = cli("wait", "inferenceservice", "llama", "-n", "default")
++
++    assert (result.code, result.out, result.err) == (
++        0,
++        "InferenceService default/llama is Ready\n",
++        "",
++    )
++    assert clock.sleeps == [4, 1.0, 1.0]
++
++
++def test_wait_fails_at_once_when_the_api_cannot_be_reached(
++    cli: Cli, clock: FakeClock, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    url = unused_url()
++    monkeypatch.setenv(API_URL_ENV, url)
++
++    result = cli("wait", "inferenceservice", "llama", "-n", "default")
++
++    assert result.code == ExitCode.CONNECTION_FAILED
++    assert result.err.startswith(f"Error: cannot reach the API at {url}: ")
++    assert clock.sleeps == []
++
++
++def test_wait_for_a_missing_service_fails_with_not_found(
++    api: FakeApi, cli: Cli, clock: FakeClock
++) -> None:
++    result = cli("wait", "inferenceservice", "llama", "-n", "default")
++
++    assert result.code == ExitCode.NOT_FOUND
++    assert clock.sleeps == []
++
++
++def test_wait_for_delete_returns_once_the_service_is_gone(
++    api: FakeApi, cli: Cli, clock: FakeClock
++) -> None:
++    api.reply("GET", PATH, 200, resource(document(), phase="Terminating"))
++
++    deleted = cli("wait", "inferenceservice", "llama", "-n", "default", "--for", "delete")
++    missing = cli("wait", "inferenceservice", "llama", "-n", "default", "--for", "delete")
++
++    assert (deleted.code, deleted.out) == (0, "InferenceService default/llama deleted\n")
++    assert (missing.code, missing.out) == (0, "InferenceService default/llama not found\n")
++    assert clock.sleeps == [1.0]
++
++
++def test_wait_for_delete_times_out(api: FakeApi, cli: Cli, clock: FakeClock) -> None:
++    api.add(document(), phase="Terminating")
++
++    result = cli(
++        "wait", "inferenceservice", "llama", "-n", "default", "--for", "delete", "--timeout", "0"
++    )
++
++    assert (result.code, result.err) == (
++        ExitCode.WAIT_TIMEOUT,
++        "Error: timed out after 0 s waiting for InferenceService default/llama to be deleted; "
++        "last seen: phase Terminating\n",
++    )
++
++
++def test_an_interrupted_wait_exits_with_130(
++    api: FakeApi, cli: Cli, clock: FakeClock, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    def interrupt(seconds: float) -> None:
++        raise KeyboardInterrupt
++
++    api.add(document())
++    monkeypatch.setattr(clock, "sleep", interrupt)
++
++    result = cli("wait", "inferenceservice", "llama", "-n", "default")
++
++    assert (result.code, result.out, result.err) == (ExitCode.INTERRUPTED, "", "")
++
++
++def test_the_api_key_from_a_file_is_sent_as_a_bearer_token_and_never_printed(
++    api: FakeApi, cli: Cli, tmp_path: Path
++) -> None:
++    key_file = tmp_path / "api-key"
++    key_file.write_text(KEY + "\n", encoding="utf-8")
++    api.reply("GET", PATH, 401, error_body("UNAUTHENTICATED", "invalid credentials"))
++
++    result = cli(
++        "get", "inferenceservice", "llama", "-n", "default", "--api-key-file", str(key_file)
++    )
++
++    assert (result.code, result.out, result.err) == (
++        ExitCode.AUTH,
++        "",
++        "Error: invalid credentials (HTTP 401 UNAUTHENTICATED, correlation id cid-server)\n",
++    )
++    assert api.calls[0].headers["authorization"] == f"Bearer {KEY}"
++
++
++def test_the_key_file_takes_precedence_over_the_environment(
++    api: FakeApi, cli: Cli, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    key_file = tmp_path / "api-key"
++    key_file.write_text(KEY, encoding="utf-8")
++    monkeypatch.setenv(API_KEY_ENV, "fmk_from_the_environment")
++
++    cli("list", "inferenceservices")
++    cli("list", "inferenceservices", "--api-key-file", str(key_file))
++
++    assert [call.headers["authorization"] for call in api.calls] == [
++        "Bearer fmk_from_the_environment",
++        f"Bearer {KEY}",
++    ]
++
++
++def test_a_401_without_a_key_says_how_to_configure_one(api: FakeApi, cli: Cli) -> None:
++    api.reply("GET", SERVICES, 401, error_body("UNAUTHENTICATED", "missing bearer credentials"))
++
++    result = cli("list", "inferenceservices")
++
++    assert "authorization" not in api.calls[0].headers
++    assert (result.code, result.err) == (
++        ExitCode.AUTH,
++        "Error: missing bearer credentials (HTTP 401 UNAUTHENTICATED, correlation id "
++        "cid-server)\n"
++        "no API key is configured: set FORGEMESH_API_KEY or pass --api-key-file (a control "
++        "plane in dev mode needs --tenant instead)\n",
++    )
++
++
++def test_a_key_file_that_does_not_hold_a_key_is_not_echoed(
++    api: FakeApi, cli: Cli, tmp_path: Path
++) -> None:
++    key_file = tmp_path / "api-key"
++    key_file.write_text("password: hunter2\n", encoding="utf-8")
++
++    result = cli("list", "inferenceservices", "--api-key-file", str(key_file))
++
++    assert result.code == ExitCode.USAGE
++    assert "hunter2" not in result.err
++    assert api.calls == []
++
++
++def test_common_options_can_be_given_before_or_after_the_command(
++    api: FakeApi, cli: Cli, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    api.add(document())
++    monkeypatch.setenv(API_URL_ENV, unused_url())
++
++    before = cli("--api-url", api.url, "-n", "default", "get", "inferenceservice", "llama")
++    after = cli(
++        "-n", "other", "get", "inferenceservice", "llama", "-n", "default", "--api-url", api.url
++    )
++
++    assert (before.code, after.code) == (0, 0)
++    assert api.log() == [f"GET {PATH}?namespace=default"] * 2
++
++
++def test_the_requests_of_one_run_share_a_correlation_id(
++    api: FakeApi, cli: Cli, tmp_path: Path
++) -> None:
++    path = write_yaml(tmp_path / "svc.yaml", document())
++
++    cli("apply", "-f", path)
++    cli("apply", "-f", path)
++
++    ids = [call.headers["x-correlation-id"] for call in api.calls]
++    assert ids[0] == ids[1] != ids[2] == ids[3]
++    assert all(re.fullmatch(r"[0-9a-f]{32}", value) for value in ids)
++
++
++@pytest.mark.parametrize(
++    "args",
++    [
++        ["get", "workflow", "llama"],
++        ["get", "inferenceservice"],
++        ["apply"],
++        ["list", "inferenceservices", "--page-size", "0"],
++        ["list", "inferenceservices", "--page-size", "1001"],
++        ["list", "inferenceservices", "--page-size", "many"],
++        ["list", "inferenceservices", "-o", "wide"],
++        ["wait", "inferenceservice", "llama", "--timeout", "-1"],
++        ["wait", "inferenceservice", "llama", "--timeout", "nan"],
++        ["wait", "inferenceservice", "llama", "--timeout", "inf"],
++        ["wait", "inferenceservice", "llama", "--for", "deleted"],
++    ],
++)
++def test_invalid_arguments_exit_with_2(args: list[str], capsys: pytest.CaptureFixture[str]) -> None:
++    with pytest.raises(SystemExit) as raised:
++        main(args)
++
++    assert raised.value.code == ExitCode.USAGE
++    assert "usage: forgemesh" in capsys.readouterr().err
++
++
++@pytest.mark.parametrize(
++    ("args", "message"),
++    [
++        (
++            ["--tenant", "team a", "list", "inferenceservices"],
++            "--tenant must be a non-empty string of visible ASCII characters",
++        ),
++        (
++            ["list", "inferenceservices", "-n", ""],
++            "--namespace must not be empty; omit it for resources without a namespace",
+         ),
+-        encoding="utf-8",
+-    )
+-    args = SimpleNamespace(file=str(yaml_path), tenant="default", namespace="default")
+-    rc = asyncio.run(cmd_apply(args))
+-    assert rc == 0
+-    out = capsys.readouterr().out
+-    assert "Created" in out
+-    assert "InferenceService/svc-1" in out
+-
+-
+-def test_get_not_found(capsys: pytest.CaptureFixture[str]) -> None:
+-    """get 不存在的资源 → 返回 1。"""
+-    args = SimpleNamespace(
+-        kind="InferenceService", name="nope", tenant="default", namespace="default"
+-    )
+-    rc = asyncio.run(cmd_get(args))
+-    assert rc == 1
+-    err = capsys.readouterr().err
+-    assert "not found" in err
+-
+-
+-def test_list_empty(capsys: pytest.CaptureFixture[str]) -> None:
+-    """list 空库 → 返回 0。"""
+-    args = SimpleNamespace(kind="InferenceService", tenant="default", namespace=None)
+-    rc = asyncio.run(cmd_list(args))
+-    assert rc == 0
+-    out = capsys.readouterr().out
+-    assert out == ""
++        (
++            ["list", "inferenceservices", "--api-url", "ftp://127.0.0.1"],
++            "--api-url must be an http or https URL such as http://127.0.0.1:8081",
++        ),
++    ],
++)
++def test_invalid_options_are_reported_before_any_request(
++    api: FakeApi, cli: Cli, args: list[str], message: str
++) -> None:
++    result = cli(*args)
++
++    assert (result.code, result.err) == (ExitCode.USAGE, f"Error: {message}\n")
++    assert api.calls == []
++
++
++def test_the_help_lists_every_exit_code() -> None:
++    text = build_parser().format_help()
++
++    listed = re.findall(r"^  (\d+) {2,}\S", text.partition("exit codes:")[2], re.MULTILINE)
++
++    assert [int(code) for code in listed] == [code.value for code in ExitCode]
+diff --git a/tests/unit/cli/test_config.py b/tests/unit/cli/test_config.py
+new file mode 100644
+index 0000000..e78a1f1
+--- /dev/null
++++ b/tests/unit/cli/test_config.py
+@@ -0,0 +1,183 @@
++"""CLI 配置单元测试：API 地址与 key 的来源、优先级与校验，错误消息不包含凭证。"""
++
++from __future__ import annotations
++
++from pathlib import Path
++
++import pytest
++from forgemesh.cli.config import (
++    API_KEY_ENV,
++    API_URL_ENV,
++    DEFAULT_API_URL,
++    check_namespace,
++    check_tenant,
++    resolve_api_key,
++    resolve_api_url,
++)
++from forgemesh.cli.errors import ExitCode, UsageError
++
++KEY = "fmk_" + "A1b2-_" * 7
++NOT_A_URL = "--api-url must be an http or https URL such as http://127.0.0.1:8081"
++NOT_A_KEY = (
++    "does not hold a single API key: expected one line with the key printed by "
++    "`python -m forgemesh.controlplane.keygen`"
++)
++
++
++def test_the_default_url_is_the_gateway_on_this_host() -> None:
++    assert resolve_api_url(None, {}) == DEFAULT_API_URL == "http://127.0.0.1:8081"
++    assert resolve_api_url(None, {API_URL_ENV: "  "}) == DEFAULT_API_URL
++
++
++def test_the_option_takes_precedence_over_the_environment() -> None:
++    environ = {API_URL_ENV: "http://127.0.0.1:8080"}
++
++    assert resolve_api_url(None, environ) == "http://127.0.0.1:8080"
++    assert resolve_api_url("https://forgemesh.example.com/", environ) == (
++        "https://forgemesh.example.com"
++    )
++
++
++def test_the_path_prefix_of_a_reverse_proxy_is_kept() -> None:
++    assert resolve_api_url("https://example.com/forgemesh/", {}) == "https://example.com/forgemesh"
++
++
++@pytest.mark.parametrize(
++    ("value", "message"),
++    [
++        ("127.0.0.1:8081", NOT_A_URL),
++        ("localhost:8081", NOT_A_URL),
++        ("ftp://example.com", NOT_A_URL),
++        ("http://", NOT_A_URL),
++        (
++            "http://user:s3cret@example.com",
++            "--api-url must not contain credentials; use --api-key-file",
++        ),
++        ("http://example.com/?limit=1", "--api-url must not contain a query or a fragment"),
++        ("http://example.com/#top", "--api-url must not contain a query or a fragment"),
++        ("http://example.com:99999", "--api-url has an invalid port"),
++        ("http://example.com:http", "--api-url has an invalid port"),
++        (
++            "http://example.com/api/v1/",
++            "--api-url is the base URL of the API; remove the trailing /api/v1",
++        ),
++    ],
++)
++def test_invalid_urls_are_rejected(value: str, message: str) -> None:
++    with pytest.raises(UsageError) as raised:
++        resolve_api_url(value, {})
++
++    assert (raised.value.exit_code, raised.value.message) == (ExitCode.USAGE, message)
++
++
++def test_an_invalid_url_in_the_environment_is_named_but_not_echoed() -> None:
++    with pytest.raises(UsageError) as raised:
++        resolve_api_url(None, {API_URL_ENV: "http://admin:s3cret@example.com"})
++
++    assert raised.value.message == (
++        "FORGEMESH_API_URL must not contain credentials; use --api-key-file"
++    )
++
++
++def test_the_key_file_takes_precedence_and_surrounding_whitespace_is_ignored(
++    tmp_path: Path,
++) -> None:
++    key_file = tmp_path / "api-key"
++    key_file.write_text(f"  {KEY}\n", encoding="utf-8")
++
++    assert resolve_api_key(str(key_file), {API_KEY_ENV: "fmk_from_the_environment"}) == KEY
++
++
++def test_without_a_file_the_key_comes_from_the_environment() -> None:
++    assert resolve_api_key(None, {API_KEY_ENV: f" {KEY}\n"}) == KEY
++    assert resolve_api_key(None, {API_KEY_ENV: "  "}) is None
++    assert resolve_api_key(None, {}) is None
++
++
++@pytest.mark.parametrize("content", ["", "\n  \n"])
++def test_an_empty_key_file_is_rejected(tmp_path: Path, content: str) -> None:
++    key_file = tmp_path / "api-key"
++    key_file.write_text(content, encoding="utf-8")
++
++    with pytest.raises(UsageError) as raised:
++        resolve_api_key(str(key_file), {API_KEY_ENV: KEY})
++
++    assert raised.value.message == f"the API key file {key_file} is empty"
++
++
++def test_an_unreadable_key_file_is_rejected(tmp_path: Path) -> None:
++    missing = tmp_path / "missing"
++
++    with pytest.raises(UsageError) as missing_file:
++        resolve_api_key(str(missing), {})
++    with pytest.raises(UsageError) as directory:
++        resolve_api_key(str(tmp_path), {})
++
++    assert missing_file.value.message == (
++        f"cannot read the API key file {missing}: No such file or directory"
++    )
++    assert directory.value.message == f"cannot read the API key file {tmp_path}: Is a directory"
++
++
++def test_a_key_file_that_is_not_utf8_is_rejected(tmp_path: Path) -> None:
++    key_file = tmp_path / "api-key"
++    key_file.write_bytes(b"\xff\xfefmk_key")
++
++    with pytest.raises(UsageError) as raised:
++        resolve_api_key(str(key_file), {})
++
++    assert raised.value.message == f"the API key file {key_file} is not UTF-8 text"
++
++
++@pytest.mark.parametrize(
++    "content",
++    [
++        "fmk_secret1 fmk_secret2",
++        "fmk_secret1\nfmk_secret2\n",
++        '{"key": "fmk_secret1"}',
++        "Bearer fmk_secret1",
++        "fmk_secret1ä",
++    ],
++)
++def test_a_key_file_with_anything_but_one_key_is_rejected_without_echoing_it(
++    tmp_path: Path, content: str
++) -> None:
++    key_file = tmp_path / "api-key"
++    key_file.write_text(content, encoding="utf-8")
++
++    with pytest.raises(UsageError) as raised:
++        resolve_api_key(str(key_file), {})
++
++    assert raised.value.message == f"the API key file {key_file} {NOT_A_KEY}"
++
++
++def test_an_invalid_key_in_the_environment_is_rejected_without_echoing_it() -> None:
++    with pytest.raises(UsageError) as raised:
++        resolve_api_key(None, {API_KEY_ENV: "fmk_secret1\r\nX-Injected: 1"})
++
++    assert raised.value.message == f"FORGEMESH_API_KEY {NOT_A_KEY}"
++
++
++@pytest.mark.parametrize("value", ["acme", "team-a", "a.b_c~1"])
++def test_visible_ascii_tenants_are_accepted(value: str) -> None:
++    assert check_tenant(value, "--tenant") == value
++
++
++@pytest.mark.parametrize("value", ["", "team a", "team-a\n", "équipe"])
++def test_tenants_that_cannot_be_sent_as_a_header_are_rejected(value: str) -> None:
++    with pytest.raises(UsageError) as raised:
++        check_tenant(value, "--tenant")
++
++    assert raised.value.message == (
++        "--tenant must be a non-empty string of visible ASCII characters"
++    )
++
++
++def test_an_empty_namespace_is_rejected() -> None:
++    assert check_namespace("team-a", "--namespace") == "team-a"
++    with pytest.raises(UsageError) as raised:
++        check_namespace("", "--namespace")
++
++    assert raised.value.message == (
++        "--namespace must not be empty; omit it for resources without a namespace"
++    )
+diff --git a/tests/unit/cli/test_documents.py b/tests/unit/cli/test_documents.py
+new file mode 100644
+index 0000000..e4db577
+--- /dev/null
++++ b/tests/unit/cli/test_documents.py
+@@ -0,0 +1,195 @@
++"""``apply -f`` 的文档读取单元测试：YAML / JSON、多文档、标准输入、命名空间与租户规则，
++以及在发出任何请求之前发现的错误。"""
++
++from __future__ import annotations
++
++import io
++import json
++from pathlib import Path
++
++import pytest
++import yaml
++from forgemesh.cli.documents import Document, load_documents
++from forgemesh.cli.errors import UsageError
++
++from .fakes import document
++
++
++def load(
++    paths: list[str], *, namespace: str | None = None, tenant: str | None = None, stdin: str = ""
++) -> list[Document]:
++    return load_documents(paths, namespace=namespace, tenant=tenant, stdin=io.StringIO(stdin))
++
++
++def load_error(stdin: str, **options: str) -> str:
++    with pytest.raises(UsageError) as raised:
++        load(["-"], stdin=stdin, **options)
++    return raised.value.message
++
++
++def test_a_yaml_file_with_several_documents(tmp_path: Path) -> None:
++    path = tmp_path / "svcs.yaml"
++    path.write_text(
++        "# two services\n---\n"
++        + yaml.safe_dump(document("a"))
++        + "---\n---\n"
++        + yaml.safe_dump(document("b")),
++        encoding="utf-8",
++    )
++
++    assert load([str(path)]) == [
++        Document(f"{path} (document 1)", document("a"), "a", "default", None),
++        Document(f"{path} (document 2)", document("b"), "b", "default", None),
++    ]
++
++
++def test_json_objects_arrays_and_yaml_lists(tmp_path: Path) -> None:
++    single = tmp_path / "svc.json"
++    single.write_text(json.dumps(document()), encoding="utf-8")
++    array = tmp_path / "svcs.json"
++    array.write_text(json.dumps([document("a"), document("b")]), encoding="utf-8")
++    sequence = tmp_path / "svcs.yaml"
++    sequence.write_text(yaml.safe_dump([document("c")]), encoding="utf-8")
++
++    docs = load([str(single), str(array), str(sequence)])
++
++    assert [(doc.source, doc.name) for doc in docs] == [
++        (str(single), "llama"),
++        (f"{array} (document 1)", "a"),
++        (f"{array} (document 2)", "b"),
++        (str(sequence), "c"),
++    ]
++
++
++def test_yaml_flow_style_is_not_mistaken_for_invalid_json() -> None:
++    [doc] = load(["-"], stdin="{kind: InferenceService, metadata: {name: a}, spec: {}}\n")
++
++    assert doc.body == {"kind": "InferenceService", "metadata": {"name": "a"}, "spec": {}}
++
++
++def test_a_byte_order_mark_is_ignored(tmp_path: Path) -> None:
++    path = tmp_path / "svc.json"
++    path.write_bytes(b"\xef\xbb\xbf" + json.dumps(document()).encode())
++
++    assert [doc.name for doc in load([str(path)])] == ["llama"]
++
++
++def test_standard_input_can_be_read_once() -> None:
++    [doc] = load(["-"], stdin=yaml.safe_dump(document()))
++
++    assert doc.source == "<stdin>"
++    with pytest.raises(UsageError) as raised:
++        load(["-", "-"])
++    assert raised.value.message == "standard input ('-') can be read only once"
++
++
++def test_the_namespace_option_fills_in_a_missing_namespace() -> None:
++    [doc] = load(["-"], namespace="team-a", stdin=json.dumps(document(namespace=None)))
++    [without] = load(["-"], stdin=json.dumps(document(namespace=None)))
++
++    assert (doc.namespace, doc.body["metadata"]) == (
++        "team-a",
++        {"name": "llama", "namespace": "team-a"},
++    )
++    assert (without.namespace, without.body["metadata"]) == (None, {"name": "llama"})
++
++
++def test_the_namespace_option_must_match_the_document() -> None:
++    assert load_error(json.dumps(document()), namespace="other") == (
++        "<stdin>: metadata.namespace 'default' does not match --namespace 'other'"
++    )
++
++
++def test_the_tenant_comes_from_the_document_or_the_option() -> None:
++    [own] = load(["-"], stdin=json.dumps(document(tenantId="team-a")))
++    [legacy] = load(["-"], stdin=json.dumps(document(tenant_id="team-a")))
++    [option] = load(["-"], tenant="team-a", stdin=json.dumps(document()))
++    [same] = load(["-"], tenant="team-a", stdin=json.dumps(document(tenantId="team-a")))
++
++    assert [doc.tenant for doc in (own, legacy, option, same)] == ["team-a"] * 4
++
++
++def test_conflicting_tenants_are_rejected() -> None:
++    assert load_error(json.dumps(document(tenantId="team-a")), tenant="team-b") == (
++        "<stdin>: metadata.tenantId 'team-a' does not match --tenant 'team-b'"
++    )
++    assert load_error(json.dumps(document(tenantId="team-a", tenant_id="team-b"))) == (
++        "<stdin>: metadata.tenantId must be a single string"
++    )
++
++
++@pytest.mark.parametrize(
++    ("text", "message"),
++    [
++        ("", "<stdin>: no documents found"),
++        ("---\n---\n", "<stdin>: no documents found"),
++        ("- 1\n", "<stdin>: a resource document must be a mapping"),
++        ("[1, 2]", "<stdin> (document 1): a resource document must be a mapping"),
++        (
++            "kind: Workflow\nmetadata: {name: a}\n",
++            "<stdin>: kind 'Workflow' is not supported; the CLI applies InferenceService",
++        ),
++        ("spec: {}\n", "<stdin>: metadata must be a mapping"),
++        ("metadata: [a]\n", "<stdin>: metadata must be a mapping"),
++        ("metadata: {name: ''}\n", "<stdin>: metadata.name must be a non-empty string"),
++        ("metadata: {name: 5}\n", "<stdin>: metadata.name must be a non-empty string"),
++        ("metadata: {name: a, namespace: 5}\n", "<stdin>: metadata.namespace must be a string"),
++        (
++            "metadata: {name: a, namespace: ''}\n",
++            "<stdin>: metadata.namespace must not be empty; omit it for resources without a "
++            "namespace",
++        ),
++        (
++            "metadata: {name: a, tenantId: team a}\n",
++            "<stdin>: metadata.tenantId must be a non-empty string of visible ASCII characters",
++        ),
++        (
++            "metadata: {name: a, tenantId: 5}\n",
++            "<stdin>: metadata.tenantId must be a single string",
++        ),
++        (
++            "metadata: {name: a}\nspec: {since: 2026-01-01}\n",
++            "<stdin>: spec.since is a date value, which JSON cannot represent; quote it to make "
++            "it a string",
++        ),
++        (
++            "metadata: {name: a}\nspec: {items: [1, 2026-01-01]}\n",
++            "<stdin>: spec.items[1] is a date value, which JSON cannot represent; quote it to "
++            "make it a string",
++        ),
++        (
++            "metadata: {name: a}\nspec: {ratio: .nan}\n",
++            "<stdin>: spec.ratio is nan, which JSON cannot represent",
++        ),
++        (
++            "metadata: {name: a}\nspec: {1: one}\n",
++            "<stdin>: spec has a key that is not a string: 1",
++        ),
++        ("&loop [*loop]\n", "<stdin>: a resource document must be a mapping"),
++        ("&loop {metadata: *loop}\n", "<stdin>: the document is nested too deeply"),
++        ("[" * 100_000 + "]" * 100_000, "<stdin> is nested too deeply"),
++    ],
++)
++def test_invalid_documents_are_rejected(text: str, message: str) -> None:
++    assert load_error(text) == message
++
++
++def test_invalid_yaml_is_reported_with_its_position() -> None:
++    assert load_error("metadata: {name: a\n").startswith(
++        "<stdin> is not valid YAML or JSON: while parsing a flow mapping"
++    )
++
++
++def test_an_unreadable_file_is_reported(tmp_path: Path) -> None:
++    binary = tmp_path / "svc.yaml"
++    binary.write_bytes(b"\xff\xfe")
++
++    with pytest.raises(UsageError) as missing:
++        load([str(tmp_path / "missing.yaml")])
++    with pytest.raises(UsageError) as not_utf8:
++        load([str(binary)])
++
++    assert missing.value.message == (
++        f"cannot read {tmp_path / 'missing.yaml'}: No such file or directory"
++    )
++    assert not_utf8.value.message == f"{binary} is not UTF-8 text"
+diff --git a/tests/unit/cli/test_packaging.py b/tests/unit/cli/test_packaging.py
+new file mode 100644
+index 0000000..7d3322e
+--- /dev/null
++++ b/tests/unit/cli/test_packaging.py
+@@ -0,0 +1,71 @@
++"""CLI 包的依赖边界：CLI 是 API 的 HTTP 客户端，只导入标准库与 ``pyproject.toml`` 声明的
++发行包，不导入控制平面或其他 ForgeMesh 包，安装它不需要服务端的代码。"""
++
++from __future__ import annotations
++
++import importlib.metadata
++import json
++import re
++import subprocess
++import sys
++import tomllib
++from pathlib import Path
++from typing import Any
++
++PYPROJECT = Path(__file__).resolve().parents[3] / "packages" / "cli" / "pyproject.toml"
++#: 在新的解释器中导入 CLI 的入口，输出因此新导入的模块；``file`` 区分有文件的模块与
++#: 扩展模块在运行时创建的模块（如 PyYAML 的 Cython 运行时 ``_cython_3_1_4``）。
++_PROBE = """
++import json, sys
++before = set(sys.modules)
++import forgemesh.cli.main
++print(json.dumps([
++    {"name": name, "file": getattr(sys.modules[name], "__file__", None) is not None}
++    for name in sorted(set(sys.modules) - before)
++]))
++"""
++
++
++def _imported() -> list[dict[str, Any]]:
++    result = subprocess.run(
++        [sys.executable, "-c", _PROBE], capture_output=True, text=True, check=True, timeout=60
++    )
++    return json.loads(result.stdout)
++
++
++def _normalize(distribution: str) -> str:
++    return re.sub(r"[-_.]+", "-", distribution).lower()
++
++
++def _project() -> dict[str, Any]:
++    return tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["project"]
++
++
++def test_the_cli_declares_exactly_the_distributions_it_imports() -> None:
++    top_level = {module["name"].partition(".")[0] for module in _imported() if module["file"]}
++    third_party = top_level - sys.stdlib_module_names - {"forgemesh"}
++    owners = importlib.metadata.packages_distributions()
++    imported = {_normalize(owner) for name in third_party for owner in owners.get(name, [name])}
++    declared = {
++        _normalize(re.match(r"[A-Za-z0-9._-]+", requirement).group())
++        for requirement in _project()["dependencies"]
++    }
++
++    assert imported == declared == {"pyyaml"}
++
++
++def test_the_cli_imports_no_other_forgemesh_package() -> None:
++    names = [module["name"] for module in _imported()]
++
++    assert "forgemesh.cli.main" in names
++    assert [
++        name
++        for name in names
++        if name.partition(".")[0] == "forgemesh"
++        and name not in ("forgemesh", "forgemesh.cli")
++        and not name.startswith("forgemesh.cli.")
++    ] == []
++
++
++def test_the_console_script_keeps_its_name() -> None:
++    assert _project()["scripts"] == {"forgemesh": "forgemesh.cli.main:main"}
+-- 
+2.43.0
+
