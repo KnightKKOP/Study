@@ -1,0 +1,468 @@
+From ce9fe7fd2062d5b124fd7ad8afee91bb795ff11c Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 13 Oct 2026 05:06:03 +0000
+Subject: [PATCH 10/11] fix(gateway): answer every gateway error with the JSON
+ envelope
+
+The rate limiter's 429, the 502 when the reverse proxy or the stream
+proxy gets no response from the control plane or an instance, and
+net/http's default 404 for paths no route matches were plain text,
+without a code, a correlation id or a trace id, unlike the gateway's
+other errors. Clients had to special-case them, and the response
+could not be matched to the logs by its body.
+
+They now use the shared envelope with stable codes: RATE_LIMITED
+(Retry-After is unchanged), UPSTREAM_UNAVAILABLE, INVALID_UPSTREAM
+when the request to an instance cannot be built, and NOT_FOUND for
+unknown paths. Under /api/v1/ the 404 still goes through the whole
+chain; elsewhere it gets the correlation id, the trace id and an
+access log line but, as before, no authentication or rate limit.
+/metrics answers methods other than GET and HEAD with
+METHOD_NOT_ALLOWED. Status codes and existing codes are unchanged,
+and responses from the control plane or instances pass through
+untouched.
+---
+ gateway/internal/middleware/chain_test.go     |   7 +-
+ gateway/internal/middleware/ratelimit.go      |   5 +-
+ gateway/internal/router/errors_test.go        | 200 ++++++++++++++++++
+ gateway/internal/router/router.go             |  33 ++-
+ gateway/internal/stream/proxy.go              |   4 +-
+ gateway/internal/stream/proxy_test.go         |  22 ++
+ gateway/internal/upstream/client.go           |   2 +-
+ .../internal/upstream/tracecontext_test.go    |  11 +-
+ 8 files changed, 271 insertions(+), 13 deletions(-)
+ create mode 100644 gateway/internal/router/errors_test.go
+
+diff --git a/gateway/internal/middleware/chain_test.go b/gateway/internal/middleware/chain_test.go
+index cefbbc6..19a60ff 100644
+--- a/gateway/internal/middleware/chain_test.go
++++ b/gateway/internal/middleware/chain_test.go
+@@ -166,7 +166,7 @@ func TestChain_ProbeBypassesChainNoLeak(t *testing.T) {
+ }
+ 
+ // TestChain_RejectResponsesOpaque 验证认证/限流失败响应不含内部细节：
+-// 均为 http.StatusText 风格的固定文案，无堆栈、源码路径或实现细节。
++// 均为固定文案的错误信封，无堆栈、源码路径或实现细节。
+ func TestChain_RejectResponsesOpaque(t *testing.T) {
+ 	h := newAPIChain(NewRateLimiter(0.001, 1), nil)
+ 
+@@ -186,8 +186,9 @@ func TestChain_RejectResponsesOpaque(t *testing.T) {
+ 	req2.Header.Set(DefaultTenantHeader, "tenant-a")
+ 	rec429 := httptest.NewRecorder()
+ 	h.ServeHTTP(rec429, req2)
+-	if want := "Too Many Requests\n"; rec429.Body.String() != want {
+-		t.Fatalf("429 响应体应为 %q，实际 %q", want, rec429.Body.String())
++	if env := readEnvelope(t, rec429); env.Code != "RATE_LIMITED" || env.Message != "rate limit exceeded" ||
++		env.CorrelationID != rec429.Header().Get(DefaultCorrelationHeader) {
++		t.Fatalf("429 响应体应为带关联 ID 的 RATE_LIMITED 错误信封，实际 %q", rec429.Body.String())
+ 	}
+ 
+ 	// 内部细节泄漏检查（401/429 两类错误信封）。
+diff --git a/gateway/internal/middleware/ratelimit.go b/gateway/internal/middleware/ratelimit.go
+index 0a87e3a..6c4a6fa 100644
+--- a/gateway/internal/middleware/ratelimit.go
++++ b/gateway/internal/middleware/ratelimit.go
+@@ -122,7 +122,8 @@ func (l *Limiter) maybeGC(now time.Time) {
+ 	}
+ }
+ 
+-// RateLimit 返回按租户限流的中间件，须位于 Authenticate 之后。
++// RateLimit 返回按租户限流的中间件，须位于 Authenticate 之后。超限返回 429 RATE_LIMITED
++// 错误信封与 Retry-After（攒够一个令牌所需的秒数）。
+ //
+ // key 取自认证中间件注入 context 的租户（来自已验证的凭证），而不是请求头——否则客户端
+ // 每换一个租户头就能得到一个新令牌桶。context 中没有租户时（链上未启用认证）按 TCP 对端
+@@ -142,7 +143,7 @@ func RateLimit(l *Limiter) Middleware {
+ 					secs = 1
+ 				}
+ 				w.Header().Set("Retry-After", strconv.Itoa(secs))
+-				http.Error(w, http.StatusText(http.StatusTooManyRequests), http.StatusTooManyRequests)
++				WriteError(w, r, http.StatusTooManyRequests, "RATE_LIMITED", "rate limit exceeded")
+ 				return
+ 			}
+ 			next.ServeHTTP(w, r)
+diff --git a/gateway/internal/router/errors_test.go b/gateway/internal/router/errors_test.go
+new file mode 100644
+index 0000000..1158264
+--- /dev/null
++++ b/gateway/internal/router/errors_test.go
+@@ -0,0 +1,200 @@
++// errors_test.go 从网关入口验证错误响应：
++//
++//   - 网关自己返回的错误都是 JSON 错误信封 {"error": {"code", "message", "correlationId", "traceId"}}
++//     （Content-Type: application/json，带 nosniff），信封中的关联 ID 与响应头一致、trace-id 与
++//     请求的 traceparent 一致，访问日志带同一组 ID；/metrics 不经过 Correlation 与 TraceContext，
++//     它的 405 不带 ID；
++//   - 控制平面与推理实例自己的错误响应原样透传。
++package router
++
++import (
++	"bytes"
++	"encoding/json"
++	"io"
++	"log"
++	"net/http"
++	"net/http/httptest"
++	"strconv"
++	"strings"
++	"testing"
++
++	"github.com/Mekoforge/ForgeMesh/gateway/internal/middleware"
++)
++
++// gatewayError 是错误信封中 error 对象的字段。
++type gatewayError struct {
++	Code          string `json:"code"`
++	Message       string `json:"message"`
++	CorrelationID string `json:"correlationId"`
++	TraceID       string `json:"traceId"`
++}
++
++// readGatewayError 解析错误信封（不允许信封之外的字段），并检查 Content-Type 与 nosniff。
++func readGatewayError(t *testing.T, rec *httptest.ResponseRecorder) gatewayError {
++	t.Helper()
++	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
++		t.Fatalf("Content-Type 应为 application/json，实际 %q（body=%s）", ct, rec.Body.String())
++	}
++	if v := rec.Header().Get("X-Content-Type-Options"); v != "nosniff" {
++		t.Fatalf("应带 X-Content-Type-Options: nosniff，实际 %q", v)
++	}
++	var body struct {
++		Error *gatewayError `json:"error"`
++	}
++	dec := json.NewDecoder(bytes.NewReader(rec.Body.Bytes()))
++	dec.DisallowUnknownFields()
++	if err := dec.Decode(&body); err != nil || body.Error == nil {
++		t.Fatalf("响应体不是错误信封: %v（body=%s）", err, rec.Body.String())
++	}
++	return *body.Error
++}
++
++// TestGatewayErrors_UseEnvelopeWithIDs 逐一验证网关自己返回的错误：状态码、Content-Type、错误码，
++// 信封与访问日志中的关联 ID（与响应头一致）与 trace-id（与请求的 traceparent 一致）；429 带
++// Retry-After。
++func TestGatewayErrors_UseEnvelopeWithIDs(t *testing.T) {
++	// 控制平面把任何服务都解析到不可达的实例（测试配置允许回环地址）。
++	cp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		w.Header().Set("Content-Type", "application/json")
++		_, _ = io.WriteString(w, readyEndpointsJSON("Ready", []string{"http://127.0.0.1:1"}))
++	}))
++	t.Cleanup(cp.Close)
++
++	cases := []struct {
++		name         string
++		upstreamURL  string
++		rateLimited  bool // 每个租户只有 1 个令牌、几乎不补充
++		method, path string
++		key          string
++		status       int
++		code         string
++	}{
++		{"限流", cp.URL, true, http.MethodGet, "/api/v1/resources", routerKeyTenantA,
++			http.StatusTooManyRequests, "RATE_LIMITED"},
++		{"控制平面不可达", "http://127.0.0.1:1", false, http.MethodGet, "/api/v1/resources", routerKeyTenantA,
++			http.StatusBadGateway, "UPSTREAM_UNAVAILABLE"},
++		{"推理实例不可达", cp.URL, false, http.MethodPost, "/api/v1/inference/svc-a/chat", routerKeyTenantA,
++			http.StatusBadGateway, "UPSTREAM_UNAVAILABLE"},
++		{"/api/v1/ 下的未知路径", cp.URL, false, http.MethodGet, "/api/v1/unknown", routerKeyTenantA,
++			http.StatusNotFound, "NOT_FOUND"},
++		{"其他未知路径（不需要凭证）", cp.URL, false, http.MethodGet, "/unknown", "",
++			http.StatusNotFound, "NOT_FOUND"},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			cfg := apiKeyConfig(t, tc.upstreamURL)
++			if tc.rateLimited {
++				cfg.RateLimitRPS, cfg.RateLimitBurst = 0.0001, 1
++			}
++			var logs syncBuffer
++			r, err := New(cfg, log.New(&logs, "", 0))
++			if err != nil {
++				t.Fatalf("New 失败: %v", err)
++			}
++			do := func() *httptest.ResponseRecorder {
++				req := httptest.NewRequest(tc.method, tc.path, nil)
++				if tc.key != "" {
++					req.Header.Set("Authorization", "Bearer "+tc.key)
++				}
++				req.Header.Set(middleware.TraceparentHeader, testTraceparent)
++				rec := httptest.NewRecorder()
++				r.ServeHTTP(rec, req)
++				return rec
++			}
++			if tc.rateLimited {
++				if rec := do(); rec.Code != http.StatusOK {
++					t.Fatalf("第一个请求应 200，实际 %d", rec.Code)
++				}
++			}
++			rec := do()
++
++			if rec.Code != tc.status {
++				t.Fatalf("应 %d，实际 %d（body=%s）", tc.status, rec.Code, rec.Body.String())
++			}
++			got := readGatewayError(t, rec)
++			corr := rec.Header().Get("X-Correlation-ID")
++			if got.Code != tc.code || got.Message == "" || corr == "" || got.CorrelationID != corr ||
++				got.TraceID != testTraceID {
++				t.Fatalf("错误信封应带 %s、关联 ID %q 与 trace-id，实际 %+v", tc.code, corr, got)
++			}
++			if tc.status == http.StatusTooManyRequests {
++				if secs, err := strconv.Atoi(rec.Header().Get("Retry-After")); err != nil || secs < 1 {
++					t.Fatalf("429 应带正整数秒的 Retry-After，实际 %q", rec.Header().Get("Retry-After"))
++				}
++			}
++			want := " status=" + strconv.Itoa(tc.status) + " "
++			found := false
++			for _, line := range strings.Split(logs.String(), "\n") {
++				if strings.HasPrefix(line, "access ") && strings.HasSuffix(line, " corr="+corr+" trace="+testTraceID) {
++					found = strings.Contains(line, want)
++				}
++			}
++			if !found {
++				t.Fatalf("访问日志应有一行%s且带同一组 ID，实际 %q", want, logs.String())
++			}
++		})
++	}
++}
++
++// TestGatewayErrors_MetricsMethodNotAllowed 验证 /metrics 的其他方法返回 405 METHOD_NOT_ALLOWED
++// 错误信封与 Allow；/metrics 不经过 Correlation 与 TraceContext，信封与响应头都没有关联 ID。
++func TestGatewayErrors_MetricsMethodNotAllowed(t *testing.T) {
++	r := newAPIKeyRouter(t, "http://127.0.0.1:1")
++	rec := httptest.NewRecorder()
++	req := httptest.NewRequest(http.MethodPost, "/metrics", nil)
++	req.Header.Set(middleware.TraceparentHeader, testTraceparent)
++	r.ServeHTTP(rec, req)
++
++	if rec.Code != http.StatusMethodNotAllowed || rec.Header().Get("Allow") != "GET, HEAD" {
++		t.Fatalf("应 405 且 Allow 为 GET, HEAD，实际 %d %q", rec.Code, rec.Header().Get("Allow"))
++	}
++	if got, want := readGatewayError(t, rec), (gatewayError{Code: "METHOD_NOT_ALLOWED", Message: "method not allowed"}); got != want {
++		t.Fatalf("错误信封应为 %+v，实际 %+v", want, got)
++	}
++	if corr := rec.Header().Get("X-Correlation-ID"); corr != "" {
++		t.Fatalf("/metrics 的响应不应带关联 ID，实际 %q", corr)
++	}
++}
++
++// TestGatewayErrors_UpstreamErrorResponsesPassThrough 验证控制平面与推理实例自己的错误响应
++// （状态码、Content-Type、响应体）原样透传，不被改写为网关的错误信封。
++func TestGatewayErrors_UpstreamErrorResponsesPassThrough(t *testing.T) {
++	instance := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
++		w.WriteHeader(http.StatusInternalServerError)
++		_, _ = io.WriteString(w, "instance failure")
++	}))
++	t.Cleanup(instance.Close)
++	cp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if r.URL.Path == "/api/v1/inference-services/svc-a" {
++			w.Header().Set("Content-Type", "application/json")
++			_, _ = io.WriteString(w, readyEndpointsJSON("Ready", []string{instance.URL}))
++			return
++		}
++		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
++		w.WriteHeader(http.StatusServiceUnavailable)
++		_, _ = io.WriteString(w, "control plane maintenance")
++	}))
++	t.Cleanup(cp.Close)
++	r := newAPIKeyRouter(t, cp.URL)
++
++	for _, c := range []struct {
++		method, path string
++		status       int
++		body         string
++	}{
++		{http.MethodGet, "/api/v1/resources", http.StatusServiceUnavailable, "control plane maintenance"},
++		{http.MethodPost, "/api/v1/inference/svc-a/chat", http.StatusInternalServerError, "instance failure"},
++	} {
++		rec := httptest.NewRecorder()
++		req := httptest.NewRequest(c.method, c.path, nil)
++		req.Header.Set("Authorization", "Bearer "+routerKeyTenantA)
++		r.ServeHTTP(rec, req)
++
++		if ct := rec.Header().Get("Content-Type"); rec.Code != c.status || ct != "text/plain; charset=utf-8" ||
++			rec.Body.String() != c.body {
++			t.Fatalf("%s 的错误响应应原样透传（%d %q），实际 %d %q %q", c.path, c.status, c.body,
++				rec.Code, ct, rec.Body.String())
++		}
++	}
++}
+diff --git a/gateway/internal/router/router.go b/gateway/internal/router/router.go
+index 1a4a854..b7a7643 100644
+--- a/gateway/internal/router/router.go
++++ b/gateway/internal/router/router.go
+@@ -15,11 +15,15 @@
+ //	                                          ready 实例，轮询分发，按实例协议映射
+ //	                                          路径；要求 read 作用域）
+ //	ANY  /api/v1/inference/{svc}/chat          同上，用于不带命名空间的服务
++//	ANY  /api/v1/ 下的其他路径                 404 NOT_FOUND（经过完整的中间件链）
++//	ANY  其他路径                              404 NOT_FOUND（经过 Correlation、TraceContext 与
++//	                                          AccessLog，不经过认证与限流）
+ //
+ // 中间件链（执行顺序）：Observe → Recovery → Correlation → TraceContext → AccessLog →
+ // Authenticate → RateLimit → LimitRequestBody → Route。
+ // Observe 与 Recovery 包住全量请求（Observe 按路由类别记录请求数与耗时，Recovery 兜底
+ // panic）；探针与 /metrics 刻意不经过认证/限流（也不写访问日志），保证健康检查与抓取可用。
++// 除探针的状态文档外，网关自己返回的错误响应都是 JSON 错误信封（见 middleware.WriteError）。
+ // 认证模式见 config.AuthModeAPIKey / config.AuthModeDev 与 ADR-014。
+ package router
+ 
+@@ -112,6 +116,7 @@ func New(cfg config.Config, logger *log.Logger) (*Router, error) {
+ 	streamHandler := middleware.RequireScope(middleware.ScopeRead)(streamProxy)
+ 	apiMux.Handle(streamRoutePattern, streamHandler)
+ 	apiMux.Handle(streamWithoutNamespacePattern, streamHandler)
++	apiMux.HandleFunc(apiPrefix, notFound)
+ 
+ 	maxBody := cfg.MaxRequestBodyBytes
+ 	if maxBody <= 0 {
+@@ -137,12 +142,18 @@ func New(cfg config.Config, logger *log.Logger) (*Router, error) {
+ 	m.WatchRateLimiter(limiter.Rejected)
+ 	m.WatchInstances(resolver.InstanceStates)
+ 
+-	// 顶层路由：探针与 /metrics 不经过鉴权/限流。
++	// 顶层路由：探针与 /metrics 不经过鉴权/限流。没有匹配的路径不经过认证与限流，但带关联 ID
++	// 与 trace-id，并写访问日志。
+ 	root := http.NewServeMux()
+ 	root.HandleFunc(healthzPath, hc.Live)
+ 	root.HandleFunc(readyzPath, hc.Ready)
+-	root.Handle(metricsPath, m)
++	root.Handle(metricsPath, getOrHead(m))
+ 	root.Handle(apiPrefix, apiHandler)
++	root.Handle("/", middleware.Chain(http.HandlerFunc(notFound),
++		middleware.Correlation(cfg.CorrelationHeader),
++		middleware.TraceContext(),
++		middleware.AccessLog(logger),
++	))
+ 
+ 	// Recovery 兜底全量请求的 panic；Observe 在它外层，兜底返回的 500 也被计入。
+ 	return &Router{handler: middleware.Chain(root,
+@@ -177,6 +188,24 @@ func classifier(root, api *http.ServeMux) func(*http.Request) metrics.Route {
+ 	}
+ }
+ 
++// notFound 回复没有匹配路由的请求。
++func notFound(w http.ResponseWriter, r *http.Request) {
++	middleware.WriteError(w, r, http.StatusNotFound, "NOT_FOUND", "route not found")
++}
++
++// getOrHead 只把 GET 与 HEAD 交给 next，其他方法返回 405 错误信封。用于 /metrics：它不经过
++// Correlation 与 TraceContext，信封不带关联 ID 与 trace-id。
++func getOrHead(next http.Handler) http.Handler {
++	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if r.Method != http.MethodGet && r.Method != http.MethodHead {
++			w.Header().Set("Allow", "GET, HEAD")
++			middleware.WriteError(w, r, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed")
++			return
++		}
++		next.ServeHTTP(w, r)
++	})
++}
++
+ // newAuthenticator 按配置构造入口认证器；未知模式视为配置错误，绝不退化为信任请求头。
+ func newAuthenticator(cfg config.Config) (middleware.Authenticator, error) {
+ 	switch cfg.AuthMode {
+diff --git a/gateway/internal/stream/proxy.go b/gateway/internal/stream/proxy.go
+index 111153f..6ace281 100644
+--- a/gateway/internal/stream/proxy.go
++++ b/gateway/internal/stream/proxy.go
+@@ -162,7 +162,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, upstreamURL, end
+ 
+ 	req, err := http.NewRequestWithContext(ctx, r.Method, upstreamURL, r.Body)
+ 	if err != nil {
+-		http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
++		middleware.WriteError(w, r, http.StatusBadGateway, "INVALID_UPSTREAM", "实例地址非法: "+endpoint)
+ 		return
+ 	}
+ 	req.Header = copyForwardHeaders(r.Header)
+@@ -191,7 +191,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, upstreamURL, end
+ 		if ctx.Err() == nil {
+ 			p.metrics.UpstreamError(metrics.UpstreamInstance, metrics.ErrorConnect)
+ 		}
+-		http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
++		middleware.WriteError(w, r, http.StatusBadGateway, "UPSTREAM_UNAVAILABLE", "推理实例不可用: "+endpoint)
+ 		return
+ 	}
+ 	defer resp.Body.Close()
+diff --git a/gateway/internal/stream/proxy_test.go b/gateway/internal/stream/proxy_test.go
+index fe34259..4d33602 100644
+--- a/gateway/internal/stream/proxy_test.go
++++ b/gateway/internal/stream/proxy_test.go
+@@ -489,11 +489,33 @@ func TestProxy_UpstreamError(t *testing.T) {
+ 	if rec.Code != http.StatusBadGateway {
+ 		t.Fatalf("实例不可达应返回 502，实际 %d", rec.Code)
+ 	}
++	want := `{"error":{"code":"UPSTREAM_UNAVAILABLE","message":"推理实例不可用: ` + endpoint + `"}}` + "\n"
++	if ct := rec.Header().Get("Content-Type"); rec.Body.String() != want || ct != "application/json" {
++		t.Fatalf("应返回 UPSTREAM_UNAVAILABLE 错误信封 %q，实际 %q（%q）", want, rec.Body.String(), ct)
++	}
+ 	if got := res.failureCount(endpoint); got != 1 {
+ 		t.Fatalf("应上报 1 次失败，实际 %d", got)
+ 	}
+ }
+ 
++// TestProxy_UnbuildableUpstreamRequest 验证由实例地址拼出的 URL 无法构造请求时返回 502
++// INVALID_UPSTREAM 错误信封。
++func TestProxy_UnbuildableUpstreamRequest(t *testing.T) {
++	const endpoint = "http://[::1"
++	proxy := New(newFakeResolver(nil, nil), "X-Tenant-ID", allowLoopback, nil)
++
++	rec := httptest.NewRecorder()
++	proxy.forward(rec, newChatRequest("svc-a"), endpoint+"/v1/chat/completions", endpoint, time.Now())
++
++	if rec.Code != http.StatusBadGateway {
++		t.Fatalf("无法构造实例请求应返回 502，实际 %d", rec.Code)
++	}
++	want := `{"error":{"code":"INVALID_UPSTREAM","message":"实例地址非法: ` + endpoint + `"}}` + "\n"
++	if ct := rec.Header().Get("Content-Type"); rec.Body.String() != want || ct != "application/json" {
++		t.Fatalf("应返回 INVALID_UPSTREAM 错误信封 %q，实际 %q（%q）", want, rec.Body.String(), ct)
++	}
++}
++
+ // TestProxy_ForwardsClientHeaders 验证客户端有效头被转发到实例、平台凭证不会转发，
+ // 且 {svc} 与租户 ID 正确传给 Resolver。
+ func TestProxy_ForwardsClientHeaders(t *testing.T) {
+diff --git a/gateway/internal/upstream/client.go b/gateway/internal/upstream/client.go
+index 3acb4c8..e1a4e78 100644
+--- a/gateway/internal/upstream/client.go
++++ b/gateway/internal/upstream/client.go
+@@ -97,7 +97,7 @@ func New(target *url.URL, correlationHeader, tenantHeader string, logger *log.Lo
+ 			}
+ 			logger.Printf("upstream proxy error: corr=%s trace=%s path=%s err=%v", r.Header.Get(c.correlationHeader),
+ 				middleware.TraceIDFromContext(r.Context()), r.URL.Path, err)
+-			http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
++			middleware.WriteError(w, r, http.StatusBadGateway, "UPSTREAM_UNAVAILABLE", "control plane unavailable")
+ 		},
+ 	}
+ 
+diff --git a/gateway/internal/upstream/tracecontext_test.go b/gateway/internal/upstream/tracecontext_test.go
+index 1fc0059..da48b8d 100644
+--- a/gateway/internal/upstream/tracecontext_test.go
++++ b/gateway/internal/upstream/tracecontext_test.go
+@@ -110,9 +110,9 @@ func TestClient_ForwardsTraceHeaders(t *testing.T) {
+ 	}
+ }
+ 
+-// TestClient_ErrorLogCarriesCorrelationAndTraceIDs 验证控制平面不可达时的错误日志带关联 ID 与
+-// trace-id。
+-func TestClient_ErrorLogCarriesCorrelationAndTraceIDs(t *testing.T) {
++// TestClient_ConnectErrorCarriesCorrelationAndTraceIDs 验证控制平面不可达时返回 502
++// UPSTREAM_UNAVAILABLE 错误信封，信封与错误日志都带关联 ID 与 trace-id。
++func TestClient_ConnectErrorCarriesCorrelationAndTraceIDs(t *testing.T) {
+ 	target, err := url.Parse("http://127.0.0.1:1")
+ 	if err != nil {
+ 		t.Fatal(err)
+@@ -130,6 +130,11 @@ func TestClient_ErrorLogCarriesCorrelationAndTraceIDs(t *testing.T) {
+ 	if rec.Code != http.StatusBadGateway {
+ 		t.Fatalf("控制平面不可达应 502，实际 %d", rec.Code)
+ 	}
++	want := `{"error":{"code":"UPSTREAM_UNAVAILABLE","message":"control plane unavailable",` +
++		`"correlationId":"corr-1","traceId":"` + testTraceID + `"}}` + "\n"
++	if ct := rec.Header().Get("Content-Type"); rec.Body.String() != want || ct != "application/json" {
++		t.Fatalf("应返回错误信封 %q，实际 %q（%q）", want, rec.Body.String(), ct)
++	}
+ 	if want := "corr=corr-1 trace=" + testTraceID + " "; !strings.Contains(logs.String(), want) {
+ 		t.Fatalf("错误日志应含 %q，实际 %q", want, logs.String())
+ 	}
+-- 
+2.43.0
+

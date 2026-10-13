@@ -1,0 +1,2501 @@
+From a7ff74f80800b1591a35d25760a1a1c28c6caf79 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 13 Oct 2026 03:34:22 +0000
+Subject: [PATCH 05/11] feat(gateway): expose Prometheus metrics at /metrics
+
+The gateway is the single entry point for the resource API and for
+streaming inference, but it exported nothing: request rates, latency,
+time to first token, upstream failures and resolver behaviour were
+only visible by grepping logs.
+
+Add a small standard-library registry for the Prometheus text format
+(internal/metrics, with a strict parser for tests) and instrument the
+gateway with it: request counts and latency by route class and status,
+time to first byte of successful streams, upstream errors by upstream
+(control plane, instance) and kind, rate-limit rejections, resolver
+lookups (hit, miss, coalesced) and the health state of the instances
+in the resolver cache. Label values are route classes, status codes
+and fixed enums only; route classes come from the route table via
+ServeMux.Handler, never from the path. Each family is capped at 200
+series with an "overflow" series behind it as a backstop.
+
+/metrics is registered next to the probes, outside the API chain: it
+needs no credentials and is not rate limited, so it only carries
+aggregate data with no tenants, services, paths or instance addresses.
+Like the probes it should not be routed through a public ingress.
+Observe wraps Recovery so that recovered panics count as 500s, and
+requests cancelled by the client are not counted as upstream errors.
+---
+ gateway/internal/metrics/gateway.go           | 169 ++++++++
+ gateway/internal/metrics/gateway_test.go      |  79 ++++
+ gateway/internal/metrics/metrics.go           | 394 ++++++++++++++++++
+ gateway/internal/metrics/metrics_test.go      | 204 +++++++++
+ .../metrics/metricstest/metricstest.go        | 196 +++++++++
+ .../metrics/metricstest/metricstest_test.go   |  71 ++++
+ gateway/internal/middleware/middleware.go     |   5 +-
+ gateway/internal/middleware/observe.go        |  69 +++
+ gateway/internal/middleware/observe_test.go   | 141 +++++++
+ gateway/internal/middleware/ratelimit.go      |   7 +
+ gateway/internal/middleware/ratelimit_test.go |  17 +
+ gateway/internal/router/metrics_test.go       | 164 ++++++++
+ gateway/internal/router/router.go             |  62 ++-
+ gateway/internal/stream/metrics_test.go       | 142 +++++++
+ gateway/internal/stream/proxy.go              |  29 +-
+ gateway/internal/upstream/client.go           |  15 +
+ gateway/internal/upstream/metrics_test.go     | 278 ++++++++++++
+ gateway/internal/upstream/resolver.go         |  44 +-
+ 18 files changed, 2071 insertions(+), 15 deletions(-)
+ create mode 100644 gateway/internal/metrics/gateway.go
+ create mode 100644 gateway/internal/metrics/gateway_test.go
+ create mode 100644 gateway/internal/metrics/metrics.go
+ create mode 100644 gateway/internal/metrics/metrics_test.go
+ create mode 100644 gateway/internal/metrics/metricstest/metricstest.go
+ create mode 100644 gateway/internal/metrics/metricstest/metricstest_test.go
+ create mode 100644 gateway/internal/middleware/observe.go
+ create mode 100644 gateway/internal/middleware/observe_test.go
+ create mode 100644 gateway/internal/router/metrics_test.go
+ create mode 100644 gateway/internal/stream/metrics_test.go
+ create mode 100644 gateway/internal/upstream/metrics_test.go
+
+diff --git a/gateway/internal/metrics/gateway.go b/gateway/internal/metrics/gateway.go
+new file mode 100644
+index 0000000..275fbd5
+--- /dev/null
++++ b/gateway/internal/metrics/gateway.go
+@@ -0,0 +1,169 @@
++package metrics
++
++import (
++	"net/http"
++	"strconv"
++	"time"
++)
++
++// Route 是请求的路由类别（http_requests_total 等指标的 route 标签）。
++type Route string
++
++// 路由类别，由 router 按路由表确定。
++const (
++	RouteProbe        Route = "probe"         // /healthz、/readyz
++	RouteMetrics      Route = "metrics"       // /metrics
++	RouteControlPlane Route = "control_plane" // 反代到控制平面的资源接口
++	RouteInference    Route = "inference"     // 流式推理代理
++	RouteUnmatched    Route = "unmatched"     // 没有匹配的路由（含 /api/v1/ 下的未知路径）
++)
++
++// Upstream 是出错的上游（upstream_errors_total 的 upstream 标签）。
++type Upstream string
++
++// 网关的上游。
++const (
++	UpstreamControlPlane Upstream = "control_plane" // 资源接口反代与 Resolver 的查询
++	UpstreamInstance     Upstream = "instance"      // 推理实例
++)
++
++// ErrorKind 是上游错误的类别（upstream_errors_total 的 kind 标签）。
++type ErrorKind string
++
++// 上游错误类别。
++const (
++	// ErrorConnect 没有收到响应：连接失败、超时等（客户端已断开的请求不计）。
++	ErrorConnect ErrorKind = "connect"
++	// ErrorStatus 上游返回 5xx。
++	ErrorStatus ErrorKind = "status"
++	// ErrorBody 响应体读取或解析失败：流在中途中断，或控制平面响应不是合法 JSON。
++	ErrorBody ErrorKind = "body"
++	// ErrorAddressNotAllowed 实例地址不在允许连接的范围内。
++	ErrorAddressNotAllowed ErrorKind = "address_not_allowed"
++	// ErrorInvalidEndpoint 实例地址或协议非法。
++	ErrorInvalidEndpoint ErrorKind = "invalid_endpoint"
++)
++
++// LookupResult 是 Resolver 一次查询的结果（resolver_lookups_total 的 result 标签）。
++type LookupResult string
++
++// Resolver 查询结果。
++const (
++	LookupHit       LookupResult = "hit"       // 缓存命中（含缓存的否定结果）
++	LookupMiss      LookupResult = "miss"      // 未命中，向控制平面查询
++	LookupCoalesced LookupResult = "coalesced" // 未命中，并入同一服务进行中的查询
++)
++
++// requestBuckets 覆盖短请求与长时间的流式请求（秒）。
++var requestBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 300}
++
++// firstByteBuckets 覆盖推理首个 token 的常见时延（秒）。
++var firstByteBuckets = []float64{0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60}
++
++// Gateway 是网关的全部指标，实现 http.Handler（/metrics）。指标如下，标签都不含租户、
++// 服务名、路径或实例地址：
++//
++//   - forgemesh_gateway_http_requests_total{route,status}：处理的 HTTP 请求数，route 为路由类别，
++//     status 为响应状态码。
++//   - forgemesh_gateway_http_request_duration_seconds{route}：请求耗时；流式请求为整个流的时长。
++//   - forgemesh_gateway_stream_first_byte_seconds：流式代理从开始处理请求（含解析实例）到把实例的
++//     第一个响应体字节写给客户端的时间，只统计实例返回 2xx 的流。
++//   - forgemesh_gateway_upstream_errors_total{upstream,kind}：上游错误数，见 Upstream 与 ErrorKind。
++//   - forgemesh_gateway_rate_limited_total：被限流拒绝（429）的请求数。
++//   - forgemesh_gateway_resolver_lookups_total{result}：Resolver 的查询数，见 LookupResult。
++//   - forgemesh_gateway_instances{state}：Resolver 缓存中（TTL 内解析过）的推理实例数：healthy
++//     参与轮询，unhealthy 因连续失败处于冷却期、被摘流。
++//
++// nil 的 *Gateway 上的记录方法什么都不做，组件可以不配置指标。
++type Gateway struct {
++	registry       *Registry
++	requests       *Counter
++	duration       *Histogram
++	firstByte      *Histogram
++	upstreamErrors *Counter
++	lookups        *Counter
++}
++
++// NewGateway 创建网关指标。
++func NewGateway() *Gateway {
++	r := NewRegistry()
++	g := &Gateway{
++		registry: r,
++		requests: r.NewCounter("forgemesh_gateway_http_requests_total",
++			"HTTP requests handled by the gateway, by route class and status.", "route", "status"),
++		duration: r.NewHistogram("forgemesh_gateway_http_request_duration_seconds",
++			"Time to handle an HTTP request, by route class; streams count until they end.",
++			requestBuckets, "route"),
++		firstByte: r.NewHistogram("forgemesh_gateway_stream_first_byte_seconds",
++			"Time from the start of a streaming request to its first response byte (2xx streams).",
++			firstByteBuckets),
++		upstreamErrors: r.NewCounter("forgemesh_gateway_upstream_errors_total",
++			"Errors from the control plane and inference instances, by upstream and kind.",
++			"upstream", "kind"),
++		lookups: r.NewCounter("forgemesh_gateway_resolver_lookups_total",
++			"Inference service resolutions, by result (hit, miss, coalesced).", "result"),
++	}
++	for _, result := range []LookupResult{LookupHit, LookupMiss, LookupCoalesced} {
++		g.lookups.Add(0, string(result))
++	}
++	return g
++}
++
++// ObserveRequest 记录一个处理完的请求。
++func (g *Gateway) ObserveRequest(route Route, status int, elapsed time.Duration) {
++	if g == nil {
++		return
++	}
++	g.requests.Inc(string(route), strconv.Itoa(status))
++	g.duration.Observe(elapsed.Seconds(), string(route))
++}
++
++// ObserveFirstByte 记录一个流的首字节时间。
++func (g *Gateway) ObserveFirstByte(elapsed time.Duration) {
++	if g == nil {
++		return
++	}
++	g.firstByte.Observe(elapsed.Seconds())
++}
++
++// UpstreamError 记录一次上游错误。
++func (g *Gateway) UpstreamError(upstream Upstream, kind ErrorKind) {
++	if g == nil {
++		return
++	}
++	g.upstreamErrors.Inc(string(upstream), string(kind))
++}
++
++// ResolverLookup 记录一次 Resolver 查询。
++func (g *Gateway) ResolverLookup(result LookupResult) {
++	if g == nil {
++		return
++	}
++	g.lookups.Inc(string(result))
++}
++
++// WatchRateLimiter 登记 forgemesh_gateway_rate_limited_total，取值为抓取时 rejected 的返回值
++// （限流器累计拒绝的请求数）。
++func (g *Gateway) WatchRateLimiter(rejected func() uint64) {
++	g.registry.NewCounterFunc("forgemesh_gateway_rate_limited_total",
++		"Requests rejected by the rate limiter (429).", nil,
++		func() []Sample { return []Sample{{Value: float64(rejected())}} })
++}
++
++// WatchInstances 登记 forgemesh_gateway_instances，取值为抓取时 states 的返回值。
++func (g *Gateway) WatchInstances(states func() (healthy, unhealthy int)) {
++	g.registry.NewGaugeFunc("forgemesh_gateway_instances",
++		"Inference instances in the resolver cache, by health state.", []string{"state"},
++		func() []Sample {
++			healthy, unhealthy := states()
++			return []Sample{
++				{Labels: []string{"healthy"}, Value: float64(healthy)},
++				{Labels: []string{"unhealthy"}, Value: float64(unhealthy)},
++			}
++		})
++}
++
++// ServeHTTP 输出全部指标（见 Registry.ServeHTTP）。
++func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
++	g.registry.ServeHTTP(w, r)
++}
+diff --git a/gateway/internal/metrics/gateway_test.go b/gateway/internal/metrics/gateway_test.go
+new file mode 100644
+index 0000000..34094b0
+--- /dev/null
++++ b/gateway/internal/metrics/gateway_test.go
+@@ -0,0 +1,79 @@
++package metrics
++
++import (
++	"net/http"
++	"net/http/httptest"
++	"testing"
++	"time"
++
++	"github.com/Mekoforge/ForgeMesh/gateway/internal/metrics/metricstest"
++)
++
++func scrape(t *testing.T, h http.Handler) map[string]float64 {
++	t.Helper()
++	rec := httptest.NewRecorder()
++	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
++	return metricstest.MustParse(t, rec.Body.String())
++}
++
++// TestGateway_NilRecordsNothing 验证未配置指标的组件可以照常调用记录方法。
++func TestGateway_NilRecordsNothing(t *testing.T) {
++	var g *Gateway
++	g.ObserveRequest(RouteProbe, http.StatusOK, time.Millisecond)
++	g.ObserveFirstByte(time.Millisecond)
++	g.UpstreamError(UpstreamInstance, ErrorConnect)
++	g.ResolverLookup(LookupHit)
++}
++
++// TestGateway_ExportsAllMetrics 验证全部网关指标的名称、标签与取值；还没有发生的事件以 0 或
++// 只有 HELP / TYPE 的形式出现，抓取时的取值来自登记的回调。
++func TestGateway_ExportsAllMetrics(t *testing.T) {
++	g := NewGateway()
++	rejected := uint64(3)
++	g.WatchRateLimiter(func() uint64 { return rejected })
++	g.WatchInstances(func() (int, int) { return 2, 1 })
++
++	before := scrape(t, g)
++	for _, key := range []string{
++		`forgemesh_gateway_stream_first_byte_seconds_count`,
++		`forgemesh_gateway_resolver_lookups_total{result="hit"}`,
++		`forgemesh_gateway_resolver_lookups_total{result="miss"}`,
++		`forgemesh_gateway_resolver_lookups_total{result="coalesced"}`,
++	} {
++		if v, ok := before[key]; !ok || v != 0 {
++			t.Errorf("%s 应以 0 出现，实际 %v（存在=%v）", key, v, ok)
++		}
++	}
++
++	g.ObserveRequest(RouteInference, http.StatusOK, 1500*time.Millisecond)
++	g.ObserveRequest(RouteInference, http.StatusOK, 20*time.Millisecond)
++	g.ObserveRequest(RouteProbe, http.StatusServiceUnavailable, time.Millisecond)
++	g.ObserveFirstByte(300 * time.Millisecond)
++	g.UpstreamError(UpstreamInstance, ErrorBody)
++	g.ResolverLookup(LookupMiss)
++	g.ResolverLookup(LookupHit)
++	g.ResolverLookup(LookupHit)
++	rejected = 5
++
++	after := scrape(t, g)
++	want := map[string]float64{
++		`forgemesh_gateway_http_requests_total{route="inference",status="200"}`:            2,
++		`forgemesh_gateway_http_requests_total{route="probe",status="503"}`:                1,
++		`forgemesh_gateway_http_request_duration_seconds_count{route="inference"}`:         2,
++		`forgemesh_gateway_http_request_duration_seconds_bucket{route="inference",le="1"}`: 1,
++		`forgemesh_gateway_http_request_duration_seconds_sum{route="inference"}`:           1.52,
++		`forgemesh_gateway_stream_first_byte_seconds_bucket{le="0.25"}`:                    0,
++		`forgemesh_gateway_stream_first_byte_seconds_bucket{le="0.5"}`:                     1,
++		`forgemesh_gateway_upstream_errors_total{upstream="instance",kind="body"}`:         1,
++		`forgemesh_gateway_rate_limited_total`:                                             5,
++		`forgemesh_gateway_resolver_lookups_total{result="hit"}`:                           2,
++		`forgemesh_gateway_resolver_lookups_total{result="miss"}`:                          1,
++		`forgemesh_gateway_instances{state="healthy"}`:                                     2,
++		`forgemesh_gateway_instances{state="unhealthy"}`:                                   1,
++	}
++	for key, value := range want {
++		if got, ok := after[key]; !ok || got != value {
++			t.Errorf("%s = %v（存在=%v），期望 %v", key, got, ok, value)
++		}
++	}
++}
+diff --git a/gateway/internal/metrics/metrics.go b/gateway/internal/metrics/metrics.go
+new file mode 100644
+index 0000000..cc020d1
+--- /dev/null
++++ b/gateway/internal/metrics/metrics.go
+@@ -0,0 +1,394 @@
++// Package metrics 以 Prometheus 文本格式（0.0.4）输出网关指标，只使用标准库。
++//
++//   - 指标名与标签名在创建时校验，非法时 panic（属于编程错误）；每个指标的标签名固定，
++//     输出时序列按标签取值排序。
++//   - 标签基数有上限：调用方只传取值有限的标签（路由类别、枚举、状态码），不传租户、服务名、
++//     路径或实例地址。作为兜底，一个指标最多 DefaultMaxSeries 个序列，之后出现的新标签组合
++//     计入全部标签都取 OverflowLabelValue 的溢出序列（总数仍然准确）。
++//   - 抓取时才确定取值的指标（如实例健康状态）由回调在每次输出时提供。
++//   - 并发安全：更新与输出都持锁；输出时调用回调不持有任何指标的锁。
++package metrics
++
++import (
++	"fmt"
++	"math"
++	"net/http"
++	"regexp"
++	"slices"
++	"sort"
++	"strconv"
++	"strings"
++	"sync"
++)
++
++// ContentType 是 /metrics 响应的 Content-Type（Prometheus 文本格式 0.0.4）。
++const ContentType = "text/plain; version=0.0.4; charset=utf-8"
++
++// DefaultMaxSeries 是每个指标默认最多的序列数。
++const DefaultMaxSeries = 200
++
++// OverflowLabelValue 是溢出序列的标签取值。
++const OverflowLabelValue = "overflow"
++
++// DefaultBuckets 是默认的直方图桶上界（秒），与 Prometheus 客户端库的默认值相同。
++var DefaultBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10}
++
++var (
++	metricNamePattern = regexp.MustCompile(`^[a-zA-Z_:][a-zA-Z0-9_:]*$`)
++	labelNamePattern  = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
++	// reservedLabels 由文本格式的直方图与摘要使用，不能再用作标签名。
++	reservedLabels = map[string]bool{"le": true, "quantile": true}
++
++	helpEscaper  = strings.NewReplacer(`\`, `\\`, "\n", `\n`)
++	labelEscaper = strings.NewReplacer(`\`, `\\`, "\n", `\n`, `"`, `\"`)
++)
++
++// Sample 是回调在抓取时提供的一个序列；Labels 与指标的标签名按位置对应。
++type Sample struct {
++	Labels []string
++	Value  float64
++}
++
++// desc 是指标的名称、说明、类型与标签名。
++type desc struct {
++	name      string
++	help      string
++	kind      string
++	labels    []string
++	maxSeries int
++}
++
++func (d *desc) writeHeader(b *strings.Builder) {
++	fmt.Fprintf(b, "# HELP %s %s\n# TYPE %s %s\n", d.name, helpEscaper.Replace(d.help), d.name, d.kind)
++}
++
++// checkLabels 校验标签取值的个数，返回序列键。
++func (d *desc) checkLabels(values []string) string {
++	if len(values) != len(d.labels) {
++		panic(fmt.Sprintf("metrics: %s 需要标签 %v，实际为 %q", d.name, d.labels, values))
++	}
++	return strings.Join(values, "\xff")
++}
++
++func (d *desc) overflow() []string {
++	values := make([]string, len(d.labels))
++	for i := range values {
++		values[i] = OverflowLabelValue
++	}
++	return values
++}
++
++// labeled 是一个序列：标签取值与数据。
++type labeled[S any] struct {
++	values []string
++	data   S
++}
++
++// sortedSeries 返回按标签取值排序的序列。
++func sortedSeries[S any](series map[string]*labeled[S]) []*labeled[S] {
++	out := make([]*labeled[S], 0, len(series))
++	for _, s := range series {
++		out = append(out, s)
++	}
++	sort.Slice(out, func(i, j int) bool { return slices.Compare(out[i].values, out[j].values) < 0 })
++	return out
++}
++
++// family 保存一个指标的全部序列，并实施序列数上限。
++type family[S any] struct {
++	desc
++	mu     sync.Mutex
++	series map[string]*labeled[S]
++}
++
++func newFamily[S any](d desc) family[S] {
++	return family[S]{desc: d, series: make(map[string]*labeled[S])}
++}
++
++// at 返回 values 对应的序列，必要时创建；达到上限后新的标签组合返回溢出序列。调用方须持有 f.mu。
++func (f *family[S]) at(values []string) *labeled[S] {
++	key := f.checkLabels(values)
++	if s, ok := f.series[key]; ok {
++		return s
++	}
++	if len(f.series) >= f.maxSeries {
++		values = f.overflow()
++		key = strings.Join(values, "\xff")
++		if s, ok := f.series[key]; ok {
++			return s
++		}
++	}
++	s := &labeled[S]{values: slices.Clone(values)}
++	f.series[key] = s
++	return s
++}
++
++// Counter 是只增不减的计数器（名称按约定以 _total 结尾）。
++type Counter struct {
++	family[float64]
++}
++
++// Inc 把 labels 对应的序列加 1。
++func (c *Counter) Inc(labels ...string) { c.Add(1, labels...) }
++
++// Add 把 labels 对应的序列加 v（v 不能为负）；Add(0, ...) 让序列以 0 出现在输出中。
++func (c *Counter) Add(v float64, labels ...string) {
++	if v < 0 || math.IsNaN(v) {
++		panic(fmt.Sprintf("metrics: 计数器 %s 不能增加 %v", c.name, v))
++	}
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	c.at(labels).data += v
++}
++
++func (c *Counter) write(b *strings.Builder) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	c.writeHeader(b)
++	for _, s := range sortedSeries(c.series) {
++		writeSample(b, c.name, c.labels, s.values, "", "", s.data)
++	}
++}
++
++// histogramData 是直方图一个序列的数据：counts 为各桶（最后一个是 +Inf）的非累计次数。
++type histogramData struct {
++	counts []uint64
++	sum    float64
++	count  uint64
++}
++
++// Histogram 按桶上界（含上界）累计观测次数，并记录总和与总次数。
++type Histogram struct {
++	family[histogramData]
++	buckets []float64
++}
++
++// Observe 记录一次观测。
++func (h *Histogram) Observe(v float64, labels ...string) {
++	if math.IsNaN(v) {
++		panic(fmt.Sprintf("metrics: 直方图 %s 不能记录 NaN", h.name))
++	}
++	index := sort.SearchFloat64s(h.buckets, v)
++	h.mu.Lock()
++	defer h.mu.Unlock()
++	s := h.at(labels)
++	if s.data.counts == nil {
++		s.data.counts = make([]uint64, len(h.buckets)+1)
++	}
++	s.data.counts[index]++
++	s.data.count++
++	s.data.sum += v
++}
++
++func (h *Histogram) write(b *strings.Builder) {
++	h.mu.Lock()
++	defer h.mu.Unlock()
++	h.writeHeader(b)
++	for _, s := range sortedSeries(h.series) {
++		counts := s.data.counts
++		if counts == nil {
++			counts = make([]uint64, len(h.buckets)+1)
++		}
++		var cumulative uint64
++		for i, observed := range counts {
++			cumulative += observed
++			bound := math.Inf(1)
++			if i < len(h.buckets) {
++				bound = h.buckets[i]
++			}
++			writeSample(b, h.name+"_bucket", h.labels, s.values, "le", formatValue(bound), float64(cumulative))
++		}
++		writeSample(b, h.name+"_sum", h.labels, s.values, "", "", s.data.sum)
++		writeSample(b, h.name+"_count", h.labels, s.values, "", "", float64(s.data.count))
++	}
++}
++
++// funcMetric 的取值在每次输出时由回调提供。
++type funcMetric struct {
++	desc
++	collect func() []Sample
++}
++
++func (f *funcMetric) write(b *strings.Builder) {
++	samples := f.collect()
++	values := make(map[string]*labeled[float64], len(samples))
++	for _, sample := range samples {
++		key := f.checkLabels(sample.Labels)
++		s, ok := values[key]
++		if !ok {
++			labels := sample.Labels
++			if len(values) >= f.maxSeries {
++				labels = f.overflow()
++				key = strings.Join(labels, "\xff")
++				s, ok = values[key]
++			}
++			if !ok {
++				s = &labeled[float64]{values: slices.Clone(labels)}
++				values[key] = s
++			}
++		}
++		s.data += sample.Value
++	}
++	f.writeHeader(b)
++	for _, s := range sortedSeries(values) {
++		writeSample(b, f.name, f.labels, s.values, "", "", s.data)
++	}
++}
++
++type metric interface {
++	write(b *strings.Builder)
++}
++
++// Registry 是一组指标，按创建顺序输出；实现 http.Handler（GET / HEAD）。
++type Registry struct {
++	maxSeries int
++
++	mu      sync.Mutex
++	names   map[string]bool
++	metrics []metric
++}
++
++// NewRegistry 返回空的指标集合。
++func NewRegistry() *Registry { return newRegistry(DefaultMaxSeries) }
++
++func newRegistry(maxSeries int) *Registry {
++	return &Registry{maxSeries: maxSeries, names: make(map[string]bool)}
++}
++
++func (r *Registry) newDesc(name, help, kind string, labels []string) desc {
++	if !metricNamePattern.MatchString(name) {
++		panic(fmt.Sprintf("metrics: 指标名非法 %q", name))
++	}
++	seen := make(map[string]bool, len(labels))
++	for _, label := range labels {
++		if !labelNamePattern.MatchString(label) || strings.HasPrefix(label, "__") || reservedLabels[label] {
++			panic(fmt.Sprintf("metrics: 指标 %s 的标签名非法 %q", name, label))
++		}
++		if seen[label] {
++			panic(fmt.Sprintf("metrics: 指标 %s 的标签名重复 %q", name, label))
++		}
++		seen[label] = true
++	}
++	return desc{name: name, help: help, kind: kind, labels: slices.Clone(labels), maxSeries: r.maxSeries}
++}
++
++func (r *Registry) register(name string, m metric) {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	if r.names[name] {
++		panic(fmt.Sprintf("metrics: 指标 %s 已登记", name))
++	}
++	r.names[name] = true
++	r.metrics = append(r.metrics, m)
++}
++
++// NewCounter 创建并登记一个计数器。没有标签的计数器从 0 开始出现在输出中。
++func (r *Registry) NewCounter(name, help string, labels ...string) *Counter {
++	c := &Counter{newFamily[float64](r.newDesc(name, help, "counter", labels))}
++	if len(labels) == 0 {
++		c.Add(0)
++	}
++	r.register(name, c)
++	return c
++}
++
++// NewHistogram 创建并登记一个直方图；buckets 为严格递增的有限上界，+Inf 桶自动追加。
++// 没有标签的直方图从 0 开始出现在输出中。
++func (r *Registry) NewHistogram(name, help string, buckets []float64, labels ...string) *Histogram {
++	if len(buckets) == 0 {
++		panic(fmt.Sprintf("metrics: 直方图 %s 至少需要一个桶", name))
++	}
++	for i, bound := range buckets {
++		if math.IsInf(bound, 0) || math.IsNaN(bound) || (i > 0 && bound <= buckets[i-1]) {
++			panic(fmt.Sprintf("metrics: 直方图 %s 的桶上界必须有限且严格递增: %v", name, buckets))
++		}
++	}
++	h := &Histogram{
++		family:  newFamily[histogramData](r.newDesc(name, help, "histogram", labels)),
++		buckets: slices.Clone(buckets),
++	}
++	if len(labels) == 0 {
++		h.mu.Lock()
++		h.at(nil)
++		h.mu.Unlock()
++	}
++	r.register(name, h)
++	return h
++}
++
++// NewCounterFunc 登记一个计数器，取值在每次输出时由 collect 提供（如组件自己维护的累计值）。
++func (r *Registry) NewCounterFunc(name, help string, labels []string, collect func() []Sample) {
++	r.register(name, &funcMetric{desc: r.newDesc(name, help, "counter", labels), collect: collect})
++}
++
++// NewGaugeFunc 登记一个仪表盘，取值在每次输出时由 collect 提供。
++func (r *Registry) NewGaugeFunc(name, help string, labels []string, collect func() []Sample) {
++	r.register(name, &funcMetric{desc: r.newDesc(name, help, "gauge", labels), collect: collect})
++}
++
++// Render 按文本格式输出全部指标的当前取值。
++func (r *Registry) Render() string {
++	r.mu.Lock()
++	metrics := slices.Clone(r.metrics)
++	r.mu.Unlock()
++	var b strings.Builder
++	for _, m := range metrics {
++		m.write(&b)
++	}
++	return b.String()
++}
++
++// ServeHTTP 以文本格式响应 GET / HEAD，其他方法返回 405。
++func (r *Registry) ServeHTTP(w http.ResponseWriter, req *http.Request) {
++	if req.Method != http.MethodGet && req.Method != http.MethodHead {
++		w.Header().Set("Allow", "GET, HEAD")
++		http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
++		return
++	}
++	body := r.Render()
++	w.Header().Set("Content-Type", ContentType)
++	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
++	w.WriteHeader(http.StatusOK)
++	if req.Method == http.MethodGet {
++		_, _ = w.Write([]byte(body))
++	}
++}
++
++func writeSample(b *strings.Builder, name string, labels, values []string, extraLabel, extraValue string, v float64) {
++	b.WriteString(name)
++	if len(labels) > 0 || extraLabel != "" {
++		b.WriteByte('{')
++		for i, label := range labels {
++			if i > 0 {
++				b.WriteByte(',')
++			}
++			fmt.Fprintf(b, `%s="%s"`, label, labelEscaper.Replace(values[i]))
++		}
++		if extraLabel != "" {
++			if len(labels) > 0 {
++				b.WriteByte(',')
++			}
++			fmt.Fprintf(b, `%s="%s"`, extraLabel, labelEscaper.Replace(extraValue))
++		}
++		b.WriteByte('}')
++	}
++	b.WriteByte(' ')
++	b.WriteString(formatValue(v))
++	b.WriteByte('\n')
++}
++
++// formatValue 把样本值写成文本格式：整数不带小数点，特殊值为 +Inf / -Inf / NaN。
++func formatValue(v float64) string {
++	switch {
++	case math.IsNaN(v):
++		return "NaN"
++	case math.IsInf(v, 1):
++		return "+Inf"
++	case math.IsInf(v, -1):
++		return "-Inf"
++	case v == math.Trunc(v) && math.Abs(v) < 1e15:
++		return strconv.FormatFloat(v, 'f', 0, 64)
++	default:
++		return strconv.FormatFloat(v, 'g', -1, 64)
++	}
++}
+diff --git a/gateway/internal/metrics/metrics_test.go b/gateway/internal/metrics/metrics_test.go
+new file mode 100644
+index 0000000..2573393
+--- /dev/null
++++ b/gateway/internal/metrics/metrics_test.go
+@@ -0,0 +1,204 @@
++package metrics
++
++import (
++	"math"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync"
++	"testing"
++
++	"github.com/Mekoforge/ForgeMesh/gateway/internal/metrics/metricstest"
++)
++
++// TestRegistry_RendersTextFormat 逐字核对输出：HELP 与标签取值的转义、序列按标签排序、
++// 直方图的累计桶（上界含边界值）与 +Inf、_sum / _count，没有标签的指标从 0 开始输出。
++func TestRegistry_RendersTextFormat(t *testing.T) {
++	r := NewRegistry()
++	c := r.NewCounter("demo_requests_total", "Requests.\nSecond line with \\ backslash.", "route", "status")
++	c.Inc("b", "200")
++	c.Inc("a", "500")
++	c.Add(2, "a", "200")
++	h := r.NewHistogram("demo_duration_seconds", "Durations.", []float64{0.25, 1}, "route")
++	for _, v := range []float64{0.25, 0.5, 3} {
++		h.Observe(v, "a")
++	}
++	r.NewCounter("demo_plain_total", "Unlabeled.")
++	r.NewHistogram("demo_plain_seconds", "Unlabeled histogram.", []float64{1})
++	r.NewGaugeFunc("demo_items", "Items.", []string{"state"}, func() []Sample {
++		return []Sample{{Labels: []string{"z"}, Value: 1.5}, {Labels: []string{"q\"\n\\"}, Value: 2}}
++	})
++
++	want := `# HELP demo_requests_total Requests.\nSecond line with \\ backslash.
++# TYPE demo_requests_total counter
++demo_requests_total{route="a",status="200"} 2
++demo_requests_total{route="a",status="500"} 1
++demo_requests_total{route="b",status="200"} 1
++# HELP demo_duration_seconds Durations.
++# TYPE demo_duration_seconds histogram
++demo_duration_seconds_bucket{route="a",le="0.25"} 1
++demo_duration_seconds_bucket{route="a",le="1"} 2
++demo_duration_seconds_bucket{route="a",le="+Inf"} 3
++demo_duration_seconds_sum{route="a"} 3.75
++demo_duration_seconds_count{route="a"} 3
++# HELP demo_plain_total Unlabeled.
++# TYPE demo_plain_total counter
++demo_plain_total 0
++# HELP demo_plain_seconds Unlabeled histogram.
++# TYPE demo_plain_seconds histogram
++demo_plain_seconds_bucket{le="1"} 0
++demo_plain_seconds_bucket{le="+Inf"} 0
++demo_plain_seconds_sum 0
++demo_plain_seconds_count 0
++# HELP demo_items Items.
++# TYPE demo_items gauge
++demo_items{state="q\"\n\\"} 2
++demo_items{state="z"} 1.5
++`
++	got := r.Render()
++	if got != want {
++		t.Fatalf("输出不符\nwant:\n%s\ngot:\n%s", want, got)
++	}
++	metricstest.MustParse(t, got)
++}
++
++// TestFormatValue 覆盖整数、小数、指数与特殊值的写法。
++func TestFormatValue(t *testing.T) {
++	cases := []struct {
++		value float64
++		want  string
++	}{
++		{0, "0"}, {3, "3"}, {-2, "-2"}, {0.005, "0.005"}, {1e-05, "1e-05"}, {1e20, "1e+20"},
++		{math.Inf(1), "+Inf"}, {math.Inf(-1), "-Inf"}, {math.NaN(), "NaN"},
++	}
++	for _, tc := range cases {
++		if got := formatValue(tc.value); got != tc.want {
++			t.Errorf("formatValue(%v) = %q，期望 %q", tc.value, got, tc.want)
++		}
++	}
++}
++
++// TestRegistry_BoundsSeries 验证序列数上限：超出后新的标签组合计入溢出序列，总数不变；
++// 已有序列照常累加。
++func TestRegistry_BoundsSeries(t *testing.T) {
++	r := newRegistry(2)
++	c := r.NewCounter("demo_total", "Demo.", "id")
++	h := r.NewHistogram("demo_seconds", "Demo.", []float64{1}, "id")
++	for _, id := range []string{"a", "b", "c", "d", "a"} {
++		c.Inc(id)
++		h.Observe(0.5, id)
++	}
++	r.NewGaugeFunc("demo_items", "Demo.", []string{"id"}, func() []Sample {
++		return []Sample{{[]string{"a"}, 1}, {[]string{"b"}, 2}, {[]string{"c"}, 3}, {[]string{"d"}, 4}}
++	})
++
++	samples := metricstest.MustParse(t, r.Render())
++	want := map[string]float64{
++		`demo_total{id="a"}`:                2,
++		`demo_total{id="b"}`:                1,
++		`demo_total{id="overflow"}`:         2,
++		`demo_seconds_count{id="a"}`:        2,
++		`demo_seconds_count{id="overflow"}`: 2,
++		`demo_items{id="a"}`:                1,
++		`demo_items{id="b"}`:                2,
++		`demo_items{id="overflow"}`:         7,
++	}
++	for key, value := range want {
++		if got, ok := samples[key]; !ok || got != value {
++			t.Errorf("%s = %v（存在=%v），期望 %v", key, got, ok, value)
++		}
++	}
++	if _, ok := samples[`demo_total{id="c"}`]; ok {
++		t.Error("超出上限的标签组合不应单独成为序列")
++	}
++}
++
++// TestRegistry_RejectsProgrammingErrors 验证非法定义与错误用法会 panic。
++func TestRegistry_RejectsProgrammingErrors(t *testing.T) {
++	r := NewRegistry()
++	c := r.NewCounter("demo_total", "Demo.", "route")
++	h := r.NewHistogram("demo_seconds", "Demo.", DefaultBuckets)
++	cases := map[string]func(){
++		"非法指标名":     func() { r.NewCounter("1demo_total", "Demo.") },
++		"非法标签名":     func() { r.NewCounter("demo_a_total", "Demo.", "bad-label") },
++		"保留标签 le":   func() { r.NewHistogram("demo_b_seconds", "Demo.", DefaultBuckets, "le") },
++		"双下划线标签":    func() { r.NewCounter("demo_c_total", "Demo.", "__name") },
++		"重复标签名":     func() { r.NewCounter("demo_d_total", "Demo.", "a", "a") },
++		"重复指标名":     func() { r.NewCounter("demo_total", "Demo.") },
++		"没有桶":       func() { r.NewHistogram("demo_e_seconds", "Demo.", nil) },
++		"桶不递增":      func() { r.NewHistogram("demo_f_seconds", "Demo.", []float64{1, 1}) },
++		"+Inf 桶":    func() { r.NewHistogram("demo_g_seconds", "Demo.", []float64{1, math.Inf(1)}) },
++		"标签个数不符":    func() { c.Inc("a", "b") },
++		"计数器减少":     func() { c.Add(-1, "a") },
++		"直方图记录 NaN": func() { h.Observe(math.NaN()) },
++		"回调标签个数不符": func() {
++			r.NewGaugeFunc("demo_h", "Demo.", []string{"a"}, func() []Sample { return []Sample{{Value: 1}} })
++			r.Render()
++		},
++	}
++	for name, fn := range cases {
++		t.Run(name, func(t *testing.T) {
++			defer func() {
++				if recover() == nil {
++					t.Fatal("应 panic")
++				}
++			}()
++			fn()
++		})
++	}
++}
++
++// TestRegistry_ServeHTTP 验证 GET 输出文本格式、HEAD 只有响应头、其他方法 405。
++func TestRegistry_ServeHTTP(t *testing.T) {
++	r := NewRegistry()
++	r.NewCounter("demo_total", "Demo.").Inc()
++
++	get := httptest.NewRecorder()
++	r.ServeHTTP(get, httptest.NewRequest(http.MethodGet, "/metrics", nil))
++	if get.Code != http.StatusOK || get.Header().Get("Content-Type") != ContentType {
++		t.Fatalf("GET 应 200 且为文本格式，实际 %d %q", get.Code, get.Header().Get("Content-Type"))
++	}
++	if !strings.Contains(get.Body.String(), "demo_total 1\n") {
++		t.Fatalf("GET 应输出指标，实际 %q", get.Body.String())
++	}
++
++	head := httptest.NewRecorder()
++	r.ServeHTTP(head, httptest.NewRequest(http.MethodHead, "/metrics", nil))
++	if head.Code != http.StatusOK || head.Body.Len() != 0 || head.Header().Get("Content-Length") == "" {
++		t.Fatalf("HEAD 应 200、无响应体且带 Content-Length，实际 %d %q", head.Code, head.Body.String())
++	}
++
++	post := httptest.NewRecorder()
++	r.ServeHTTP(post, httptest.NewRequest(http.MethodPost, "/metrics", nil))
++	if post.Code != http.StatusMethodNotAllowed || post.Header().Get("Allow") != "GET, HEAD" {
++		t.Fatalf("POST 应 405 且带 Allow，实际 %d %q", post.Code, post.Header().Get("Allow"))
++	}
++}
++
++// TestRegistry_ConcurrentUpdates 在 -race 下并发更新与输出，计数不丢失。
++func TestRegistry_ConcurrentUpdates(t *testing.T) {
++	r := NewRegistry()
++	c := r.NewCounter("demo_total", "Demo.", "route")
++	h := r.NewHistogram("demo_seconds", "Demo.", DefaultBuckets, "route")
++	var wg sync.WaitGroup
++	for i := 0; i < 8; i++ {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			for j := 0; j < 500; j++ {
++				c.Inc("a")
++				h.Observe(0.01, "a")
++				if j%100 == 0 {
++					_ = r.Render()
++				}
++			}
++		}()
++	}
++	wg.Wait()
++
++	samples := metricstest.MustParse(t, r.Render())
++	if samples[`demo_total{route="a"}`] != 4000 || samples[`demo_seconds_count{route="a"}`] != 4000 {
++		t.Fatalf("并发更新后计数应为 4000，实际 %v / %v",
++			samples[`demo_total{route="a"}`], samples[`demo_seconds_count{route="a"}`])
++	}
++}
+diff --git a/gateway/internal/metrics/metricstest/metricstest.go b/gateway/internal/metrics/metricstest/metricstest.go
+new file mode 100644
+index 0000000..e656f14
+--- /dev/null
++++ b/gateway/internal/metrics/metricstest/metricstest.go
+@@ -0,0 +1,196 @@
++// Package metricstest 严格解析 Prometheus 文本格式（0.0.4），供测试校验 /metrics 的输出并读取
++// 样本取值。
++package metricstest
++
++import (
++	"fmt"
++	"math"
++	"regexp"
++	"strconv"
++	"strings"
++	"testing"
++)
++
++var (
++	helpLine   = regexp.MustCompile(`^# HELP ([a-zA-Z_:][a-zA-Z0-9_:]*) ((?:[^\\]|\\[\\n])*)$`)
++	typeLine   = regexp.MustCompile(`^# TYPE ([a-zA-Z_:][a-zA-Z0-9_:]*) (counter|gauge|histogram|summary|untyped)$`)
++	sampleLine = regexp.MustCompile(`^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{(.*)\})? (\S+)$`)
++	labelPair  = regexp.MustCompile(`^([a-zA-Z_][a-zA-Z0-9_]*)="((?:[^"\\\n]|\\[\\"n])*)"`)
++	floatValue = regexp.MustCompile(`^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$`)
++)
++
++type pair struct{ name, raw string }
++
++// bucket 是直方图一个序列中的一个桶。
++type bucket struct {
++	le         float64
++	cumulative float64
++}
++
++// Parse 严格解析 text，返回以「名称{标签}」（与输出相同的写法）为键的样本取值。
++//
++// 校验：以换行结束、没有空行与多余的注释；每个指标只声明一次 TYPE，样本紧跟在所属指标的
++// TYPE 之后（直方图为 _bucket / _sum / _count）；标签名合法、不重复，取值只用 \\、\"、\n
++// 转义；取值为浮点数或 +Inf / -Inf / NaN；样本不重复；直方图每个序列的 le 严格递增、累计值
++// 不减，以 le="+Inf" 结束且等于 _count。
++func Parse(text string) (map[string]float64, error) {
++	if !strings.HasSuffix(text, "\n") {
++		return nil, fmt.Errorf("输出必须以换行结束")
++	}
++	samples := make(map[string]float64)
++	declared := make(map[string]bool)
++	helps := make(map[string]bool)
++	histograms := make(map[string][]bucket)
++	var family, kind string
++	for i, line := range strings.Split(strings.TrimSuffix(text, "\n"), "\n") {
++		where := fmt.Sprintf("第 %d 行 %q", i+1, line)
++		switch {
++		case line == "":
++			return nil, fmt.Errorf("%s: 空行", where)
++		case strings.HasPrefix(line, "# HELP "):
++			m := helpLine.FindStringSubmatch(line)
++			if m == nil || helps[m[1]] {
++				return nil, fmt.Errorf("%s: HELP 不合法或重复", where)
++			}
++			helps[m[1]] = true
++		case strings.HasPrefix(line, "# TYPE "):
++			m := typeLine.FindStringSubmatch(line)
++			if m == nil || declared[m[1]] {
++				return nil, fmt.Errorf("%s: TYPE 不合法或重复", where)
++			}
++			declared[m[1]] = true
++			family, kind = m[1], m[2]
++		case strings.HasPrefix(line, "#"):
++			return nil, fmt.Errorf("%s: 多余的注释", where)
++		default:
++			m := sampleLine.FindStringSubmatch(line)
++			if m == nil {
++				return nil, fmt.Errorf("%s: 样本行不合法", where)
++			}
++			name, rawLabels, rawValue := m[1], m[2], m[3]
++			if !belongs(name, family, kind) {
++				return nil, fmt.Errorf("%s: 样本不属于前面声明的指标 %q（%s）", where, family, kind)
++			}
++			labels, err := parseLabels(rawLabels)
++			if err != nil {
++				return nil, fmt.Errorf("%s: %w", where, err)
++			}
++			value, err := parseValue(rawValue)
++			if err != nil {
++				return nil, fmt.Errorf("%s: %w", where, err)
++			}
++			key := line[:len(line)-len(rawValue)-1]
++			if _, dup := samples[key]; dup {
++				return nil, fmt.Errorf("%s: 样本重复", where)
++			}
++			samples[key] = value
++			if kind == "histogram" && name == family+"_bucket" {
++				series, le, err := splitLE(family, labels)
++				if err != nil {
++					return nil, fmt.Errorf("%s: %w", where, err)
++				}
++				histograms[series] = append(histograms[series], bucket{le: le, cumulative: value})
++			}
++		}
++	}
++	for series, buckets := range histograms {
++		if err := checkHistogram(series, buckets, samples); err != nil {
++			return nil, err
++		}
++	}
++	return samples, nil
++}
++
++// MustParse 同 Parse，格式不合法时令测试失败。
++func MustParse(t testing.TB, text string) map[string]float64 {
++	t.Helper()
++	samples, err := Parse(text)
++	if err != nil {
++		t.Fatalf("指标输出不是合法的文本格式: %v\n%s", err, text)
++	}
++	return samples
++}
++
++func belongs(name, family, kind string) bool {
++	switch kind {
++	case "histogram":
++		return name == family+"_bucket" || name == family+"_sum" || name == family+"_count"
++	case "summary":
++		return name == family || name == family+"_sum" || name == family+"_count"
++	case "":
++		return false
++	default:
++		return name == family
++	}
++}
++
++func parseLabels(text string) ([]pair, error) {
++	var pairs []pair
++	seen := make(map[string]bool)
++	for rest := text; rest != ""; {
++		m := labelPair.FindStringSubmatch(rest)
++		if m == nil || seen[m[1]] {
++			return nil, fmt.Errorf("标签不合法或重复: %q", rest)
++		}
++		seen[m[1]] = true
++		pairs = append(pairs, pair{name: m[1], raw: m[2]})
++		rest = rest[len(m[0]):]
++		if rest != "" {
++			if rest[0] != ',' || len(rest) == 1 {
++				return nil, fmt.Errorf("标签之间须以逗号分隔: %q", text)
++			}
++			rest = rest[1:]
++		}
++	}
++	return pairs, nil
++}
++
++func parseValue(raw string) (float64, error) {
++	switch raw {
++	case "+Inf", "-Inf", "NaN":
++	default:
++		if !floatValue.MatchString(raw) {
++			return 0, fmt.Errorf("取值不合法: %q", raw)
++		}
++	}
++	return strconv.ParseFloat(raw, 64)
++}
++
++// splitLE 取出 le，返回去掉 le 之后的 _count 样本键与 le 的取值。
++func splitLE(family string, labels []pair) (string, float64, error) {
++	var rest []string
++	le, found := 0.0, false
++	for _, p := range labels {
++		if p.name != "le" {
++			rest = append(rest, p.name+`="`+p.raw+`"`)
++			continue
++		}
++		v, err := parseValue(p.raw)
++		if err != nil {
++			return "", 0, fmt.Errorf("le %w", err)
++		}
++		le, found = v, true
++	}
++	if !found {
++		return "", 0, fmt.Errorf("_bucket 样本缺少 le")
++	}
++	key := family + "_count"
++	if len(rest) > 0 {
++		key += "{" + strings.Join(rest, ",") + "}"
++	}
++	return key, le, nil
++}
++
++func checkHistogram(countKey string, buckets []bucket, samples map[string]float64) error {
++	for i := 1; i < len(buckets); i++ {
++		if buckets[i].le <= buckets[i-1].le || buckets[i].cumulative < buckets[i-1].cumulative {
++			return fmt.Errorf("%s 的桶 le 须严格递增、累计值不减", countKey)
++		}
++	}
++	last := buckets[len(buckets)-1]
++	count, ok := samples[countKey]
++	if !math.IsInf(last.le, 1) || !ok || count != last.cumulative {
++		return fmt.Errorf("%s 须以 le=\"+Inf\" 结束且等于 _count", countKey)
++	}
++	return nil
++}
+diff --git a/gateway/internal/metrics/metricstest/metricstest_test.go b/gateway/internal/metrics/metricstest/metricstest_test.go
+new file mode 100644
+index 0000000..2ecbd13
+--- /dev/null
++++ b/gateway/internal/metrics/metricstest/metricstest_test.go
+@@ -0,0 +1,71 @@
++package metricstest
++
++import (
++	"math"
++	"testing"
++)
++
++func TestParse_AcceptsValidText(t *testing.T) {
++	text := `# HELP demo_total Demo \\ counter\nline two.
++# TYPE demo_total counter
++demo_total{a="x\"y",b="\\\n"} 3
++demo_total 1.5e+03
++# HELP demo_seconds Demo histogram.
++# TYPE demo_seconds histogram
++demo_seconds_bucket{id="a",le="0.5"} 1
++demo_seconds_bucket{id="a",le="+Inf"} 2
++demo_seconds_sum{id="a"} 1.25
++demo_seconds_count{id="a"} 2
++# TYPE demo_items gauge
++demo_items NaN
++`
++	samples := MustParse(t, text)
++	want := map[string]float64{
++		`demo_total{a="x\"y",b="\\\n"}`:        3,
++		`demo_total`:                           1500,
++		`demo_seconds_bucket{id="a",le="0.5"}`: 1,
++		`demo_seconds_count{id="a"}`:           2,
++		`demo_seconds_sum{id="a"}`:             1.25,
++	}
++	for key, value := range want {
++		if got, ok := samples[key]; !ok || got != value {
++			t.Errorf("%s = %v (存在 %v), want %v", key, got, ok, value)
++		}
++	}
++	if got := samples["demo_items"]; !math.IsNaN(got) {
++		t.Errorf("demo_items = %v, want NaN", got)
++	}
++}
++
++func TestParse_RejectsInvalidText(t *testing.T) {
++	cases := map[string]string{
++		"缺少结尾换行":  "# TYPE a counter\na 1",
++		"空行":      "# TYPE a counter\n\na 1\n",
++		"多余的注释":   "# TYPE a counter\n# note\na 1\n",
++		"未声明类型":   "a 1\n",
++		"重复的类型":   "# TYPE a counter\na 1\n# TYPE a counter\n",
++		"重复的说明":   "# HELP a x\n# HELP a y\n# TYPE a counter\na 1\n",
++		"说明转义非法":  "# HELP a bad \\t escape\n# TYPE a counter\na 1\n",
++		"不属于当前指标": "# TYPE a counter\nb 1\n",
++		"标签转义非法":  "# TYPE a counter\na{x=\"\\t\"} 1\n",
++		"标签名重复":   "# TYPE a counter\na{x=\"1\",x=\"2\"} 1\n",
++		"标签缺少逗号":  "# TYPE a counter\na{x=\"1\"y=\"2\"} 1\n",
++		"标签结尾逗号":  "# TYPE a counter\na{x=\"1\",} 1\n",
++		"取值非法":    "# TYPE a counter\na one\n",
++		"样本重复":    "# TYPE a counter\na{x=\"1\"} 1\na{x=\"1\"} 2\n",
++		"桶缺少 le":  "# TYPE h histogram\nh_bucket 1\nh_count 1\n",
++		"桶不递增": "# TYPE h histogram\nh_bucket{le=\"1\"} 1\nh_bucket{le=\"0.5\"} 1\n" +
++			"h_bucket{le=\"+Inf\"} 1\nh_count 1\n",
++		"累计值减少":            "# TYPE h histogram\nh_bucket{le=\"1\"} 2\nh_bucket{le=\"+Inf\"} 1\nh_count 1\n",
++		"没有 +Inf 桶":        "# TYPE h histogram\nh_bucket{le=\"1\"} 1\nh_count 1\n",
++		"+Inf 与 _count 不等": "# TYPE h histogram\nh_bucket{le=\"+Inf\"} 2\nh_count 1\n",
++		"缺少 _count":        "# TYPE h histogram\nh_bucket{le=\"+Inf\"} 1\n",
++	}
++	for name, text := range cases {
++		t.Run(name, func(t *testing.T) {
++			if _, err := Parse(text); err == nil {
++				t.Fatalf("Parse(%q) 应失败", text)
++			}
++		})
++	}
++}
+diff --git a/gateway/internal/middleware/middleware.go b/gateway/internal/middleware/middleware.go
+index 83d2d04..b18cdb5 100644
+--- a/gateway/internal/middleware/middleware.go
++++ b/gateway/internal/middleware/middleware.go
+@@ -2,9 +2,10 @@
+ //
+ // 链的执行顺序（外层 → 内层）：
+ //
+-//	Recovery → Correlation → Authenticate → RateLimit → LimitRequestBody → Route
++//	Observe → Recovery → Correlation → Authenticate → RateLimit → LimitRequestBody → Route
+ //
+-// Recovery 位于最外层，保证任何下游 panic 都能被兜底；
++// Observe 位于最外层，按路由类别记录请求数与耗时（含 Recovery 兜底返回的 500）；
++// Recovery 保证任何下游 panic 都能被兜底；
+ // Correlation 尽早生成关联 ID，认证失败的响应也能携带；
+ // Authenticate 先于 RateLimit，被拒请求不消耗令牌；
+ // LimitRequestBody 紧挨路由，请求体只在转发时才被读取。
+diff --git a/gateway/internal/middleware/observe.go b/gateway/internal/middleware/observe.go
+new file mode 100644
+index 0000000..18472ff
+--- /dev/null
++++ b/gateway/internal/middleware/observe.go
+@@ -0,0 +1,69 @@
++package middleware
++
++import (
++	"net/http"
++	"time"
++
++	"github.com/Mekoforge/ForgeMesh/gateway/internal/metrics"
++)
++
++// Observe 返回记录请求数与耗时的中间件，须位于最外层（Recovery 之外），panic 兜底的 500
++// 也被计入。classify 在请求开始时按路由表确定路由类别，指标只用路由类别、不用路径；
++// m 为 nil 时不记录。流式请求的耗时是整个流的时长。
++func Observe(m *metrics.Gateway, classify func(*http.Request) metrics.Route) Middleware {
++	if classify == nil {
++		panic("middleware: Observe 需要非空 classify")
++	}
++	return func(next http.Handler) http.Handler {
++		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++			start := time.Now()
++			route := classify(r)
++			sw := &statusWriter{ResponseWriter: w}
++			next.ServeHTTP(sw, r)
++			m.ObserveRequest(route, sw.Status(), time.Since(start))
++		})
++	}
++}
++
++// statusWriter 记录写出的状态码。实现 http.Flusher（流式代理逐块 Flush）与 Unwrap
++// （http.ResponseController 借此使用底层连接的其他能力）。
++type statusWriter struct {
++	http.ResponseWriter
++	status int
++}
++
++// WriteHeader 记录第一个最终状态码：1xx 信息响应（101 除外）之后还有最终响应，不记录。
++func (s *statusWriter) WriteHeader(code int) {
++	if s.status == 0 && (code >= 200 || code == http.StatusSwitchingProtocols) {
++		s.status = code
++	}
++	s.ResponseWriter.WriteHeader(code)
++}
++
++func (s *statusWriter) Write(b []byte) (int, error) {
++	if s.status == 0 {
++		s.status = http.StatusOK
++	}
++	return s.ResponseWriter.Write(b)
++}
++
++// Flush 把已写出的内容推给客户端；底层不支持 Flush 时什么都不做。
++func (s *statusWriter) Flush() {
++	if s.status == 0 {
++		s.status = http.StatusOK
++	}
++	if f, ok := s.ResponseWriter.(http.Flusher); ok {
++		f.Flush()
++	}
++}
++
++// Unwrap 返回底层的 ResponseWriter。
++func (s *statusWriter) Unwrap() http.ResponseWriter { return s.ResponseWriter }
++
++// Status 返回响应的状态码；处理器什么都没写时 net/http 回复 200。
++func (s *statusWriter) Status() int {
++	if s.status == 0 {
++		return http.StatusOK
++	}
++	return s.status
++}
+diff --git a/gateway/internal/middleware/observe_test.go b/gateway/internal/middleware/observe_test.go
+new file mode 100644
+index 0000000..ba7a435
+--- /dev/null
++++ b/gateway/internal/middleware/observe_test.go
+@@ -0,0 +1,141 @@
++package middleware
++
++import (
++	"io"
++	"log"
++	"net/http"
++	"net/http/httptest"
++	"testing"
++
++	"github.com/Mekoforge/ForgeMesh/gateway/internal/metrics"
++	"github.com/Mekoforge/ForgeMesh/gateway/internal/metrics/metricstest"
++)
++
++// scrapeMetrics 抓取 m 的输出并按文本格式严格解析。
++func scrapeMetrics(t *testing.T, m *metrics.Gateway) map[string]float64 {
++	t.Helper()
++	rec := httptest.NewRecorder()
++	m.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
++	return metricstest.MustParse(t, rec.Body.String())
++}
++
++func requestsKey(route metrics.Route, status string) string {
++	return `forgemesh_gateway_http_requests_total{route="` + string(route) + `",status="` + status + `"}`
++}
++
++func classifyAs(route metrics.Route) func(*http.Request) metrics.Route {
++	return func(*http.Request) metrics.Route { return route }
++}
++
++// TestObserve_RecordsRouteClassAndStatus 验证按路由类别与最终状态码计数并记录耗时：
++// 什么都没写或只写响应体为 200；先 Flush 后 WriteHeader 时状态码已是 200。
++func TestObserve_RecordsRouteClassAndStatus(t *testing.T) {
++	handlers := map[string]http.HandlerFunc{
++		"什么都没写": func(http.ResponseWriter, *http.Request) {},
++		"只写响应体": func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "ok") },
++		"404":   func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNotFound) },
++		"500": func(w http.ResponseWriter, _ *http.Request) {
++			http.Error(w, "boom", http.StatusInternalServerError)
++		},
++		"先 Flush": func(w http.ResponseWriter, _ *http.Request) {
++			w.(http.Flusher).Flush()
++			w.WriteHeader(http.StatusBadGateway)
++		},
++	}
++	m := metrics.NewGateway()
++	for name, h := range handlers {
++		rec := httptest.NewRecorder()
++		Observe(m, classifyAs(metrics.RouteControlPlane))(h).ServeHTTP(rec,
++			httptest.NewRequest(http.MethodGet, "/api/v1/resources", nil))
++		if name == "404" && rec.Code != http.StatusNotFound {
++			t.Fatalf("Observe 不应改变响应，实际 %d", rec.Code)
++		}
++	}
++
++	samples := scrapeMetrics(t, m)
++	want := map[string]float64{
++		requestsKey(metrics.RouteControlPlane, "200"):                                  3,
++		requestsKey(metrics.RouteControlPlane, "404"):                                  1,
++		requestsKey(metrics.RouteControlPlane, "500"):                                  1,
++		`forgemesh_gateway_http_request_duration_seconds_count{route="control_plane"}`: 5,
++	}
++	for key, value := range want {
++		if got, ok := samples[key]; !ok || got != value {
++			t.Errorf("%s = %v（存在 %v），want %v", key, got, ok, value)
++		}
++	}
++	if _, ok := samples[requestsKey(metrics.RouteControlPlane, "502")]; ok {
++		t.Error("Flush 之后的 WriteHeader 不再生效，不应计为 502")
++	}
++}
++
++// TestObserve_IgnoresInformationalStatus 验证 1xx 信息响应之后记录最终状态码。
++func TestObserve_IgnoresInformationalStatus(t *testing.T) {
++	m := metrics.NewGateway()
++	srv := httptest.NewServer(Observe(m, classifyAs(metrics.RouteInference))(
++		http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++			w.WriteHeader(http.StatusEarlyHints)
++			w.WriteHeader(http.StatusCreated)
++		})))
++	defer srv.Close()
++
++	resp, err := http.Get(srv.URL)
++	if err != nil {
++		t.Fatalf("请求失败: %v", err)
++	}
++	resp.Body.Close()
++	if resp.StatusCode != http.StatusCreated {
++		t.Fatalf("客户端应收到 201，实际 %d", resp.StatusCode)
++	}
++
++	samples := scrapeMetrics(t, m)
++	if got := samples[requestsKey(metrics.RouteInference, "201")]; got != 1 {
++		t.Fatalf("应记录最终状态码 201，实际 %v（%v）", got, samples)
++	}
++	if _, ok := samples[requestsKey(metrics.RouteInference, "103")]; ok {
++		t.Fatal("不应记录 1xx 信息响应")
++	}
++}
++
++// TestObserve_KeepsFlusherAndUnwrap 验证包装后的 ResponseWriter 仍能 Flush（流式代理依赖），
++// 且 Unwrap 返回底层 ResponseWriter。
++func TestObserve_KeepsFlusherAndUnwrap(t *testing.T) {
++	rec := httptest.NewRecorder()
++	var unwrapped http.ResponseWriter
++	h := Observe(nil, classifyAs(metrics.RouteInference))(
++		http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++			if err := http.NewResponseController(w).Flush(); err != nil {
++				t.Errorf("Flush 失败: %v", err)
++			}
++			if u, ok := w.(interface{ Unwrap() http.ResponseWriter }); ok {
++				unwrapped = u.Unwrap()
++			}
++		}))
++	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/v1/inference/svc/chat", nil))
++
++	if !rec.Flushed {
++		t.Fatal("Flush 应传到底层 ResponseWriter")
++	}
++	if unwrapped != rec {
++		t.Fatalf("Unwrap 应返回底层 ResponseWriter，实际 %T", unwrapped)
++	}
++}
++
++// TestObserve_CountsRecoveredPanicAs500 验证 Observe 位于 Recovery 外层时，panic 兜底返回的
++// 500 被计入。
++func TestObserve_CountsRecoveredPanicAs500(t *testing.T) {
++	m := metrics.NewGateway()
++	h := Chain(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { panic("boom") }),
++		Observe(m, classifyAs(metrics.RouteControlPlane)),
++		Recovery(log.New(io.Discard, "", 0)),
++	)
++	rec := httptest.NewRecorder()
++	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/resources", nil))
++
++	if rec.Code != http.StatusInternalServerError {
++		t.Fatalf("panic 应兜底为 500，实际 %d", rec.Code)
++	}
++	if got := scrapeMetrics(t, m)[requestsKey(metrics.RouteControlPlane, "500")]; got != 1 {
++		t.Fatalf("兜底的 500 应计入，实际 %v", got)
++	}
++}
+diff --git a/gateway/internal/middleware/ratelimit.go b/gateway/internal/middleware/ratelimit.go
+index bc925a0..0a87e3a 100644
+--- a/gateway/internal/middleware/ratelimit.go
++++ b/gateway/internal/middleware/ratelimit.go
+@@ -6,6 +6,7 @@ import (
+ 	"net/http"
+ 	"strconv"
+ 	"sync"
++	"sync/atomic"
+ 	"time"
+ )
+ 
+@@ -35,6 +36,8 @@ type Limiter struct {
+ 	buckets map[string]*bucket
+ 	now     func() time.Time // 注入式时钟，便于单元测试与时间推进
+ 	lastGC  time.Time
++
++	rejected atomic.Uint64
+ }
+ 
+ // bucket 表示单个 key 的令牌桶状态。
+@@ -92,6 +95,7 @@ func (l *Limiter) Allow(key string) (allowed bool, retryAfter time.Duration) {
+ 		return true, 0
+ 	}
+ 
++	l.rejected.Add(1)
+ 	// 令牌不足：计算补足到 1 个令牌所需的等待时长。
+ 	deficit := 1 - b.tokens
+ 	retry := time.Duration(deficit / l.rps * float64(time.Second))
+@@ -102,6 +106,9 @@ func (l *Limiter) Allow(key string) (allowed bool, retryAfter time.Duration) {
+ 	return false, retry
+ }
+ 
++// Rejected 返回 Allow 累计拒绝的次数（供 /metrics 的 rate_limited_total）。
++func (l *Limiter) Rejected() uint64 { return l.rejected.Load() }
++
+ // maybeGC 惰性回收长时间空闲的桶。调用方必须持有锁。
+ func (l *Limiter) maybeGC(now time.Time) {
+ 	if now.Sub(l.lastGC) < gcInterval {
+diff --git a/gateway/internal/middleware/ratelimit_test.go b/gateway/internal/middleware/ratelimit_test.go
+index e21f517..1fece45 100644
+--- a/gateway/internal/middleware/ratelimit_test.go
++++ b/gateway/internal/middleware/ratelimit_test.go
+@@ -105,3 +105,20 @@ func TestRateLimit_IgnoresClientControlledHeaders(t *testing.T) {
+ 		})
+ 	}
+ }
++
++// TestLimiter_CountsRejections 验证 Rejected 累计各个 key 被拒绝的次数，放行的请求不计。
++func TestLimiter_CountsRejections(t *testing.T) {
++	l := NewRateLimiter(0.0001, 2)
++	h := RateLimit(l)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
++
++	for i := 0; i < 5; i++ {
++		rec := doTenantRequest(h, "tenant-a")
++		if i >= 2 && rec.Code != http.StatusTooManyRequests {
++			t.Fatalf("第 %d 次请求应 429，实际 %d", i+1, rec.Code)
++		}
++	}
++	doTenantRequest(h, "tenant-b")
++	if got := l.Rejected(); got != 3 {
++		t.Fatalf("应累计拒绝 3 次，实际 %d", got)
++	}
++}
+diff --git a/gateway/internal/router/metrics_test.go b/gateway/internal/router/metrics_test.go
+new file mode 100644
+index 0000000..2fc0e65
+--- /dev/null
++++ b/gateway/internal/router/metrics_test.go
+@@ -0,0 +1,164 @@
++// metrics_test.go 从网关入口验证 /metrics：
++//
++//   - 与探针一样不需要凭证、不经过限流，只响应 GET / HEAD；
++//   - 请求按路由类别与状态码计数（被认证拒绝的请求按目标路由计）；
++//   - 各组件的指标都已接入：限流拒绝、Resolver 查询、首字节时间、实例状态、上游错误；
++//   - 输出不含租户、服务名、凭证主体、路径与实例地址。
++package router
++
++import (
++	"io"
++	"log"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++
++	"github.com/Mekoforge/ForgeMesh/gateway/internal/metrics"
++	"github.com/Mekoforge/ForgeMesh/gateway/internal/metrics/metricstest"
++)
++
++// scrapeText 不带凭证抓取 /metrics，返回响应体。
++func scrapeText(t *testing.T, r *Router) string {
++	t.Helper()
++	rec := httptest.NewRecorder()
++	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
++	if rec.Code != http.StatusOK {
++		t.Fatalf("/metrics 应 200，实际 %d", rec.Code)
++	}
++	if got := rec.Header().Get("Content-Type"); got != metrics.ContentType {
++		t.Fatalf("Content-Type 应为 %q，实际 %q", metrics.ContentType, got)
++	}
++	return rec.Body.String()
++}
++
++func requestsKey(route metrics.Route, status string) string {
++	return `forgemesh_gateway_http_requests_total{route="` + string(route) + `",status="` + status + `"}`
++}
++
++func assertSamples(t *testing.T, samples, want map[string]float64) {
++	t.Helper()
++	for key, value := range want {
++		if got, ok := samples[key]; !ok || got != value {
++			t.Errorf("%s = %v（存在 %v），want %v", key, got, ok, value)
++		}
++	}
++}
++
++// TestMetrics_ServedWithoutCredentials 验证 apikey 模式下 /metrics 不需要凭证，输出合法的
++// 文本格式；HEAD 不带响应体，其他方法 405。
++func TestMetrics_ServedWithoutCredentials(t *testing.T) {
++	r := newAPIKeyRouter(t, "http://127.0.0.1:1")
++
++	samples := metricstest.MustParse(t, scrapeText(t, r))
++	assertSamples(t, samples, map[string]float64{
++		"forgemesh_gateway_rate_limited_total":                    0,
++		`forgemesh_gateway_resolver_lookups_total{result="miss"}`: 0,
++		"forgemesh_gateway_stream_first_byte_seconds_count":       0,
++		`forgemesh_gateway_instances{state="healthy"}`:            0,
++		`forgemesh_gateway_instances{state="unhealthy"}`:          0,
++	})
++
++	head := httptest.NewRecorder()
++	r.ServeHTTP(head, httptest.NewRequest(http.MethodHead, "/metrics", nil))
++	if head.Code != http.StatusOK || head.Body.Len() != 0 {
++		t.Fatalf("HEAD 应 200 且没有响应体，实际 %d（%d 字节）", head.Code, head.Body.Len())
++	}
++	post := httptest.NewRecorder()
++	r.ServeHTTP(post, httptest.NewRequest(http.MethodPost, "/metrics", nil))
++	if post.Code != http.StatusMethodNotAllowed {
++		t.Fatalf("POST 应 405，实际 %d", post.Code)
++	}
++}
++
++// TestMetrics_CountsRequestsByRouteClass 验证请求按路由类别与状态码计数，推理请求的 Resolver
++// 查询、首字节时间与实例状态可见，且输出不含租户、服务名、凭证主体、路径与实例地址。
++func TestMetrics_CountsRequestsByRouteClass(t *testing.T) {
++	env := newInferenceEnv(t, http.StatusOK)
++	if rec := env.chat(routerKeyTenantA); rec.Code != http.StatusOK {
++		t.Fatalf("推理请求应 200，实际 %d", rec.Code)
++	}
++	for _, c := range []struct {
++		path, key string
++		want      int
++	}{
++		{"/api/v1/inference-services", routerKeyTenantA, http.StatusOK},
++		{"/api/v1/resources", "", http.StatusUnauthorized},
++		{"/api/v1/unknown", routerKeyTenantA, http.StatusNotFound},
++		{"/unknown", "", http.StatusNotFound},
++		{"/healthz", "", http.StatusOK},
++	} {
++		rec := httptest.NewRecorder()
++		req := httptest.NewRequest(http.MethodGet, c.path, nil)
++		if c.key != "" {
++			req.Header.Set("Authorization", "Bearer "+c.key)
++		}
++		env.router.ServeHTTP(rec, req)
++		if rec.Code != c.want {
++			t.Fatalf("%s 应 %d，实际 %d", c.path, c.want, rec.Code)
++		}
++	}
++	scrapeText(t, env.router)
++
++	text := scrapeText(t, env.router)
++	assertSamples(t, metricstest.MustParse(t, text), map[string]float64{
++		requestsKey(metrics.RouteInference, "200"):                               1,
++		requestsKey(metrics.RouteControlPlane, "200"):                            1,
++		requestsKey(metrics.RouteControlPlane, "401"):                            1,
++		requestsKey(metrics.RouteUnmatched, "404"):                               2,
++		requestsKey(metrics.RouteProbe, "200"):                                   1,
++		requestsKey(metrics.RouteMetrics, "200"):                                 1,
++		`forgemesh_gateway_http_request_duration_seconds_count{route="probe"}`:   1,
++		`forgemesh_gateway_resolver_lookups_total{result="miss"}`:                1,
++		"forgemesh_gateway_stream_first_byte_seconds_count":                      1,
++		`forgemesh_gateway_instances{state="healthy"}`:                           1,
++		`forgemesh_gateway_http_request_duration_seconds_count{route="metrics"}`: 1,
++	})
++	for _, secret := range []string{"tenant-a", "svc-a", "alice", routerKeyTenantA, "127.0.0.1", "/api/v1"} {
++		if strings.Contains(text, secret) {
++			t.Errorf("指标输出不应包含 %q", secret)
++		}
++	}
++}
++
++// TestMetrics_CountsRateLimitedRequests 验证被限流拒绝的请求计入 rate_limited_total 与 429。
++func TestMetrics_CountsRateLimitedRequests(t *testing.T) {
++	_, upstreamURL := newRecordingUpstream(t)
++	cfg := apiKeyConfig(t, upstreamURL)
++	cfg.RateLimitRPS, cfg.RateLimitBurst = 0.0001, 1
++	r, err := New(cfg, log.New(io.Discard, "", 0))
++	if err != nil {
++		t.Fatalf("New 失败: %v", err)
++	}
++	for i, want := range []int{http.StatusOK, http.StatusTooManyRequests} {
++		rec := httptest.NewRecorder()
++		req := httptest.NewRequest(http.MethodGet, "/api/v1/resources", nil)
++		req.Header.Set("Authorization", "Bearer "+routerKeyTenantA)
++		r.ServeHTTP(rec, req)
++		if rec.Code != want {
++			t.Fatalf("第 %d 个请求应 %d，实际 %d", i+1, want, rec.Code)
++		}
++	}
++
++	assertSamples(t, metricstest.MustParse(t, scrapeText(t, r)), map[string]float64{
++		"forgemesh_gateway_rate_limited_total":        1,
++		requestsKey(metrics.RouteControlPlane, "429"): 1,
++	})
++}
++
++// TestMetrics_CountsControlPlaneErrors 验证资源接口反代连不上控制平面时计一次上游错误。
++func TestMetrics_CountsControlPlaneErrors(t *testing.T) {
++	r := newTestRouter(t, "http://127.0.0.1:1")
++	rec := httptest.NewRecorder()
++	req := httptest.NewRequest(http.MethodGet, "/api/v1/resources", nil)
++	req.Header.Set("X-Tenant-ID", "tenant-a")
++	r.ServeHTTP(rec, req)
++	if rec.Code != http.StatusBadGateway {
++		t.Fatalf("控制平面不可达应 502，实际 %d", rec.Code)
++	}
++
++	assertSamples(t, metricstest.MustParse(t, scrapeText(t, r)), map[string]float64{
++		`forgemesh_gateway_upstream_errors_total{upstream="control_plane",kind="connect"}`: 1,
++		requestsKey(metrics.RouteControlPlane, "502"):                                      1,
++	})
++}
+diff --git a/gateway/internal/router/router.go b/gateway/internal/router/router.go
+index 4049580..ea08f9c 100644
+--- a/gateway/internal/router/router.go
++++ b/gateway/internal/router/router.go
+@@ -4,6 +4,8 @@
+ //
+ //	GET  /healthz                              存活探针（无中间件）
+ //	GET  /readyz                               就绪探针（请求控制平面 /readyz，无中间件）
++//	GET  /metrics                              Prometheus 指标（无认证/限流，只含聚合数据，
++//	                                          见 metrics.Gateway）
+ //	ANY  /api/v1/resources[/...]               反代到 Python 控制平面
+ //	ANY  /api/v1/inference-services[/...]      反代到 Python 控制平面
+ //	ANY  /api/v1/workflows[/...]               反代到 Python 控制平面
+@@ -14,9 +16,10 @@
+ //	                                          路径；要求 read 作用域）
+ //	ANY  /api/v1/inference/{svc}/chat          同上，用于不带命名空间的服务
+ //
+-// 中间件链（执行顺序）：Recovery → Correlation → Authenticate → RateLimit →
++// 中间件链（执行顺序）：Observe → Recovery → Correlation → Authenticate → RateLimit →
+ // LimitRequestBody → Route。
+-// Recovery 作为最外层兜底全量请求；探针刻意不经过认证/限流，保证健康检查可用。
++// Observe 与 Recovery 包住全量请求（Observe 按路由类别记录请求数与耗时，Recovery 兜底
++// panic）；探针与 /metrics 刻意不经过认证/限流，保证健康检查与抓取可用。
+ // 认证模式见 config.AuthModeAPIKey / config.AuthModeDev 与 ADR-014。
+ package router
+ 
+@@ -29,6 +32,7 @@ import (
+ 
+ 	"github.com/Mekoforge/ForgeMesh/gateway/internal/config"
+ 	"github.com/Mekoforge/ForgeMesh/gateway/internal/health"
++	"github.com/Mekoforge/ForgeMesh/gateway/internal/metrics"
+ 	"github.com/Mekoforge/ForgeMesh/gateway/internal/middleware"
+ 	"github.com/Mekoforge/ForgeMesh/gateway/internal/stream"
+ 	"github.com/Mekoforge/ForgeMesh/gateway/internal/upstream"
+@@ -37,6 +41,13 @@ import (
+ // apiPrefix 是所有对外 API 的版本前缀。
+ const apiPrefix = "/api/v1/"
+ 
++// 不经过 API 中间件链的顶层路由。
++const (
++	healthzPath = "/healthz"
++	readyzPath  = "/readyz"
++	metricsPath = "/metrics"
++)
++
+ // proxyRoutes 是需要反代到 Python 控制平面的资源类路由前缀。
+ var proxyRoutes = []string{
+ 	"/api/v1/resources",
+@@ -116,14 +127,51 @@ func New(cfg config.Config, logger *log.Logger) (*Router, error) {
+ 		middleware.LimitRequestBody(maxBody),
+ 	)
+ 
+-	// 顶层路由：探针不经过鉴权/限流。
++	m := metrics.NewGateway()
++	proxy.SetMetrics(m)
++	resolver.SetMetrics(m)
++	streamProxy.SetMetrics(m)
++	m.WatchRateLimiter(limiter.Rejected)
++	m.WatchInstances(resolver.InstanceStates)
++
++	// 顶层路由：探针与 /metrics 不经过鉴权/限流。
+ 	root := http.NewServeMux()
+-	root.HandleFunc("/healthz", hc.Live)
+-	root.HandleFunc("/readyz", hc.Ready)
++	root.HandleFunc(healthzPath, hc.Live)
++	root.HandleFunc(readyzPath, hc.Ready)
++	root.Handle(metricsPath, m)
+ 	root.Handle(apiPrefix, apiHandler)
+ 
+-	// Recovery 作为最外层，兜底全量请求的 panic。
+-	return &Router{handler: middleware.Recovery(logger)(root)}, nil
++	// Recovery 兜底全量请求的 panic；Observe 在它外层，兜底返回的 500 也被计入。
++	return &Router{handler: middleware.Chain(root,
++		middleware.Observe(m, classifier(root, apiMux)),
++		middleware.Recovery(logger),
++	)}, nil
++}
++
++// classifier 返回按路由表确定请求路由类别的函数。ServeMux.Handler 只查找、不执行，与实际
++// 分发的匹配规则一致；没有匹配的请求（含 /api/v1/ 下的未知路径）归为 unmatched。
++func classifier(root, api *http.ServeMux) func(*http.Request) metrics.Route {
++	routes := map[string]metrics.Route{
++		healthzPath:                   metrics.RouteProbe,
++		readyzPath:                    metrics.RouteProbe,
++		metricsPath:                   metrics.RouteMetrics,
++		streamRoutePattern:            metrics.RouteInference,
++		streamWithoutNamespacePattern: metrics.RouteInference,
++	}
++	for _, p := range proxyRoutes {
++		routes[p] = metrics.RouteControlPlane
++		routes[p+"/"] = metrics.RouteControlPlane
++	}
++	return func(r *http.Request) metrics.Route {
++		_, pattern := root.Handler(r)
++		if pattern == apiPrefix {
++			_, pattern = api.Handler(r)
++		}
++		if route, ok := routes[pattern]; ok {
++			return route
++		}
++		return metrics.RouteUnmatched
++	}
+ }
+ 
+ // newAuthenticator 按配置构造入口认证器；未知模式视为配置错误，绝不退化为信任请求头。
+diff --git a/gateway/internal/stream/metrics_test.go b/gateway/internal/stream/metrics_test.go
+new file mode 100644
+index 0000000..58963ce
+--- /dev/null
++++ b/gateway/internal/stream/metrics_test.go
+@@ -0,0 +1,142 @@
++package stream
++
++import (
++	"context"
++	"io"
++	"log"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/Mekoforge/ForgeMesh/gateway/internal/metrics"
++	"github.com/Mekoforge/ForgeMesh/gateway/internal/metrics/metricstest"
++)
++
++// scrape 抓取 g 的输出并按文本格式严格解析。
++func scrape(t *testing.T, g *metrics.Gateway) map[string]float64 {
++	t.Helper()
++	rec := httptest.NewRecorder()
++	g.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
++	return metricstest.MustParse(t, rec.Body.String())
++}
++
++// instanceErrors 返回各类实例错误的计数（没有出现的类别不在结果中）。
++func instanceErrors(t *testing.T, g *metrics.Gateway) map[string]float64 {
++	t.Helper()
++	const prefix = `forgemesh_gateway_upstream_errors_total{upstream="instance",kind="`
++	errs := make(map[string]float64)
++	for key, value := range scrape(t, g) {
++		if kind, ok := strings.CutPrefix(key, prefix); ok {
++			errs[strings.TrimSuffix(kind, `"}`)] = value
++		}
++	}
++	return errs
++}
++
++func newMeteredProxy(res Resolver, policy AddressPolicy) (*Proxy, *metrics.Gateway) {
++	p := New(res, "X-Tenant-ID", policy, log.New(io.Discard, "", 0))
++	g := metrics.NewGateway()
++	p.SetMetrics(g)
++	return p, g
++}
++
++// TestProxyMetrics_ObservesFirstByteOfSuccessfulStreams 验证首字节时间计到实例第一个响应体
++// 字节写给客户端（不是响应头到达），且只统计 2xx 的流。
++func TestProxyMetrics_ObservesFirstByteOfSuccessfulStreams(t *testing.T) {
++	const delay = 30 * time.Millisecond
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		w.Header().Set("Content-Type", "text/event-stream")
++		w.WriteHeader(http.StatusOK)
++		w.(http.Flusher).Flush()
++		time.Sleep(delay)
++		_, _ = io.WriteString(w, "data: first\n\n")
++	}))
++	defer srv.Close()
++
++	p, g := newMeteredProxy(newFakeResolver([]string{srv.URL}, nil), allowLoopback)
++	p.ServeHTTP(httptest.NewRecorder(), newChatRequest("svc-a"))
++
++	samples := scrape(t, g)
++	count := samples["forgemesh_gateway_stream_first_byte_seconds_count"]
++	sum := samples["forgemesh_gateway_stream_first_byte_seconds_sum"]
++	if count != 1 || sum < delay.Seconds() {
++		t.Fatalf("应记录 1 次不短于 %v 的首字节时间，实际 count=%v sum=%v", delay, count, sum)
++	}
++
++	for _, status := range []int{http.StatusBadRequest, http.StatusInternalServerError} {
++		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++			w.WriteHeader(status)
++			_, _ = io.WriteString(w, `{"error":"bad"}`)
++		}))
++		p, g := newMeteredProxy(newFakeResolver([]string{srv.URL}, nil), allowLoopback)
++		p.ServeHTTP(httptest.NewRecorder(), newChatRequest("svc-a"))
++		srv.Close()
++		if got := scrape(t, g)["forgemesh_gateway_stream_first_byte_seconds_count"]; got != 0 {
++			t.Fatalf("实例返回 %d 时不应记录首字节时间，实际 %v 次", status, got)
++		}
++	}
++}
++
++// TestProxyMetrics_CountsInstanceErrors 验证实例错误按类别计数；4xx 与客户端已断开的请求不计。
++func TestProxyMetrics_CountsInstanceErrors(t *testing.T) {
++	respond := func(status int) string {
++		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++			w.WriteHeader(status)
++			_, _ = io.WriteString(w, "data: x\n\n")
++		}))
++		t.Cleanup(srv.Close)
++		return srv.URL
++	}
++	broken := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		w.Header().Set("Content-Type", "text/event-stream")
++		_, _ = io.WriteString(w, "data: partial\n\n")
++		w.(http.Flusher).Flush()
++		conn, _, err := w.(http.Hijacker).Hijack()
++		if err != nil {
++			t.Errorf("hijack 失败: %v", err)
++			return
++		}
++		conn.Close()
++	}))
++	t.Cleanup(broken.Close)
++
++	cases := map[string]struct {
++		endpoint string
++		policy   AddressPolicy
++		canceled bool
++		want     map[string]float64
++	}{
++		"连接失败":   {endpoint: "http://127.0.0.1:1", policy: allowLoopback, want: map[string]float64{"connect": 1}},
++		"地址不允许":  {endpoint: respond(http.StatusOK), want: map[string]float64{"address_not_allowed": 1}},
++		"地址非法":   {endpoint: "://bad-endpoint", policy: allowLoopback, want: map[string]float64{"invalid_endpoint": 1}},
++		"5xx":    {endpoint: respond(http.StatusServiceUnavailable), policy: allowLoopback, want: map[string]float64{"status": 1}},
++		"流中途中断":  {endpoint: broken.URL, policy: allowLoopback, want: map[string]float64{"body": 1}},
++		"4xx":    {endpoint: respond(http.StatusBadRequest), policy: allowLoopback, want: map[string]float64{}},
++		"客户端已断开": {endpoint: respond(http.StatusOK), policy: allowLoopback, canceled: true, want: map[string]float64{}},
++		"正常":     {endpoint: respond(http.StatusOK), policy: allowLoopback, want: map[string]float64{}},
++	}
++	for name, tc := range cases {
++		t.Run(name, func(t *testing.T) {
++			p, g := newMeteredProxy(newFakeResolver([]string{tc.endpoint}, nil), tc.policy)
++			req := newChatRequest("svc-a")
++			if tc.canceled {
++				ctx, cancel := context.WithCancel(req.Context())
++				cancel()
++				req = req.WithContext(ctx)
++			}
++			p.ServeHTTP(httptest.NewRecorder(), req)
++
++			got := instanceErrors(t, g)
++			if len(got) != len(tc.want) {
++				t.Fatalf("错误计数应为 %v，实际 %v", tc.want, got)
++			}
++			for kind, value := range tc.want {
++				if got[kind] != value {
++					t.Fatalf("错误计数应为 %v，实际 %v", tc.want, got)
++				}
++			}
++		})
++	}
++}
+diff --git a/gateway/internal/stream/proxy.go b/gateway/internal/stream/proxy.go
+index a0f066c..6e43fd9 100644
+--- a/gateway/internal/stream/proxy.go
++++ b/gateway/internal/stream/proxy.go
+@@ -31,6 +31,7 @@ import (
+ 	"sync/atomic"
+ 	"time"
+ 
++	"github.com/Mekoforge/ForgeMesh/gateway/internal/metrics"
+ 	"github.com/Mekoforge/ForgeMesh/gateway/internal/upstream"
+ )
+ 
+@@ -62,6 +63,7 @@ type Proxy struct {
+ 	tenantHeader string
+ 	client       *http.Client
+ 	logger       *log.Logger
++	metrics      *metrics.Gateway
+ 	rr           atomic.Uint64 // 轮询计数器
+ }
+ 
+@@ -105,8 +107,12 @@ func New(resolver Resolver, tenantHeader string, policy AddressPolicy, logger *l
+ 	}
+ }
+ 
++// SetMetrics 设置记录首字节时间与实例错误的指标，须在开始处理请求前调用。
++func (p *Proxy) SetMetrics(m *metrics.Gateway) { p.metrics = m }
++
+ // ServeHTTP 解析 {ns}/{svc} → 选择实例 → 转发单个流式请求。
+ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
++	start := time.Now()
+ 	svc := upstream.ServiceRef{Namespace: r.PathValue("ns"), Name: r.PathValue("svc")}
+ 	if svc.Name == "" {
+ 		writeJSONError(w, http.StatusBadRequest, "MISSING_SERVICE", "路径缺少推理服务名 {svc}")
+@@ -137,16 +143,17 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 		p.logger.Printf("stream invalid endpoint: corr=%s svc=%s endpoint=%q protocol=%q err=%v",
+ 			r.Header.Get("X-Correlation-ID"), svc, endpoint.URL, endpoint.Protocol, err)
+ 		p.resolver.ReportFailure(endpoint.URL)
++		p.metrics.UpstreamError(metrics.UpstreamInstance, metrics.ErrorInvalidEndpoint)
+ 		writeJSONError(w, http.StatusBadGateway, "INVALID_UPSTREAM",
+ 			"实例地址或协议非法: "+endpoint.URL)
+ 		return
+ 	}
+ 
+-	p.forward(w, r, buildUpstreamURL(target, path, r.URL.RawQuery), endpoint.URL)
++	p.forward(w, r, buildUpstreamURL(target, path, r.URL.RawQuery), endpoint.URL, start)
+ }
+ 
+-// forward 执行单次流式转发，并依据结果向 Resolver 上报健康度。
+-func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, upstreamURL, endpoint string) {
++// forward 执行单次流式转发，并依据结果向 Resolver 上报健康度；start 是开始处理请求的时间。
++func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, upstreamURL, endpoint string, start time.Time) {
+ 	// 使用客户端请求的 context：客户端断开时，Go 运行时会取消该 context，
+ 	// 进而取消这里的上游请求，实现“断连即取消上游”。
+ 	ctx := r.Context()
+@@ -174,10 +181,14 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, upstreamURL, end
+ 			r.Header.Get("X-Correlation-ID"), r.URL.Path, endpoint, err)
+ 		p.resolver.ReportFailure(endpoint)
+ 		if errors.Is(err, ErrAddressNotAllowed) {
++			p.metrics.UpstreamError(metrics.UpstreamInstance, metrics.ErrorAddressNotAllowed)
+ 			writeJSONError(w, http.StatusBadGateway, "INSTANCE_ADDRESS_NOT_ALLOWED",
+ 				"实例地址不在允许连接的范围内: "+endpoint)
+ 			return
+ 		}
++		if ctx.Err() == nil {
++			p.metrics.UpstreamError(metrics.UpstreamInstance, metrics.ErrorConnect)
++		}
+ 		http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
+ 		return
+ 	}
+@@ -188,7 +199,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, upstreamURL, end
+ 	upstreamFailed := resp.StatusCode >= 500
+ 	if upstreamFailed {
+ 		p.resolver.ReportFailure(endpoint)
+-
++		p.metrics.UpstreamError(metrics.UpstreamInstance, metrics.ErrorStatus)
+ 	}
+ 
+ 	// 透传上游头，但剔除 hop-by-hop 头，避免连接语义污染。
+@@ -200,7 +211,8 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, upstreamURL, end
+ 		dst[k] = append([]string(nil), vs...)
+ 	}
+ 	// 成功响应强制流式语义；错误响应保留实例的 Content-Type，客户端才能按格式解析错误体。
+-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
++	succeeded := resp.StatusCode >= 200 && resp.StatusCode < 300
++	if succeeded {
+ 		dst.Set("Content-Type", "text/event-stream")
+ 	}
+ 	dst.Set("Cache-Control", "no-cache")
+@@ -215,6 +227,8 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, upstreamURL, end
+ 		flusher.Flush() // 尽早把响应头推给客户端，建立流通道
+ 	}
+ 
++	// 首字节时间只统计成功的流：错误响应体不是推理输出。
++	awaitingFirstByte := succeeded
+ 	buf := make([]byte, readBufferSize)
+ 	for {
+ 		n, readErr := resp.Body.Read(buf)
+@@ -227,6 +241,10 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, upstreamURL, end
+ 			if flusher != nil {
+ 				flusher.Flush()
+ 			}
++			if awaitingFirstByte {
++				awaitingFirstByte = false
++				p.metrics.ObserveFirstByte(time.Since(start))
++			}
+ 		}
+ 		if readErr != nil {
+ 			// 客户端断开导致上游请求被取消：属客户端行为，不计实例健康度。
+@@ -238,6 +256,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, upstreamURL, end
+ 				p.logger.Printf("stream read error: corr=%s path=%s endpoint=%s err=%v",
+ 					r.Header.Get("X-Correlation-ID"), r.URL.Path, endpoint, readErr)
+ 				p.resolver.ReportFailure(endpoint)
++				p.metrics.UpstreamError(metrics.UpstreamInstance, metrics.ErrorBody)
+ 				return
+ 			}
+ 			// 流完整读尽：实例工作正常（5xx 响应已单独计失败，不覆盖）。
+diff --git a/gateway/internal/upstream/client.go b/gateway/internal/upstream/client.go
+index 3e42c04..da335ee 100644
+--- a/gateway/internal/upstream/client.go
++++ b/gateway/internal/upstream/client.go
+@@ -13,6 +13,7 @@ import (
+ 	"net/url"
+ 	"time"
+ 
++	"github.com/Mekoforge/ForgeMesh/gateway/internal/metrics"
+ 	"github.com/Mekoforge/ForgeMesh/gateway/internal/middleware"
+ )
+ 
+@@ -35,6 +36,7 @@ type Client struct {
+ 	proxy             *httputil.ReverseProxy
+ 	correlationHeader string
+ 	tenantHeader      string
++	metrics           *metrics.Gateway
+ }
+ 
+ // New 构造反向代理客户端。
+@@ -76,6 +78,12 @@ func New(target *url.URL, correlationHeader, tenantHeader string, logger *log.Lo
+ 				}
+ 			}
+ 		},
++		ModifyResponse: func(resp *http.Response) error {
++			if resp.StatusCode >= 500 {
++				c.metrics.UpstreamError(metrics.UpstreamControlPlane, metrics.ErrorStatus)
++			}
++			return nil
++		},
+ 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+ 			var tooLarge *http.MaxBytesError
+ 			if errors.As(err, &tooLarge) {
+@@ -83,6 +91,10 @@ func New(target *url.URL, correlationHeader, tenantHeader string, logger *log.Lo
+ 					fmt.Sprintf("request body exceeds %d bytes", tooLarge.Limit))
+ 				return
+ 			}
++			// 客户端已断开时请求随之取消，不是控制平面的问题。
++			if r.Context().Err() == nil {
++				c.metrics.UpstreamError(metrics.UpstreamControlPlane, metrics.ErrorConnect)
++			}
+ 			logger.Printf("upstream proxy error: corr=%s path=%s err=%v", r.Header.Get(c.correlationHeader), r.URL.Path, err)
+ 			http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
+ 		},
+@@ -91,6 +103,9 @@ func New(target *url.URL, correlationHeader, tenantHeader string, logger *log.Lo
+ 	return c
+ }
+ 
++// SetMetrics 设置记录控制平面错误（5xx 响应与连接失败）的指标，须在开始处理请求前调用。
++func (c *Client) SetMetrics(m *metrics.Gateway) { c.metrics = m }
++
+ // ServeHTTP 实现 http.Handler，将请求反代到上游。
+ func (c *Client) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 	c.proxy.ServeHTTP(w, r)
+diff --git a/gateway/internal/upstream/metrics_test.go b/gateway/internal/upstream/metrics_test.go
+new file mode 100644
+index 0000000..975a43d
+--- /dev/null
++++ b/gateway/internal/upstream/metrics_test.go
+@@ -0,0 +1,278 @@
++package upstream
++
++import (
++	"context"
++	"io"
++	"log"
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/Mekoforge/ForgeMesh/gateway/internal/metrics"
++	"github.com/Mekoforge/ForgeMesh/gateway/internal/metrics/metricstest"
++)
++
++// scrape 抓取 g 的输出并按文本格式严格解析。
++func scrape(t *testing.T, g *metrics.Gateway) map[string]float64 {
++	t.Helper()
++	rec := httptest.NewRecorder()
++	g.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
++	return metricstest.MustParse(t, rec.Body.String())
++}
++
++func lookupsKey(result metrics.LookupResult) string {
++	return `forgemesh_gateway_resolver_lookups_total{result="` + string(result) + `"}`
++}
++
++// controlPlaneErrors 返回各类控制平面错误的计数（没有出现的类别不在结果中）。
++func controlPlaneErrors(t *testing.T, g *metrics.Gateway) map[string]float64 {
++	t.Helper()
++	const prefix = `forgemesh_gateway_upstream_errors_total{upstream="control_plane",kind="`
++	errs := make(map[string]float64)
++	for key, value := range scrape(t, g) {
++		if kind, ok := strings.CutPrefix(key, prefix); ok {
++			errs[strings.TrimSuffix(kind, `"}`)] = value
++		}
++	}
++	return errs
++}
++
++// TestResolverMetrics_CountsHitsAndMisses 验证首次解析计 miss、缓存期内计 hit，
++// 缓存的否定结果（服务不存在）同样计 hit。
++func TestResolverMetrics_CountsHitsAndMisses(t *testing.T) {
++	srv, _ := newControlPlane(t, func(w http.ResponseWriter, r *http.Request) {
++		if strings.HasSuffix(r.URL.Path, "/missing") {
++			w.WriteHeader(http.StatusNotFound)
++			return
++		}
++		_, _ = io.WriteString(w, readyBody("Ready", "http://10.0.0.1:8000"))
++	})
++	r := newTestResolver(srv.URL, time.Minute, time.Minute)
++	g := metrics.NewGateway()
++	r.SetMetrics(g)
++
++	for _, svc := range []ServiceRef{svcA, svcA, {Name: "missing"}, {Name: "missing"}, svcA} {
++		_, _ = r.Resolve(context.Background(), svc, "tenant-a")
++	}
++
++	samples := scrape(t, g)
++	want := map[metrics.LookupResult]float64{
++		metrics.LookupMiss: 2, metrics.LookupHit: 3, metrics.LookupCoalesced: 0,
++	}
++	for result, value := range want {
++		if got := samples[lookupsKey(result)]; got != value {
++			t.Errorf("%s = %v，want %v", result, got, value)
++		}
++	}
++}
++
++// TestResolverMetrics_CountsCoalescedLookups 验证并入进行中查询的调用方计 coalesced，
++// 不重复计 miss。
++func TestResolverMetrics_CountsCoalescedLookups(t *testing.T) {
++	srv, calls, release := blockingControlPlane(t)
++	r := newTestResolver(srv.URL, time.Minute, time.Minute)
++	g := metrics.NewGateway()
++	r.SetMetrics(g)
++
++	results := make(chan error, 2)
++	resolve := func() {
++		_, err := r.Resolve(context.Background(), svcA, "tenant-a")
++		results <- err
++	}
++	go resolve()
++	waitForCalls(t, calls, 1)
++	go resolve()
++	deadline := time.Now().Add(2 * time.Second)
++	for scrape(t, g)[lookupsKey(metrics.LookupCoalesced)] != 1 {
++		if time.Now().After(deadline) {
++			t.Fatal("第二个调用方应并入进行中的查询")
++		}
++		time.Sleep(time.Millisecond)
++	}
++	release()
++	for i := 0; i < 2; i++ {
++		if err := <-results; err != nil {
++			t.Fatalf("调用方应成功: %v", err)
++		}
++	}
++
++	samples := scrape(t, g)
++	if miss, hit := samples[lookupsKey(metrics.LookupMiss)], samples[lookupsKey(metrics.LookupHit)]; miss != 1 || hit != 0 {
++		t.Fatalf("应计 1 次 miss、0 次 hit，实际 miss=%v hit=%v", miss, hit)
++	}
++}
++
++// hijackAfter 返回一个先写出 head 再直接关闭连接的处理器（响应体在中途中断）。
++func hijackAfter(t *testing.T, head string) http.HandlerFunc {
++	return func(w http.ResponseWriter, r *http.Request) {
++		conn, _, err := w.(http.Hijacker).Hijack()
++		if err != nil {
++			t.Errorf("hijack 失败: %v", err)
++			return
++		}
++		_, _ = io.WriteString(conn, head)
++		conn.Close()
++	}
++}
++
++// TestResolverMetrics_CountsControlPlaneErrors 验证 Resolver 查询控制平面的错误按类别计数：
++// 连接失败 connect、5xx status、响应体读取或解析失败 body；404 / 403 / 其他 4xx 与未就绪
++// 是正常的否定结果，不计。
++func TestResolverMetrics_CountsControlPlaneErrors(t *testing.T) {
++	cases := map[string]struct {
++		handler http.HandlerFunc
++		want    map[string]float64
++	}{
++		"5xx": {
++			handler: func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusServiceUnavailable) },
++			want:    map[string]float64{"status": 1},
++		},
++		"非法 JSON": {
++			handler: func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "{") },
++			want:    map[string]float64{"body": 1},
++		},
++		"响应体中断": {
++			handler: hijackAfter(t, "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{"),
++			want:    map[string]float64{"body": 1},
++		},
++		"404": {
++			handler: func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNotFound) },
++			want:    map[string]float64{},
++		},
++		"403": {
++			handler: func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusForbidden) },
++			want:    map[string]float64{},
++		},
++		"422": {
++			handler: func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusUnprocessableEntity) },
++			want:    map[string]float64{},
++		},
++		"未就绪": {
++			handler: func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, readyBody("Pending")) },
++			want:    map[string]float64{},
++		},
++	}
++	for name, tc := range cases {
++		t.Run(name, func(t *testing.T) {
++			srv, _ := newControlPlane(t, tc.handler)
++			r := newTestResolver(srv.URL, time.Minute, time.Minute)
++			g := metrics.NewGateway()
++			r.SetMetrics(g)
++			if _, err := r.Resolve(context.Background(), svcA, "tenant-a"); err == nil {
++				t.Fatal("解析应失败")
++			}
++			assertErrors(t, controlPlaneErrors(t, g), tc.want)
++		})
++	}
++
++	t.Run("连接失败", func(t *testing.T) {
++		r := newTestResolver("http://127.0.0.1:1", time.Minute, time.Minute)
++		g := metrics.NewGateway()
++		r.SetMetrics(g)
++		if _, err := r.Resolve(context.Background(), svcA, "tenant-a"); err == nil {
++			t.Fatal("解析应失败")
++		}
++		assertErrors(t, controlPlaneErrors(t, g), map[string]float64{"connect": 1})
++	})
++}
++
++func assertErrors(t *testing.T, got, want map[string]float64) {
++	t.Helper()
++	if len(got) != len(want) {
++		t.Fatalf("错误计数应为 %v，实际 %v", want, got)
++	}
++	for kind, value := range want {
++		if got[kind] != value {
++			t.Fatalf("错误计数应为 %v，实际 %v", want, got)
++		}
++	}
++}
++
++// TestResolver_InstanceStates 验证实例状态只统计未过期的缓存条目中的不同实例 URL，
++// 冷却期内的实例计 unhealthy。
++func TestResolver_InstanceStates(t *testing.T) {
++	srv, _ := newControlPlane(t, func(w http.ResponseWriter, r *http.Request) {
++		if strings.HasSuffix(r.URL.Path, "/svc-b") {
++			_, _ = io.WriteString(w, readyBody("Ready", "http://10.0.0.2:8000", "http://10.0.0.3:8000"))
++			return
++		}
++		_, _ = io.WriteString(w, readyBody("Ready", "http://10.0.0.1:8000", "http://10.0.0.2:8000"))
++	})
++	r := newTestResolver(srv.URL, time.Minute, time.Minute)
++	states := func() [2]int {
++		healthy, unhealthy := r.InstanceStates()
++		return [2]int{healthy, unhealthy}
++	}
++	if got := states(); got != [2]int{0, 0} {
++		t.Fatalf("缓存为空时应为 0/0，实际 %v", got)
++	}
++
++	svcB := ServiceRef{Name: "svc-b"}
++	for _, svc := range []ServiceRef{svcA, svcB} {
++		if _, err := r.Resolve(context.Background(), svc, "tenant-a"); err != nil {
++			t.Fatalf("解析 %s 失败: %v", svc, err)
++		}
++	}
++	if got := states(); got != [2]int{3, 0} {
++		t.Fatalf("两个服务共用的实例只计一次，应为 3/0，实际 %v", got)
++	}
++
++	for i := 0; i < defaultFailureThreshold; i++ {
++		r.ReportFailure("http://10.0.0.2:8000")
++	}
++	if got := states(); got != [2]int{2, 1} {
++		t.Fatalf("摘流的实例应计 unhealthy，应为 2/1，实际 %v", got)
++	}
++
++	r.mu.Lock()
++	entry := r.cache[cacheKey("tenant-a", svcB)]
++	entry.expiry = time.Now().Add(-time.Second)
++	r.cache[cacheKey("tenant-a", svcB)] = entry
++	r.mu.Unlock()
++	if got := states(); got != [2]int{1, 1} {
++		t.Fatalf("过期的缓存条目不应计入，应为 1/1，实际 %v", got)
++	}
++}
++
++// TestClientMetrics_CountsControlPlaneErrors 验证资源接口反代把控制平面 5xx 计 status、
++// 连接失败计 connect；4xx 与客户端已断开的请求不计。
++func TestClientMetrics_CountsControlPlaneErrors(t *testing.T) {
++	status := http.StatusBadGateway
++	cp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		w.WriteHeader(status)
++	}))
++	defer cp.Close()
++	newClient := func(rawURL string) (*Client, *metrics.Gateway) {
++		target, err := url.Parse(rawURL)
++		if err != nil {
++			t.Fatal(err)
++		}
++		c := New(target, "X-Correlation-ID", "X-Tenant-ID", log.New(io.Discard, "", 0))
++		g := metrics.NewGateway()
++		c.SetMetrics(g)
++		return c, g
++	}
++	serve := func(c *Client, ctx context.Context) int {
++		rec := httptest.NewRecorder()
++		c.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/resources", nil).WithContext(ctx))
++		return rec.Code
++	}
++
++	c, g := newClient(cp.URL)
++	serve(c, context.Background())
++	status = http.StatusNotFound
++	serve(c, context.Background())
++	assertErrors(t, controlPlaneErrors(t, g), map[string]float64{"status": 1})
++
++	c, g = newClient("http://127.0.0.1:1")
++	if code := serve(c, context.Background()); code != http.StatusBadGateway {
++		t.Fatalf("控制平面不可达应 502，实际 %d", code)
++	}
++	canceled, cancel := context.WithCancel(context.Background())
++	cancel()
++	serve(c, canceled)
++	assertErrors(t, controlPlaneErrors(t, g), map[string]float64{"connect": 1})
++}
+diff --git a/gateway/internal/upstream/resolver.go b/gateway/internal/upstream/resolver.go
+index 3c6ad00..a09a872 100644
+--- a/gateway/internal/upstream/resolver.go
++++ b/gateway/internal/upstream/resolver.go
+@@ -33,6 +33,8 @@ import (
+ 	"strings"
+ 	"sync"
+ 	"time"
++
++	"github.com/Mekoforge/ForgeMesh/gateway/internal/metrics"
+ )
+ 
+ // 解析失败的哨兵错误，调用方通过 errors.Is 分类转成对应的 HTTP 状态码。
+@@ -167,6 +169,7 @@ type Resolver struct {
+ 	cooldown         time.Duration
+ 	failureThreshold int
+ 	logger           *log.Logger
++	metrics          *metrics.Gateway
+ 
+ 	mu       sync.Mutex
+ 	cache    map[string]cacheEntry      // key: 见 cacheKey
+@@ -206,6 +209,9 @@ func NewResolver(controlPlaneURL string, client *http.Client, ttl, cooldown time
+ 	}
+ }
+ 
++// SetMetrics 设置记录查询结果与控制平面错误的指标，须在开始处理请求前调用。
++func (r *Resolver) SetMetrics(m *metrics.Gateway) { r.metrics = m }
++
+ // Resolve 返回服务的健康实例 endpoint 列表（已过滤冷却期内的实例）。
+ //
+ // 返回哨兵错误：ErrServiceNotFound / ErrNotReady / ErrNoEndpoints /
+@@ -217,10 +223,14 @@ func (r *Resolver) Resolve(ctx context.Context, svc ServiceRef, tenantID string)
+ 	r.mu.Lock()
+ 	if entry, ok := r.cache[key]; ok && time.Now().Before(entry.expiry) {
+ 		defer r.mu.Unlock()
++		r.metrics.ResolverLookup(metrics.LookupHit)
+ 		return r.healthyLocked(entry.endpoints, entry.err, svc, tenantID)
+ 	}
+ 	l, running := r.inflight[key]
+-	if !running {
++	if running {
++		r.metrics.ResolverLookup(metrics.LookupCoalesced)
++	} else {
++		r.metrics.ResolverLookup(metrics.LookupMiss)
+ 		l = &lookup{done: make(chan struct{})}
+ 		r.inflight[key] = l
+ 		// 查询不随发起它的调用方取消：其他等待者与缓存还需要结果。
+@@ -296,6 +306,7 @@ func (r *Resolver) fetch(ctx context.Context, svc ServiceRef, tenantID string) (
+ 
+ 	resp, err := r.client.Do(req)
+ 	if err != nil {
++		r.metrics.UpstreamError(metrics.UpstreamControlPlane, metrics.ErrorConnect)
+ 		return nil, fmt.Errorf("resolver: 查询控制平面失败 (svc=%s): %w", svc, err)
+ 	}
+ 	defer resp.Body.Close()
+@@ -306,16 +317,21 @@ func (r *Resolver) fetch(ctx context.Context, svc ServiceRef, tenantID string) (
+ 	case resp.StatusCode == http.StatusForbidden:
+ 		return nil, fmt.Errorf("%w: svc=%s tenant=%s", ErrForbidden, svc, tenantID)
+ 	case resp.StatusCode < 200 || resp.StatusCode >= 300:
++		if resp.StatusCode >= 500 {
++			r.metrics.UpstreamError(metrics.UpstreamControlPlane, metrics.ErrorStatus)
++		}
+ 		return nil, fmt.Errorf("resolver: 控制平面返回异常状态 %d (svc=%s)", resp.StatusCode, svc)
+ 	}
+ 
+ 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResolveBodySize))
+ 	if err != nil {
++		r.metrics.UpstreamError(metrics.UpstreamControlPlane, metrics.ErrorBody)
+ 		return nil, fmt.Errorf("resolver: 读取控制平面响应失败 (svc=%s): %w", svc, err)
+ 	}
+ 
+ 	var payload inferenceServicePayload
+ 	if err := json.Unmarshal(body, &payload); err != nil {
++		r.metrics.UpstreamError(metrics.UpstreamControlPlane, metrics.ErrorBody)
+ 		return nil, fmt.Errorf("resolver: 解析控制平面响应失败 (svc=%s): %w", svc, err)
+ 	}
+ 
+@@ -369,6 +385,32 @@ func (r *Resolver) ReportSuccess(endpoint string) {
+ 	delete(r.health, endpoint)
+ }
+ 
++// InstanceStates 返回未过期的缓存条目中不同实例 URL 的个数：unhealthy 处于冷却期（被摘流），
++// healthy 为其余实例。
++func (r *Resolver) InstanceStates() (healthy, unhealthy int) {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	now := time.Now()
++	seen := make(map[string]bool)
++	for _, entry := range r.cache {
++		if !now.Before(entry.expiry) {
++			continue
++		}
++		for _, ep := range entry.endpoints {
++			if seen[ep.URL] {
++				continue
++			}
++			seen[ep.URL] = true
++			if h, ok := r.health[ep.URL]; ok && now.Before(h.unhealthyUntil) {
++				unhealthy++
++			} else {
++				healthy++
++			}
++		}
++	}
++	return healthy, unhealthy
++}
++
+ // filterHealthyLocked 过滤冷却期内的 endpoint（调用方须持有 r.mu）。
+ //
+ // 冷却期结束的实例按 half-open 语义放行：清零失败计数，给实例一次
+-- 
+2.43.0
+

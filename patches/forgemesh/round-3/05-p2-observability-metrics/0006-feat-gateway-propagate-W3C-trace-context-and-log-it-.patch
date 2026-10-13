@@ -1,0 +1,1217 @@
+From 7baa099746b1347fc5e5ff2b40136ffd2eae2178 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 13 Oct 2026 03:46:04 +0000
+Subject: [PATCH 06/11] feat(gateway): propagate W3C trace context and log it
+ with the ids
+
+Requests crossing the gateway could only be correlated through the
+correlation id, which inference instances and tracing tools do not
+understand. The gateway now keeps exactly one valid inbound W3C
+traceparent (with its tracestate) or otherwise starts a new unsampled
+trace and drops tracestate. The resulting header is forwarded to the
+control plane, to resolver lookups and to inference instances, so the
+control plane logs and error envelopes carry the same trace id. The
+gateway records no spans, so a valid header is passed on unchanged;
+OTLP export is left as a follow-up.
+
+To make the ids visible where operators look, every /api/v1 request
+now gets one access log line with method, path, status, duration,
+correlation id and trace id. It sits before authentication and rate
+limiting, so rejected requests are logged too, and records 500 when a
+handler panics before writing a response. Gateway error envelopes gain
+an optional traceId, matching the control plane's Error schema.
+
+The stream proxy now writes its errors through middleware.WriteError,
+so they also carry correlationId, and its logs read the correlation id
+from the request context instead of a hard-coded X-Correlation-ID
+header, which was wrong when GATEWAY_CORRELATION_HEADER is customised.
+---
+ gateway/internal/middleware/accesslog.go      |  38 ++++
+ gateway/internal/middleware/accesslog_test.go |  86 ++++++++
+ gateway/internal/middleware/chain_test.go     |   6 +-
+ gateway/internal/middleware/errors.go         |  12 +-
+ gateway/internal/middleware/middleware.go     |   5 +-
+ gateway/internal/middleware/tracecontext.go   | 113 ++++++++++
+ .../internal/middleware/tracecontext_test.go  | 196 ++++++++++++++++++
+ gateway/internal/router/router.go             |  11 +-
+ gateway/internal/router/tracecontext_test.go  | 178 ++++++++++++++++
+ gateway/internal/stream/proxy.go              |  51 ++---
+ gateway/internal/stream/tracecontext_test.go  |  85 ++++++++
+ gateway/internal/upstream/client.go           |   3 +-
+ gateway/internal/upstream/resolver.go         |  11 +-
+ .../internal/upstream/tracecontext_test.go    | 136 ++++++++++++
+ 14 files changed, 884 insertions(+), 47 deletions(-)
+ create mode 100644 gateway/internal/middleware/accesslog.go
+ create mode 100644 gateway/internal/middleware/accesslog_test.go
+ create mode 100644 gateway/internal/middleware/tracecontext.go
+ create mode 100644 gateway/internal/middleware/tracecontext_test.go
+ create mode 100644 gateway/internal/router/tracecontext_test.go
+ create mode 100644 gateway/internal/stream/tracecontext_test.go
+ create mode 100644 gateway/internal/upstream/tracecontext_test.go
+
+diff --git a/gateway/internal/middleware/accesslog.go b/gateway/internal/middleware/accesslog.go
+new file mode 100644
+index 0000000..4d96704
+--- /dev/null
++++ b/gateway/internal/middleware/accesslog.go
+@@ -0,0 +1,38 @@
++package middleware
++
++import (
++	"log"
++	"net/http"
++	"time"
++)
++
++// AccessLog 返回为每个请求输出一行访问日志的中间件，须位于 Correlation 与 TraceContext 之后，
++// 使关联 ID 与 trace-id 出现在同一行：
++//
++//	access method=POST path="/api/v1/inference/svc/chat" status=200 duration=1.5ms corr=… trace=…
++//
++// path 不含查询串；流式请求的 duration 是整个流的时长。处理器 panic 时（由外层 Recovery
++// 兜底）记录 status=500，响应头已写出时记录已写出的状态码。
++func AccessLog(logger *log.Logger) Middleware {
++	if logger == nil {
++		logger = log.Default()
++	}
++	return func(next http.Handler) http.Handler {
++		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++			start := time.Now()
++			sw := &statusWriter{ResponseWriter: w}
++			completed := false
++			defer func() {
++				status := sw.Status()
++				if !completed && sw.status == 0 {
++					status = http.StatusInternalServerError
++				}
++				logger.Printf("access method=%s path=%q status=%d duration=%s corr=%s trace=%s",
++					r.Method, r.URL.Path, status, time.Since(start).Round(time.Microsecond),
++					CorrelationIDFromContext(r.Context()), TraceIDFromContext(r.Context()))
++			}()
++			next.ServeHTTP(sw, r)
++			completed = true
++		})
++	}
++}
+diff --git a/gateway/internal/middleware/accesslog_test.go b/gateway/internal/middleware/accesslog_test.go
+new file mode 100644
+index 0000000..baef14a
+--- /dev/null
++++ b/gateway/internal/middleware/accesslog_test.go
+@@ -0,0 +1,86 @@
++package middleware
++
++import (
++	"bytes"
++	"io"
++	"log"
++	"net/http"
++	"net/http/httptest"
++	"regexp"
++	"strings"
++	"testing"
++)
++
++// serveLogged 经 Correlation → TraceContext → AccessLog 处理 req（外层 Recovery 兜底 panic），
++// 返回响应与访问日志。
++func serveLogged(t *testing.T, h http.Handler, req *http.Request) (*httptest.ResponseRecorder, string) {
++	t.Helper()
++	var buf bytes.Buffer
++	chain := Recovery(log.New(io.Discard, "", 0))(Chain(h,
++		Correlation(DefaultCorrelationHeader),
++		TraceContext(),
++		AccessLog(log.New(&buf, "", 0)),
++	))
++	rec := httptest.NewRecorder()
++	chain.ServeHTTP(rec, req)
++	return rec, buf.String()
++}
++
++// TestAccessLog_LogsRequestWithCorrelationAndTraceIDs 验证每个请求一行访问日志，带方法、路径、
++// 状态码、耗时、关联 ID 与 trace-id。
++func TestAccessLog_LogsRequestWithCorrelationAndTraceIDs(t *testing.T) {
++	req := httptest.NewRequest(http.MethodPost, "/api/v1/workflows?limit=1", nil)
++	req.Header.Set(DefaultCorrelationHeader, "corr-1")
++	req.Header.Set(TraceparentHeader, testTraceparent)
++	_, logged := serveLogged(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		w.WriteHeader(http.StatusCreated)
++	}), req)
++
++	want := regexp.MustCompile(`^access method=POST path="/api/v1/workflows" status=201 ` +
++		`duration=\S+ corr=corr-1 trace=` + testTraceID + "\n$")
++	if !want.MatchString(logged) {
++		t.Fatalf("访问日志不符: %q", logged)
++	}
++}
++
++// TestAccessLog_QuotesThePath 验证路径加引号转义，解码出的换行不会伪造日志行。
++func TestAccessLog_QuotesThePath(t *testing.T) {
++	_, logged := serveLogged(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}),
++		httptest.NewRequest(http.MethodGet, "/api/v1/a%0Aaccess%20method=GET", nil))
++
++	if strings.Count(logged, "\n") != 1 || !strings.Contains(logged, `path="/api/v1/a\naccess method=GET"`) {
++		t.Fatalf("路径应转义且只输出一行: %q", logged)
++	}
++}
++
++// TestAccessLog_LogsPanics 验证处理器 panic 时（Recovery 兜底）仍输出访问日志：响应头未写出时
++// 记 500，已写出时记已写出的状态码。
++func TestAccessLog_LogsPanics(t *testing.T) {
++	cases := map[string]struct {
++		handler http.HandlerFunc
++		want    string
++	}{
++		"响应头未写出": {
++			handler: func(http.ResponseWriter, *http.Request) { panic("boom") },
++			want:    "status=500",
++		},
++		"响应头已写出": {
++			handler: func(w http.ResponseWriter, _ *http.Request) {
++				w.WriteHeader(http.StatusAccepted)
++				panic("boom")
++			},
++			want: "status=202",
++		},
++	}
++	for name, tc := range cases {
++		t.Run(name, func(t *testing.T) {
++			rec, logged := serveLogged(t, tc.handler, httptest.NewRequest(http.MethodGet, "/api/v1/resources", nil))
++			if !strings.Contains(logged, tc.want) || !strings.Contains(logged, " trace=") {
++				t.Fatalf("访问日志应含 %s: %q", tc.want, logged)
++			}
++			if name == "响应头未写出" && rec.Code != http.StatusInternalServerError {
++				t.Fatalf("Recovery 应兜底为 500，实际 %d", rec.Code)
++			}
++		})
++	}
++}
+diff --git a/gateway/internal/middleware/chain_test.go b/gateway/internal/middleware/chain_test.go
+index f7bca9e..67ce6c4 100644
+--- a/gateway/internal/middleware/chain_test.go
++++ b/gateway/internal/middleware/chain_test.go
+@@ -1,8 +1,8 @@
+ // chain_test.go 验证中间件链的组合语义（WP-D1）：
+ //
+-// 链序（与 router.go 实际组装一致，外层 → 内层）：
++// 链序（与 router.go 实际组装一致，外层 → 内层；更外层的 Observe 见 observe_test.go）：
+ //
+-//		Recovery → Correlation → Authz → RateLimit → LimitRequestBody → Route
++//		Recovery → Correlation → TraceContext → AccessLog → Authz → RateLimit → LimitRequestBody → Route
+ //
+ //	  - Correlation 先于 Authz：认证失败的响应也携带关联 ID；
+ //	  - Authz 先于 RateLimit：被拒请求不产生限流副作用（不耗令牌、不误伤）；
+@@ -30,6 +30,8 @@ func newAPIChain(l *Limiter, route http.Handler) http.Handler {
+ 	}
+ 	api := Chain(route,
+ 		Correlation(DefaultCorrelationHeader),
++		TraceContext(),
++		AccessLog(log.New(io.Discard, "", 0)),
+ 		Authz(DefaultTenantHeader),
+ 		RateLimit(l),
+ 		LimitRequestBody(1<<20),
+diff --git a/gateway/internal/middleware/errors.go b/gateway/internal/middleware/errors.go
+index 3d61545..27b296b 100644
+--- a/gateway/internal/middleware/errors.go
++++ b/gateway/internal/middleware/errors.go
+@@ -7,18 +7,24 @@ import (
+ 
+ // WriteError 输出与控制平面一致的错误信封：
+ //
+-//	{"error":{"code":"...","message":"...","correlationId":"..."}}
++//	{"error":{"code":"...","message":"...","correlationId":"...","traceId":"..."}}
+ //
+-// correlationId 取自 Correlation 中间件注入的 context，缺失时省略。
++// correlationId 与 traceId 取自 Correlation 与 TraceContext 中间件注入的 context，缺失时省略。
+ func WriteError(w http.ResponseWriter, r *http.Request, status int, code, message string) {
+ 	type errorBody struct {
+ 		Code          string `json:"code"`
+ 		Message       string `json:"message"`
+ 		CorrelationID string `json:"correlationId,omitempty"`
++		TraceID       string `json:"traceId,omitempty"`
+ 	}
+ 	body := struct {
+ 		Error errorBody `json:"error"`
+-	}{errorBody{Code: code, Message: message, CorrelationID: CorrelationIDFromContext(r.Context())}}
++	}{errorBody{
++		Code:          code,
++		Message:       message,
++		CorrelationID: CorrelationIDFromContext(r.Context()),
++		TraceID:       TraceIDFromContext(r.Context()),
++	}}
+ 
+ 	w.Header().Set("Content-Type", "application/json")
+ 	w.WriteHeader(status)
+diff --git a/gateway/internal/middleware/middleware.go b/gateway/internal/middleware/middleware.go
+index b18cdb5..a8900c0 100644
+--- a/gateway/internal/middleware/middleware.go
++++ b/gateway/internal/middleware/middleware.go
+@@ -2,11 +2,14 @@
+ //
+ // 链的执行顺序（外层 → 内层）：
+ //
+-//	Observe → Recovery → Correlation → Authenticate → RateLimit → LimitRequestBody → Route
++//	Observe → Recovery → Correlation → TraceContext → AccessLog → Authenticate → RateLimit →
++//	LimitRequestBody → Route
+ //
+ // Observe 位于最外层，按路由类别记录请求数与耗时（含 Recovery 兜底返回的 500）；
+ // Recovery 保证任何下游 panic 都能被兜底；
+ // Correlation 尽早生成关联 ID，认证失败的响应也能携带；
++// TraceContext 沿用或生成 traceparent，AccessLog 在它之后，访问日志同时带关联 ID 与 trace-id，
++// 被认证或限流拒绝的请求也有记录；
+ // Authenticate 先于 RateLimit，被拒请求不消耗令牌；
+ // LimitRequestBody 紧挨路由，请求体只在转发时才被读取。
+ package middleware
+diff --git a/gateway/internal/middleware/tracecontext.go b/gateway/internal/middleware/tracecontext.go
+new file mode 100644
+index 0000000..5ffd688
+--- /dev/null
++++ b/gateway/internal/middleware/tracecontext.go
+@@ -0,0 +1,113 @@
++package middleware
++
++import (
++	"context"
++	"fmt"
++	"math/rand/v2"
++	"net/http"
++	"regexp"
++)
++
++// W3C Trace Context（https://www.w3.org/TR/trace-context/）的请求头（HTTP 头大小写不敏感）。
++const (
++	TraceparentHeader = "traceparent"
++	TracestateHeader  = "tracestate"
++)
++
++var traceparentPattern = regexp.MustCompile(`^([0-9a-f]{2})-([0-9a-f]{32})-([0-9a-f]{16})-[0-9a-f]{2}`)
++
++const (
++	traceparentV00Length = 55
++	invalidTraceID       = "00000000000000000000000000000000"
++	invalidParentID      = "0000000000000000"
++)
++
++// randUint64 生成 trace-id 与 parent-id。math/rand/v2 的全局生成器由运行时的 ChaCha8 提供、
++// 按进程随机播种：取值不可预测，且没有 crypto/rand 那样需要处理的出错路径。
++var randUint64 = rand.Uint64
++
++// ParseTraceparent 按 W3C Trace Context 解析 traceparent，返回其中的 trace-id；不合法时返回
++// false。只接受小写十六进制；trace-id / parent-id 全零、版本 ff 都不合法；版本 00 必须恰好
++// 55 个字符，更高的版本按前 55 个字符解析，之后若还有内容须以 "-" 分隔。
++func ParseTraceparent(value string) (traceID string, ok bool) {
++	m := traceparentPattern.FindStringSubmatch(value)
++	if m == nil {
++		return "", false
++	}
++	version, traceID, parentID := m[1], m[2], m[3]
++	wellFormed := len(value) == traceparentV00Length
++	if version != "00" {
++		wellFormed = version != "ff" && (wellFormed || value[traceparentV00Length] == '-')
++	}
++	if !wellFormed || traceID == invalidTraceID || parentID == invalidParentID {
++		return "", false
++	}
++	return traceID, true
++}
++
++// newTraceparent 生成新追踪的 traceparent（版本 00；flags 00 即未采样：网关不记录 span），
++// 返回它与其中的 trace-id。
++func newTraceparent() (traceparent, traceID string) {
++	var high, low, parent uint64
++	for high == 0 && low == 0 {
++		high, low = randUint64(), randUint64()
++	}
++	for parent == 0 {
++		parent = randUint64()
++	}
++	traceID = fmt.Sprintf("%016x%016x", high, low)
++	return fmt.Sprintf("00-%s-%016x-00", traceID, parent), traceID
++}
++
++// traceInfo 是请求的追踪上下文：转发的 traceparent 与其中的 trace-id。
++type traceInfo struct {
++	traceparent string
++	traceID     string
++}
++
++type traceInfoKey struct{}
++
++// TraceContext 返回确定每个请求追踪上下文的中间件（网关不记录 span，也不导出追踪）：
++//
++//   - 请求恰好带一个合法的 traceparent 时原样沿用，tracestate 一并保留；
++//   - 否则（缺失、不合法或多个）开始新的追踪：生成新的 traceparent，丢弃 tracestate；
++//   - 确定的 traceparent 写回请求头，随请求转发给控制平面与推理实例（Resolver 的查询经
++//     TraceparentFromContext 附带），trace-id 注入 context 供日志与错误信封读取。
++//
++// 响应不回写 traceparent：客户端凭响应头中的关联 ID 或错误信封中的 traceId 报障。
++func TraceContext() Middleware {
++	return func(next http.Handler) http.Handler {
++		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++			var info traceInfo
++			if values := r.Header.Values(TraceparentHeader); len(values) == 1 {
++				if traceID, ok := ParseTraceparent(values[0]); ok {
++					info = traceInfo{traceparent: values[0], traceID: traceID}
++				}
++			}
++			if info.traceID == "" {
++				info.traceparent, info.traceID = newTraceparent()
++				r.Header.Set(TraceparentHeader, info.traceparent)
++				r.Header.Del(TracestateHeader)
++			}
++			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), traceInfoKey{}, info)))
++		})
++	}
++}
++
++// TraceIDFromContext 返回请求的 trace-id（32 个小写十六进制字符），缺失时返回空字符串。
++func TraceIDFromContext(ctx context.Context) string {
++	return traceInfoFrom(ctx).traceID
++}
++
++// TraceparentFromContext 返回请求转发的 traceparent，缺失时返回空字符串。
++func TraceparentFromContext(ctx context.Context) string {
++	return traceInfoFrom(ctx).traceparent
++}
++
++func traceInfoFrom(ctx context.Context) traceInfo {
++	if ctx == nil {
++		return traceInfo{}
++	}
++	info, _ := ctx.Value(traceInfoKey{}).(traceInfo)
++	return info
++}
+diff --git a/gateway/internal/middleware/tracecontext_test.go b/gateway/internal/middleware/tracecontext_test.go
+new file mode 100644
+index 0000000..69c66b0
+--- /dev/null
++++ b/gateway/internal/middleware/tracecontext_test.go
+@@ -0,0 +1,196 @@
++package middleware
++
++import (
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++)
++
++const (
++	testTraceID     = "4bf92f3577b34da6a3ce929d0e0e4736"
++	testParentID    = "00f067aa0ba902b7"
++	testTraceparent = "00-" + testTraceID + "-" + testParentID + "-01"
++)
++
++// TestParseTraceparent_AcceptsValidHeaders 验证合法的版本 00 与更高版本（按前 55 个字符解析，
++// 之后的内容以 "-" 分隔）。
++func TestParseTraceparent_AcceptsValidHeaders(t *testing.T) {
++	for _, value := range []string{
++		testTraceparent,
++		"cc-" + testTraceID + "-" + testParentID + "-01",
++		"cc-" + testTraceID + "-" + testParentID + "-01-future-field",
++	} {
++		if traceID, ok := ParseTraceparent(value); !ok || traceID != testTraceID {
++			t.Errorf("ParseTraceparent(%q) = %q, %v，want %q", value, traceID, ok, testTraceID)
++		}
++	}
++}
++
++// TestParseTraceparent_RejectsInvalidHeaders 验证不合法的 traceparent（与控制平面的规则一致）。
++func TestParseTraceparent_RejectsInvalidHeaders(t *testing.T) {
++	for _, value := range []string{
++		"",
++		testTraceparent[:len(testTraceparent)-1],
++		" " + testTraceparent,
++		"00-" + strings.ToUpper(testTraceID) + "-" + testParentID + "-01",
++		"00-" + testTraceID + "-" + strings.ToUpper(testParentID) + "-01",
++		"00-" + testTraceID + "-" + testParentID + "-0A",
++		"00-" + testTraceID[:31] + "g-" + testParentID + "-01",
++		"00_" + testTraceID + "_" + testParentID + "_01",
++		"00-" + strings.Repeat("0", 32) + "-" + testParentID + "-01",
++		"00-" + testTraceID + "-" + strings.Repeat("0", 16) + "-01",
++		"ff-" + testTraceID + "-" + testParentID + "-01",
++		testTraceparent + "-",
++		testTraceparent + "-future",
++		"cc-" + testTraceID + "-" + testParentID + "-01x",
++	} {
++		if traceID, ok := ParseTraceparent(value); ok {
++			t.Errorf("ParseTraceparent(%q) 应不合法，实际得到 %q", value, traceID)
++		}
++	}
++}
++
++// TestNewTraceparent_IsValidUnsampledAndDistinct 验证生成的 traceparent 合法、版本 00、
++// 未采样，且每次不同。
++func TestNewTraceparent_IsValidUnsampledAndDistinct(t *testing.T) {
++	first, firstID := newTraceparent()
++	second, secondID := newTraceparent()
++
++	if traceID, ok := ParseTraceparent(first); !ok || traceID != firstID {
++		t.Fatalf("生成的 traceparent %q 应合法且 trace-id 为 %q", first, firstID)
++	}
++	if !strings.HasPrefix(first, "00-") || !strings.HasSuffix(first, "-00") {
++		t.Fatalf("应为版本 00、flags 00，实际 %q", first)
++	}
++	if firstID == secondID || first[36:52] == second[36:52] {
++		t.Fatalf("两次生成的 trace-id 与 parent-id 应不同: %q / %q", first, second)
++	}
++}
++
++// TestNewTraceparent_NeverUsesAllZeroIDs 验证随机数全为零时重新生成 trace-id 与 parent-id。
++func TestNewTraceparent_NeverUsesAllZeroIDs(t *testing.T) {
++	values := []uint64{0, 0, 0, 2, 0, 3}
++	original := randUint64
++	t.Cleanup(func() { randUint64 = original })
++	randUint64 = func() uint64 {
++		v := values[0]
++		values = values[1:]
++		return v
++	}
++
++	traceparent, traceID := newTraceparent()
++	if want := "00-00000000000000000000000000000002-0000000000000003-00"; traceparent != want {
++		t.Fatalf("traceparent 应为 %q，实际 %q", want, traceparent)
++	}
++	if traceID != "00000000000000000000000000000002" {
++		t.Fatalf("trace-id 不符: %q", traceID)
++	}
++}
++
++// captureTrace 经 TraceContext 处理 req，返回下游看到的请求。
++func captureTrace(t *testing.T, req *http.Request) *http.Request {
++	t.Helper()
++	var seen *http.Request
++	TraceContext()(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) { seen = r })).
++		ServeHTTP(httptest.NewRecorder(), req)
++	if seen == nil {
++		t.Fatal("下游处理器应被调用")
++	}
++	return seen
++}
++
++// TestTraceContext_KeepsSingleValidTraceparent 验证恰好一个合法的 traceparent 原样沿用，
++// tracestate 一并保留。
++func TestTraceContext_KeepsSingleValidTraceparent(t *testing.T) {
++	req := httptest.NewRequest(http.MethodGet, "/api/v1/resources", nil)
++	req.Header.Set(TraceparentHeader, testTraceparent)
++	req.Header.Set(TracestateHeader, "vendor=opaque")
++
++	seen := captureTrace(t, req)
++	if got := seen.Header.Values(TraceparentHeader); len(got) != 1 || got[0] != testTraceparent {
++		t.Fatalf("traceparent 应原样转发，实际 %v", got)
++	}
++	if got := seen.Header.Get(TracestateHeader); got != "vendor=opaque" {
++		t.Fatalf("tracestate 应保留，实际 %q", got)
++	}
++	if got := TraceIDFromContext(seen.Context()); got != testTraceID {
++		t.Fatalf("context 中的 trace-id 应为 %q，实际 %q", testTraceID, got)
++	}
++	if got := TraceparentFromContext(seen.Context()); got != testTraceparent {
++		t.Fatalf("context 中的 traceparent 应为 %q，实际 %q", testTraceparent, got)
++	}
++}
++
++// TestTraceContext_StartsNewTraceOtherwise 验证缺失、不合法或多个 traceparent 时开始新的追踪：
++// 转发恰好一个新生成的 traceparent，丢弃 tracestate。
++func TestTraceContext_StartsNewTraceOtherwise(t *testing.T) {
++	cases := map[string][]string{
++		"缺失":  nil,
++		"不合法": {"00-" + strings.Repeat("0", 32) + "-" + testParentID + "-01"},
++		"多个":  {testTraceparent, testTraceparent},
++	}
++	for name, inbound := range cases {
++		t.Run(name, func(t *testing.T) {
++			req := httptest.NewRequest(http.MethodGet, "/api/v1/resources", nil)
++			for _, value := range inbound {
++				req.Header.Add(TraceparentHeader, value)
++			}
++			req.Header.Set(TracestateHeader, "vendor=opaque")
++
++			seen := captureTrace(t, req)
++			got := seen.Header.Values(TraceparentHeader)
++			if len(got) != 1 {
++				t.Fatalf("应转发恰好一个 traceparent，实际 %v", got)
++			}
++			traceID, ok := ParseTraceparent(got[0])
++			if !ok || traceID == testTraceID {
++				t.Fatalf("应转发新生成的合法 traceparent，实际 %q", got[0])
++			}
++			if TraceIDFromContext(seen.Context()) != traceID || TraceparentFromContext(seen.Context()) != got[0] {
++				t.Fatal("context 中的追踪上下文应与转发的 traceparent 一致")
++			}
++			if _, present := seen.Header[http.CanonicalHeaderKey(TracestateHeader)]; present {
++				t.Fatal("开始新的追踪时应丢弃 tracestate")
++			}
++		})
++	}
++}
++
++// TestWriteError_IncludesCorrelationAndTraceIDs 验证错误信封带上 context 中的关联 ID 与
++// trace-id，没有时省略这两个字段。
++func TestWriteError_IncludesCorrelationAndTraceIDs(t *testing.T) {
++	decode := func(rec *httptest.ResponseRecorder) map[string]any {
++		var body struct {
++			Error map[string]any `json:"error"`
++		}
++		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
++			t.Fatalf("错误信封不是 JSON: %v", err)
++		}
++		return body.Error
++	}
++	writeUnauthorized := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		WriteError(w, r, http.StatusUnauthorized, "UNAUTHORIZED", "missing credentials")
++	})
++
++	rec := httptest.NewRecorder()
++	req := httptest.NewRequest(http.MethodGet, "/api/v1/resources", nil)
++	req.Header.Set(DefaultCorrelationHeader, "corr-1")
++	req.Header.Set(TraceparentHeader, testTraceparent)
++	Chain(writeUnauthorized, Correlation(DefaultCorrelationHeader), TraceContext()).ServeHTTP(rec, req)
++	body := decode(rec)
++	if body["correlationId"] != "corr-1" || body["traceId"] != testTraceID {
++		t.Fatalf("错误信封应带关联 ID 与 trace-id，实际 %v", body)
++	}
++
++	rec = httptest.NewRecorder()
++	writeUnauthorized.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/resources", nil))
++	body = decode(rec)
++	if _, ok := body["correlationId"]; ok {
++		t.Fatalf("没有关联 ID 时应省略 correlationId，实际 %v", body)
++	}
++	if _, ok := body["traceId"]; ok {
++		t.Fatalf("没有追踪上下文时应省略 traceId，实际 %v", body)
++	}
++}
+diff --git a/gateway/internal/router/router.go b/gateway/internal/router/router.go
+index ea08f9c..1a4a854 100644
+--- a/gateway/internal/router/router.go
++++ b/gateway/internal/router/router.go
+@@ -16,10 +16,10 @@
+ //	                                          路径；要求 read 作用域）
+ //	ANY  /api/v1/inference/{svc}/chat          同上，用于不带命名空间的服务
+ //
+-// 中间件链（执行顺序）：Observe → Recovery → Correlation → Authenticate → RateLimit →
+-// LimitRequestBody → Route。
++// 中间件链（执行顺序）：Observe → Recovery → Correlation → TraceContext → AccessLog →
++// Authenticate → RateLimit → LimitRequestBody → Route。
+ // Observe 与 Recovery 包住全量请求（Observe 按路由类别记录请求数与耗时，Recovery 兜底
+-// panic）；探针与 /metrics 刻意不经过认证/限流，保证健康检查与抓取可用。
++// panic）；探针与 /metrics 刻意不经过认证/限流（也不写访问日志），保证健康检查与抓取可用。
+ // 认证模式见 config.AuthModeAPIKey / config.AuthModeDev 与 ADR-014。
+ package router
+ 
+@@ -118,10 +118,13 @@ func New(cfg config.Config, logger *log.Logger) (*Router, error) {
+ 		maxBody = config.DefaultMaxRequestBodyBytes
+ 	}
+ 
+-	// API 中间件链：Correlation → Authenticate → RateLimit → LimitRequestBody。
++	// API 中间件链：Correlation → TraceContext → AccessLog → Authenticate → RateLimit →
++	// LimitRequestBody。
+ 	limiter := middleware.NewRateLimiter(cfg.RateLimitRPS, cfg.RateLimitBurst)
+ 	apiHandler := middleware.Chain(apiMux,
+ 		middleware.Correlation(cfg.CorrelationHeader),
++		middleware.TraceContext(),
++		middleware.AccessLog(logger),
+ 		middleware.Authenticate(authn, cfg.TenantHeader),
+ 		middleware.RateLimit(limiter),
+ 		middleware.LimitRequestBody(maxBody),
+diff --git a/gateway/internal/router/tracecontext_test.go b/gateway/internal/router/tracecontext_test.go
+new file mode 100644
+index 0000000..6b11c13
+--- /dev/null
++++ b/gateway/internal/router/tracecontext_test.go
+@@ -0,0 +1,178 @@
++// tracecontext_test.go 从网关入口验证追踪上下文：
++//
++//   - 合法的 traceparent 原样转发给控制平面（资源接口反代与 Resolver 查询）与推理实例；
++//   - 缺失时由网关生成，控制平面收到的与访问日志中的 trace-id 一致；
++//   - 网关自己返回的错误信封带关联 ID 与 trace-id。
++package router
++
++import (
++	"bytes"
++	"encoding/json"
++	"io"
++	"log"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync"
++	"testing"
++
++	"github.com/Mekoforge/ForgeMesh/gateway/internal/middleware"
++)
++
++const (
++	testTraceID     = "4bf92f3577b34da6a3ce929d0e0e4736"
++	testTraceparent = "00-" + testTraceID + "-00f067aa0ba902b7-01"
++)
++
++// syncBuffer 是可并发写入的日志缓冲。
++type syncBuffer struct {
++	mu  sync.Mutex
++	buf bytes.Buffer
++}
++
++func (b *syncBuffer) Write(p []byte) (int, error) {
++	b.mu.Lock()
++	defer b.mu.Unlock()
++	return b.buf.Write(p)
++}
++
++func (b *syncBuffer) String() string {
++	b.mu.Lock()
++	defer b.mu.Unlock()
++	return b.buf.String()
++}
++
++// traceEnv 是假控制平面 + 假推理实例（apikey 模式），记录各自收到的 traceparent。
++type traceEnv struct {
++	router *Router
++	logs   syncBuffer
++
++	mu   sync.Mutex
++	seen map[string][]string // "cp <path>" / "instance" → 收到的 traceparent
++}
++
++func newTraceEnv(t *testing.T) *traceEnv {
++	t.Helper()
++	env := &traceEnv{seen: make(map[string][]string)}
++	instance := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		env.record("instance", r)
++		_, _ = io.WriteString(w, "data: ok\n\n")
++	}))
++	t.Cleanup(instance.Close)
++	cp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		env.record("cp "+r.URL.Path, r)
++		w.Header().Set("Content-Type", "application/json")
++		_, _ = io.WriteString(w, readyEndpointsJSON("Ready", []string{instance.URL}))
++	}))
++	t.Cleanup(cp.Close)
++	r, err := New(apiKeyConfig(t, cp.URL), log.New(&env.logs, "", 0))
++	if err != nil {
++		t.Fatalf("New 失败: %v", err)
++	}
++	env.router = r
++	return env
++}
++
++func (e *traceEnv) record(who string, r *http.Request) {
++	e.mu.Lock()
++	defer e.mu.Unlock()
++	e.seen[who] = append(e.seen[who], r.Header.Values(middleware.TraceparentHeader)...)
++}
++
++func (e *traceEnv) received(who string) []string {
++	e.mu.Lock()
++	defer e.mu.Unlock()
++	return e.seen[who]
++}
++
++func (e *traceEnv) do(method, path string, headers map[string]string) *httptest.ResponseRecorder {
++	rec := httptest.NewRecorder()
++	req := httptest.NewRequest(method, path, nil)
++	for k, v := range headers {
++		req.Header.Set(k, v)
++	}
++	e.router.ServeHTTP(rec, req)
++	return rec
++}
++
++// TestTraceContext_ForwardsInboundTraceparent 验证推理请求的 traceparent 原样带给 Resolver 对
++// 控制平面的查询与推理实例，访问日志带关联 ID 与 trace-id。
++func TestTraceContext_ForwardsInboundTraceparent(t *testing.T) {
++	env := newTraceEnv(t)
++	rec := env.do(http.MethodPost, "/api/v1/inference/svc-a/chat", map[string]string{
++		"Authorization":              "Bearer " + routerKeyTenantA,
++		"X-Correlation-ID":           "corr-1",
++		middleware.TraceparentHeader: testTraceparent,
++	})
++	if rec.Code != http.StatusOK {
++		t.Fatalf("推理请求应 200，实际 %d（%s）", rec.Code, rec.Body.String())
++	}
++
++	for _, who := range []string{"cp /api/v1/inference-services/svc-a", "instance"} {
++		if got := env.received(who); len(got) != 1 || got[0] != testTraceparent {
++			t.Errorf("%s 应收到原样的 traceparent，实际 %v", who, got)
++		}
++	}
++	want := `access method=POST path="/api/v1/inference/svc-a/chat" status=200 `
++	if logs := env.logs.String(); !strings.Contains(logs, want) ||
++		!strings.Contains(logs, "corr=corr-1 trace="+testTraceID+"\n") {
++		t.Fatalf("访问日志应带关联 ID 与 trace-id，实际 %q", logs)
++	}
++}
++
++// TestTraceContext_GeneratesTraceparentWhenMissing 验证请求没有 traceparent 时由网关生成，
++// 控制平面收到的 trace-id 与访问日志、响应的关联 ID 对得上。
++func TestTraceContext_GeneratesTraceparentWhenMissing(t *testing.T) {
++	env := newTraceEnv(t)
++	rec := env.do(http.MethodGet, "/api/v1/inference-services", map[string]string{
++		"Authorization": "Bearer " + routerKeyTenantA,
++	})
++	if rec.Code != http.StatusOK {
++		t.Fatalf("资源请求应 200，实际 %d", rec.Code)
++	}
++
++	got := env.received("cp /api/v1/inference-services")
++	if len(got) != 1 {
++		t.Fatalf("控制平面应收到恰好一个 traceparent，实际 %v", got)
++	}
++	traceID, ok := middleware.ParseTraceparent(got[0])
++	if !ok {
++		t.Fatalf("网关生成的 traceparent 不合法: %q", got[0])
++	}
++	corr := rec.Header().Get("X-Correlation-ID")
++	if want := "corr=" + corr + " trace=" + traceID + "\n"; corr == "" || !strings.Contains(env.logs.String(), want) {
++		t.Fatalf("访问日志应含 %q，实际 %q", want, env.logs.String())
++	}
++}
++
++// TestTraceContext_GatewayErrorsCarryIDs 验证网关自己返回的错误信封（认证失败）带关联 ID 与
++// trace-id，与访问日志一致。
++func TestTraceContext_GatewayErrorsCarryIDs(t *testing.T) {
++	env := newTraceEnv(t)
++	rec := env.do(http.MethodGet, "/api/v1/resources", map[string]string{
++		middleware.TraceparentHeader: testTraceparent,
++	})
++	if rec.Code != http.StatusUnauthorized {
++		t.Fatalf("没有凭证应 401，实际 %d", rec.Code)
++	}
++
++	var body struct {
++		Error struct {
++			CorrelationID string `json:"correlationId"`
++			TraceID       string `json:"traceId"`
++		} `json:"error"`
++	}
++	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
++		t.Fatalf("错误信封不是 JSON: %v", err)
++	}
++	corr := rec.Header().Get("X-Correlation-ID")
++	if body.Error.CorrelationID == "" || body.Error.CorrelationID != corr || body.Error.TraceID != testTraceID {
++		t.Fatalf("错误信封应带关联 ID %q 与 trace-id，实际 %+v", corr, body.Error)
++	}
++	if want := "status=401 "; !strings.Contains(env.logs.String(), want) {
++		t.Fatalf("被拒绝的请求也应有访问日志，实际 %q", env.logs.String())
++	}
++	if len(env.received("cp /api/v1/resources")) != 0 {
++		t.Fatal("被拒绝的请求不应触达控制平面")
++	}
++}
+diff --git a/gateway/internal/stream/proxy.go b/gateway/internal/stream/proxy.go
+index 6e43fd9..111153f 100644
+--- a/gateway/internal/stream/proxy.go
++++ b/gateway/internal/stream/proxy.go
+@@ -19,7 +19,6 @@ package stream
+ 
+ import (
+ 	"context"
+-	"encoding/json"
+ 	"errors"
+ 	"fmt"
+ 	"io"
+@@ -32,6 +31,7 @@ import (
+ 	"time"
+ 
+ 	"github.com/Mekoforge/ForgeMesh/gateway/internal/metrics"
++	"github.com/Mekoforge/ForgeMesh/gateway/internal/middleware"
+ 	"github.com/Mekoforge/ForgeMesh/gateway/internal/upstream"
+ )
+ 
+@@ -115,7 +115,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 	start := time.Now()
+ 	svc := upstream.ServiceRef{Namespace: r.PathValue("ns"), Name: r.PathValue("svc")}
+ 	if svc.Name == "" {
+-		writeJSONError(w, http.StatusBadRequest, "MISSING_SERVICE", "路径缺少推理服务名 {svc}")
++		middleware.WriteError(w, r, http.StatusBadRequest, "MISSING_SERVICE", "路径缺少推理服务名 {svc}")
+ 		return
+ 	}
+ 	tenantID := r.Header.Get(p.tenantHeader)
+@@ -123,14 +123,15 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 	resolveCtx := upstream.WithAuthorization(r.Context(), r.Header.Get("Authorization"))
+ 	endpoints, err := p.resolver.Resolve(resolveCtx, svc, tenantID)
+ 	if err != nil {
+-		p.logger.Printf("stream resolve error: corr=%s svc=%s tenant=%s err=%v",
+-			r.Header.Get("X-Correlation-ID"), svc, tenantID, err)
++		p.logger.Printf("stream resolve error: corr=%s trace=%s svc=%s tenant=%s err=%v",
++			middleware.CorrelationIDFromContext(r.Context()), middleware.TraceIDFromContext(r.Context()),
++			svc, tenantID, err)
+ 		status, code := classifyResolveError(err)
+-		writeJSONError(w, status, code, err.Error())
++		middleware.WriteError(w, r, status, code, err.Error())
+ 		return
+ 	}
+ 	if len(endpoints) == 0 {
+-		writeJSONError(w, http.StatusServiceUnavailable, "NO_HEALTHY_UPSTREAM",
++		middleware.WriteError(w, r, http.StatusServiceUnavailable, "NO_HEALTHY_UPSTREAM",
+ 			"推理服务 "+svc.String()+" 当前没有可用实例")
+ 		return
+ 	}
+@@ -140,11 +141,12 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 	target, err := url.Parse(endpoint.URL)
+ 	path, known := endpoint.Protocol.Path()
+ 	if err != nil || target.Scheme == "" || target.Host == "" || !known {
+-		p.logger.Printf("stream invalid endpoint: corr=%s svc=%s endpoint=%q protocol=%q err=%v",
+-			r.Header.Get("X-Correlation-ID"), svc, endpoint.URL, endpoint.Protocol, err)
++		p.logger.Printf("stream invalid endpoint: corr=%s trace=%s svc=%s endpoint=%q protocol=%q err=%v",
++			middleware.CorrelationIDFromContext(r.Context()), middleware.TraceIDFromContext(r.Context()),
++			svc, endpoint.URL, endpoint.Protocol, err)
+ 		p.resolver.ReportFailure(endpoint.URL)
+ 		p.metrics.UpstreamError(metrics.UpstreamInstance, metrics.ErrorInvalidEndpoint)
+-		writeJSONError(w, http.StatusBadGateway, "INVALID_UPSTREAM",
++		middleware.WriteError(w, r, http.StatusBadGateway, "INVALID_UPSTREAM",
+ 			"实例地址或协议非法: "+endpoint.URL)
+ 		return
+ 	}
+@@ -173,16 +175,16 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, upstreamURL, end
+ 	if err != nil {
+ 		var tooLarge *http.MaxBytesError
+ 		if errors.As(err, &tooLarge) {
+-			writeJSONError(w, http.StatusRequestEntityTooLarge, "REQUEST_TOO_LARGE",
++			middleware.WriteError(w, r, http.StatusRequestEntityTooLarge, "REQUEST_TOO_LARGE",
+ 				fmt.Sprintf("请求体超过 %d 字节", tooLarge.Limit))
+ 			return
+ 		}
+-		p.logger.Printf("stream upstream error: corr=%s path=%s endpoint=%s err=%v",
+-			r.Header.Get("X-Correlation-ID"), r.URL.Path, endpoint, err)
++		p.logger.Printf("stream upstream error: corr=%s trace=%s path=%s endpoint=%s err=%v",
++			middleware.CorrelationIDFromContext(ctx), middleware.TraceIDFromContext(ctx), r.URL.Path, endpoint, err)
+ 		p.resolver.ReportFailure(endpoint)
+ 		if errors.Is(err, ErrAddressNotAllowed) {
+ 			p.metrics.UpstreamError(metrics.UpstreamInstance, metrics.ErrorAddressNotAllowed)
+-			writeJSONError(w, http.StatusBadGateway, "INSTANCE_ADDRESS_NOT_ALLOWED",
++			middleware.WriteError(w, r, http.StatusBadGateway, "INSTANCE_ADDRESS_NOT_ALLOWED",
+ 				"实例地址不在允许连接的范围内: "+endpoint)
+ 			return
+ 		}
+@@ -253,8 +255,9 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, upstreamURL, end
+ 			}
+ 			if readErr != io.EOF {
+ 				// 上游流中途异常终止：计一次实例失败。
+-				p.logger.Printf("stream read error: corr=%s path=%s endpoint=%s err=%v",
+-					r.Header.Get("X-Correlation-ID"), r.URL.Path, endpoint, readErr)
++				p.logger.Printf("stream read error: corr=%s trace=%s path=%s endpoint=%s err=%v",
++					middleware.CorrelationIDFromContext(ctx), middleware.TraceIDFromContext(ctx),
++					r.URL.Path, endpoint, readErr)
+ 				p.resolver.ReportFailure(endpoint)
+ 				p.metrics.UpstreamError(metrics.UpstreamInstance, metrics.ErrorBody)
+ 				return
+@@ -288,24 +291,6 @@ func classifyResolveError(err error) (int, string) {
+ 	}
+ }
+ 
+-// writeJSONError 输出与控制平面错误信封风格对齐的 JSON 错误体：
+-//
+-//	{"error":{"code":"...","message":"..."}}
+-func writeJSONError(w http.ResponseWriter, status int, code, message string) {
+-	w.Header().Set("Content-Type", "application/json")
+-	w.WriteHeader(status)
+-	body := struct {
+-		Error struct {
+-			Code    string `json:"code"`
+-			Message string `json:"message"`
+-		} `json:"error"`
+-	}{}
+-	body.Error.Code = code
+-	body.Error.Message = message
+-	// 序列化失败只可能源于内部构造，忽略并保留已写出的状态码。
+-	_ = json.NewEncoder(w).Encode(body)
+-}
+-
+ // buildUpstreamURL 拼接实例基路径与协议的推理路径（避免出现双斜杠），并带上查询串。
+ func buildUpstreamURL(base *url.URL, path, rawQuery string) string {
+ 	u := *base
+diff --git a/gateway/internal/stream/tracecontext_test.go b/gateway/internal/stream/tracecontext_test.go
+new file mode 100644
+index 0000000..f508e78
+--- /dev/null
++++ b/gateway/internal/stream/tracecontext_test.go
+@@ -0,0 +1,85 @@
++package stream
++
++import (
++	"bytes"
++	"encoding/json"
++	"io"
++	"log"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync"
++	"testing"
++
++	"github.com/Mekoforge/ForgeMesh/gateway/internal/middleware"
++	"github.com/Mekoforge/ForgeMesh/gateway/internal/upstream"
++)
++
++const (
++	testTraceID     = "4bf92f3577b34da6a3ce929d0e0e4736"
++	testTraceparent = "00-" + testTraceID + "-00f067aa0ba902b7-01"
++)
++
++// TestProxy_ForwardsTraceHeadersToInstance 验证 traceparent 与 tracestate 随推理请求转发给实例。
++func TestProxy_ForwardsTraceHeadersToInstance(t *testing.T) {
++	var mu sync.Mutex
++	var got http.Header
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		mu.Lock()
++		got = r.Header.Clone()
++		mu.Unlock()
++		_, _ = io.WriteString(w, "data: ok\n\n")
++	}))
++	defer srv.Close()
++
++	req := newChatRequest("svc-a")
++	req.Header.Set(middleware.TraceparentHeader, testTraceparent)
++	req.Header.Set(middleware.TracestateHeader, "vendor=opaque")
++	New(newFakeResolver([]string{srv.URL}, nil), "X-Tenant-ID", allowLoopback, nil).
++		ServeHTTP(httptest.NewRecorder(), req)
++
++	mu.Lock()
++	defer mu.Unlock()
++	if tp := got.Get(middleware.TraceparentHeader); tp != testTraceparent {
++		t.Fatalf("traceparent 应转发给实例，实际 %q", tp)
++	}
++	if ts := got.Get(middleware.TracestateHeader); ts != "vendor=opaque" {
++		t.Fatalf("tracestate 应转发给实例，实际 %q", ts)
++	}
++}
++
++// TestProxy_ErrorsCarryCorrelationAndTraceIDs 验证代理自己返回的错误信封与错误日志带关联 ID
++// 与 trace-id（关联 ID 取自 context，自定义的关联 ID 请求头同样适用）。
++func TestProxy_ErrorsCarryCorrelationAndTraceIDs(t *testing.T) {
++	var logs bytes.Buffer
++	proxy := New(newFakeResolver(nil, upstream.ErrServiceNotFound), "X-Tenant-ID", allowLoopback,
++		log.New(&logs, "", 0))
++	h := middleware.Chain(proxy, middleware.Correlation("X-Request-ID"), middleware.TraceContext())
++
++	req := newChatRequest("svc-a")
++	req.Header.Set("X-Request-ID", "corr-1")
++	req.Header.Set(middleware.TraceparentHeader, testTraceparent)
++	rec := httptest.NewRecorder()
++	h.ServeHTTP(rec, req)
++
++	if rec.Code != http.StatusServiceUnavailable {
++		t.Fatalf("服务不存在应 503，实际 %d", rec.Code)
++	}
++	var body struct {
++		Error struct {
++			Code          string `json:"code"`
++			CorrelationID string `json:"correlationId"`
++			TraceID       string `json:"traceId"`
++		} `json:"error"`
++	}
++	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
++		t.Fatalf("错误信封不是 JSON: %v", err)
++	}
++	if body.Error.Code != "NO_HEALTHY_UPSTREAM" || body.Error.CorrelationID != "corr-1" ||
++		body.Error.TraceID != testTraceID {
++		t.Fatalf("错误信封应带错误码、关联 ID 与 trace-id，实际 %+v", body.Error)
++	}
++	if want := "corr=corr-1 trace=" + testTraceID; !strings.Contains(logs.String(), want) {
++		t.Fatalf("错误日志应含 %q，实际 %q", want, logs.String())
++	}
++}
+diff --git a/gateway/internal/upstream/client.go b/gateway/internal/upstream/client.go
+index da335ee..3acb4c8 100644
+--- a/gateway/internal/upstream/client.go
++++ b/gateway/internal/upstream/client.go
+@@ -95,7 +95,8 @@ func New(target *url.URL, correlationHeader, tenantHeader string, logger *log.Lo
+ 			if r.Context().Err() == nil {
+ 				c.metrics.UpstreamError(metrics.UpstreamControlPlane, metrics.ErrorConnect)
+ 			}
+-			logger.Printf("upstream proxy error: corr=%s path=%s err=%v", r.Header.Get(c.correlationHeader), r.URL.Path, err)
++			logger.Printf("upstream proxy error: corr=%s trace=%s path=%s err=%v", r.Header.Get(c.correlationHeader),
++				middleware.TraceIDFromContext(r.Context()), r.URL.Path, err)
+ 			http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
+ 		},
+ 	}
+diff --git a/gateway/internal/upstream/resolver.go b/gateway/internal/upstream/resolver.go
+index a09a872..afe5db6 100644
+--- a/gateway/internal/upstream/resolver.go
++++ b/gateway/internal/upstream/resolver.go
+@@ -2,7 +2,8 @@
+ //
+ // 数据源：控制平面 GET /api/v1/inference-services/{svc}[?namespace={ns}]（携带
+ // X-Tenant-Id 与调用方的 Authorization，控制平面据此独立校验调用方，见
+-// WithAuthorization），从响应 status.endpoints[] 取就绪实例的地址与协议
++// WithAuthorization；并携带 middleware.TraceContext 确定的 traceparent），
++// 从响应 status.endpoints[] 取就绪实例的地址与协议
+ // （如 {"url": "http://10.0.0.1:8000", "protocol": "openai-chat"}）。
+ //
+ // 设计要点：
+@@ -35,6 +36,7 @@ import (
+ 	"time"
+ 
+ 	"github.com/Mekoforge/ForgeMesh/gateway/internal/metrics"
++	"github.com/Mekoforge/ForgeMesh/gateway/internal/middleware"
+ )
+ 
+ // 解析失败的哨兵错误，调用方通过 errors.Is 分类转成对应的 HTTP 状态码。
+@@ -146,8 +148,8 @@ type cacheEntry struct {
+ }
+ 
+ // lookup 是一次进行中的控制平面查询，同一个缓存 key 的并发未命中共用它；
+-// done 关闭之后 endpoints / err 只读。查询使用发起者的凭证，等待者共用结果与共用
+-// 缓存的语义相同：网关已对每个调用方校验过凭证、租户与 read scope。
++// done 关闭之后 endpoints / err 只读。查询使用发起者的凭证（与 traceparent），等待者共用
++// 结果与共用缓存的语义相同：网关已对每个调用方校验过凭证、租户与 read scope。
+ type lookup struct {
+ 	done      chan struct{}
+ 	endpoints []Endpoint
+@@ -303,6 +305,9 @@ func (r *Resolver) fetch(ctx context.Context, svc ServiceRef, tenantID string) (
+ 	if auth, _ := ctx.Value(authorizationKey{}).(string); auth != "" {
+ 		req.Header.Set("Authorization", auth)
+ 	}
++	if traceparent := middleware.TraceparentFromContext(ctx); traceparent != "" {
++		req.Header.Set(middleware.TraceparentHeader, traceparent)
++	}
+ 
+ 	resp, err := r.client.Do(req)
+ 	if err != nil {
+diff --git a/gateway/internal/upstream/tracecontext_test.go b/gateway/internal/upstream/tracecontext_test.go
+new file mode 100644
+index 0000000..1fc0059
+--- /dev/null
++++ b/gateway/internal/upstream/tracecontext_test.go
+@@ -0,0 +1,136 @@
++package upstream
++
++import (
++	"bytes"
++	"context"
++	"io"
++	"log"
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/Mekoforge/ForgeMesh/gateway/internal/middleware"
++)
++
++const (
++	testTraceID     = "4bf92f3577b34da6a3ce929d0e0e4736"
++	testTraceparent = "00-" + testTraceID + "-00f067aa0ba902b7-01"
++)
++
++// tracedContext 返回经 middleware.TraceContext 处理、携带 traceparent 的请求 context。
++func tracedContext(t *testing.T, traceparent string) context.Context {
++	t.Helper()
++	var ctx context.Context
++	req := httptest.NewRequest(http.MethodPost, "/api/v1/inference/svc-a/chat", nil)
++	req.Header.Set(middleware.TraceparentHeader, traceparent)
++	middleware.TraceContext()(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
++		ctx = r.Context()
++	})).ServeHTTP(httptest.NewRecorder(), req)
++	return ctx
++}
++
++// headerLog 记录模拟控制平面收到的请求头。
++type headerLog struct {
++	mu      sync.Mutex
++	headers []http.Header
++}
++
++func (h *headerLog) record(r *http.Request) {
++	h.mu.Lock()
++	defer h.mu.Unlock()
++	h.headers = append(h.headers, r.Header.Clone())
++}
++
++func (h *headerLog) all() []http.Header {
++	h.mu.Lock()
++	defer h.mu.Unlock()
++	return h.headers
++}
++
++// TestResolve_ForwardsTraceparent 验证 Resolver 查询控制平面时附带请求的 traceparent；
++// context 中没有追踪上下文时不带。
++func TestResolve_ForwardsTraceparent(t *testing.T) {
++	var got headerLog
++	srv, _ := newControlPlane(t, func(w http.ResponseWriter, r *http.Request) {
++		got.record(r)
++		_, _ = io.WriteString(w, readyBody("Ready", "http://10.0.0.1:8000"))
++	})
++	r := newTestResolver(srv.URL, time.Minute, time.Minute)
++
++	if _, err := r.Resolve(tracedContext(t, testTraceparent), svcA, "tenant-a"); err != nil {
++		t.Fatalf("解析失败: %v", err)
++	}
++	if _, err := r.Resolve(context.Background(), ServiceRef{Name: "svc-b"}, "tenant-a"); err != nil {
++		t.Fatalf("解析失败: %v", err)
++	}
++
++	headers := got.all()
++	if len(headers) != 2 {
++		t.Fatalf("控制平面应收到 2 次查询，实际 %d", len(headers))
++	}
++	if tp := headers[0].Values(middleware.TraceparentHeader); len(tp) != 1 || tp[0] != testTraceparent {
++		t.Fatalf("查询应附带请求的 traceparent，实际 %v", tp)
++	}
++	if tp := headers[1].Get(middleware.TraceparentHeader); tp != "" {
++		t.Fatalf("没有追踪上下文时不应附带 traceparent，实际 %q", tp)
++	}
++}
++
++// TestClient_ForwardsTraceHeaders 验证资源接口反代把 traceparent 与 tracestate 转发给控制平面。
++func TestClient_ForwardsTraceHeaders(t *testing.T) {
++	var got headerLog
++	cp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		got.record(r)
++	}))
++	defer cp.Close()
++	target, err := url.Parse(cp.URL)
++	if err != nil {
++		t.Fatal(err)
++	}
++	c := New(target, "X-Correlation-ID", "X-Tenant-ID", log.New(io.Discard, "", 0))
++
++	req := httptest.NewRequest(http.MethodGet, "/api/v1/resources", nil)
++	req.Header.Set(middleware.TraceparentHeader, testTraceparent)
++	req.Header.Set(middleware.TracestateHeader, "vendor=opaque")
++	c.ServeHTTP(httptest.NewRecorder(), req)
++
++	headers := got.all()
++	if len(headers) != 1 {
++		t.Fatalf("控制平面应收到 1 个请求，实际 %d", len(headers))
++	}
++	if tp := headers[0].Get(middleware.TraceparentHeader); tp != testTraceparent {
++		t.Fatalf("traceparent 应转发给控制平面，实际 %q", tp)
++	}
++	if ts := headers[0].Get(middleware.TracestateHeader); ts != "vendor=opaque" {
++		t.Fatalf("tracestate 应转发给控制平面，实际 %q", ts)
++	}
++}
++
++// TestClient_ErrorLogCarriesCorrelationAndTraceIDs 验证控制平面不可达时的错误日志带关联 ID 与
++// trace-id。
++func TestClient_ErrorLogCarriesCorrelationAndTraceIDs(t *testing.T) {
++	target, err := url.Parse("http://127.0.0.1:1")
++	if err != nil {
++		t.Fatal(err)
++	}
++	var logs bytes.Buffer
++	c := New(target, "X-Correlation-ID", "X-Tenant-ID", log.New(&logs, "", 0))
++	h := middleware.Chain(c, middleware.Correlation("X-Correlation-ID"), middleware.TraceContext())
++
++	req := httptest.NewRequest(http.MethodGet, "/api/v1/resources", nil)
++	req.Header.Set("X-Correlation-ID", "corr-1")
++	req.Header.Set(middleware.TraceparentHeader, testTraceparent)
++	rec := httptest.NewRecorder()
++	h.ServeHTTP(rec, req)
++
++	if rec.Code != http.StatusBadGateway {
++		t.Fatalf("控制平面不可达应 502，实际 %d", rec.Code)
++	}
++	if want := "corr=corr-1 trace=" + testTraceID + " "; !strings.Contains(logs.String(), want) {
++		t.Fatalf("错误日志应含 %q，实际 %q", want, logs.String())
++	}
++}
+-- 
+2.43.0
+

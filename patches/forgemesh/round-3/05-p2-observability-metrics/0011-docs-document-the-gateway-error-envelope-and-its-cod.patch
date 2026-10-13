@@ -1,0 +1,203 @@
+From 2005297fc4a265408e82b0f5df5d27ee8a9a4838 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 13 Oct 2026 05:06:22 +0000
+Subject: [PATCH 11/11] docs: document the gateway error envelope and its codes
+
+List every error the gateway itself produces, with its status and
+code, in the gateway README, and drop the note that the 502 and the
+recovered 500 were plain text. Record the change in the CHANGELOG.
+
+It is not marked breaking: no documented contract described the
+plain-text bodies (the README only named the 429 with Retry-After and
+the 500, and OpenAPI does not describe the gateway's 429, 500 or
+502), and status codes and headers are unchanged. The entry tells
+clients that read the text to read error.code instead. Also record
+the panic log fix and update the gateway file and test counts in
+module-mapping.
+---
+ CHANGELOG.md                        |  6 ++--
+ docs/architecture/module-mapping.md | 10 +++---
+ gateway/README.md                   | 51 ++++++++++++++++++++++++-----
+ 3 files changed, 51 insertions(+), 16 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 5282568..55b3a04 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -48,7 +48,7 @@
+ - 控制平面 `GET /metrics`：以 Prometheus 文本格式 0.0.4 输出聚合指标，不引入新依赖（`forgemesh.controlplane.metrics`：计数器、仪表盘与直方图，每个指标最多 200 个标签组合，超出的计入标签全为 `overflow` 的一个序列）。指标定义在 `forgemesh.controlplane.telemetry`：`forgemesh_http_requests_total{method,route,status}` 与 `forgemesh_http_request_duration_seconds{method,route}`（`route` 为路由模板，未匹配路由的请求记为 `unmatched`）、`forgemesh_reconcile_total{operation,outcome}` 与 `forgemesh_reconcile_duration_seconds{operation}`、`forgemesh_controller_retries_total`、`forgemesh_controller_queue_depth{state}`、`forgemesh_deployments_total{outcome,reason}`（推理服务进入 `Ready` / `Failed` 的次数）、`forgemesh_inference_services{phase}`、`forgemesh_allocations_active{accelerator_type}`、`forgemesh_accelerator_devices{accelerator_type,state}`、`forgemesh_workflow_runs{status}` 与 `forgemesh_registry_lock_wait_seconds`（注册中心的数据库操作等待连接锁的时间），状态类指标在抓取时读取。`/metrics` 与探针一样不要求认证，只输出跨租户聚合的数据，标签不含租户、名称、命名空间、uid 或地址；它不在 `/api/v1` 之下，网关不转发。OpenAPI 新增 `/metrics`（`security: []`）。为此 `ControllerManager` 新增可选参数 `metrics` 与 `queue_depth()`（工作队列新增 `depth()`），`SQLiteRegistry` 新增 `count_by_phase`、`active_allocation_devices` 与 `set_lock_wait_observer`，`WorkflowStore` 新增 `count_runs_by_status`。指标说明见 README「可观测性」。
+ - 网关 `GET /metrics`（`internal/metrics`，只用标准库，文本格式与标签上限同上）：`forgemesh_gateway_http_requests_total{route,status}` 与 `forgemesh_gateway_http_request_duration_seconds{route}`（`route` 为按路由表确定的路由类别 `probe` / `metrics` / `control_plane` / `inference` / `unmatched`，不取请求路径；含 Recovery 兜底的 `500`）、`forgemesh_gateway_stream_first_byte_seconds`（流式代理从开始处理请求到写出实例的第一个响应字节，只统计实例返回 2xx 的流）、`forgemesh_gateway_upstream_errors_total{upstream,kind}`（`control_plane` / `instance`；`connect` / `status`（5xx）/ `body` / `address_not_allowed` / `invalid_endpoint`，客户端已断开的请求不计）、`forgemesh_gateway_rate_limited_total`、`forgemesh_gateway_resolver_lookups_total{result}`（`hit` / `miss` / `coalesced`）与 `forgemesh_gateway_instances{state}`（Resolver 缓存中 `healthy` / `unhealthy` 的实例数）。与探针一样不经过认证与限流，只输出聚合数据，见网关 README「可观测性」。
+ - W3C Trace Context：网关的 `TraceContext` 中间件沿用请求中恰好一个合法的 `traceparent`（连同 `tracestate`），否则（缺失、不合法或多个）生成新的 `traceparent`（版本 `00`，flags `00`）并丢弃 `tracestate`；确定的 `traceparent` 随请求转发给控制平面（资源反代与 Resolver 的查询）与推理实例，响应不回写。控制平面的 `RequestContextMiddleware` 按同样的规则确定 trace-id，沿用 `X-Correlation-Id`（缺失时生成），在请求处理期间绑定两者，这个请求的日志与错误信封都带上它们。两边都不记录 span、不导出追踪，OTLP 导出留待后续。错误信封新增可选字段 `traceId`（OpenAPI `Error.traceId`，32 个小写十六进制字符），网关与控制平面一致。
+-- 网关访问日志：每个 `/api/v1` 请求输出一行 `access method=… path="…" status=… duration=… corr=<关联 ID> trace=<trace-id>`（路径加引号转义、不含查询串；流式请求的 `duration` 是整个流的时长；处理器在写出响应头之前 panic 时记 `500`），位于认证与限流之前，被拒绝的请求同样记录；探针与 `/metrics` 不记录。反代与流式代理的错误日志同样带 `trace=`。
++- 网关访问日志：每个 `/api/v1` 请求与没有匹配路由的请求输出一行 `access method=… path="…" status=… duration=… corr=<关联 ID> trace=<trace-id>`（路径加引号转义、不含查询串；流式请求的 `duration` 是整个流的时长；处理器在写出响应头之前 panic 时记 `500`），位于认证与限流之前，被拒绝的请求同样记录；探针与 `/metrics` 不记录。反代与流式代理的错误日志、Recovery 的 panic 日志同样带 `trace=`。
+ - `scripts/compose_smoke.sh` 在第一次对话之后不带凭证抓取一次控制平面与网关的 `/metrics`，核对 Content-Type、若干指标及其此时确定的取值，以及输出不含租户、服务名、key 与实例 id；并带 `traceparent` 经网关读取不存在的服务，核对控制平面的 `404` 信封与日志、网关的访问日志都带同一个 trace-id。
+ 
+ ### Changed
+@@ -95,7 +95,7 @@
+ - `PluginSdk.validate_manifest` 的告警与实际行为一致：未设置 `isolation` 时说明插件在进程内运行（此前称安装器默认使用 `restricted-rpc`），未设置 `entrypoint` 时说明插件无法加载；清单仍写 `artifactDigest` / `signature` 时给出弃用告警（见 Deprecated）。
+ - [docs/plugin-development/guide.md](docs/plugin-development/guide.md) 按当前实现更新运行方式与隔离、权限词表、入口点、签名与注册流程；`SECURITY.md` 3.2 / 3.3 节、README 与 [ADR-006](docs/design-decisions/adr-006.md)（新增实施现状）同步更新；[docs/architecture/module-mapping.md](docs/architecture/module-mapping.md) 更新插件的加载方式与运行形态，更正 `runtime-vllm` 的文件列表（没有 `provider.py`），新增偏差 D3（受限 RPC 宿主未实现）。
+ - 控制平面日志：`forgemesh-control-plane` 启动时按 `FORGEMESH_LOG_FORMAT`（`json`，默认；或 `text`）与 `FORGEMESH_LOG_LEVEL`（`DEBUG` / `INFO`（默认）/ `WARNING` / `ERROR`）配置根 logger，写到标准错误，取值非法时拒绝启动（`forgemesh.controlplane.logs`）。JSON 格式每行一个对象（`time` / `level` / `logger` / `message`，请求中的日志另有 `trace_id` 与 `correlation_id`，带异常时另有 `exception`）；uvicorn 不再另行配置日志，它的访问日志与错误日志经同一个处理器输出。此前根 logger 没有配置：控制平面自己的 `INFO` 日志（如部署就绪）不输出，`WARNING` 以上只输出消息文本。
+-- 网关流式代理自己返回的错误（如 `NO_HEALTHY_UPSTREAM`、`INVALID_UPSTREAM`、`INSTANCE_ADDRESS_NOT_ALLOWED`、`REQUEST_TOO_LARGE`）改用与网关其他错误相同的信封，新增 `correlationId` 与 `traceId`（此前只有 `code` 与 `message`）。
++- 网关自己返回的错误响应全部使用 JSON 错误信封 `{"error": {"code", "message", "correlationId", "traceId"}}`（`Content-Type: application/json`），状态码与 `Retry-After` 不变：限流的 `429`（`RATE_LIMITED`）、Recovery 兜底的 `500`（`INTERNAL_ERROR`）、连接控制平面（资源接口反代）或推理实例失败的 `502`（`UPSTREAM_UNAVAILABLE`）与没有匹配路由的 `404`（`NOT_FOUND`，此前为 `net/http` 默认的 `404 page not found`）此前是纯文本；流式代理的错误（如 `NO_HEALTHY_UPSTREAM`、`INVALID_UPSTREAM`、`INSTANCE_ADDRESS_NOT_ALLOWED`、`REQUEST_TOO_LARGE`）此前只有 `code` 与 `message`。已有的错误码不变。按纯文本读取这些响应体的客户端改为读取 `error.code`，或只看状态码。`/api/v1/` 之外没有匹配路由的请求现在经过 Correlation、TraceContext 与访问日志（仍不经过认证与限流），响应带关联 ID。控制平面与推理实例的响应原样透传；探针的状态文档与 `net/http` 在路由之前拒绝的请求（如请求头格式错误，纯文本）不变；错误码见网关 README「错误响应」。
+ 
+ ### Deprecated
+ 
+@@ -144,6 +144,8 @@
+ - `plugin-sdk` 包补齐 `pyyaml` 依赖声明：`forgemesh.plugin.sdk` 与签名工具都用它读取清单，此前独立安装（如控制平面镜像）后导入 `forgemesh.plugin.sdk` 即失败。
+ - 网关流式代理的错误日志从固定的 `X-Correlation-ID` 请求头读取关联 ID，设置了 `GATEWAY_CORRELATION_HEADER` 时记录的不是网关实际使用的关联 ID（通常为空）：现取自 Correlation 中间件注入的 context。
+ - 控制平面 `limit` 越界（`400`）与删除冲突（`409`）的错误信封忽略请求的 `X-Correlation-Id`，总是新生成一个关联 ID：现与其他错误一样使用这个请求的关联 ID（请求没有带时由 `RequestContextMiddleware` 生成一次，日志与错误信封一致）。
++- 网关 Recovery 的 panic 日志中 `corr=` 总是为空，也没有 trace-id：Recovery 位于 Correlation 与 TraceContext 之外，读不到它们写入下游 context 的 ID。现由这两个中间件把 ID 记录给 Recovery，panic 日志与兜底的 `500` 错误信封都带上这个请求的关联 ID 与 trace-id。
++- 响应头写出之后发生的 panic 被网关 Recovery 当作普通 panic：记录堆栈后仍调用 `http.Error`，把 `Internal Server Error` 写在已写出的响应体（来自控制平面或推理实例）之后；`httputil.ReverseProxy` 复制控制平面的响应体失败时以 `http.ErrAbortHandler` 中止响应，同样被记录为 panic 并追加这段文本。现在 `http.ErrAbortHandler` 原样交给 `net/http`，不记录为 panic；其他 panic 记录日志后同样中止响应，客户端读到的是不完整的响应。
+ 
+ ### Security
+ 
+diff --git a/docs/architecture/module-mapping.md b/docs/architecture/module-mapping.md
+index c8d1c34..77f0ed5 100644
+--- a/docs/architecture/module-mapping.md
++++ b/docs/architecture/module-mapping.md
+@@ -22,7 +22,7 @@
+ - 路径存在性：`ls` / `find` / glob 实测（本文所有路径均已在 2026-10-11 于本分支核对）。
+ - 依赖边界：`grep -rn` 对 `--include="*.py"` 的 import 扫描，命令与输出结论逐条记录于第 3 节。
+ - 测试基线：`python -m pytest tests/ -q` → **993 passed**（本机 2026-10-11，5.34s）。
+-- Go 侧：本机无 Go 工具链，`go test` 以 CI `go` job 为准（gateway 29 个 `*_test.go` 经 glob 核对存在）。
++- Go 侧：本机无 Go 工具链，`go test` 以 CI `go` job 为准（gateway 31 个 `*_test.go` 经 glob 核对存在）。
+ 
+ ---
+ 
+@@ -75,13 +75,13 @@
+ | 字段 | 内容 |
+ |---|---|
+ | 架构模块 | Data Plane Gateway（L1 推理流量入口，architecture.md 3.1 L1 / Dev-5） |
+-| 当前代码路径 | `gateway/cmd/gateway/main.go`；`gateway/internal/{config,health,metrics,middleware,router,stream,upstream}/`（共 51 个 `.go` 文件，其中 29 个 `_test.go`，glob 核对）；`gateway/go.mod`（`github.com/Mekoforge/ForgeMesh/gateway`，go 1.22）；`gateway/Makefile`、`gateway/README.md` |
++| 当前代码路径 | `gateway/cmd/gateway/main.go`；`gateway/internal/{config,health,metrics,middleware,router,stream,upstream}/`（共 53 个 `.go` 文件，其中 31 个 `_test.go`，glob 核对）；`gateway/go.mod`（`github.com/Mekoforge/ForgeMesh/gateway`，go 1.22）；`gateway/Makefile`、`gateway/README.md` |
+ | 核心契约 | `/api/v1/` REST + SSE 流式转发（见 openapi.yaml）；中间件链 `Observe → Recovery → Correlation → TraceContext → AccessLog → Authenticate → RateLimit → LimitRequestBody → Route`；API key 认证（ADR-014，`middleware/{authz,apikey}.go`）；上游解析 `upstream/resolver.go`（按命名空间解析 ready 实例、`protocol` → 实例推理路径、合并回源、健康摘流）；实例地址限制 `stream/addrpolicy.go`；`/metrics`（Prometheus 文本格式，不经认证/限流，`metrics/{metrics,gateway}.go`，测试用解析 `metrics/metricstest`）；W3C `traceparent` 沿用/生成并转发、访问日志（`middleware/{observe,tracecontext,accesslog}.go`） |
+ | 运行形态 | 独立进程（Go 二进制），经 `GATEWAY_UPSTREAM_URL` 转发至控制平面 |
+ | 数据所有权 | 无权威数据（运行态转发；端点解析缓存为派生数据） |
+ | 允许依赖 | 控制平面 HTTP API（上游）、Go 标准库 |
+ | 禁止依赖 | Python 进程内模块、直连 SQLite/数据库、任何插件、LLM SDK |
+-| 测试路径 | `gateway/internal/` 下 29 个 `*_test.go`：`config_test.go`、`health_test.go`、`metrics/{gateway,metrics}_test.go`、`metrics/metricstest/metricstest_test.go`、`middleware/{accesslog,apikey,authz,bodylimit,chain,correlation,observe,ratelimit,tracecontext}_test.go`、`router/{auth,metrics,resolver,router,tenant_security,tracecontext}_test.go`、`stream/{addrpolicy,metrics,proxy,sse_cancel,tracecontext}_test.go`、`upstream/{client,metrics,resolver,tracecontext}_test.go`；CI 以 `-race` 运行 |
++| 测试路径 | `gateway/internal/` 下 31 个 `*_test.go`：`config_test.go`、`health_test.go`、`metrics/{gateway,metrics}_test.go`、`metrics/metricstest/metricstest_test.go`、`middleware/{accesslog,apikey,authz,bodylimit,chain,correlation,observe,ratelimit,recovery,tracecontext}_test.go`、`router/{auth,errors,metrics,resolver,router,tenant_security,tracecontext}_test.go`、`stream/{addrpolicy,metrics,proxy,sse_cancel,tracecontext}_test.go`、`upstream/{client,metrics,resolver,tracecontext}_test.go`；CI 以 `-race` 运行 |
+ | 状态 | 已实现且有测试覆盖（本机无 Go 工具链，`go test` 以 CI `go` job 为准；`find gateway -name "*.py"` = 0，纯 Go 已循证，见 3.4） |
+ | 演进动作 | 保留；WP-D1 补多租户安全验证（tenant 绑定、Resolver 行为、SSE 取消、链序） |
+ 
+@@ -372,12 +372,12 @@ grep -rn "controlplane" packages/node-agent/src/ --include="*.py" | grep -v egg-
+ 
+ ```bash
+ ls gateway/*.go gateway/cmd/... 2>/dev/null | head   # 根级无 *.go，代码在 cmd/ 与 internal/
+-find gateway -name "*.go" | wc -l                     # → 51
++find gateway -name "*.go" | wc -l                     # → 53
+ find gateway -name "*.py" -o -name "requirements*.txt" | wc -l   # → 0
+ cat gateway/go.mod                                     # module github.com/Mekoforge/ForgeMesh/gateway (go 1.22)
+ ```
+ 
+-**输出：** 51 个 `.go`（含 29 个 `_test.go`）、0 个 `.py`、无 Python 依赖清单；`go.mod` 无任何第三方 require（仅标准库 + go 1.22）。
++**输出：** 53 个 `.go`（含 31 个 `_test.go`）、0 个 `.py`、无 Python 依赖清单；`go.mod` 无任何第三方 require（仅标准库 + go 1.22）。
+ 
+ **结论：✅ 符合** —— 网关与 Python 控制平面为进程边界隔离（HTTP 上游），无语言互操作。
+ 
+diff --git a/gateway/README.md b/gateway/README.md
+index 5ab5476..ed04396 100644
+--- a/gateway/README.md
++++ b/gateway/README.md
+@@ -34,13 +34,15 @@ ForgeMesh 的**统一外部入口**与**高性能流式代理**。与 Python 控
+ | --- | --- | --- | --- |
+ | GET | `/healthz` | 存活探针（始终 200） | 仅 Observe、Recovery |
+ | GET | `/readyz` | 就绪探针（请求控制平面 `/readyz`，非 200 或不可达时 503） | 仅 Observe、Recovery |
+-| GET | `/metrics` | Prometheus 指标（见「可观测性」；`GET` / `HEAD` 之外返回 405） | 仅 Observe、Recovery |
++| GET | `/metrics` | Prometheus 指标（见「可观测性」；`GET` / `HEAD` 之外返回 `405 METHOD_NOT_ALLOWED`） | 仅 Observe、Recovery |
+ | ANY | `/api/v1/resources[/...]` | 反代 → Python 控制平面 | 全链 |
+ | ANY | `/api/v1/inference-services[/...]` | 反代 → Python 控制平面 | 全链 |
+ | ANY | `/api/v1/workflows[/...]` | 反代 → Python 控制平面 | 全链 |
+ | ANY | `/api/v1/decisions[/...]` | 反代 → Python 控制平面 | 全链 |
+ | ANY | `/api/v1/namespaces/{ns}/inference/{svc}/chat` | **SSE 流式代理**（命名空间 `{ns}` 中的服务） | 全链 + `read` scope |
+ | ANY | `/api/v1/inference/{svc}/chat` | **SSE 流式代理**（不带命名空间的服务） | 全链 + `read` scope |
++| ANY | `/api/v1/` 下的其他路径 | `404 NOT_FOUND` | 全链 |
++| ANY | 其他路径 | `404 NOT_FOUND` | Observe、Recovery、Correlation、TraceContext、AccessLog |
+ 
+ `{ns}`、`{svc}` 为 Go 1.22 `net/http.ServeMux` 的路径变量语法，各表示单个路径段（命名空间与推理服务名）。
+ 
+@@ -80,16 +82,49 @@ Observe → Recovery → Correlation → TraceContext → AccessLog → Authenti
+ ```
+ 
+ - **Observe**：按路由类别记录请求数与耗时（见「可观测性」），位于最外层：Recovery 兜底的 500 与被认证、限流拒绝的请求都计入。
+-- **Recovery**：兜底 panic → 500，记录堆栈，进程不退出（覆盖全量请求）。
++- **Recovery**：兜底全量请求的 panic，日志带关联 ID、trace-id 与堆栈；响应头尚未写出时返回 `500 INTERNAL_ERROR`，已写出时中止响应（见「错误响应」）。
+ - **Correlation**：缺失则用 `crypto/rand` 生成 128-bit hex 关联 ID，注入 context 与响应头；已携带则透传。
+ - **TraceContext**：沿用或生成 W3C `traceparent`，trace-id 注入 context（见「可观测性」）。
+ - **AccessLog**：每个请求一行访问日志，带关联 ID 与 trace-id；位于 Authenticate 之前，被认证或限流拒绝的请求同样记录。
+ - **Authenticate**：按 `GATEWAY_AUTH_MODE` 校验凭证——`apikey`（默认）以 `Authorization: Bearer <key>` 的 SHA-256 摘要查 key 文件，`dev` 直接信任租户头。已验证的主体（subject / 租户 / scope）注入 context，并以已验证的租户**覆写**入站租户头。缺少或无效凭证返回 `401`（带 `WWW-Authenticate: Bearer realm="forgemesh"`），租户头与 key 绑定的租户不一致返回 `403`，响应体均为 JSON 错误信封。
+-- **RateLimit**：按已验证租户的令牌桶限流，超限 `429 + Retry-After`；位于 Authenticate 之后，被拒请求不消耗令牌；不读取租户头或 `X-Forwarded-For`。
++- **RateLimit**：按已验证租户的令牌桶限流，超限返回 `429 RATE_LIMITED` 与 `Retry-After`；位于 Authenticate 之后，被拒请求不消耗令牌；不读取租户头或 `X-Forwarded-For`。
+ - **LimitRequestBody**：请求体上限为 `GATEWAY_MAX_REQUEST_BODY_BYTES`（默认 10 MiB）。声明的 `Content-Length` 超限时直接返回 `413 REQUEST_TOO_LARGE`，不访问上游；分块传输的请求体读到上限时，反代与流式代理同样返回 `413`，不计实例失败。
+ 
+ > 说明：探针与 `/metrics` 刻意不经过认证/限流（也不写访问日志），保证负载均衡健康检查与指标抓取始终可用。
+ 
++### 错误响应
++
++网关自己返回的错误响应都是 JSON 错误信封（`Content-Type: application/json`，结构即 OpenAPI 中的 `Error`）：
++
++```json
++{"error": {"code": "RATE_LIMITED", "message": "rate limit exceeded", "correlationId": "ad1cd525116940f682ea882c0c7a6b67", "traceId": "4bf92f3577b34da6a3ce929d0e0e4736"}}
++```
++
++`correlationId` 与响应头中的关联 ID 相同，`traceId` 是这个请求的 trace-id（见「可观测性」）。
++探针与 `/metrics` 不经过 Correlation 与 TraceContext，它们的错误信封（`/metrics` 的 `405`、
++panic 兜底的 `500`）没有这两个字段。客户端按状态码与 `error.code` 区分错误，不要解析 `message`。
++
++| 状态码 | `code` | 场景 |
++| --- | --- | --- |
++| `401` | `UNAUTHENTICATED` | 缺少或无效凭证（`dev` 模式下为缺少租户头），带 `WWW-Authenticate` |
++| `403` | `FORBIDDEN` | 租户头与 key 绑定的租户不一致；推理路由缺少 `read` scope；控制平面拒绝 Resolver 的查询 |
++| `404` | `NOT_FOUND` | 没有匹配的路由 |
++| `405` | `METHOD_NOT_ALLOWED` | `/metrics` 收到 `GET` / `HEAD` 之外的方法（带 `Allow: GET, HEAD`） |
++| `413` | `REQUEST_TOO_LARGE` | 请求体超过 `GATEWAY_MAX_REQUEST_BODY_BYTES` |
++| `429` | `RATE_LIMITED` | 超过租户的限流（带 `Retry-After`：攒够一个令牌所需的秒数，向上取整，至少为 `1`） |
++| `500` | `INTERNAL_ERROR` | 处理器在写出响应头之前 panic（信封不含 panic 的内容，细节只写入日志） |
++| `502` | `UPSTREAM_UNAVAILABLE` | 没有收到控制平面（资源接口反代）或推理实例的响应，如连接失败，或控制平面 30 秒内没有返回响应头 |
++| `502` | `UPSTREAM_RESOLVE_FAILED` | Resolver 没能从控制平面取得服务的状态：网络错误、`2xx` / `403` / `404` 之外的状态码，或响应无法读取、不是合法 JSON |
++| `502` | `INVALID_UPSTREAM` | 实例地址或协议非法 |
++| `502` | `INSTANCE_ADDRESS_NOT_ALLOWED` | 实例地址不在允许连接的范围内（见「实例地址限制」） |
++| `503` | `NO_HEALTHY_UPSTREAM` | 推理服务不存在、未就绪或没有可用实例 |
++
++控制平面与推理实例的响应（含错误响应）原样透传，网关不改写。以下响应不是错误信封：探针的
++状态文档（如 `/readyz` 的 `503 {"status":"unavailable","reason":"upstream not ready"}`），以及
++`net/http` 在路由之前拒绝的请求（如请求行或请求头格式错误），后者是纯文本。处理器在写出响应头
++之后 panic 时（如控制平面的响应体中途中断），状态码与已写出的响应体都无法更改，网关中止响应，
++客户端读到的是不完整的响应。
++
+ ### Header 转发与剥离策略
+ 
+ 两个转发方向的 header 策略（受信来源与处理动作）：
+@@ -167,17 +202,15 @@ trace-id 或 parent-id 全零、版本 `ff` 都不合法；版本 `00` 必须恰
+ `traceparent`，控制平面按同样的规则读取它（见根 README「可观测性」）。网关不记录 span，也不
+ 导出追踪（OTLP 导出尚未实现）。
+ 
+-**访问日志**：`/api/v1/` 下的每个请求结束时，网关向标准输出写一行（与网关的其他日志相同）：
++**访问日志**：探针与 `/metrics` 之外的每个请求结束时，网关向标准输出写一行（与网关的其他日志相同）：
+ 
+ ```
+ gateway 2026/10/13 03:53:36 access method=POST path="/api/v1/namespaces/default/inference/llama/chat" status=200 duration=1.234s corr=ad1cd525116940f682ea882c0c7a6b67 trace=4bf92f3577b34da6a3ce929d0e0e4736
+ ```
+ 
+ `path` 不含查询串，流式请求的 `duration` 是整个流的时长；被认证、限流拒绝的请求同样记录；
+-处理器在写出响应头之前 panic 时记 `status=500`。网关的 JSON 错误信封
+-（`{"error": {"code", "message", "correlationId", "traceId"}}`）与反代、流式代理的错误日志
+-（`corr=… trace=…`）带同一组 ID。连接上游失败时的 `502` 与 Recovery 兜底的 `500` 是纯文本
+-响应、不带 `traceId`，可按响应头中的关联 ID 在访问日志中找到 trace-id。
++处理器在写出响应头之前 panic 时记 `status=500`。网关的错误信封（见「错误响应」）与反代、
++流式代理的错误日志、Recovery 的 panic 日志（`corr=… trace=…`）带同一组 ID。
+ 
+ ---
+ 
+@@ -216,7 +249,7 @@ gateway/
+     ├── middleware/
+     │   ├── middleware.go           # Middleware 类型 + Chain 组合子
+     │   ├── observe.go              # 按路由类别记录请求数与耗时
+-    │   ├── recovery.go             # panic 兜底 → 500
++    │   ├── recovery.go             # panic 兜底 → 500 INTERNAL_ERROR
+     │   ├── correlation.go          # 关联 ID 生成/透传 + context 注入
+     │   ├── tracecontext.go         # W3C traceparent 校验/生成 + context 注入
+     │   ├── accesslog.go            # 访问日志（带关联 ID 与 trace-id）
+-- 
+2.43.0
+

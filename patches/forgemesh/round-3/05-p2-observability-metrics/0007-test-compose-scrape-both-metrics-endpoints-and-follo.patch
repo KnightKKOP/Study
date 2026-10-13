@@ -1,0 +1,127 @@
+From 2077a6762fb324a44af4b62297be7e8bef7cb84b Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 13 Oct 2026 03:52:08 +0000
+Subject: [PATCH 07/11] test(compose): scrape both /metrics endpoints and
+ follow a trace
+
+The closed-loop smoke only exercised the API. It now scrapes the
+control plane and gateway /metrics once, without credentials, right
+after the first chat, when exactly one service is Ready on the only
+device. It checks the content type, a few metric families and samples
+whose values are known at that point (one Ready service holding the
+device, one successful deployment run, one request rejected for a
+missing key, no rate limiting), and that neither output contains the
+tenant, the service name, the key or the instance id.
+
+It also reads a missing service through the gateway with a valid
+traceparent and checks that the control plane's 404 envelope, the
+control plane's logs and the gateway access log all carry the same
+trace id, which the unit tests on each side cannot show on their own.
+The log checks retry briefly because a container's output can reach
+docker compose logs a moment after the response.
+---
+ scripts/compose_smoke.sh | 67 ++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 67 insertions(+)
+
+diff --git a/scripts/compose_smoke.sh b/scripts/compose_smoke.sh
+index 49b23c7..c3fbc4a 100755
+--- a/scripts/compose_smoke.sh
++++ b/scripts/compose_smoke.sh
+@@ -3,6 +3,7 @@
+ # deploy/docker/docker-compose.fake-runtime.yaml（一块设备的加速器清单 + 假启动器，不需要 GPU）
+ # 启动控制平面与网关，经网关走完推理服务的闭环：
+ #   创建 → Ready（status.endpoints 指向假实例）→ 经网关流式对话（SSE，以 [DONE] 结束）→
++#   抓取控制平面与网关的 /metrics（不带凭证，不含租户数据）→ traceparent 经网关到达控制平面 →
+ #   删除 → 资源消失、实例停止 → 同名重新创建（只有一块设备，可见分配已释放）→ 再次对话 →
+ #   重启控制平面：资源仍在，实例随旧进程结束，服务转为 Degraded（Ready=False，
+ #   InstanceLost），网关不再转发（503）→ 删除。
+@@ -167,6 +168,37 @@ sys.exit(1)
+ EOF
+ }
+ 
++# scrape <说明> <URL> <模式...>：不带凭证抓取一次 /metrics 写入 $metrics。每个模式（基本正则）
++# 都要匹配某个样本行的开头；输出不得含租户、服务名、key 或实例 id。
++scrape() {
++  local description=$1 url=$2 pattern content_type
++  shift 2
++  content_type=$(curl -sf -o "$metrics" -w '%{content_type}' "$url") \
++    || fail "$description: GET $url failed"
++  [[ "$content_type" == "text/plain; version=0.0.4"* ]] \
++    || fail "$description: unexpected content type $content_type"
++  for pattern in "$@"; do
++    grep -q "^$pattern" "$metrics" || fail "$description: no sample matches ^$pattern"
++  done
++  if grep -qF -e smoke -e "$key" -e "$first_instance" "$metrics"; then
++    fail "$description: the output contains tenant data"
++  fi
++  echo "ok: $description"
++}
++
++# logged <服务> <模式>：服务的日志中有一行匹配该基本正则（日志可能稍晚于响应写出，因此重试）。
++logged() {
++  local log="$work/$1.log"
++  for _ in $(seq 1 10); do
++    "${compose[@]}" logs --no-color "$1" > "$log"
++    if grep -q -- "$2" "$log"; then
++      return 0
++    fi
++    sleep 0.5
++  done
++  return 1
++}
++
+ "${compose[@]}" build
+ 
+ # keygen 输出的第 2 行是 key，最后一行是 key 文件条目。
+@@ -187,6 +219,7 @@ chat_url="$gateway/api/v1/namespaces/default/inference/smoke-svc/chat"
+ resource="$work/resource.json"
+ headers="$work/headers.txt"
+ stream="$work/stream.txt"
++metrics="$work/metrics.txt"
+ body='{"kind": "InferenceService", "metadata": {"name": "smoke-svc", "namespace": "default"},
+   "spec": {"model": {"reference": "models/llama"}, "runtime": {"provider": "vllm"},
+   "resources": {"accelerator": {"type": "nvidia-gpu", "minMemoryGiB": 16}}}}'
+@@ -213,6 +246,40 @@ expect_reply "$first_instance"
+   || fail "the workflow store is not next to the registry"
+ echo "ok: the workflow store lives next to the registry"
+ 
++# 此时只有 smoke-svc：Ready，占用清单中唯一的设备，部署工作流已成功。
++scrape "control plane /metrics" http://127.0.0.1:8080/metrics \
++  'forgemesh_http_requests_total{method="POST",route="/api/v1/inference-services",status="201"} ' \
++  'forgemesh_reconcile_total{operation="reconcile",outcome="done"} ' \
++  'forgemesh_reconcile_duration_seconds_count{operation="reconcile"} ' \
++  'forgemesh_controller_queue_depth{state="ready"} ' \
++  'forgemesh_deployments_total{outcome="ready",reason="Reconciled"} 1$' \
++  'forgemesh_inference_services{phase="Ready"} 1$' \
++  'forgemesh_allocations_active{accelerator_type="nvidia-gpu"} 1$' \
++  'forgemesh_accelerator_devices{accelerator_type="nvidia-gpu",state="free"} 0$' \
++  'forgemesh_workflow_runs{status="Succeeded"} 1$'
++scrape "gateway /metrics" "$gateway/metrics" \
++  'forgemesh_gateway_http_requests_total{route="control_plane",status="401"} 1$' \
++  'forgemesh_gateway_http_requests_total{route="inference",status="200"} ' \
++  'forgemesh_gateway_stream_first_byte_seconds_count ' \
++  'forgemesh_gateway_resolver_lookups_total{result="miss"} ' \
++  'forgemesh_gateway_rate_limited_total 0$' \
++  'forgemesh_gateway_instances{state="healthy"} '
++
++# 合法的 traceparent 经网关原样转发：控制平面的错误信封与日志、网关的访问日志都带其中的
++# trace-id。
++trace_id=4bf92f3577b34da6a3ce929d0e0e4736
++code=$(curl -s -o "$resource" -w '%{http_code}' "${auth[@]}" \
++  -H "traceparent: 00-$trace_id-00f067aa0ba902b7-01" "$services/no-such-svc?namespace=default")
++[[ "$code" == 404 ]] || fail "read a missing service: expected HTTP 404, got $code"
++# shellcheck disable=SC2016 # $id 是 jq 变量
++expect "the control plane error envelope carries the forwarded trace id" \
++  '.error.traceId == $id' --arg id "$trace_id"
++logged gateway "access method=GET .* status=404 .* trace=$trace_id\$" \
++  || fail "the gateway access log does not carry the trace id"
++logged control-plane "\"trace_id\": \"$trace_id\"" \
++  || fail "the control plane logs do not carry the trace id"
++echo "ok: the gateway and control plane logs carry the trace id"
++
+ check "delete through the gateway" 202 "${auth[@]}" -X DELETE "$service"
+ wait_gone
+ port_closed "$first_port" \
+-- 
+2.43.0
+

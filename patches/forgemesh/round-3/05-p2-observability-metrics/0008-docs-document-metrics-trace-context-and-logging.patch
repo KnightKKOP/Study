@@ -1,0 +1,387 @@
+From 52155416779a547cd6b3551c518029bc67c187de Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 13 Oct 2026 04:11:43 +0000
+Subject: [PATCH 08/11] docs: document metrics, trace context and logging
+
+Operators need to know what the two /metrics endpoints expose and how
+they are protected before pointing Prometheus at them, and how to
+follow one request through the gateway and control plane logs.
+
+The root README gains an observability section: the control plane
+metrics, the protection decision (no authentication, aggregate data
+only, bounded labels, keep both endpoints off public ingress), the
+trace context rules and the log format, plus FORGEMESH_LOG_FORMAT and
+FORGEMESH_LOG_LEVEL in the configuration table. The gateway README
+documents its metrics, route classes, access log, trace headers and
+the new middleware order, and moves probes and /metrics out of the
+authenticated path in the request diagram, which is where the router
+mounts them. CHANGELOG and module-mapping list the new modules, hooks
+and tests, with the file counts of this branch.
+---
+ CHANGELOG.md                        |  9 +++
+ README.md                           | 40 ++++++++++++-
+ docs/architecture/module-mapping.md | 18 +++---
+ gateway/README.md                   | 91 ++++++++++++++++++++++++-----
+ 4 files changed, 133 insertions(+), 25 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 6b2fc00..5282568 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -45,6 +45,11 @@
+ - 插件策略文件（JSON，由管理员维护）：`trustedKeys` 列出受信任的 Ed25519 签名公钥（PEM），`grants` 按插件的 `metadata.id` 授予权限，对该插件的所有版本生效。`load_plugin_policy` 严格校验：文件不可读、未知字段、非法或重复的公钥、带版本号的 `pluginId`、同一插件的多条授予、词表之外或重复的权限都抛出 `PluginPolicyError`；`PluginManager.from_policy_file` 按策略文件构造插件管理器，`PluginManager.effective_permissions` 返回插件实际拥有的权限。控制平面应用目前不构造插件管理器，因此没有对应的环境变量。
+ - 插件权限词表 `forgemesh.plugin.permissions.Permission`（15 项，形如 `<域>.<动作>`，如 `resource.read`、`network.egress`、`platform.admin`）：清单的 `spec.permissions`、JSON Schema 的权限枚举、管理员的授予与 `forgemesh.plugin.isolation` 共用这一份词表，契约测试保证 Schema 枚举与词表逐项一致。
+ - `forgemesh.plugin.loader.load_entrypoint(plugin_dir, entrypoint)`：按清单 `spec.entrypoint`（`<模块>:<类>`）把插件目录作为 Python 包加载并返回入口类；插件目录必须含 `__init__.py`，入口类必须定义在插件包内。加载在当前进程内执行插件代码，不提供任何隔离。
++- 控制平面 `GET /metrics`：以 Prometheus 文本格式 0.0.4 输出聚合指标，不引入新依赖（`forgemesh.controlplane.metrics`：计数器、仪表盘与直方图，每个指标最多 200 个标签组合，超出的计入标签全为 `overflow` 的一个序列）。指标定义在 `forgemesh.controlplane.telemetry`：`forgemesh_http_requests_total{method,route,status}` 与 `forgemesh_http_request_duration_seconds{method,route}`（`route` 为路由模板，未匹配路由的请求记为 `unmatched`）、`forgemesh_reconcile_total{operation,outcome}` 与 `forgemesh_reconcile_duration_seconds{operation}`、`forgemesh_controller_retries_total`、`forgemesh_controller_queue_depth{state}`、`forgemesh_deployments_total{outcome,reason}`（推理服务进入 `Ready` / `Failed` 的次数）、`forgemesh_inference_services{phase}`、`forgemesh_allocations_active{accelerator_type}`、`forgemesh_accelerator_devices{accelerator_type,state}`、`forgemesh_workflow_runs{status}` 与 `forgemesh_registry_lock_wait_seconds`（注册中心的数据库操作等待连接锁的时间），状态类指标在抓取时读取。`/metrics` 与探针一样不要求认证，只输出跨租户聚合的数据，标签不含租户、名称、命名空间、uid 或地址；它不在 `/api/v1` 之下，网关不转发。OpenAPI 新增 `/metrics`（`security: []`）。为此 `ControllerManager` 新增可选参数 `metrics` 与 `queue_depth()`（工作队列新增 `depth()`），`SQLiteRegistry` 新增 `count_by_phase`、`active_allocation_devices` 与 `set_lock_wait_observer`，`WorkflowStore` 新增 `count_runs_by_status`。指标说明见 README「可观测性」。
++- 网关 `GET /metrics`（`internal/metrics`，只用标准库，文本格式与标签上限同上）：`forgemesh_gateway_http_requests_total{route,status}` 与 `forgemesh_gateway_http_request_duration_seconds{route}`（`route` 为按路由表确定的路由类别 `probe` / `metrics` / `control_plane` / `inference` / `unmatched`，不取请求路径；含 Recovery 兜底的 `500`）、`forgemesh_gateway_stream_first_byte_seconds`（流式代理从开始处理请求到写出实例的第一个响应字节，只统计实例返回 2xx 的流）、`forgemesh_gateway_upstream_errors_total{upstream,kind}`（`control_plane` / `instance`；`connect` / `status`（5xx）/ `body` / `address_not_allowed` / `invalid_endpoint`，客户端已断开的请求不计）、`forgemesh_gateway_rate_limited_total`、`forgemesh_gateway_resolver_lookups_total{result}`（`hit` / `miss` / `coalesced`）与 `forgemesh_gateway_instances{state}`（Resolver 缓存中 `healthy` / `unhealthy` 的实例数）。与探针一样不经过认证与限流，只输出聚合数据，见网关 README「可观测性」。
++- W3C Trace Context：网关的 `TraceContext` 中间件沿用请求中恰好一个合法的 `traceparent`（连同 `tracestate`），否则（缺失、不合法或多个）生成新的 `traceparent`（版本 `00`，flags `00`）并丢弃 `tracestate`；确定的 `traceparent` 随请求转发给控制平面（资源反代与 Resolver 的查询）与推理实例，响应不回写。控制平面的 `RequestContextMiddleware` 按同样的规则确定 trace-id，沿用 `X-Correlation-Id`（缺失时生成），在请求处理期间绑定两者，这个请求的日志与错误信封都带上它们。两边都不记录 span、不导出追踪，OTLP 导出留待后续。错误信封新增可选字段 `traceId`（OpenAPI `Error.traceId`，32 个小写十六进制字符），网关与控制平面一致。
++- 网关访问日志：每个 `/api/v1` 请求输出一行 `access method=… path="…" status=… duration=… corr=<关联 ID> trace=<trace-id>`（路径加引号转义、不含查询串；流式请求的 `duration` 是整个流的时长；处理器在写出响应头之前 panic 时记 `500`），位于认证与限流之前，被拒绝的请求同样记录；探针与 `/metrics` 不记录。反代与流式代理的错误日志同样带 `trace=`。
++- `scripts/compose_smoke.sh` 在第一次对话之后不带凭证抓取一次控制平面与网关的 `/metrics`，核对 Content-Type、若干指标及其此时确定的取值，以及输出不含租户、服务名、key 与实例 id；并带 `traceparent` 经网关读取不存在的服务，核对控制平面的 `404` 信封与日志、网关的访问日志都带同一个 trace-id。
+ 
+ ### Changed
+ 
+@@ -89,6 +94,8 @@
+ - `scripts/plugin_entrypoint_smoke.py` 按清单 `spec.entrypoint` 经 `load_entrypoint` 加载入口类，缺少 `entrypoint` 即失败（此前跳过），并做基本健康检查：构造器没有必填参数时实例化一次（目前 6 个插件）；需要宿主注入依赖的只报告所需参数（`decision-typesafe-jev` 的客户端、`metering-basic` 的存储、`qos-basic` 的配置、`workflow-reference` 的存储与执行器等）。
+ - `PluginSdk.validate_manifest` 的告警与实际行为一致：未设置 `isolation` 时说明插件在进程内运行（此前称安装器默认使用 `restricted-rpc`），未设置 `entrypoint` 时说明插件无法加载；清单仍写 `artifactDigest` / `signature` 时给出弃用告警（见 Deprecated）。
+ - [docs/plugin-development/guide.md](docs/plugin-development/guide.md) 按当前实现更新运行方式与隔离、权限词表、入口点、签名与注册流程；`SECURITY.md` 3.2 / 3.3 节、README 与 [ADR-006](docs/design-decisions/adr-006.md)（新增实施现状）同步更新；[docs/architecture/module-mapping.md](docs/architecture/module-mapping.md) 更新插件的加载方式与运行形态，更正 `runtime-vllm` 的文件列表（没有 `provider.py`），新增偏差 D3（受限 RPC 宿主未实现）。
++- 控制平面日志：`forgemesh-control-plane` 启动时按 `FORGEMESH_LOG_FORMAT`（`json`，默认；或 `text`）与 `FORGEMESH_LOG_LEVEL`（`DEBUG` / `INFO`（默认）/ `WARNING` / `ERROR`）配置根 logger，写到标准错误，取值非法时拒绝启动（`forgemesh.controlplane.logs`）。JSON 格式每行一个对象（`time` / `level` / `logger` / `message`，请求中的日志另有 `trace_id` 与 `correlation_id`，带异常时另有 `exception`）；uvicorn 不再另行配置日志，它的访问日志与错误日志经同一个处理器输出。此前根 logger 没有配置：控制平面自己的 `INFO` 日志（如部署就绪）不输出，`WARNING` 以上只输出消息文本。
++- 网关流式代理自己返回的错误（如 `NO_HEALTHY_UPSTREAM`、`INVALID_UPSTREAM`、`INSTANCE_ADDRESS_NOT_ALLOWED`、`REQUEST_TOO_LARGE`）改用与网关其他错误相同的信封，新增 `correlationId` 与 `traceId`（此前只有 `code` 与 `message`）。
+ 
+ ### Deprecated
+ 
+@@ -135,6 +142,8 @@
+ - 全部 10 个插件清单与示例清单的 `entrypoint` 写成 `python -m forgemesh_<名称>`，而这些模块并不存在，没有一个插件能按清单加载；入口冒烟只用 `entrypoint` 判断是否跳过，随后绕开它按文件路径加载 `provider.py`（或包的 `__init__.py`），只断言其中有公有类。现改为真实的 `<模块>:<类>` 入口，冒烟按入口加载（见 Changed）。
+ - 全部 10 个插件与示例清单声明 `isolation: restricted-rpc`，而受限 RPC 宿主并不存在，插件实际都在宿主进程内运行；其中 `decision-typesafe-jev` 在进程内经 `urllib` 直接请求 TypeSafe API。现全部改为 `in-process`（`decision-typesafe-jev` 已申请 `network.egress`）。
+ - `plugin-sdk` 包补齐 `pyyaml` 依赖声明：`forgemesh.plugin.sdk` 与签名工具都用它读取清单，此前独立安装（如控制平面镜像）后导入 `forgemesh.plugin.sdk` 即失败。
++- 网关流式代理的错误日志从固定的 `X-Correlation-ID` 请求头读取关联 ID，设置了 `GATEWAY_CORRELATION_HEADER` 时记录的不是网关实际使用的关联 ID（通常为空）：现取自 Correlation 中间件注入的 context。
++- 控制平面 `limit` 越界（`400`）与删除冲突（`409`）的错误信封忽略请求的 `X-Correlation-Id`，总是新生成一个关联 ID：现与其他错误一样使用这个请求的关联 ID（请求没有带时由 `RequestContextMiddleware` 生成一次，日志与错误信封一致）。
+ 
+ ### Security
+ 
+diff --git a/README.md b/README.md
+index 9cd2d69..0f57dcc 100644
+--- a/README.md
++++ b/README.md
+@@ -159,6 +159,8 @@ curl -s -H "Authorization: Bearer fmk_…" http://127.0.0.1:8080/api/v1/inferenc
+ | `FORGEMESH_DB_PATH` | `forgemesh.db` | SQLite 权威存储文件；同一文件只允许一个控制平面实例写入（ADR-013）。以 WAL 模式打开，运行时旁边有 `-wal` / `-shm` 文件，不能直接复制文件做备份，见 [备份与灾备演练](docs/operations/backup-restore.md)。设置了 `FORGEMESH_RUNTIME_LAUNCHER` 时，部署工作流的运行记录在同目录的第二个文件中（`forgemesh.db` → `forgemesh.workflows.db`），两个文件一起备份与恢复 |
+ | `FORGEMESH_HOST` | `127.0.0.1` | 监听地址 |
+ | `FORGEMESH_PORT` | `8080` | 监听端口 |
++| `FORGEMESH_LOG_FORMAT` | `json` | 日志格式：`json`（每行一个 JSON 对象）或 `text`，写到标准错误，见「可观测性」；不区分大小写，其他取值拒绝启动 |
++| `FORGEMESH_LOG_LEVEL` | `INFO` | 日志级别：`DEBUG` / `INFO` / `WARNING` / `ERROR`，不区分大小写，其他取值拒绝启动 |
+ | `FORGEMESH_INVENTORY_FILE` | — | 静态加速器清单（JSON，格式见下），设置后启用首次适配调度器；文件不可读或格式非法时拒绝启动，修改后需重启。未设置时不启用调度器 |
+ | `FORGEMESH_RUNTIME_LAUNCHER` | — | 推理实例启动器，设置后部署推理服务（见「部署推理服务」）：`fake`（控制平面进程内的 OpenAI 兼容桩服务，不需要 GPU，供 CI 与本地开发）或 `vllm-process`（本机上的 vLLM 子进程），不区分大小写。必须同时设置 `FORGEMESH_INVENTORY_FILE`；取值未知、缺少清单或所选启动器的配置非法时拒绝启动。未设置时不部署。下面各启动器的变量只在选中该启动器时读取，空白值视同未设置 |
+ | `FORGEMESH_FAKE_LAUNCHER_BIND_HOST` | `127.0.0.1` | `fake`：实例监听的 IP 地址，`0.0.0.0` / `::` 监听全部地址 |
+@@ -274,10 +276,46 @@ docker compose -f deploy/docker/docker-compose.yaml \
+ scripts/compose_smoke.sh   # 端到端冒烟（CI 同样执行）
+ ```
+ 
+-只用 `docker-compose.yaml` 时控制平面没有清单与启动器，新建的服务停在 `Pending`（`SchedulerUnavailable`）。`docker-compose.fake-runtime.yaml` 为控制平面加上清单 `deploy/docker/fake-runtime-inventory.json`（一个节点、一块设备 `gpu-0`）与 `fake` 启动器：实例在控制平面容器内监听全部地址，写进 `status.endpoints` 的主机是服务名 `control-plane`，网关经 compose 网络连接它（私网地址默认允许），实例端口不发布到宿主机。`scripts/compose_smoke.sh` 用这两个文件经网关走完闭环：无 key 的请求返回 `401`；创建 → `Ready`（一个就绪的 `openai-chat` 端点）→ 流式对话到达实例、以 `[DONE]` 结束 → 删除后资源消失、实例停止监听 → 同名重新创建（只有一块设备，可见分配已释放）→ 再次对话到达新实例 → 重启控制平面：资源仍在，服务转为 `Degraded`（`InstanceLost`），网关返回 `503`（`NO_HEALTHY_UPSTREAM`）→ 删除。
++只用 `docker-compose.yaml` 时控制平面没有清单与启动器，新建的服务停在 `Pending`（`SchedulerUnavailable`）。`docker-compose.fake-runtime.yaml` 为控制平面加上清单 `deploy/docker/fake-runtime-inventory.json`（一个节点、一块设备 `gpu-0`）与 `fake` 启动器：实例在控制平面容器内监听全部地址，写进 `status.endpoints` 的主机是服务名 `control-plane`，网关经 compose 网络连接它（私网地址默认允许），实例端口不发布到宿主机。`scripts/compose_smoke.sh` 用这两个文件经网关走完闭环：无 key 的请求返回 `401`；创建 → `Ready`（一个就绪的 `openai-chat` 端点）→ 流式对话到达实例、以 `[DONE]` 结束 → 不带凭证抓取两边的 `/metrics`，带 `traceparent` 的请求在两边的日志与错误信封中带同一个 trace-id（见「可观测性」）→ 删除后资源消失、实例停止监听 → 同名重新创建（只有一块设备，可见分配已释放）→ 再次对话到达新实例 → 重启控制平面：资源仍在，服务转为 `Degraded`（`InstanceLost`），网关返回 `503`（`NO_HEALTHY_UPSTREAM`）→ 删除。
+ 
+ 控制平面的 SQLite 数据库（部署推理服务时还有工作流存储 `forgemesh.workflows.db`）在 compose 卷 `control-plane-data` 中。Kubernetes 清单见 `deploy/kubernetes/`：数据库放在 PersistentVolumeClaim 上，key 文件来自 Secret `forgemesh-api-keys`，更新策略为 `Recreate`，保证任何时刻只有一个控制平面写数据库（ADR-013）；清单没有设置加速器清单与启动器，不部署推理实例。容器中的备份与恢复见 [备份与灾备演练](docs/operations/backup-restore.md) 2.5 / 3.4 节。
+ 
++### 可观测性
++
++控制平面与网关各自在 `/metrics` 以 Prometheus 文本格式（0.0.4）输出指标，不依赖第三方库：
++
++```bash
++curl -s http://127.0.0.1:8080/metrics   # 控制平面
++curl -s http://127.0.0.1:8081/metrics   # 网关
++```
++
++两个 `/metrics` 与探针一样不要求认证，网关也不对它限流。输出只有跨租户聚合的计数与耗时：标签只取路由模板（网关为路由类别）、方法、状态码与固定的枚举值（加速器类型取自运维配置的清单），不含租户、服务名、命名空间、uid、路径或实例地址；每个指标最多 200 个标签组合，超出的计入标签全为 `overflow` 的一个序列。控制平面的 `/metrics` 不在 `/api/v1` 之下，网关不转发它。指标仍能反映整体负载，不要经公网入口暴露这两个端点，只让 Prometheus 所在的网络访问（compose 只发布在 `127.0.0.1`）。
++
++控制平面的指标（网关的指标见 [gateway/README.md](gateway/README.md)「可观测性」）：
++
++| 指标 | 类型 | 说明 |
++| --- | --- | --- |
++| `forgemesh_http_requests_total{method,route,status}` | counter | HTTP 请求数；`route` 为路由模板（如 `/api/v1/inference-services/{name}`），未匹配路由的请求为 `unmatched` |
++| `forgemesh_http_request_duration_seconds{method,route}` | histogram | 处理 HTTP 请求的耗时 |
++| `forgemesh_reconcile_total{operation,outcome}` | counter | 协调次数；`operation` 为 `reconcile` / `terminate`，`outcome` 为 `done` / `requeue` / `wait` / `conflict` / `error` |
++| `forgemesh_reconcile_duration_seconds{operation}` | histogram | 一次协调的耗时，含 status 回写 |
++| `forgemesh_controller_retries_total` | counter | 协调抛出异常、按退避重新排队的次数 |
++| `forgemesh_controller_queue_depth{state}` | gauge | 工作队列中的键数：`ready`（可立即处理）/ `delayed`（等待延迟到期）/ `processing` |
++| `forgemesh_deployments_total{outcome,reason}` | counter | 推理服务进入 `Ready`（`outcome="ready"`）或 `Failed`（`outcome="failed"`）的次数，`reason` 为 `Ready` 条件的原因 |
++| `forgemesh_inference_services{phase}` | gauge | 各阶段的推理服务数 |
++| `forgemesh_allocations_active{accelerator_type}` | gauge | Active 分配数，按其设备在清单中的类型 |
++| `forgemesh_accelerator_devices{accelerator_type,state}` | gauge | 清单中的设备数，`state` 为 `free` / `allocated`；未配置清单时没有样本 |
++| `forgemesh_workflow_runs{status}` | gauge | 各状态的部署工作流运行数；未设置启动器时没有样本 |
++| `forgemesh_registry_lock_wait_seconds` | histogram | 注册中心的一次数据库操作等待连接锁的时间（不含 SQLite 内部的忙等待） |
++
++**追踪上下文与日志**：网关沿用请求中合法的 W3C `traceparent`，否则生成一个，随请求转发给控制平面与推理实例。控制平面按同样的规则读取 `traceparent`（直连控制平面的请求同样适用），并沿用 `X-Correlation-Id`（缺失时生成），这个请求的日志与错误信封（`{"error": {"code", "message", "correlationId", "traceId", …}}`）都带上 trace-id 与关联 ID，一次请求在网关与控制平面的日志里可以按 trace-id 对上。控制平面的日志写到标准错误，默认每行一个 JSON 对象，uvicorn 的访问日志也是如此：
++
++```json
++{"time": "2026-10-13T03:53:36.002Z", "level": "INFO", "logger": "uvicorn.access", "message": "127.0.0.1:38956 - \"GET /api/v1/inference-services/llama HTTP/1.1\" 200", "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736", "correlation_id": "ad1cd525116940f682ea882c0c7a6b67"}
++```
++
++`FORGEMESH_LOG_FORMAT=text` 时每行为 `时间 级别 logger trace=<trace-id> corr=<关联 ID> 消息`（UTC 时间，缺失的 ID 记为 `-`）。网关的访问日志见 [gateway/README.md](gateway/README.md)「可观测性」。两边都不记录 span，也不导出追踪（OTLP 导出尚未实现）；`forgemesh.controlplane.observability` 中的内存记录器（`MetricsRecorder` / `TraceRecorder`）不经 `/metrics` 输出。
++
+ ---
+ 
+ ## 4. 功能概览（v1.0.0）
+diff --git a/docs/architecture/module-mapping.md b/docs/architecture/module-mapping.md
+index 0fce571..c8d1c34 100644
+--- a/docs/architecture/module-mapping.md
++++ b/docs/architecture/module-mapping.md
+@@ -22,7 +22,7 @@
+ - 路径存在性：`ls` / `find` / glob 实测（本文所有路径均已在 2026-10-11 于本分支核对）。
+ - 依赖边界：`grep -rn` 对 `--include="*.py"` 的 import 扫描，命令与输出结论逐条记录于第 3 节。
+ - 测试基线：`python -m pytest tests/ -q` → **993 passed**（本机 2026-10-11，5.34s）。
+-- Go 侧：本机无 Go 工具链，`go test` 以 CI `go` job 为准（gateway 17 个 `*_test.go` 经 glob 核对存在）。
++- Go 侧：本机无 Go 工具链，`go test` 以 CI `go` job 为准（gateway 29 个 `*_test.go` 经 glob 核对存在）。
+ 
+ ---
+ 
+@@ -75,13 +75,13 @@
+ | 字段 | 内容 |
+ |---|---|
+ | 架构模块 | Data Plane Gateway（L1 推理流量入口，architecture.md 3.1 L1 / Dev-5） |
+-| 当前代码路径 | `gateway/cmd/gateway/main.go`；`gateway/internal/{config,health,middleware,router,stream,upstream}/`（共 33 个 `.go` 文件，其中 17 个 `_test.go`，glob 核对）；`gateway/go.mod`（`github.com/Mekoforge/ForgeMesh/gateway`，go 1.22）；`gateway/Makefile`、`gateway/README.md` |
+-| 核心契约 | `/api/v1/` REST + SSE 流式转发（见 openapi.yaml）；中间件链 `Recovery → Correlation → Authenticate → RateLimit → LimitRequestBody → Route`；API key 认证（ADR-014，`middleware/{authz,apikey}.go`）；上游解析 `upstream/resolver.go`（按命名空间解析 ready 实例、`protocol` → 实例推理路径、合并回源、健康摘流）；实例地址限制 `stream/addrpolicy.go` |
++| 当前代码路径 | `gateway/cmd/gateway/main.go`；`gateway/internal/{config,health,metrics,middleware,router,stream,upstream}/`（共 51 个 `.go` 文件，其中 29 个 `_test.go`，glob 核对）；`gateway/go.mod`（`github.com/Mekoforge/ForgeMesh/gateway`，go 1.22）；`gateway/Makefile`、`gateway/README.md` |
++| 核心契约 | `/api/v1/` REST + SSE 流式转发（见 openapi.yaml）；中间件链 `Observe → Recovery → Correlation → TraceContext → AccessLog → Authenticate → RateLimit → LimitRequestBody → Route`；API key 认证（ADR-014，`middleware/{authz,apikey}.go`）；上游解析 `upstream/resolver.go`（按命名空间解析 ready 实例、`protocol` → 实例推理路径、合并回源、健康摘流）；实例地址限制 `stream/addrpolicy.go`；`/metrics`（Prometheus 文本格式，不经认证/限流，`metrics/{metrics,gateway}.go`，测试用解析 `metrics/metricstest`）；W3C `traceparent` 沿用/生成并转发、访问日志（`middleware/{observe,tracecontext,accesslog}.go`） |
+ | 运行形态 | 独立进程（Go 二进制），经 `GATEWAY_UPSTREAM_URL` 转发至控制平面 |
+ | 数据所有权 | 无权威数据（运行态转发；端点解析缓存为派生数据） |
+ | 允许依赖 | 控制平面 HTTP API（上游）、Go 标准库 |
+ | 禁止依赖 | Python 进程内模块、直连 SQLite/数据库、任何插件、LLM SDK |
+-| 测试路径 | `gateway/internal/` 下 17 个 `*_test.go`：`config_test.go`、`health_test.go`、`middleware/{apikey,authz,bodylimit,chain,correlation,ratelimit}_test.go`、`router/{auth,resolver,router,tenant_security}_test.go`、`stream/{addrpolicy,proxy,sse_cancel}_test.go`、`upstream/{client,resolver}_test.go`；CI 以 `-race` 运行 |
++| 测试路径 | `gateway/internal/` 下 29 个 `*_test.go`：`config_test.go`、`health_test.go`、`metrics/{gateway,metrics}_test.go`、`metrics/metricstest/metricstest_test.go`、`middleware/{accesslog,apikey,authz,bodylimit,chain,correlation,observe,ratelimit,tracecontext}_test.go`、`router/{auth,metrics,resolver,router,tenant_security,tracecontext}_test.go`、`stream/{addrpolicy,metrics,proxy,sse_cancel,tracecontext}_test.go`、`upstream/{client,metrics,resolver,tracecontext}_test.go`；CI 以 `-race` 运行 |
+ | 状态 | 已实现且有测试覆盖（本机无 Go 工具链，`go test` 以 CI `go` job 为准；`find gateway -name "*.py"` = 0，纯 Go 已循证，见 3.4） |
+ | 演进动作 | 保留；WP-D1 补多租户安全验证（tenant 绑定、Resolver 行为、SSE 取消、链序） |
+ 
+@@ -120,13 +120,13 @@
+ | 字段 | 内容 |
+ |---|---|
+ | 架构模块 | L2 Core Control Plane（权威状态、协调、插件管理、审计） |
+-| 当前代码路径 | `packages/control-plane/src/forgemesh/controlplane/`：`registry/{models,store}.py`、`reconciler/{core,dedup}.py`、`controller/{manager,queue}.py`、`scheduler/{inventory,first_fit}.py`、`deployment/{launcher,workflow,release,recovery,config,network,fake,vllm_process,memory}.py`、`api/{routes,dependencies,errors}.py`、`plugin_manager.py`、`outbox.py`、`audit.py`、`tasks.py`、`heartbeat.py`、`observability.py`、`diagnostics.py`、`app.py`、`auth.py`、`keygen.py`、`sqlite.py`（共 38 个 `.py`；其中 `auth.py` / `keygen.py` / `api/errors.py` 为 API 认证与错误信封，见 ADR-014；`controller/` 驱动协调器并回写 status；`scheduler/` 按静态加速器清单首次适配分配；`deployment/` 为部署工作流（准备模型 → 启动实例 → 验证实例）、启动器契约 `RuntimeLauncher` 与两个启动器（`fake.py`：控制平面进程内的 OpenAI 兼容桩服务 `FakeLauncher`；`vllm_process.py`：本机 vLLM 子进程 `VLLMProcessLauncher`；由 `config.py` 按 `FORGEMESH_RUNTIME_LAUNCHER` 选择，`network.py` 为两者共用的地址校验与健康检查）、删除时的清理 `DeploymentReleaser`、重启之后把实例已不在运行的 `Ready` 服务转为 `Degraded` 的 `mark_lost_instances`（`recovery.py`）与测试替身 `InMemoryLauncher`；`sqlite.py` 统一 SQLite 连接设置（WAL、外键），并由 `workflow_db_path` 给出工作流存储文件；其余与任务书的 9 个子模块一一对应） |
++| 当前代码路径 | `packages/control-plane/src/forgemesh/controlplane/`：`registry/{models,store}.py`、`reconciler/{core,dedup}.py`、`controller/{manager,queue}.py`、`scheduler/{inventory,first_fit}.py`、`deployment/{launcher,workflow,release,recovery,config,network,fake,vllm_process,memory}.py`、`api/{routes,dependencies,errors,middleware}.py`、`plugin_manager.py`、`outbox.py`、`audit.py`、`tasks.py`、`heartbeat.py`、`observability.py`、`metrics.py`、`telemetry.py`、`tracecontext.py`、`logs.py`、`diagnostics.py`、`app.py`、`auth.py`、`keygen.py`、`sqlite.py`（共 43 个 `.py`；其中 `auth.py` / `keygen.py` / `api/errors.py` 为 API 认证与错误信封，见 ADR-014；`metrics.py` 为不依赖第三方库的 Prometheus 文本格式指标，`telemetry.py` 定义 `GET /metrics` 输出的指标，`tracecontext.py` 解析 W3C `traceparent`，`api/middleware.py` 为每个请求绑定关联 ID 与 trace-id 并记录请求指标，`logs.py` 为带这两个 ID 的 JSON / 文本日志；`observability.py` 的内存记录器不经 `/metrics` 输出；`controller/` 驱动协调器并回写 status；`scheduler/` 按静态加速器清单首次适配分配；`deployment/` 为部署工作流（准备模型 → 启动实例 → 验证实例）、启动器契约 `RuntimeLauncher` 与两个启动器（`fake.py`：控制平面进程内的 OpenAI 兼容桩服务 `FakeLauncher`；`vllm_process.py`：本机 vLLM 子进程 `VLLMProcessLauncher`；由 `config.py` 按 `FORGEMESH_RUNTIME_LAUNCHER` 选择，`network.py` 为两者共用的地址校验与健康检查）、删除时的清理 `DeploymentReleaser`、重启之后把实例已不在运行的 `Ready` 服务转为 `Degraded` 的 `mark_lost_instances`（`recovery.py`）与测试替身 `InMemoryLauncher`；`sqlite.py` 统一 SQLite 连接设置（WAL、外键），并由 `workflow_db_path` 给出工作流存储文件；其余与任务书的 9 个子模块一一对应） |
+ | 核心契约 | 实现 `core-contracts` 的 `ResourceRegistry` / `Reconciler` / `Scheduler`（`FirstFitScheduler`：清单来自 `FORGEMESH_INVENTORY_FILE`，设置时才注入控制器；分配与设备占用经 `SQLiteRegistry.create_allocation` 在同一事务中写入，设备独占由 `allocation_devices` 部分唯一索引保证）；协调器按 phase 逐轮推进 `InferenceService`（`Pending` → `Scheduling` → `Preparing` → `Deploying` → `Verifying` → `Ready`），以 `deployment:{uid}` 为幂等键启动并查询部署工作流，成功后写入 `status.endpoints`，删除时经 `DeploymentReleaser` 取消部署、停止实例（部署包只依赖工作流契约，运行时与启动器由组装方注入：`app.py` 在设置了 `FORGEMESH_RUNTIME_LAUNCHER` 时以 `workflow-runtime` 的 `LocalWorkflowRuntime` 与所选启动器组装，未设置时不注入，协调器在分配之前报告 `WorkflowRuntimeUnavailable`）；`app.py` 提供 HTTP 服务（FastAPI，未安装时回退纯标准库占位——生产必须 FastAPI/ASGI），并在 lifespan 中运行控制器（设置了启动器时，先恢复未结束的部署运行、把实例已不在运行的 `Ready` 服务转为 `Degraded`，再启动控制器）；控制器按序号增量读取 `resource_changes` 变更记录，经 `update_status`（status 子资源，CAS）回写协调结果；Outbox 事务性事件（architecture.md 3.3 规则 7）；`ProcessedKeyStore` 去重（reconciler/dedup.py）；`PluginManager`（plugin_manager.py）注册时校验插件清单与 Ed25519 签名（受信任公钥来自插件策略文件），插件实际权限为清单申请与管理员授予的交集，控制平面应用尚未接入 |
+ | 运行形态 | 单实例控制平面进程（模块化单体，architecture.md 3.3 规则 8）；ADR-013 约束：仅允许单写方写同一 SQLite 权威库；控制器与 API 同进程运行，不得以多个 worker 进程启动 |
+ | 数据所有权 | **全部业务资源权威状态**（registry/store.py）、审计事件（audit.py，默认内存库，控制平面应用尚未接入）、Outbox 事件、任务与心跳状态 |
+ | 允许依赖 | `forgemesh.core` / `forgemesh.resource` / `forgemesh.policy` / `forgemesh.decision` / `forgemesh.workflow*` / `forgemesh.plugin`（plugin-sdk）、标准库 `sqlite3`、FastAPI |
+ | 禁止依赖 | 任何插件私有模块（`decision_rules` / `gpu_nvidia` 等，扫描二验证 ✅，见 3.2） |
+-| 测试路径 | `tests/unit/controlplane/`：`test_api.py`、`test_routes.py`、`test_registry.py`、`test_reconciler.py`、`test_dedup_store.py`、`test_plugin_manager.py`、`test_outbox.py`、`test_audit.py`、`test_tasks.py`、`test_heartbeat.py`、`test_observability.py`、`test_diagnostics.py`、`test_app.py`、`test_auth.py`、`test_controller_manager.py`、`test_controller_queue.py`、`test_registry_changes.py`、`test_registry_status.py`、`test_registry_allocations.py`、`test_sqlite.py`、`test_scheduler.py`、`test_scheduler_inventory.py`、`test_allocation_lifecycle.py`、`test_deployment.py`、`test_deployment_lifecycle.py`、`test_fake_launcher.py`、`test_vllm_launcher.py`、`test_launcher_config.py`、`test_launcher_network.py`（29 个文件，glob 核对；`test_deployment_lifecycle.py` 以控制器、调度器、本地工作流运行时与内存启动器覆盖部署、重启、失败与删除闭环；`test_vllm_launcher.py` 以同目录的替身 `vllm_standin.py` 代替 vLLM 运行，不需要 GPU）；端到端 `tests/e2e/test_closed_loop.py`（应用 + 假启动器：创建 → `Ready` → 对话 → 删除 → 重新创建 → 重启后 `Degraded`） |
++| 测试路径 | `tests/unit/controlplane/`：`test_api.py`、`test_routes.py`、`test_registry.py`、`test_reconciler.py`、`test_dedup_store.py`、`test_plugin_manager.py`、`test_outbox.py`、`test_audit.py`、`test_tasks.py`、`test_heartbeat.py`、`test_observability.py`、`test_diagnostics.py`、`test_app.py`、`test_auth.py`、`test_controller_manager.py`、`test_controller_queue.py`、`test_registry_changes.py`、`test_registry_status.py`、`test_registry_allocations.py`、`test_sqlite.py`、`test_scheduler.py`、`test_scheduler_inventory.py`、`test_allocation_lifecycle.py`、`test_deployment.py`、`test_deployment_lifecycle.py`、`test_fake_launcher.py`、`test_vllm_launcher.py`、`test_launcher_config.py`、`test_launcher_network.py`、`test_metrics.py`、`test_metrics_endpoint.py`、`test_telemetry.py`、`test_tracecontext.py`、`test_request_context.py`、`test_logs.py`（35 个文件，glob 核对；`exposition.py` 为指标测试共用的文本格式严格解析；`test_deployment_lifecycle.py` 以控制器、调度器、本地工作流运行时与内存启动器覆盖部署、重启、失败与删除闭环；`test_vllm_launcher.py` 以同目录的替身 `vllm_standin.py` 代替 vLLM 运行，不需要 GPU）；端到端 `tests/e2e/test_closed_loop.py`（应用 + 假启动器：创建 → `Ready` → 对话 → 删除 → 重新创建 → 重启后 `Degraded`） |
+ | 状态 | 已实现且有测试覆盖 |
+ | 演进动作 | 保留；WP-C1 补故障路径（CAS 并发、重启恢复、finalizer 闭环、Allocation 唯一性） |
+ 
+@@ -321,7 +321,7 @@
+ | 数据所有权 | 无；控制平面的 SQLite 库（叠加 `docker-compose.fake-runtime.yaml` 时还有工作流存储 `forgemesh.workflows.db`）位于 compose 卷 `control-plane-data` / k8s PVC `forgemesh-control-plane-data`（pgdata 卷属目标态预置，仅 `postgres` profile 使用） |
+ | 允许依赖 | — |
+ | 禁止依赖 | —（约束：部署不得暗示多副本写同一 SQLite） |
+-| 测试路径 | `scripts/compose_smoke.sh`（CI `compose-smoke` job：构建镜像，以两个 compose 文件启动，经网关验证无 key 返回 401，创建 `InferenceService` → `Ready` → 经网关流式对话 → 删除（实例端口关闭）→ 同名重新创建并再次对话 → 重启控制平面：资源仍在，服务转为 `Degraded`（`InstanceLost`），网关返回 503 → 删除）；k8s 清单无自动化测试；备份恢复有人工演练清单 |
++| 测试路径 | `scripts/compose_smoke.sh`（CI `compose-smoke` job：构建镜像，以两个 compose 文件启动，经网关验证无 key 返回 401，创建 `InferenceService` → `Ready` → 经网关流式对话 → 不带凭证抓取两边的 `/metrics`，带 `traceparent` 的请求在控制平面的错误信封与两边的日志中带同一个 trace-id → 删除（实例端口关闭）→ 同名重新创建并再次对话 → 重启控制平面：资源仍在，服务转为 `Degraded`（`InstanceLost`），网关返回 503 → 删除）；k8s 清单无自动化测试；备份恢复有人工演练清单 |
+ | 状态 | compose 已实现且有测试覆盖；k8s 清单实现待核验（无自动化测试，尚未提供网关清单、ServiceAccount、NetworkPolicy）；运维文档已交付 |
+ | 演进动作 | k8s 补网关清单、ServiceAccount 与 NetworkPolicy；A1.5 已核对部署文档含单实例约束；目标态 PostgreSQL 部署属阶段 F |
+ 
+@@ -372,12 +372,12 @@ grep -rn "controlplane" packages/node-agent/src/ --include="*.py" | grep -v egg-
+ 
+ ```bash
+ ls gateway/*.go gateway/cmd/... 2>/dev/null | head   # 根级无 *.go，代码在 cmd/ 与 internal/
+-find gateway -name "*.go" | wc -l                     # → 33
++find gateway -name "*.go" | wc -l                     # → 51
+ find gateway -name "*.py" -o -name "requirements*.txt" | wc -l   # → 0
+ cat gateway/go.mod                                     # module github.com/Mekoforge/ForgeMesh/gateway (go 1.22)
+ ```
+ 
+-**输出：** 33 个 `.go`（含 17 个 `_test.go`）、0 个 `.py`、无 Python 依赖清单；`go.mod` 无任何第三方 require（仅标准库 + go 1.22）。
++**输出：** 51 个 `.go`（含 29 个 `_test.go`）、0 个 `.py`、无 Python 依赖清单；`go.mod` 无任何第三方 require（仅标准库 + go 1.22）。
+ 
+ **结论：✅ 符合** —— 网关与 Python 控制平面为进程边界隔离（HTTP 上游），无语言互操作。
+ 
+diff --git a/gateway/README.md b/gateway/README.md
+index 826fedb..5ab5476 100644
+--- a/gateway/README.md
++++ b/gateway/README.md
+@@ -20,7 +20,7 @@ ForgeMesh 的**统一外部入口**与**高性能流式代理**。与 Python 控
+ | SSE / 流式 Token 转发 | ✅ 负责 | 提供上游流 |
+ | 协议 / 版本转换 | ✅ 负责 | 提供 `v1alpha1` 内部契约 |
+ | 资源权威状态 / 协调 / 工作流 | ❌ 不涉及 | ✅ 负责 |
+-| 探针 | ✅ `/healthz`、`/readyz` | ✅ `/healthz`、`/readyz` |
++| 探针与指标 | ✅ `/healthz`、`/readyz`、`/metrics`（网关自己的指标） | ✅ `/healthz`、`/readyz`、`/metrics` |
+ 
+ > **零信任提示**：网关校验 API key 后，以 key 绑定的租户覆写租户头再转发；控制平面
+ > 不信任这个头，而是用调用方的 `Authorization` 自行校验（[ADR-014](../docs/design-decisions/adr-014.md)）。
+@@ -32,8 +32,9 @@ ForgeMesh 的**统一外部入口**与**高性能流式代理**。与 Python 控
+ 
+ | 方法 | 路径 | 处理器 | 中间件 |
+ | --- | --- | --- | --- |
+-| GET | `/healthz` | 存活探针（始终 200） | 仅 Recovery |
+-| GET | `/readyz` | 就绪探针（请求控制平面 `/readyz`，非 200 或不可达时 503） | 仅 Recovery |
++| GET | `/healthz` | 存活探针（始终 200） | 仅 Observe、Recovery |
++| GET | `/readyz` | 就绪探针（请求控制平面 `/readyz`，非 200 或不可达时 503） | 仅 Observe、Recovery |
++| GET | `/metrics` | Prometheus 指标（见「可观测性」；`GET` / `HEAD` 之外返回 405） | 仅 Observe、Recovery |
+ | ANY | `/api/v1/resources[/...]` | 反代 → Python 控制平面 | 全链 |
+ | ANY | `/api/v1/inference-services[/...]` | 反代 → Python 控制平面 | 全链 |
+ | ANY | `/api/v1/workflows[/...]` | 反代 → Python 控制平面 | 全链 |
+@@ -71,20 +72,23 @@ ForgeMesh 的**统一外部入口**与**高性能流式代理**。与 Python 控
+ 
+ ### 中间件链
+ 
+-执行顺序（外层 → 内层，与 `router.go` 实际组装一致，并由
++执行顺序（外层 → 内层，与 `router.go` 实际组装一致；Recovery 之内的顺序由
+ `internal/middleware/chain_test.go` 验证）：
+ 
+ ```
+-Recovery → Correlation → Authenticate → RateLimit → LimitRequestBody → Route
++Observe → Recovery → Correlation → TraceContext → AccessLog → Authenticate → RateLimit → LimitRequestBody → Route
+ ```
+ 
+-- **Recovery**：兜底 panic → 500，记录堆栈，进程不退出（最外层，覆盖全量请求）。
++- **Observe**：按路由类别记录请求数与耗时（见「可观测性」），位于最外层：Recovery 兜底的 500 与被认证、限流拒绝的请求都计入。
++- **Recovery**：兜底 panic → 500，记录堆栈，进程不退出（覆盖全量请求）。
+ - **Correlation**：缺失则用 `crypto/rand` 生成 128-bit hex 关联 ID，注入 context 与响应头；已携带则透传。
++- **TraceContext**：沿用或生成 W3C `traceparent`，trace-id 注入 context（见「可观测性」）。
++- **AccessLog**：每个请求一行访问日志，带关联 ID 与 trace-id；位于 Authenticate 之前，被认证或限流拒绝的请求同样记录。
+ - **Authenticate**：按 `GATEWAY_AUTH_MODE` 校验凭证——`apikey`（默认）以 `Authorization: Bearer <key>` 的 SHA-256 摘要查 key 文件，`dev` 直接信任租户头。已验证的主体（subject / 租户 / scope）注入 context，并以已验证的租户**覆写**入站租户头。缺少或无效凭证返回 `401`（带 `WWW-Authenticate: Bearer realm="forgemesh"`），租户头与 key 绑定的租户不一致返回 `403`，响应体均为 JSON 错误信封。
+ - **RateLimit**：按已验证租户的令牌桶限流，超限 `429 + Retry-After`；位于 Authenticate 之后，被拒请求不消耗令牌；不读取租户头或 `X-Forwarded-For`。
+ - **LimitRequestBody**：请求体上限为 `GATEWAY_MAX_REQUEST_BODY_BYTES`（默认 10 MiB）。声明的 `Content-Length` 超限时直接返回 `413 REQUEST_TOO_LARGE`，不访问上游；分块传输的请求体读到上限时，反代与流式代理同样返回 `413`，不计实例失败。
+ 
+-> 说明：探针刻意不经过认证/限流，保证负载均衡健康检查始终可用。
++> 说明：探针与 `/metrics` 刻意不经过认证/限流（也不写访问日志），保证负载均衡健康检查与指标抓取始终可用。
+ 
+ ### Header 转发与剥离策略
+ 
+@@ -97,6 +101,8 @@ Recovery → Correlation → Authenticate → RateLimit → LimitRequestBody →
+ | `X-Tenant-ID`（可经 `GATEWAY_TENANT_HEADER` 配置） | **覆写后转发** | Authenticate 以已验证的租户**覆写**入站头再放行（`apikey` 模式取自 key；`dev` 模式取 TrimSpace 后首个值），下游读到的与认证上下文严格同源；`apikey` 模式下任一取值与 key 不一致即返回 `403` |
+ | `Authorization` | 透传 | 控制平面用同一份 key 文件独立复核调用方（ADR-014） |
+ | `X-Correlation-ID`（可配置） | 生成/透传 | Correlation 中间件受信：缺失则生成 128-bit hex，已携带则原样透传（跨服务链路连续） |
++| `traceparent` | 透传/生成 | TraceContext 中间件：恰好一个合法的值原样转发，否则生成新的（见「可观测性」）；Resolver 查询控制平面时同样携带 |
++| `tracestate` | 透传/剥离 | 随合法的 `traceparent` 原样转发；网关开始新的追踪时剥离 |
+ | `X-Forwarded-*`（For/Proto/Host） | 网关注入 | ReverseProxy `SetXForwarded` 标准注入，标记经代理的事实 |
+ | `Host`、`Content-Length` | 剥离后重写 | 由出站 Transport 按上游语义重写，避免长度/主机不一致 |
+ | hop-by-hop 头（`Connection`/`Keep-Alive`/`TE`/`Upgrade` 等） | 剥离 | 逐跳语义不跨节点转发 |
+@@ -107,6 +113,7 @@ Recovery → Correlation → Authenticate → RateLimit → LimitRequestBody →
+ | --- | --- | --- |
+ | `X-Tenant-ID` | 覆写后转发 | 同方向一：Authenticate 写入的已验证租户，同时作为 Resolver 查询与多租户缓存隔离的 key |
+ | `X-Correlation-ID` | 透传 | 由 Correlation 中间件保证存在（缺失时已生成） |
++| `traceparent`、`tracestate` | 透传/生成 | 同方向一：推理实例收到的与控制平面收到的相同 |
+ | `Authorization`、`Cookie` | **剥离** | 调用方的平台凭证只交给网关与控制平面，不交给推理实例；Resolver 查询控制平面时携带调用方的 `Authorization`，控制平面拒绝（`403`）时网关同样返回 `403` |
+ | `Accept` | **强制覆写** | 网关强制 `text/event-stream`，保证流式语义 |
+ | `Host`、`Content-Length` | 剥离后重写 | 同方向一 |
+@@ -114,7 +121,8 @@ Recovery → Correlation → Authenticate → RateLimit → LimitRequestBody →
+ 
+ **响应方向（上游/实例 → 客户端）**：非 hop-by-hop 头透传；流式代理的 2xx 响应强制
+ `Content-Type: text/event-stream`，错误响应保留实例的 `Content-Type`（如 JSON 错误体）；
+-流式代理的响应一律设置 `Cache-Control: no-cache`、`X-Accel-Buffering: no`。
++流式代理的响应一律设置 `Cache-Control: no-cache`、`X-Accel-Buffering: no`。网关不在响应中回写
++`traceparent`：客户端凭响应头中的关联 ID 或错误信封中的 `traceId` 报障。
+ 
+ **安全缺陷记录（WP-D1，已修复）**：修复前 Authz 仅校验租户头存在性、不回写
+ 请求头，下游（反代/流式代理/限流 key）重新读取客户端**原始头**——多值头
+@@ -129,6 +137,48 @@ Recovery → Correlation → Authenticate → RateLimit → LimitRequestBody →
+ `internal/router/auth_test.go`、`internal/middleware/authz_test.go` 与
+ `tests/unit/controlplane/test_auth.py`。
+ 
++### 可观测性
++
++**指标**：`/metrics` 以 Prometheus 文本格式（0.0.4）输出网关自己的指标，由 `internal/metrics`
++用标准库实现。它与探针在同一个监听地址上，不经过认证、限流与访问日志，输出只有聚合数据：标签
++只取路由类别、状态码与固定的枚举值，不含租户、服务名、路径或实例地址；每个指标最多 200 个标签
++组合，超出的计入标签全为 `overflow` 的一个序列。指标仍能反映整体负载，只让 Prometheus 所在的
++网络访问这个端点，不要经公网入口暴露。
++
++| 指标 | 类型 | 说明 |
++| --- | --- | --- |
++| `forgemesh_gateway_http_requests_total{route,status}` | counter | 处理的请求数，含 Recovery 兜底的 `500` 与被认证、限流拒绝的请求 |
++| `forgemesh_gateway_http_request_duration_seconds{route}` | histogram | 请求耗时；流式请求为整个流的时长 |
++| `forgemesh_gateway_stream_first_byte_seconds` | histogram | 流式代理从开始处理请求（含解析实例）到把实例的第一个响应体字节写给客户端的时间，只统计实例返回 2xx 的流 |
++| `forgemesh_gateway_upstream_errors_total{upstream,kind}` | counter | 上游错误数。`upstream`：`control_plane`（资源接口反代与 Resolver 的查询）/ `instance`；`kind`：`connect`（没有收到响应，客户端已断开的请求不计）/ `status`（上游返回 5xx）/ `body`（流在中途中断，或控制平面的响应不是合法 JSON）/ `address_not_allowed` / `invalid_endpoint` |
++| `forgemesh_gateway_rate_limited_total` | counter | 被限流拒绝（`429`）的请求数 |
++| `forgemesh_gateway_resolver_lookups_total{result}` | counter | Resolver 的查询数。`result`：`hit`（缓存命中，含缓存的"服务不存在 / 未就绪 / 无可用实例"）/ `miss`（向控制平面查询）/ `coalesced`（并入同一服务进行中的查询） |
++| `forgemesh_gateway_instances{state}` | gauge | Resolver 缓存中（TTL 内解析过）的实例数：`healthy` 参与轮询，`unhealthy` 因连续失败处于冷却期 |
++
++`route` 按路由表确定，不取请求路径：`probe`（`/healthz`、`/readyz`）、`metrics`、`control_plane`
++（反代到控制平面的资源接口）、`inference`（流式推理代理）、`unmatched`（没有匹配的路由，含
++`/api/v1/` 下的未知路径）。
++
++**追踪上下文**：TraceContext 按 W3C Trace Context 校验 `traceparent`：只接受小写十六进制，
++trace-id 或 parent-id 全零、版本 `ff` 都不合法；版本 `00` 必须恰好 55 个字符，更高的版本按前
++55 个字符解析，之后若还有内容须以 `-` 分隔。请求恰好带一个合法的值时原样转发，`tracestate`
++一并保留；否则（缺失、不合法或有多个）网关开始新的追踪：生成版本 `00`、flags `00`（未采样）的
++`traceparent`，剥离 `tracestate`。控制平面、推理实例与 Resolver 对控制平面的查询收到同一个
++`traceparent`，控制平面按同样的规则读取它（见根 README「可观测性」）。网关不记录 span，也不
++导出追踪（OTLP 导出尚未实现）。
++
++**访问日志**：`/api/v1/` 下的每个请求结束时，网关向标准输出写一行（与网关的其他日志相同）：
++
++```
++gateway 2026/10/13 03:53:36 access method=POST path="/api/v1/namespaces/default/inference/llama/chat" status=200 duration=1.234s corr=ad1cd525116940f682ea882c0c7a6b67 trace=4bf92f3577b34da6a3ce929d0e0e4736
++```
++
++`path` 不含查询串，流式请求的 `duration` 是整个流的时长；被认证、限流拒绝的请求同样记录；
++处理器在写出响应头之前 panic 时记 `status=500`。网关的 JSON 错误信封
++（`{"error": {"code", "message", "correlationId", "traceId"}}`）与反代、流式代理的错误日志
++（`corr=… trace=…`）带同一组 ID。连接上游失败时的 `502` 与 Recovery 兜底的 `500` 是纯文本
++响应、不带 `traceId`，可按响应头中的关联 ID 在访问日志中找到 trace-id。
++
+ ---
+ 
+ ## 3. 环境变量
+@@ -159,21 +209,28 @@ gateway/
+ ├── cmd/gateway/main.go             # 入口：配置 → 路由 → http.Server → 优雅停机
+ └── internal/
+     ├── config/config.go            # 环境变量加载与校验
++    ├── metrics/
++    │   ├── metrics.go              # Prometheus 文本格式：Counter / Histogram / 回调指标，序列上限
++    │   ├── gateway.go              # 网关的指标与 /metrics 处理器
++    │   └── metricstest/            # 测试用：严格解析文本格式、读取样本取值
+     ├── middleware/
+     │   ├── middleware.go           # Middleware 类型 + Chain 组合子
++    │   ├── observe.go              # 按路由类别记录请求数与耗时
+     │   ├── recovery.go             # panic 兜底 → 500
+     │   ├── correlation.go          # 关联 ID 生成/透传 + context 注入
++    │   ├── tracecontext.go         # W3C traceparent 校验/生成 + context 注入
++    │   ├── accesslog.go            # 访问日志（带关联 ID 与 trace-id）
+     │   ├── ratelimit.go            # 按已验证租户的令牌桶（自实现）
+     │   ├── authz.go                # Authenticate / RequireScope、Principal、dev 模式认证器
+     │   ├── apikey.go               # key 文件解析与 API key 认证器
+     │   ├── bodylimit.go            # 请求体上限
+-    │   └── errors.go               # JSON 错误信封
++    │   └── errors.go               # JSON 错误信封（带关联 ID 与 trace-id）
+     ├── upstream/client.go          # httputil.ReverseProxy 反代
+     ├── upstream/resolver.go        # 推理服务 → 实例 endpoint 解析（TTL 缓存、合并回源、健康摘流）
+     ├── stream/proxy.go             # SSE 流式代理（逐块 Flush，断连取消上游）
+     ├── stream/addrpolicy.go        # 实例地址限制（拨号时检查）
+     ├── health/health.go            # /healthz、/readyz
+-    └── router/router.go            # 路由表 + 中间件链
++    └── router/router.go            # 路由表 + 中间件链 + 路由类别
+ ```
+ 
+ ---
+@@ -222,16 +279,19 @@ go test ./...
+ 
+ ```mermaid
+ flowchart LR
+-    C[Client] --> R[Recovery]
+-    R --> CO[Correlation]
+-    CO --> AZ[Authenticate\n校验 API key 并覆写租户头]
++    C[Client] --> OB[Observe\n按路由类别计数与计时]
++    OB --> R[Recovery]
++    R -->|/healthz /readyz /metrics| H[Probe / Metrics]
++    R -->|/api/v1/| CO[Correlation]
++    CO --> TC[TraceContext\n沿用或生成 traceparent]
++    TC --> AL[AccessLog]
++    AL --> AZ[Authenticate\n校验 API key 并覆写租户头]
+     AZ -->|401 / 403| C
+     AZ --> RL[RateLimit\n已验证租户令牌桶]
+     RL -->|429| C
+     RL --> BL[LimitRequestBody\n请求体上限]
+     BL -->|413| C
+     BL --> RT{Route}
+-    RT -->|/healthz /readyz| H[Probe]
+     RT -->|/api/v1/resources 等| UP[ReverseProxy]
+     RT -->|/api/v1/namespaces/{ns}/inference/{svc}/chat 等| SP[SSE StreamProxy]
+     UP --> CP[(Python 控制平面)]
+@@ -246,4 +306,5 @@ flowchart LR
+ - 在 API key 之外接入 OIDC/JWT 与 mTLS（新的 `Authenticator` 实现）；key 文件热加载与过期时间（见 ADR-014 后续事项）。
+ - RateLimit 改为分布式限流（如 Redis），支持多网关实例共享配额。
+ - 协议/版本转换（`v1alpha1` ↔ 对外版本）与 gRPC-stream 转发。
+-- OpenTelemetry 链路追踪导出（复用 Correlation ID 作为 trace 关联）。
+\ No newline at end of file
++- OpenTelemetry：记录 span 并以 OTLP 导出（现在只传递 `traceparent`，见「可观测性」）。
++- `/metrics` 改到单独的监听地址，与对外入口分开。
+\ No newline at end of file
+-- 
+2.43.0
+

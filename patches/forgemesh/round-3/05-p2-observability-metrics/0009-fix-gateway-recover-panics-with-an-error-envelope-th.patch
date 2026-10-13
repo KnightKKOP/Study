@@ -1,0 +1,533 @@
+From 9e51c69d731532c52387b7554ebac0bdda1c9b2c Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 13 Oct 2026 05:05:43 +0000
+Subject: [PATCH 09/11] fix(gateway): recover panics with an error envelope
+ that carries ids
+
+Recovery is the outermost middleware, so it never saw the correlation
+id or the trace id that Correlation and TraceContext put into the
+downstream context: every "panic recovered" line had an empty corr=
+and no trace, and the 500 was a plain-text body without either id.
+
+Recovery now puts a small holder into the request context that
+Correlation and TraceContext fill in. The panic log carries both ids
+and, while no header has been written, the response is the
+INTERNAL_ERROR envelope with the same ids. WriteError and the
+recovery path share writeEnvelope, which also drops a Content-Length
+the handler may have set before panicking and sets nosniff as
+http.Error did.
+
+Once headers are written, the status and the bytes already sent
+(usually from the control plane or an instance) cannot be changed.
+Recovery used to write "Internal Server Error" after them, which a
+client cannot tell apart from the real body. It now logs the panic
+and re-panics with http.ErrAbortHandler so that net/http aborts the
+response, and it passes a handler's own http.ErrAbortHandler
+(httputil.ReverseProxy uses it when copying a body fails) through
+without logging it as a panic. Observe and AccessLog record from a
+deferred call, so aborted requests are still counted and logged.
+---
+ gateway/internal/middleware/accesslog.go      |  10 +-
+ gateway/internal/middleware/accesslog_test.go |  12 +-
+ gateway/internal/middleware/chain_test.go     |  17 +-
+ gateway/internal/middleware/correlation.go    |   5 +-
+ gateway/internal/middleware/errors.go         |  15 +-
+ gateway/internal/middleware/observe.go        |  19 ++-
+ gateway/internal/middleware/observe_test.go   |  31 ++++
+ gateway/internal/middleware/recovery.go       |  55 +++++--
+ gateway/internal/middleware/recovery_test.go  | 145 ++++++++++++++++++
+ gateway/internal/middleware/tracecontext.go   |   6 +-
+ 10 files changed, 277 insertions(+), 38 deletions(-)
+ create mode 100644 gateway/internal/middleware/recovery_test.go
+
+diff --git a/gateway/internal/middleware/accesslog.go b/gateway/internal/middleware/accesslog.go
+index 4d96704..86b1a63 100644
+--- a/gateway/internal/middleware/accesslog.go
++++ b/gateway/internal/middleware/accesslog.go
+@@ -21,18 +21,14 @@ func AccessLog(logger *log.Logger) Middleware {
+ 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+ 			start := time.Now()
+ 			sw := &statusWriter{ResponseWriter: w}
+-			completed := false
++			returned := false
+ 			defer func() {
+-				status := sw.Status()
+-				if !completed && sw.status == 0 {
+-					status = http.StatusInternalServerError
+-				}
+ 				logger.Printf("access method=%s path=%q status=%d duration=%s corr=%s trace=%s",
+-					r.Method, r.URL.Path, status, time.Since(start).Round(time.Microsecond),
++					r.Method, r.URL.Path, sw.statusAfter(returned), time.Since(start).Round(time.Microsecond),
+ 					CorrelationIDFromContext(r.Context()), TraceIDFromContext(r.Context()))
+ 			}()
+ 			next.ServeHTTP(sw, r)
+-			completed = true
++			returned = true
+ 		})
+ 	}
+ }
+diff --git a/gateway/internal/middleware/accesslog_test.go b/gateway/internal/middleware/accesslog_test.go
+index baef14a..925ba7e 100644
+--- a/gateway/internal/middleware/accesslog_test.go
++++ b/gateway/internal/middleware/accesslog_test.go
+@@ -12,7 +12,8 @@ import (
+ )
+ 
+ // serveLogged 经 Correlation → TraceContext → AccessLog 处理 req（外层 Recovery 兜底 panic），
+-// 返回响应与访问日志。
++// 返回响应与访问日志。响应头写出之后的 panic 由 Recovery 以 http.ErrAbortHandler 中止，这里代替
++// net/http 接住它。
+ func serveLogged(t *testing.T, h http.Handler, req *http.Request) (*httptest.ResponseRecorder, string) {
+ 	t.Helper()
+ 	var buf bytes.Buffer
+@@ -22,7 +23,14 @@ func serveLogged(t *testing.T, h http.Handler, req *http.Request) (*httptest.Res
+ 		AccessLog(log.New(&buf, "", 0)),
+ 	))
+ 	rec := httptest.NewRecorder()
+-	chain.ServeHTTP(rec, req)
++	func() {
++		defer func() {
++			if v := recover(); v != nil && v != http.ErrAbortHandler {
++				panic(v)
++			}
++		}()
++		chain.ServeHTTP(rec, req)
++	}()
+ 	return rec, buf.String()
+ }
+ 
+diff --git a/gateway/internal/middleware/chain_test.go b/gateway/internal/middleware/chain_test.go
+index 67ce6c4..cefbbc6 100644
+--- a/gateway/internal/middleware/chain_test.go
++++ b/gateway/internal/middleware/chain_test.go
+@@ -103,8 +103,8 @@ func TestChain_RateLimitKeysTenantAfterAuthz(t *testing.T) {
+ }
+ 
+ // TestChain_RecoveryOutermostOpaque500 验证 Recovery 位于最外层：
+-// 下游 handler panic 被兜底为 500，响应体为固定文案（无堆栈/源码路径），
+-// 且仍携带关联 ID（Correlation 位于其内侧已先行写入响应头）。
++// 下游 handler panic 被兜底为 500 INTERNAL_ERROR 错误信封（固定文案，无堆栈/源码路径），
++// 响应头与信封都带关联 ID（Correlation 位于其内侧，已先行写入响应头并记录给 Recovery）。
+ func TestChain_RecoveryOutermostOpaque500(t *testing.T) {
+ 	panicRoute := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+ 		panic("boom: 内部敏感细节")
+@@ -119,11 +119,16 @@ func TestChain_RecoveryOutermostOpaque500(t *testing.T) {
+ 	if rec.Code != http.StatusInternalServerError {
+ 		t.Fatalf("panic 应兜底 500，实际 %d", rec.Code)
+ 	}
+-	if body := rec.Body.String(); body != "Internal Server Error\n" {
+-		t.Fatalf("500 响应体应为固定文案，实际 %q", body)
++	env := readEnvelope(t, rec)
++	if env.Code != "INTERNAL_ERROR" || env.Message != "internal server error" {
++		t.Fatalf("500 应为固定文案的 INTERNAL_ERROR 错误信封，实际 %+v", env)
+ 	}
+-	if rec.Header().Get(DefaultCorrelationHeader) == "" {
+-		t.Fatal("panic 兜底响应仍应携带关联 ID（Recovery 位于 Correlation 外层）")
++	corr := rec.Header().Get(DefaultCorrelationHeader)
++	if corr == "" || env.CorrelationID != corr || len(env.TraceID) != 32 {
++		t.Fatalf("响应头与信封应带同一个关联 ID（%q）及 trace-id，实际 %+v", corr, env)
++	}
++	if strings.Contains(rec.Body.String(), "boom") {
++		t.Fatalf("500 响应体不应包含 panic 的内容: %s", rec.Body.String())
+ 	}
+ }
+ 
+diff --git a/gateway/internal/middleware/correlation.go b/gateway/internal/middleware/correlation.go
+index 2de885f..d45f495 100644
+--- a/gateway/internal/middleware/correlation.go
++++ b/gateway/internal/middleware/correlation.go
+@@ -64,7 +64,7 @@ func fallbackCorrelationID() string {
+ //
+ // 行为：
+ //   - 若入站请求缺失关联 ID，则以 crypto/rand 生成一个并回填请求头。
+-//   - 将关联 ID 注入 context（供日志/链路追踪读取）与响应头。
++//   - 将关联 ID 注入 context（供日志/链路追踪读取）与响应头，并记录给外层的 Recovery。
+ //   - 若入站已携带关联 ID，则原样透传，保证跨服务链路连续。
+ func Correlation(header string) Middleware {
+ 	if header == "" {
+@@ -84,6 +84,9 @@ func Correlation(header string) Middleware {
+ 			// 回填请求头（下游反代/日志可见）与响应头（客户端可见）。
+ 			r.Header.Set(header, cid)
+ 			w.Header().Set(header, cid)
++			if ids := requestIDsFrom(r.Context()); ids != nil {
++				ids.correlationID = cid
++			}
+ 
+ 			ctx := context.WithValue(r.Context(), correlationIDKey, cid)
+ 			next.ServeHTTP(w, r.WithContext(ctx))
+diff --git a/gateway/internal/middleware/errors.go b/gateway/internal/middleware/errors.go
+index 27b296b..d647c60 100644
+--- a/gateway/internal/middleware/errors.go
++++ b/gateway/internal/middleware/errors.go
+@@ -11,6 +11,12 @@ import (
+ //
+ // correlationId 与 traceId 取自 Correlation 与 TraceContext 中间件注入的 context，缺失时省略。
+ func WriteError(w http.ResponseWriter, r *http.Request, status int, code, message string) {
++	writeEnvelope(w, status, code, message, CorrelationIDFromContext(r.Context()), TraceIDFromContext(r.Context()))
++}
++
++// writeEnvelope 写出错误信封，ID 为空时省略对应字段。处理器可能已设置 Content-Length，
++// 与信封的长度不符，因此删除；nosniff 与 http.Error 一致。
++func writeEnvelope(w http.ResponseWriter, status int, code, message, correlationID, traceID string) {
+ 	type errorBody struct {
+ 		Code          string `json:"code"`
+ 		Message       string `json:"message"`
+@@ -22,11 +28,14 @@ func WriteError(w http.ResponseWriter, r *http.Request, status int, code, messag
+ 	}{errorBody{
+ 		Code:          code,
+ 		Message:       message,
+-		CorrelationID: CorrelationIDFromContext(r.Context()),
+-		TraceID:       TraceIDFromContext(r.Context()),
++		CorrelationID: correlationID,
++		TraceID:       traceID,
+ 	}}
+ 
+-	w.Header().Set("Content-Type", "application/json")
++	h := w.Header()
++	h.Del("Content-Length")
++	h.Set("Content-Type", "application/json")
++	h.Set("X-Content-Type-Options", "nosniff")
+ 	w.WriteHeader(status)
+ 	// 序列化失败只可能源于内部构造，忽略并保留已写出的状态码。
+ 	_ = json.NewEncoder(w).Encode(body)
+diff --git a/gateway/internal/middleware/observe.go b/gateway/internal/middleware/observe.go
+index 18472ff..613601f 100644
+--- a/gateway/internal/middleware/observe.go
++++ b/gateway/internal/middleware/observe.go
+@@ -8,8 +8,9 @@ import (
+ )
+ 
+ // Observe 返回记录请求数与耗时的中间件，须位于最外层（Recovery 之外），panic 兜底的 500
+-// 也被计入。classify 在请求开始时按路由表确定路由类别，指标只用路由类别、不用路径；
+-// m 为 nil 时不记录。流式请求的耗时是整个流的时长。
++// 也被计入；以 http.ErrAbortHandler 中止的响应按已写出的状态码计入，什么都没写出时计 500。
++// classify 在请求开始时按路由表确定路由类别，指标只用路由类别、不用路径；m 为 nil 时不记录。
++// 流式请求的耗时是整个流的时长。
+ func Observe(m *metrics.Gateway, classify func(*http.Request) metrics.Route) Middleware {
+ 	if classify == nil {
+ 		panic("middleware: Observe 需要非空 classify")
+@@ -19,8 +20,10 @@ func Observe(m *metrics.Gateway, classify func(*http.Request) metrics.Route) Mid
+ 			start := time.Now()
+ 			route := classify(r)
+ 			sw := &statusWriter{ResponseWriter: w}
++			returned := false
++			defer func() { m.ObserveRequest(route, sw.statusAfter(returned), time.Since(start)) }()
+ 			next.ServeHTTP(sw, r)
+-			m.ObserveRequest(route, sw.Status(), time.Since(start))
++			returned = true
+ 		})
+ 	}
+ }
+@@ -67,3 +70,13 @@ func (s *statusWriter) Status() int {
+ 	}
+ 	return s.status
+ }
++
++// statusAfter 返回请求结束时记录的状态码；returned 表示处理器正常返回。处理器 panic 时
++// 什么都没写记 500：Recovery 兜底返回 500，以 http.ErrAbortHandler 中止、什么都没写出的
++// 响应同样记 500。
++func (s *statusWriter) statusAfter(returned bool) int {
++	if !returned && s.status == 0 {
++		return http.StatusInternalServerError
++	}
++	return s.Status()
++}
+diff --git a/gateway/internal/middleware/observe_test.go b/gateway/internal/middleware/observe_test.go
+index ba7a435..de51785 100644
+--- a/gateway/internal/middleware/observe_test.go
++++ b/gateway/internal/middleware/observe_test.go
+@@ -139,3 +139,34 @@ func TestObserve_CountsRecoveredPanicAs500(t *testing.T) {
+ 		t.Fatalf("兜底的 500 应计入，实际 %v", got)
+ 	}
+ }
++
++// TestObserve_CountsAbortedRequests 验证以 http.ErrAbortHandler 中止的请求同样计入（panic 原样
++// 交给 net/http）：已写出状态码时按它计，什么都没写出时计 500。
++func TestObserve_CountsAbortedRequests(t *testing.T) {
++	m := metrics.NewGateway()
++	handlers := []http.HandlerFunc{
++		func(w http.ResponseWriter, _ *http.Request) {
++			w.WriteHeader(http.StatusOK)
++			panic(http.ErrAbortHandler)
++		},
++		func(http.ResponseWriter, *http.Request) { panic(http.ErrAbortHandler) },
++	}
++	for _, h := range handlers {
++		func() {
++			defer func() {
++				if v := recover(); v != http.ErrAbortHandler {
++					t.Errorf("Observe 应把 panic 原样交给 net/http，实际 %v", v)
++				}
++			}()
++			Observe(m, classifyAs(metrics.RouteInference))(h).ServeHTTP(httptest.NewRecorder(),
++				httptest.NewRequest(http.MethodPost, "/api/v1/inference/svc/chat", nil))
++		}()
++	}
++
++	samples := scrapeMetrics(t, m)
++	for _, status := range []string{"200", "500"} {
++		if got := samples[requestsKey(metrics.RouteInference, status)]; got != 1 {
++			t.Errorf("中止的请求应计 %s 一次，实际 %v", status, got)
++		}
++	}
++}
+diff --git a/gateway/internal/middleware/recovery.go b/gateway/internal/middleware/recovery.go
+index c4b3d91..40e1190 100644
+--- a/gateway/internal/middleware/recovery.go
++++ b/gateway/internal/middleware/recovery.go
+@@ -1,37 +1,62 @@
+ package middleware
+ 
+ import (
++	"context"
+ 	"log"
+ 	"net/http"
+ 	"runtime/debug"
+ )
+ 
+-// Recovery 返回兜底 panic 的中间件。
++// requestIDs 记录 Correlation 与 TraceContext 为请求确定的 ID，只在处理请求的 goroutine 中读写。
++type requestIDs struct {
++	correlationID string
++	traceID       string
++}
++
++type requestIDsKey struct{}
++
++// requestIDsFrom 返回 Recovery 放入 context 的 requestIDs；链上没有 Recovery 时返回 nil。
++func requestIDsFrom(ctx context.Context) *requestIDs {
++	ids, _ := ctx.Value(requestIDsKey{}).(*requestIDs)
++	return ids
++}
++
++// Recovery 返回兜底 panic 的中间件：记录关联 ID、trace-id、方法、路径与堆栈，响应头尚未写出时
++// 返回 500 INTERNAL_ERROR 错误信封（不含 panic 的内容）。
+ //
+-// 行为：捕获下游 handler 抛出的 panic，记录关联 ID、路径与堆栈，
+-// 并返回 500，避免单个请求的 panic 导致整个网关进程退出。
++// Recovery 位于 Correlation 与 TraceContext 之外，读不到它们写入下游 context 的 ID，改由它们
++// 记录到 Recovery 放入 context 的 requestIDs；没有经过这两个中间件的请求（探针与 /metrics）
++// 日志与信封中没有 ID。
+ //
+-// 注意：若响应头/状态码已被写出，则无法再改为 500，此时仅记录日志。
++// 响应头已写出时，状态码与已写出的响应体（可能来自控制平面或推理实例）都无法更改：记录日志后
++// 以 http.ErrAbortHandler 中止响应，客户端看到的是不完整的响应，而不是末尾追加的错误信封。
++// panic(http.ErrAbortHandler) 本身（如 httputil.ReverseProxy 复制响应体失败）不记录日志，原样
++// 交给 net/http。
+ func Recovery(logger *log.Logger) Middleware {
+ 	if logger == nil {
+ 		logger = log.Default()
+ 	}
+ 	return func(next http.Handler) http.Handler {
+ 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++			ids := &requestIDs{}
++			sw := &statusWriter{ResponseWriter: w}
+ 			defer func() {
+-				if rec := recover(); rec != nil {
+-					logger.Printf(
+-						"panic recovered: corr=%s method=%s path=%s err=%v\n%s",
+-						CorrelationIDFromContext(r.Context()),
+-						r.Method,
+-						r.URL.Path,
+-						rec,
+-						debug.Stack(),
+-					)
+-					http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
++				rec := recover()
++				if rec == nil {
++					return
++				}
++				if rec == http.ErrAbortHandler {
++					panic(rec)
++				}
++				logger.Printf("panic recovered: corr=%s trace=%s method=%s path=%s err=%v\n%s",
++					ids.correlationID, ids.traceID, r.Method, r.URL.Path, rec, debug.Stack())
++				if sw.status != 0 {
++					panic(http.ErrAbortHandler)
+ 				}
++				writeEnvelope(w, http.StatusInternalServerError, "INTERNAL_ERROR", "internal server error",
++					ids.correlationID, ids.traceID)
+ 			}()
+-			next.ServeHTTP(w, r)
++			next.ServeHTTP(sw, r.WithContext(context.WithValue(r.Context(), requestIDsKey{}, ids)))
+ 		})
+ 	}
+ }
+diff --git a/gateway/internal/middleware/recovery_test.go b/gateway/internal/middleware/recovery_test.go
+new file mode 100644
+index 0000000..69a6a08
+--- /dev/null
++++ b/gateway/internal/middleware/recovery_test.go
+@@ -0,0 +1,145 @@
++package middleware
++
++import (
++	"bytes"
++	"encoding/json"
++	"errors"
++	"io"
++	"log"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++)
++
++// errorEnvelope 是错误信封中 error 对象的字段。
++type errorEnvelope struct {
++	Code          string `json:"code"`
++	Message       string `json:"message"`
++	CorrelationID string `json:"correlationId"`
++	TraceID       string `json:"traceId"`
++}
++
++// readEnvelope 解析错误信封（不允许信封之外的字段），并检查 Content-Type 与 nosniff。
++func readEnvelope(t *testing.T, rec *httptest.ResponseRecorder) errorEnvelope {
++	t.Helper()
++	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
++		t.Fatalf("错误响应 Content-Type 应为 application/json，实际 %q", ct)
++	}
++	if v := rec.Header().Get("X-Content-Type-Options"); v != "nosniff" {
++		t.Fatalf("错误响应应带 X-Content-Type-Options: nosniff，实际 %q", v)
++	}
++	var body struct {
++		Error *errorEnvelope `json:"error"`
++	}
++	dec := json.NewDecoder(bytes.NewReader(rec.Body.Bytes()))
++	dec.DisallowUnknownFields()
++	if err := dec.Decode(&body); err != nil || body.Error == nil {
++		t.Fatalf("响应体不是错误信封: %v（body=%s）", err, rec.Body.String())
++	}
++	return *body.Error
++}
++
++// TestRecovery_RespondsWithEnvelope 验证响应头写出之前的 panic 兜底为 500 INTERNAL_ERROR 错误
++// 信封，不含 panic 的内容，处理器设置的 Content-Length 被删除；信封与日志带 Correlation、
++// TraceContext（位于 Recovery 之内）确定的 ID，没有经过它们的请求不带 ID（不读取请求头）。
++func TestRecovery_RespondsWithEnvelope(t *testing.T) {
++	panicky := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		w.Header().Set("Content-Length", "1000")
++		panic("boom: 内部细节")
++	})
++	cases := map[string]struct {
++		inner   []Middleware
++		want    errorEnvelope
++		wantLog string
++	}{
++		"经过 Correlation 与 TraceContext": {
++			inner: []Middleware{Correlation(DefaultCorrelationHeader), TraceContext()},
++			want: errorEnvelope{Code: "INTERNAL_ERROR", Message: "internal server error",
++				CorrelationID: "corr-1", TraceID: testTraceID},
++			wantLog: "panic recovered: corr=corr-1 trace=" + testTraceID +
++				" method=POST path=/api/v1/resources err=boom: 内部细节\n",
++		},
++		"没有经过（探针与 /metrics）": {
++			want:    errorEnvelope{Code: "INTERNAL_ERROR", Message: "internal server error"},
++			wantLog: "panic recovered: corr= trace= method=POST path=/api/v1/resources err=boom: 内部细节\n",
++		},
++	}
++	for name, tc := range cases {
++		t.Run(name, func(t *testing.T) {
++			var logs bytes.Buffer
++			h := Recovery(log.New(&logs, "", 0))(Chain(panicky, tc.inner...))
++			req := httptest.NewRequest(http.MethodPost, "/api/v1/resources", nil)
++			req.Header.Set(DefaultCorrelationHeader, "corr-1")
++			req.Header.Set(TraceparentHeader, testTraceparent)
++			rec := httptest.NewRecorder()
++			h.ServeHTTP(rec, req)
++
++			if rec.Code != http.StatusInternalServerError {
++				t.Fatalf("panic 应兜底为 500，实际 %d", rec.Code)
++			}
++			if got := readEnvelope(t, rec); got != tc.want {
++				t.Fatalf("错误信封应为 %+v，实际 %+v", tc.want, got)
++			}
++			if cl := rec.Header().Get("Content-Length"); cl != "" {
++				t.Fatalf("处理器设置的 Content-Length 应被删除，实际 %q", cl)
++			}
++			if strings.Contains(rec.Body.String(), "boom") {
++				t.Fatalf("响应体不应包含 panic 的内容: %s", rec.Body.String())
++			}
++			if got := logs.String(); !strings.HasPrefix(got, tc.wantLog) || !strings.Contains(got, "goroutine ") {
++				t.Fatalf("日志应以 %q 开头并带堆栈，实际 %q", tc.wantLog, got)
++			}
++		})
++	}
++}
++
++// TestRecovery_AbortsStartedResponses 验证响应头写出之后的 panic 不再向响应末尾追加内容，而是以
++// http.ErrAbortHandler 中止响应（net/http 不记录）：客户端读到已写出的部分后遇到 unexpected EOF。
++// 处理器自己 panic(http.ErrAbortHandler)（如 ReverseProxy 复制响应体失败）时 Recovery 不记录日志。
++func TestRecovery_AbortsStartedResponses(t *testing.T) {
++	cases := map[string]struct {
++		value   any
++		wantLog bool
++	}{
++		"处理器 panic":                   {value: "boom", wantLog: true},
++		"panic(http.ErrAbortHandler)": {value: http.ErrAbortHandler, wantLog: false},
++	}
++	for name, tc := range cases {
++		t.Run(name, func(t *testing.T) {
++			var logs, serverLogs bytes.Buffer
++			srv := httptest.NewUnstartedServer(Recovery(log.New(&logs, "", 0))(
++				http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++					w.Header().Set("Content-Type", "text/event-stream")
++					_, _ = io.WriteString(w, "data: partial\n\n")
++					w.(http.Flusher).Flush()
++					panic(tc.value)
++				})))
++			srv.Config.ErrorLog = log.New(&serverLogs, "", 0)
++			srv.Start()
++
++			resp, err := srv.Client().Get(srv.URL)
++			if err != nil {
++				srv.Close()
++				t.Fatalf("请求失败: %v", err)
++			}
++			body, readErr := io.ReadAll(resp.Body)
++			resp.Body.Close()
++			// Close 等待处理请求的 goroutine 结束，之后读取两份日志没有数据竞争。
++			srv.Close()
++
++			if resp.StatusCode != http.StatusOK || string(body) != "data: partial\n\n" {
++				t.Fatalf("客户端应只收到已写出的 200 与部分响应体，实际 %d %q", resp.StatusCode, body)
++			}
++			if !errors.Is(readErr, io.ErrUnexpectedEOF) {
++				t.Fatalf("响应应被中止（unexpected EOF），实际 %v", readErr)
++			}
++			if logged := strings.HasPrefix(logs.String(), "panic recovered: "); logged != tc.wantLog {
++				t.Fatalf("Recovery 是否记录日志应为 %v，实际 %q", tc.wantLog, logs.String())
++			}
++			if serverLogs.Len() != 0 {
++				t.Fatalf("应以 http.ErrAbortHandler 中止（net/http 不记录），实际 %q", serverLogs.String())
++			}
++		})
++	}
++}
+diff --git a/gateway/internal/middleware/tracecontext.go b/gateway/internal/middleware/tracecontext.go
+index 5ffd688..f3df6bd 100644
+--- a/gateway/internal/middleware/tracecontext.go
++++ b/gateway/internal/middleware/tracecontext.go
+@@ -72,7 +72,8 @@ type traceInfoKey struct{}
+ //   - 请求恰好带一个合法的 traceparent 时原样沿用，tracestate 一并保留；
+ //   - 否则（缺失、不合法或多个）开始新的追踪：生成新的 traceparent，丢弃 tracestate；
+ //   - 确定的 traceparent 写回请求头，随请求转发给控制平面与推理实例（Resolver 的查询经
+-//     TraceparentFromContext 附带），trace-id 注入 context 供日志与错误信封读取。
++//     TraceparentFromContext 附带），trace-id 注入 context 供日志与错误信封读取，并记录给
++//     外层的 Recovery。
+ //
+ // 响应不回写 traceparent：客户端凭响应头中的关联 ID 或错误信封中的 traceId 报障。
+ func TraceContext() Middleware {
+@@ -89,6 +90,9 @@ func TraceContext() Middleware {
+ 				r.Header.Set(TraceparentHeader, info.traceparent)
+ 				r.Header.Del(TracestateHeader)
+ 			}
++			if ids := requestIDsFrom(r.Context()); ids != nil {
++				ids.traceID = info.traceID
++			}
+ 			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), traceInfoKey{}, info)))
+ 		})
+ 	}
+-- 
+2.43.0
+

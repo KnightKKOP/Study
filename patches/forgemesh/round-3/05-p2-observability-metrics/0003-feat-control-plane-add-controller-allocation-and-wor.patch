@@ -1,0 +1,1136 @@
+From bc65424f5cf3b3e165a0ef4b08db8ad7fbd126a5 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 13 Oct 2026 02:50:38 +0000
+Subject: [PATCH 03/11] feat(control-plane): add controller, allocation and
+ workflow metrics
+
+Operators need to see whether the controller keeps up and what the
+cluster looks like, so /metrics now also covers:
+
+- forgemesh_reconcile_total{operation,outcome} and
+  forgemesh_reconcile_duration_seconds{operation}, recorded by the
+  controller manager around each reconcile (outcomes done, requeue,
+  wait, conflict, error);
+- forgemesh_controller_retries_total and
+  forgemesh_controller_queue_depth{state};
+- forgemesh_deployments_total{outcome,reason}: status writes that move
+  a service into Ready or Failed, with the Ready condition reason;
+- forgemesh_inference_services{phase},
+  forgemesh_allocations_active{accelerator_type},
+  forgemesh_accelerator_devices{accelerator_type,state} and
+  forgemesh_workflow_runs{status}, read from the registry, the
+  inventory and the workflow store at scrape time;
+- forgemesh_registry_lock_wait_seconds, the time registry operations
+  wait for the connection lock that serialises all database access.
+
+The hooks stay in the controller manager (a wrapper around the
+reconcile body and one line in the retry path), so the reconciler and
+the deployment code are untouched; deployment outcomes are derived
+from the status patch the manager writes. Labels are fixed enums,
+accelerator types from the operator's inventory and sanitised
+condition reasons; tenants, names and uids never become labels. The
+new registry and workflow store queries aggregate across tenants and
+are only used for /metrics.
+---
+ .../src/forgemesh/controlplane/app.py         |  11 +-
+ .../controlplane/controller/manager.py        |  32 +-
+ .../controlplane/controller/queue.py          |  11 +
+ .../forgemesh/controlplane/registry/store.py  |  46 +++
+ .../src/forgemesh/controlplane/telemetry.py   | 251 ++++++++++++
+ .../src/forgemesh/workflowruntime/store.py    |  11 +
+ .../controlplane/test_controller_queue.py     |  13 +
+ .../controlplane/test_metrics_endpoint.py     |  53 +++
+ tests/unit/controlplane/test_telemetry.py     | 371 ++++++++++++++++++
+ tests/unit/workflowruntime/test_store.py      |  12 +
+ 10 files changed, 803 insertions(+), 8 deletions(-)
+ create mode 100644 tests/unit/controlplane/test_telemetry.py
+
+diff --git a/packages/control-plane/src/forgemesh/controlplane/app.py b/packages/control-plane/src/forgemesh/controlplane/app.py
+index 4f8dc89..ae3f13a 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/app.py
++++ b/packages/control-plane/src/forgemesh/controlplane/app.py
+@@ -80,7 +80,7 @@ from .metrics import CONTENT_TYPE
+ from .reconciler import ProcessedKeyStore, ReconciliationController
+ from .scheduler import INVENTORY_FILE_ENV, FirstFitScheduler, inventory_from_env
+ from .sqlite import workflow_db_path
+-from .telemetry import ControlPlaneMetrics
++from .telemetry import ControllerMetrics, ControlPlaneMetrics
+ 
+ if TYPE_CHECKING:  # pragma: no cover - 仅静态类型检查使用
+     from .auth import Authenticator
+@@ -182,6 +182,7 @@ def _build_controller(
+     inventory: Inventory | None,
+     runtime: LocalWorkflowRuntime | None = None,
+     launcher: RuntimeLauncher | None = None,
++    metrics: ControllerMetrics | None = None,
+ ) -> ControllerManager:
+     # 没有授权规则的 DefaultPolicyEngine 拒绝一切操作。资源的创建和删除已经由 API 的
+     # 认证与 scope 把关，协调只是推进这些已被接受的期望状态，因此放行 reconcile。
+@@ -203,7 +204,9 @@ def _build_controller(
+         workflow_poll_interval=WORKFLOW_POLL_INTERVAL_SECONDS,
+         launcher=launcher,
+     )
+-    return ControllerManager(registry, reconciler, poll_interval=CONTROLLER_POLL_INTERVAL_SECONDS)
++    return ControllerManager(
++        registry, reconciler, poll_interval=CONTROLLER_POLL_INTERVAL_SECONDS, metrics=metrics
++    )
+ 
+ 
+ if _FASTAPI_AVAILABLE:
+@@ -261,6 +264,7 @@ if _FASTAPI_AVAILABLE:
+                 processed_store = ProcessedKeyStore(path)
+                 cleanup.push_async_callback(processed_store.close)
+                 runtime: LocalWorkflowRuntime | None = None
++                workflow_store: WorkflowStore | None = None
+                 if launcher is not None:
+                     workflow_path = workflow_db_path(path)
+                     workflow_store = WorkflowStore(workflow_path)
+@@ -284,9 +288,10 @@ if _FASTAPI_AVAILABLE:
+                         len(lost),
+                     )
+                 controller = _build_controller(
+-                    registry, processed_store, inventory, runtime, launcher
++                    registry, processed_store, inventory, runtime, launcher, metrics.controller
+                 )
+                 cleanup.push_async_callback(controller.stop)
++                cleanup.callback(metrics.watch(registry, controller, inventory, workflow_store))
+                 await controller.start()
+                 yield
+ 
+diff --git a/packages/control-plane/src/forgemesh/controlplane/controller/manager.py b/packages/control-plane/src/forgemesh/controlplane/controller/manager.py
+index f37f0bf..04e3d69 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/controller/manager.py
++++ b/packages/control-plane/src/forgemesh/controlplane/controller/manager.py
+@@ -24,6 +24,7 @@ from __future__ import annotations
+ 
+ import asyncio
+ import logging
++import time
+ from collections.abc import Collection
+ from typing import Any
+ from uuid import uuid4
+@@ -34,6 +35,7 @@ from forgemesh.core.reconciler import ReconcileContext
+ 
+ from ..reconciler import ReconciliationController, compute_dedup_key
+ from ..registry import ChangeType, ResourceKey, SQLiteRegistry
++from ..telemetry import ControllerMetrics, ReconcileOutcome
+ from .queue import WorkQueue
+ 
+ logger = logging.getLogger(__name__)
+@@ -68,6 +70,7 @@ class ControllerManager:
+         batch_size: 每次读取的变更记录条数上限。
+         status_write_attempts: status 写入遇到版本冲突时的最多尝试次数。
+         queue: 工作队列；为空时新建（测试可注入）。
++        metrics: 协调与队列的指标；为空时新建（不会被导出）。
+     """
+ 
+     def __init__(
+@@ -82,6 +85,7 @@ class ControllerManager:
+         batch_size: int = 500,
+         status_write_attempts: int = 3,
+         queue: WorkQueue[ResourceKey] | None = None,
++        metrics: ControllerMetrics | None = None,
+     ) -> None:
+         if reconciler.records_dedup_keys:
+             raise ValueError(
+@@ -101,6 +105,7 @@ class ControllerManager:
+         self._batch_size = batch_size
+         self._status_write_attempts = status_write_attempts
+         self._queue: WorkQueue[ResourceKey] = queue if queue is not None else WorkQueue()
++        self._metrics = metrics if metrics is not None else ControllerMetrics()
+         self._cursor = 0
+         self._started = False
+         self._watchers: list[asyncio.Task[None]] = []
+@@ -168,6 +173,17 @@ class ControllerManager:
+             self._queue.forget(key)
+             return
+         operation = _operation(phase)
++        started = time.perf_counter()
++        outcome = ReconcileOutcome.ERROR
++        try:
++            outcome = await self._reconcile(key, resource, phase, operation)
++        finally:
++            self._metrics.reconciled(operation, outcome, time.perf_counter() - started)
++
++    async def _reconcile(
++        self, key: ResourceKey, resource: Resource, phase: str | None, operation: str
++    ) -> ReconcileOutcome:
++        """协调、回写 status、登记去重键并安排下一次，返回这次协调的结果。"""
+         meta = resource.metadata
+         dedup_key = compute_dedup_key(
+             key.kind, key.namespace, key.name, meta.uid, meta.generation, operation
+@@ -181,16 +197,21 @@ class ControllerManager:
+                 dedup_key=dedup_key,
+             )
+         )
+-        if result.status_patch and not await self._write_status(
+-            key, resource, operation, result.status_patch
+-        ):
+-            self._queue.add(key)
+-            return
++        if result.status_patch:
++            if not await self._write_status(key, resource, operation, result.status_patch):
++                self._queue.add(key)
++                return ReconcileOutcome.CONFLICT
++            self._metrics.status_written(phase, result.status_patch)
+         if result.done:
+             await self._reconciler.mark_processed(dedup_key)
+         self._queue.forget(key)
+         if result.requeue_after is not None:
+             self._queue.add_after(key, result.requeue_after)
++        return ReconcileOutcome.of(result)
++
++    def queue_depth(self) -> dict[str, int]:
++        """工作队列中各状态的键数（见 :meth:`WorkQueue.depth`）。"""
++        return self._queue.depth()
+ 
+     async def _write_status(
+         self,
+@@ -233,6 +254,7 @@ class ControllerManager:
+             try:
+                 await self.process(key)
+             except Exception:  # noqa: BLE001 - 单个资源失败不得影响其他资源
++                self._metrics.retried()
+                 delay = self._queue.add_rate_limited(key)
+                 logger.exception(
+                     "reconcile failed for %s; retrying in %.1fs", _describe(key), delay
+diff --git a/packages/control-plane/src/forgemesh/controlplane/controller/queue.py b/packages/control-plane/src/forgemesh/controlplane/controller/queue.py
+index 43b324c..5653fcf 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/controller/queue.py
++++ b/packages/control-plane/src/forgemesh/controlplane/controller/queue.py
+@@ -65,6 +65,17 @@ class WorkQueue[K: Hashable]:
+         """可立即取出的键数量（不含延迟中的键）。"""
+         return len(self._ready)
+ 
++    def depth(self) -> dict[str, int]:
++        """各状态的键数：``ready`` 可立即取出，``delayed`` 等待延迟到期，``processing`` 处理中。
++
++        同一键可能同时计入 ``ready`` 与 ``delayed``（已排队，另有一次延迟加入未到期）。
++        """
++        return {
++            "ready": len(self._ready),
++            "delayed": len(self._due),
++            "processing": len(self._processing),
++        }
++
+     def add(self, key: K) -> None:
+         """加入键；已在队列中则忽略，正在处理则在 :meth:`done` 后重新排队。"""
+         if self._shutting_down or key in self._dirty:
+diff --git a/packages/control-plane/src/forgemesh/controlplane/registry/store.py b/packages/control-plane/src/forgemesh/controlplane/registry/store.py
+index bb3954d..9df4b96 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/registry/store.py
++++ b/packages/control-plane/src/forgemesh/controlplane/registry/store.py
+@@ -66,6 +66,8 @@ Allocation 持久化
+ 是例外：它们跨租户返回资源键，仅供控制平面内部的控制器使用，不得暴露给 API；
+ :meth:`SQLiteRegistry.get_allocation` 与 :meth:`SQLiteRegistry.allocated_devices`
+ 同样跨租户读取，仅供调度器使用（设备由全部租户共享）。
++:meth:`SQLiteRegistry.count_by_phase` 与 :meth:`SQLiteRegistry.active_allocation_devices`
++跨租户读取，仅供 ``/metrics`` 输出聚合计数。
+ """
+ 
+ from __future__ import annotations
+@@ -78,6 +80,7 @@ import json
+ import logging
+ import sqlite3
+ import threading
++import time
+ from collections.abc import Callable, Collection, Iterator, Sequence
+ from dataclasses import dataclass, field
+ from datetime import UTC, datetime
+@@ -265,6 +268,7 @@ class SQLiteRegistry(ResourceRegistry):
+         self._conn = connect(db_path)
+         self._conn.row_factory = sqlite3.Row
+         self._lock = threading.RLock()
++        self._lock_wait_observer: Callable[[float], None] | None = None
+         self._init_schema()
+ 
+     # ------------------------------------------------------------------ #
+@@ -273,13 +277,21 @@ class SQLiteRegistry(ResourceRegistry):
+ 
+     async def _run(self, fn: Callable[[], _T]) -> _T:
+         """在工作线程中持锁执行一段同步数据库操作（读写均串行化）。"""
++        observer = self._lock_wait_observer
+ 
+         def _locked() -> _T:
++            waiting = time.perf_counter()
+             with self._lock:
++                if observer is not None:
++                    observer(time.perf_counter() - waiting)
+                 return fn()
+ 
+         return await asyncio.to_thread(_locked)
+ 
++    def set_lock_wait_observer(self, observer: Callable[[float], None] | None) -> None:
++        """登记锁等待的观测函数：每次数据库操作取得连接锁后，以等待的秒数调用（指标使用）。"""
++        self._lock_wait_observer = observer
++
+     @staticmethod
+     def _record_change(
+         cur: sqlite3.Cursor,
+@@ -1424,6 +1436,40 @@ class SQLiteRegistry(ResourceRegistry):
+ 
+         return await self._run(_list_allocations)
+ 
++    # ------------------------------------------------------------------ #
++    # 指标（跨租户聚合）
++    # ------------------------------------------------------------------ #
++
++    async def count_by_phase(self, kind: str) -> dict[str | None, int]:
++        """按 phase 统计 ``kind`` 的资源数（跨租户，仅供指标使用）。"""
++
++        def _count() -> dict[str | None, int]:
++            rows = self._conn.execute(
++                "SELECT phase, COUNT(*) AS n FROM resources WHERE kind=? GROUP BY phase",
++                (kind,),
++            ).fetchall()
++            return {row["phase"]: row["n"] for row in rows}
++
++        return await self._run(_count)
++
++    async def active_allocation_devices(self) -> dict[str, frozenset[AllocatedDevice]]:
++        """每个 Active 分配（键为分配 id）的设备，没有设备的分配对应空集合（跨租户，仅供指标使用）。"""
++
++        def _active() -> dict[str, frozenset[AllocatedDevice]]:
++            rows = self._conn.execute(
++                "SELECT a.id, d.node_id, d.device_id FROM allocations AS a "
++                "LEFT JOIN allocation_devices AS d ON d.allocation_id = a.id WHERE a.status=?",
++                (AllocationStatus.ACTIVE.value,),
++            ).fetchall()
++            held: dict[str, set[AllocatedDevice]] = {}
++            for row in rows:
++                devices = held.setdefault(row["id"], set())
++                if row["node_id"] is not None:
++                    devices.add(AllocatedDevice(node_id=row["node_id"], device_id=row["device_id"]))
++            return {allocation_id: frozenset(devices) for allocation_id, devices in held.items()}
++
++        return await self._run(_active)
++
+     # ------------------------------------------------------------------ #
+     # 生命周期
+     # ------------------------------------------------------------------ #
+diff --git a/packages/control-plane/src/forgemesh/controlplane/telemetry.py b/packages/control-plane/src/forgemesh/controlplane/telemetry.py
+index 09dad88..7089bd2 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/telemetry.py
++++ b/packages/control-plane/src/forgemesh/controlplane/telemetry.py
+@@ -6,6 +6,29 @@
+   模板（如 ``/api/v1/inference-services/{name}``），没有匹配任何路由的请求记为
+   ``unmatched``；``method`` 不是常见方法时记为 ``OTHER``。
+ * ``forgemesh_http_request_duration_seconds{method,route}``：处理 HTTP 请求的耗时。
++* ``forgemesh_reconcile_total{operation,outcome}``：控制器的协调次数。``operation`` 为
++  ``reconcile`` / ``terminate``；``outcome`` 见 :class:`ReconcileOutcome`。
++* ``forgemesh_reconcile_duration_seconds{operation}``：一次协调的耗时，含 status 回写。
++* ``forgemesh_controller_retries_total``：协调抛出异常、按退避重新排队的次数。
++* ``forgemesh_controller_queue_depth{state}``：工作队列中的键数，``state`` 为 ``ready``
++  （可立即处理）、``delayed``（等待延迟到期）、``processing``（处理中）。
++* ``forgemesh_deployments_total{outcome,reason}``：推理服务从别的阶段进入 ``Ready``
++  （``outcome="ready"``）或 ``Failed``（``outcome="failed"``）的次数，在 status 写入成功后
++  计数；``reason`` 为 ``Ready`` 条件的原因（如 ``Reconciled`` / ``WorkflowFailed``），不是
++  标识符形式时记为 ``Unknown``。
++* ``forgemesh_inference_services{phase}``：各阶段的推理服务数，每个阶段都输出。
++* ``forgemesh_allocations_active{accelerator_type}``：Active 分配数，按其设备在加速器清单中的
++  类型；设备不在清单中（或类型不一）时记为 ``unknown``，没有设备的分配记为 ``none``。
++* ``forgemesh_accelerator_devices{accelerator_type,state}``：清单中的设备数，``state`` 为
++  ``free`` / ``allocated``；未配置清单时没有样本。
++* ``forgemesh_workflow_runs{status}``：各状态的部署工作流运行数，每个状态都输出；未配置启动器
++  时没有样本。
++* ``forgemesh_registry_lock_wait_seconds``：注册中心的一次数据库操作等待连接锁的时间（不含
++  SQLite 内部的忙等待）。
++
++仪表盘（队列深度、服务、分配、设备与工作流运行数）在抓取时从控制器、注册中心、加速器清单与
++工作流存储读取（见 :meth:`ControlPlaneMetrics.watch`），跨租户聚合；锁等待时间在每次数据库操作
++时记录。加速器类型取自运维配置的清单，不是租户数据。
+ 
+ ``/metrics`` 与探针一样不要求认证，只输出聚合数据；它不在 ``/api/v1`` 之下，网关不会
+ 转发它（见 README「可观测性」）。
+@@ -13,14 +36,75 @@
+ 
+ from __future__ import annotations
+ 
++import re
++from collections.abc import Callable, Mapping
++from enum import StrEnum
++from typing import TYPE_CHECKING, Any
++
++from forgemesh.resource.inference import InferencePhase
++from forgemesh.workflow.states import WorkflowStatus
++
+ from .metrics import MetricsRegistry
+ 
++if TYPE_CHECKING:  # pragma: no cover - 仅静态类型检查使用
++    from forgemesh.core.reconciler import ReconcileResult
++    from forgemesh.workflowruntime.store import WorkflowStore
++
++    from .controller import ControllerManager
++    from .registry import SQLiteRegistry
++    from .scheduler import Inventory
++
+ #: 记作 ``method`` 标签的 HTTP 方法，其余方法记为 :data:`OTHER_METHOD`。
+ HTTP_METHODS = frozenset({"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"})
+ OTHER_METHOD = "OTHER"
+ #: 没有匹配任何路由的请求的 ``route`` 标签。
+ UNMATCHED_ROUTE = "unmatched"
+ 
++#: ``forgemesh_controller_queue_depth`` 的 ``state`` 取值。
++QUEUE_STATES = ("ready", "delayed", "processing")
++#: 设备不在加速器清单中（或一个分配的设备类型不一）时的 ``accelerator_type``。
++UNKNOWN_ACCELERATOR_TYPE = "unknown"
++#: 没有设备的分配的 ``accelerator_type``。
++NO_ACCELERATOR_TYPE = "none"
++#: 注册中心锁等待的直方图桶上界（秒）。
++LOCK_WAIT_BUCKETS = (0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5)
++
++_INFERENCE_SERVICE = "InferenceService"
++_DEPLOYMENT_OUTCOMES = {InferencePhase.READY.value: "ready", InferencePhase.FAILED.value: "failed"}
++_REASON = re.compile(r"[A-Za-z][A-Za-z0-9]{0,63}")
++_UNKNOWN_REASON = "Unknown"
++
++
++class ReconcileOutcome(StrEnum):
++    """一次协调的结果（``forgemesh_reconcile_total`` 的 ``outcome`` 标签）。"""
++
++    #: 当前 generation 已处理完毕。
++    DONE = "done"
++    #: 按协调器给出的延迟重新排队。
++    REQUEUE = "requeue"
++    #: 不定时重试，等待资源变更或下一次全量同步。
++    WAIT = "wait"
++    #: 资源在协调期间已变化（或已删除），结果被丢弃并重新排队。
++    CONFLICT = "conflict"
++    #: 协调抛出异常（随后按退避重试）。
++    ERROR = "error"
++
++    @classmethod
++    def of(cls, result: ReconcileResult) -> ReconcileOutcome:
++        """status 写入成功（或无需写入）之后，按协调结果归类。"""
++        if result.done:
++            return cls.DONE
++        return cls.REQUEUE if result.requeue_after is not None else cls.WAIT
++
++
++def _ready_reason(patch: Mapping[str, Any]) -> str:
++    for condition in patch.get("conditions") or ():
++        if isinstance(condition, Mapping) and condition.get("type") == "Ready":
++            reason = condition.get("reason")
++            if isinstance(reason, str) and _REASON.fullmatch(reason):
++                return reason
++    return _UNKNOWN_REASON
++
+ 
+ class HTTPMetrics:
+     """HTTP 请求的计数与耗时。"""
+@@ -45,18 +129,185 @@ class HTTPMetrics:
+         self._duration.observe(seconds, method, route)
+ 
+ 
++class ControllerMetrics:
++    """控制器的协调次数与耗时、重试、部署结果与工作队列深度。
++
++    Args:
++        registry: 指标所在的注册中心；为空时新建（指标不会被导出）。
++    """
++
++    def __init__(self, registry: MetricsRegistry | None = None) -> None:
++        registry = registry if registry is not None else MetricsRegistry()
++        self._reconciles = registry.counter(
++            "forgemesh_reconcile_total",
++            "Reconciliations by operation and outcome.",
++            ("operation", "outcome"),
++        )
++        self._duration = registry.histogram(
++            "forgemesh_reconcile_duration_seconds",
++            "Time spent reconciling one resource, including the status write, by operation.",
++            ("operation",),
++        )
++        self._retries = registry.counter(
++            "forgemesh_controller_retries_total",
++            "Reconciliations that raised and were requeued with backoff.",
++        )
++        self._deployments = registry.counter(
++            "forgemesh_deployments_total",
++            "Inference services that entered Ready or Failed, by outcome and Ready reason.",
++            ("outcome", "reason"),
++        )
++        #: 由 :meth:`ControlPlaneMetrics.watch` 登记的采集器在抓取时更新。
++        self.queue_depth = registry.gauge(
++            "forgemesh_controller_queue_depth",
++            "Keys in the controller work queue, by state.",
++            ("state",),
++        )
++
++    def reconciled(self, operation: str, outcome: ReconcileOutcome, seconds: float) -> None:
++        """记录一次协调的结果与耗时。"""
++        self._reconciles.inc(operation, outcome.value)
++        self._duration.observe(seconds, operation)
++
++    def retried(self) -> None:
++        """记录一次抛出异常之后的退避重试。"""
++        self._retries.inc()
++
++    def status_written(self, phase: str | None, patch: Mapping[str, Any]) -> None:
++        """记录一次成功的 status 写入；``phase`` 是写入之前的阶段。"""
++        target = patch.get("phase")
++        outcome = _DEPLOYMENT_OUTCOMES.get(target) if isinstance(target, str) else None
++        if outcome is not None and target != phase:
++            self._deployments.inc(outcome, _ready_reason(patch))
++
++
+ class ControlPlaneMetrics:
+     """控制平面的指标注册中心及各组件的指标。"""
+ 
+     def __init__(self) -> None:
+         self.registry = MetricsRegistry()
+         self.http = HTTPMetrics(self.registry)
++        self.controller = ControllerMetrics(self.registry)
++        self._services = self.registry.gauge(
++            "forgemesh_inference_services",
++            "Inference services by phase.",
++            ("phase",),
++        )
++        self._allocations = self.registry.gauge(
++            "forgemesh_allocations_active",
++            "Active accelerator allocations, by accelerator type of their devices.",
++            ("accelerator_type",),
++        )
++        self._devices = self.registry.gauge(
++            "forgemesh_accelerator_devices",
++            "Accelerator devices in the inventory, by type and state (free or allocated).",
++            ("accelerator_type", "state"),
++        )
++        self._workflow_runs = self.registry.gauge(
++            "forgemesh_workflow_runs",
++            "Deployment workflow runs by status.",
++            ("status",),
++        )
++        self._lock_wait = self.registry.histogram(
++            "forgemesh_registry_lock_wait_seconds",
++            "Time registry database operations waited for the registry connection lock.",
++            buckets=LOCK_WAIT_BUCKETS,
++        )
++
++    def watch(
++        self,
++        registry: SQLiteRegistry,
++        controller: ControllerManager,
++        inventory: Inventory | None = None,
++        workflow_store: WorkflowStore | None = None,
++    ) -> Callable[[], None]:
++        """在抓取时从这些组件读取状态类指标，并观测注册中心的锁等待。
++
++        返回注销函数：之后不再读取这些组件，状态类指标没有样本。
++        """
++        device_types = {
++            (node.id, device.id): device.type
++            for node in (inventory.nodes if inventory is not None else ())
++            for device in node.devices
++        }
++
++        async def queue() -> None:
++            depth = controller.queue_depth()
++            self.controller.queue_depth.replace({(state,): depth[state] for state in QUEUE_STATES})
++
++        async def services() -> None:
++            counts = dict.fromkeys((phase.value for phase in InferencePhase), 0)
++            for phase, count in (await registry.count_by_phase(_INFERENCE_SERVICE)).items():
++                counts[phase if phase in counts else InferencePhase.UNKNOWN.value] += count
++            self._services.replace({(phase,): count for phase, count in counts.items()})
++
++        async def allocations() -> None:
++            active = await registry.active_allocation_devices()
++            by_type = {(accelerator,): 0 for accelerator in device_types.values()}
++            for devices in active.values():
++                types = {
++                    device_types.get((d.node_id, d.device_id), UNKNOWN_ACCELERATOR_TYPE)
++                    for d in devices
++                }
++                if not types:
++                    accelerator = NO_ACCELERATOR_TYPE
++                else:
++                    accelerator = types.pop() if len(types) == 1 else UNKNOWN_ACCELERATOR_TYPE
++                by_type[(accelerator,)] = by_type.get((accelerator,), 0) + 1
++            taken = {(d.node_id, d.device_id) for devices in active.values() for d in devices}
++            by_state = {
++                (accelerator, state): 0
++                for accelerator in device_types.values()
++                for state in ("free", "allocated")
++            }
++            for device, accelerator in device_types.items():
++                by_state[(accelerator, "allocated" if device in taken else "free")] += 1
++            self._allocations.replace(by_type)
++            self._devices.replace(by_state)
++
++        removers = [
++            self.registry.add_collector(queue, [self.controller.queue_depth]),
++            self.registry.add_collector(services, [self._services]),
++            self.registry.add_collector(allocations, [self._allocations, self._devices]),
++        ]
++        if workflow_store is not None:
++            store = workflow_store
++
++            async def workflow_runs() -> None:
++                counts = await store.count_runs_by_status()
++                self._workflow_runs.replace(
++                    {(status.value,): counts.get(status.value, 0) for status in WorkflowStatus}
++                )
++
++            removers.append(self.registry.add_collector(workflow_runs, [self._workflow_runs]))
++        registry.set_lock_wait_observer(self._lock_wait.observe)
++
++        def unwatch() -> None:
++            registry.set_lock_wait_observer(None)
++            for remove in removers:
++                remove()
++            for gauge in (
++                self.controller.queue_depth,
++                self._services,
++                self._allocations,
++                self._devices,
++                self._workflow_runs,
++            ):
++                gauge.replace({})
++
++        return unwatch
+ 
+ 
+ __all__ = [
+     "HTTP_METHODS",
++    "LOCK_WAIT_BUCKETS",
++    "NO_ACCELERATOR_TYPE",
+     "OTHER_METHOD",
++    "QUEUE_STATES",
++    "UNKNOWN_ACCELERATOR_TYPE",
+     "UNMATCHED_ROUTE",
+     "ControlPlaneMetrics",
++    "ControllerMetrics",
+     "HTTPMetrics",
++    "ReconcileOutcome",
+ ]
+diff --git a/packages/workflow-runtime/src/forgemesh/workflowruntime/store.py b/packages/workflow-runtime/src/forgemesh/workflowruntime/store.py
+index f817272..3a719c9 100644
+--- a/packages/workflow-runtime/src/forgemesh/workflowruntime/store.py
++++ b/packages/workflow-runtime/src/forgemesh/workflowruntime/store.py
+@@ -361,6 +361,13 @@ class WorkflowStore:
+                 raise NotFoundError(f"run not found: {run_id}")
+         return {r["step_id"]: StepStatus(r["status"]) for r in rows}
+ 
++    def _count_runs_by_status_sync(self) -> dict[str, int]:
++        """同步按状态统计运行数。"""
++        rows = self._conn.execute(
++            "SELECT status, COUNT(*) AS n FROM workflow_runs GROUP BY status"
++        ).fetchall()
++        return {r["status"]: r["n"] for r in rows}
++
+     def _close_sync(self) -> None:
+         """同步关闭连接。"""
+         self._conn.close()
+@@ -443,6 +450,10 @@ class WorkflowStore:
+         """
+         return await self._call(self._get_step_statuses_sync, run_id)
+ 
++    async def count_runs_by_status(self) -> dict[str, int]:
++        """按状态统计运行数（状态 → 运行数，没有运行的状态不出现；供指标使用）。"""
++        return await self._call(self._count_runs_by_status_sync)
++
+     async def close(self) -> None:
+         """关闭数据库连接。"""
+         await self._call(self._close_sync)
+diff --git a/tests/unit/controlplane/test_controller_queue.py b/tests/unit/controlplane/test_controller_queue.py
+index 5e4600a..fb9a20e 100644
+--- a/tests/unit/controlplane/test_controller_queue.py
++++ b/tests/unit/controlplane/test_controller_queue.py
+@@ -107,3 +107,16 @@ def test_shutdown_releases_waiting_workers_and_ignores_new_keys() -> None:
+ def test_invalid_backoff_settings_are_rejected(kwargs) -> None:
+     with pytest.raises(ValueError):
+         WorkQueue(**kwargs)
++
++
++@pytest.mark.unit
++def test_depth_counts_ready_delayed_and_processing_keys() -> None:
++    async def scenario() -> dict[str, int]:
++        queue: WorkQueue[str] = WorkQueue()
++        queue.add("a")
++        queue.add("b")
++        queue.add_after("c", 60)
++        assert await queue.get() == "a"
++        return queue.depth()
++
++    assert _run(scenario()) == {"ready": 1, "delayed": 1, "processing": 1}
+diff --git a/tests/unit/controlplane/test_metrics_endpoint.py b/tests/unit/controlplane/test_metrics_endpoint.py
+index ae2026d..922319c 100644
+--- a/tests/unit/controlplane/test_metrics_endpoint.py
++++ b/tests/unit/controlplane/test_metrics_endpoint.py
+@@ -2,8 +2,12 @@
+ 
+ from __future__ import annotations
+ 
++import json
++import time
++
+ import pytest
+ from fastapi.testclient import TestClient
++from forgemesh.controlplane import app as app_module
+ from forgemesh.controlplane.api.dependencies import get_registry, reset_runtime_components
+ from forgemesh.controlplane.app import create_app
+ from forgemesh.controlplane.auth import (
+@@ -13,6 +17,7 @@ from forgemesh.controlplane.auth import (
+     hash_api_key,
+ )
+ from forgemesh.controlplane.deployment import RUNTIME_LAUNCHER_ENV
++from forgemesh.controlplane.deployment.config import FAKE_ADVERTISE_HOST_ENV, FAKE_BIND_HOST_ENV
+ from forgemesh.controlplane.metrics import CONTENT_TYPE
+ from forgemesh.controlplane.scheduler import INVENTORY_FILE_ENV
+ 
+@@ -110,3 +115,51 @@ def test_unhandled_errors_are_counted_as_500(tmp_path, monkeypatch) -> None:
+ 
+     requests = parse(text)["forgemesh_http_requests_total"]
+     assert requests.value(method="GET", route="/api/v1/inference-services", status="500") == 1
++
++
++@pytest.mark.unit
++def test_a_deployment_shows_up_in_the_controller_and_state_metrics(tmp_path, monkeypatch) -> None:
++    inventory = tmp_path / "inventory.json"
++    gpus = [{"id": f"gpu-{index}", "type": "nvidia-gpu", "memoryGiB": 80} for index in range(2)]
++    inventory.write_text(json.dumps({"nodes": [{"id": "node-hidden", "devices": gpus}]}))
++    monkeypatch.setenv(INVENTORY_FILE_ENV, str(inventory))
++    monkeypatch.setenv(RUNTIME_LAUNCHER_ENV, "fake")
++    monkeypatch.delenv(FAKE_BIND_HOST_ENV, raising=False)
++    monkeypatch.delenv(FAKE_ADVERTISE_HOST_ENV, raising=False)
++    monkeypatch.setattr(app_module, "CONTROLLER_POLL_INTERVAL_SECONDS", 0.05)
++    monkeypatch.setattr(app_module, "WORKFLOW_POLL_INTERVAL_SECONDS", 0.05)
++
++    done = 'forgemesh_reconcile_total{operation="reconcile",outcome="done"}'
++    with TestClient(_dev_app(tmp_path)) as client:
++        created = client.post("/api/v1/inference-services", json=BODY, headers=HEADERS)
++        assert created.status_code == 201
++        deadline = time.monotonic() + 10
++        while done not in (text := client.get("/metrics").text):
++            assert time.monotonic() < deadline, "the deployment did not finish"
++            time.sleep(0.02)
++        service = client.get(
++            "/api/v1/inference-services/secret-llama",
++            params={"namespace": NAMESPACE},
++            headers=HEADERS,
++        ).json()
++
++    assert service["status"]["phase"] == "Ready"
++    families = parse(text)
++    assert families["forgemesh_inference_services"].value(phase="Ready") == 1
++    assert families["forgemesh_allocations_active"].value(accelerator_type="nvidia-gpu") == 1
++    devices = families["forgemesh_accelerator_devices"]
++    assert devices.value(accelerator_type="nvidia-gpu", state="allocated") == 1
++    assert devices.value(accelerator_type="nvidia-gpu", state="free") == 1
++    assert families["forgemesh_workflow_runs"].value(status="Succeeded") == 1
++    deployments = families["forgemesh_deployments_total"]
++    assert deployments.value(outcome="ready", reason="Reconciled") == 1
++    lock_wait = families["forgemesh_registry_lock_wait_seconds"]
++    assert lock_wait.value("forgemesh_registry_lock_wait_seconds_count") > 0
++    assert {s.labels["state"] for s in families["forgemesh_controller_queue_depth"].samples} == {
++        "ready",
++        "delayed",
++        "processing",
++    }
++    endpoint = service["status"]["endpoints"][0]["url"]
++    for tenant_data in (TENANT, NAMESPACE, "secret-llama", "node-hidden", "gpu-", endpoint):
++        assert tenant_data not in text
+diff --git a/tests/unit/controlplane/test_telemetry.py b/tests/unit/controlplane/test_telemetry.py
+new file mode 100644
+index 0000000..f665232
+--- /dev/null
++++ b/tests/unit/controlplane/test_telemetry.py
+@@ -0,0 +1,371 @@
++"""控制平面的指标：协调结果与耗时、重试、部署结果，以及抓取时读取的状态类指标。"""
++
++from __future__ import annotations
++
++import asyncio
++import json
++import logging
++import time
++from collections.abc import Awaitable, Callable
++from typing import Any
++
++import pytest
++from forgemesh.controlplane.controller import ControllerManager, WorkQueue
++from forgemesh.controlplane.metrics import MetricsRegistry
++from forgemesh.controlplane.registry import ResourceKey, SQLiteRegistry
++from forgemesh.controlplane.scheduler import Inventory
++from forgemesh.controlplane.telemetry import ControllerMetrics, ControlPlaneMetrics
++from forgemesh.core.objects import ObjectMeta
++from forgemesh.core.reconciler import ReconcileResult
++from forgemesh.core.scheduler import AllocatedDevice, ResourceRef
++from forgemesh.resource.inference import (
++    AcceleratorSpec,
++    InferencePhase,
++    InferenceService,
++    InferenceServiceSpec,
++    InferenceServiceStatus,
++    ModelRef,
++    ResourcesSpec,
++    RuntimeRef,
++)
++from forgemesh.workflow.runtime import Step, WorkflowDefinition
++from forgemesh.workflow.states import WorkflowStatus
++from forgemesh.workflowruntime.store import WorkflowStore
++
++from .exposition import parse
++
++KIND = "InferenceService"
++TENANT = "tenant-a"
++NAMESPACE = "ns-hidden"
++INVENTORY = Inventory.model_validate_json(
++    json.dumps(
++        {
++            "nodes": [
++                {
++                    "id": "node-a",
++                    "devices": [
++                        {"id": "gpu-0", "type": "nvidia-gpu", "memoryGiB": 80},
++                        {"id": "gpu-1", "type": "nvidia-gpu", "memoryGiB": 80},
++                    ],
++                },
++                {
++                    "id": "node-b",
++                    "devices": [{"id": "npu-0", "type": "ascend-npu", "memoryGiB": 64}],
++                },
++            ]
++        }
++    )
++)
++
++
++def _run(coro):
++    """同步驱动协程（不依赖 pytest-asyncio）。"""
++    return asyncio.run(coro)
++
++
++def _service(
++    name: str, tenant: str = TENANT, phase: InferencePhase = InferencePhase.PENDING
++) -> InferenceService:
++    return InferenceService(
++        metadata=ObjectMeta(name=name, namespace=NAMESPACE, tenant_id=tenant, uid=f"uid-{name}"),
++        spec=InferenceServiceSpec(
++            model=ModelRef(reference="models/llama"),
++            runtime=RuntimeRef(provider="vllm"),
++            resources=ResourcesSpec(
++                accelerator=AcceleratorSpec(type="nvidia-gpu", minMemoryGiB=16)
++            ),
++        ),
++        status=InferenceServiceStatus(phase=phase),
++    )
++
++
++def _key(name: str) -> ResourceKey:
++    return ResourceKey(TENANT, KIND, NAMESPACE, name)
++
++
++def _ready(status: str, reason: str) -> dict[str, str]:
++    return {"type": "Ready", "status": status, "reason": reason, "message": "details"}
++
++
++class StubReconciler:
++    """依次返回给定的结果：异常则抛出，异步函数则返回它的结果。"""
++
++    records_dedup_keys = False
++
++    def __init__(
++        self, *results: ReconcileResult | Exception | Callable[[], Awaitable[ReconcileResult]]
++    ) -> None:
++        self.results = list(results)
++
++    async def reconcile(self, ctx: Any) -> ReconcileResult:
++        result = self.results.pop(0)
++        if isinstance(result, Exception):
++            raise result
++        if callable(result):
++            return await result()
++        return result
++
++    async def mark_processed(self, dedup_key: str) -> None:
++        return None
++
++
++class FailingReconciler(StubReconciler):
++    async def reconcile(self, ctx: Any) -> ReconcileResult:
++        raise RuntimeError("reconciler backend unavailable")
++
++
++async def _eventually(check: Callable[[], bool], timeout: float = 5.0) -> None:
++    deadline = time.monotonic() + timeout
++    while not check():
++        assert time.monotonic() < deadline, "condition was not met in time"
++        await asyncio.sleep(0.01)
++
++
++@pytest.mark.unit
++def test_reconcile_outcomes_and_durations_are_counted_per_operation() -> None:
++    async def scenario() -> str:
++        registry = SQLiteRegistry()
++
++        async def deleted_meanwhile() -> ReconcileResult:
++            await registry.delete(KIND, NAMESPACE, "svc", TENANT)
++            return ReconcileResult(status_patch={"conditions": [_ready("False", "Waiting")]})
++
++        reconciler = StubReconciler(
++            ReconcileResult(requeue_after=30),
++            ReconcileResult(),
++            ReconcileResult(done=True),
++            RuntimeError("boom"),
++            deleted_meanwhile,
++            ReconcileResult(done=True),
++        )
++        metrics = MetricsRegistry()
++        manager = ControllerManager(registry, reconciler, metrics=ControllerMetrics(metrics))
++        await registry.put(_service("svc"))
++        for _ in range(3):
++            await manager.process(_key("svc"))
++        with pytest.raises(RuntimeError):
++            await manager.process(_key("svc"))
++        await manager.process(_key("svc"))
++        await registry.put(_service("old", phase=InferencePhase.READY))
++        await registry.request_delete(KIND, NAMESPACE, "old", TENANT)
++        await manager.process(_key("old"))
++        await manager.process(_key("missing"))
++        await registry.close()
++        return metrics.render()
++
++    families = parse(_run(scenario()))
++    reconciles = families["forgemesh_reconcile_total"]
++    assert {(s.labels["operation"], s.labels["outcome"]): s.value for s in reconciles.samples} == {
++        ("reconcile", "requeue"): 1,
++        ("reconcile", "wait"): 1,
++        ("reconcile", "done"): 1,
++        ("reconcile", "error"): 1,
++        ("reconcile", "conflict"): 1,
++        ("terminate", "done"): 1,
++    }
++    duration = families["forgemesh_reconcile_duration_seconds"]
++    count = "forgemesh_reconcile_duration_seconds_count"
++    assert duration.value(count, operation="reconcile") == 5
++    assert duration.value(count, operation="terminate") == 1
++
++
++@pytest.mark.unit
++def test_reconciles_that_raise_are_counted_as_retries() -> None:
++    async def scenario() -> tuple[str, int]:
++        registry = SQLiteRegistry()
++        queue: WorkQueue[ResourceKey] = WorkQueue(base_delay=0.01, max_delay=0.05, jitter=0)
++        metrics = MetricsRegistry()
++        manager = ControllerManager(
++            registry,
++            FailingReconciler(),
++            queue=queue,
++            poll_interval=0.01,
++            metrics=ControllerMetrics(metrics),
++        )
++        await registry.put(_service("svc"))
++        await manager.start()
++        try:
++            await _eventually(lambda: queue.failures(_key("svc")) >= 2)
++        finally:
++            await manager.stop()
++            await registry.close()
++        return metrics.render(), queue.failures(_key("svc"))
++
++    text, failures = _run(scenario())
++    families = parse(text)
++    assert families["forgemesh_controller_retries_total"].value() == failures
++    errors = families["forgemesh_reconcile_total"].value(operation="reconcile", outcome="error")
++    assert errors == failures
++
++
++@pytest.mark.unit
++def test_deployments_count_transitions_into_ready_or_failed_with_bounded_reasons() -> None:
++    registry = MetricsRegistry()
++    metrics = ControllerMetrics(registry)
++    ready = {"phase": "Ready", "conditions": [_ready("True", "Reconciled")]}
++
++    metrics.status_written("Verifying", ready)
++    metrics.status_written("Ready", ready)
++    metrics.status_written(
++        "Deploying", {"phase": "Failed", "conditions": [_ready("False", "WorkflowFailed")]}
++    )
++    metrics.status_written(
++        "Verifying", {"phase": "Failed", "conditions": [_ready("False", "run 7f3a failed")]}
++    )
++    metrics.status_written("Pending", {"phase": "Failed"})
++    metrics.status_written(
++        "Ready", {"phase": "Degraded", "conditions": [_ready("False", "InstanceLost")]}
++    )
++    metrics.status_written("Pending", {"conditions": [_ready("False", "SchedulerUnavailable")]})
++
++    deployments = parse(registry.render())["forgemesh_deployments_total"]
++    assert {(s.labels["outcome"], s.labels["reason"]): s.value for s in deployments.samples} == {
++        ("ready", "Reconciled"): 1,
++        ("failed", "WorkflowFailed"): 1,
++        ("failed", "Unknown"): 2,
++    }
++
++
++@pytest.mark.unit
++def test_state_metrics_are_read_at_scrape_time_without_tenant_data() -> None:
++    definition = WorkflowDefinition(name="deploy", steps=[Step(id="launch", uses="launch")])
++
++    async def scenario() -> tuple[str, str]:
++        registry = SQLiteRegistry()
++        store = WorkflowStore()
++        metrics = ControlPlaneMetrics()
++        manager = ControllerManager(registry, StubReconciler(), metrics=metrics.controller)
++        services = {
++            "svc-pending": ("tenant-a", InferencePhase.PENDING, None),
++            "svc-gpu": ("tenant-b", InferencePhase.READY, [("node-a", "gpu-1")]),
++            "svc-lost": ("tenant-b", InferencePhase.READY, [("node-gone", "gpu-9")]),
++            "svc-cpu": ("tenant-c", InferencePhase.DEPLOYING, []),
++            "svc-released": ("tenant-c", InferencePhase.FAILED, [("node-a", "gpu-0")]),
++        }
++        for name, (tenant, phase, devices) in services.items():
++            await registry.put(_service(name, tenant, phase))
++            if devices is None:
++                continue
++            record = await registry.create_allocation(
++                tenant,
++                ResourceRef(kind=KIND, namespace=NAMESPACE, name=name, uid=f"uid-{name}"),
++                f"{name}:1",
++                [AllocatedDevice(node_id=node, device_id=device) for node, device in devices],
++            )
++            if name == "svc-released":
++                await registry.release_allocation(record["id"], tenant)
++        running = await store.create_run(definition, {}, "run-1")
++        await store.create_run(definition, {}, "run-2")
++        await store.update_run_status(running.run_id, WorkflowStatus.RUNNING.value)
++        await manager.resync()
++
++        unwatch = metrics.watch(registry, manager, INVENTORY, store)
++        watched = await metrics.registry.scrape()
++        unwatch()
++        await registry.ping()
++        unwatched = await metrics.registry.scrape()
++        await store.close()
++        await registry.close()
++        return watched, unwatched
++
++    watched, unwatched = _run(scenario())
++    families = parse(watched)
++    services = families["forgemesh_inference_services"]
++    assert {s.labels["phase"]: s.value for s in services.samples} == {
++        **dict.fromkeys((phase.value for phase in InferencePhase), 0),
++        "Pending": 1,
++        "Ready": 2,
++        "Deploying": 1,
++        "Failed": 1,
++    }
++    allocations = families["forgemesh_allocations_active"]
++    assert {s.labels["accelerator_type"]: s.value for s in allocations.samples} == {
++        "nvidia-gpu": 1,
++        "ascend-npu": 0,
++        "unknown": 1,
++        "none": 1,
++    }
++    devices = families["forgemesh_accelerator_devices"]
++    assert {
++        (s.labels["accelerator_type"], s.labels["state"]): s.value for s in devices.samples
++    } == {
++        ("nvidia-gpu", "allocated"): 1,
++        ("nvidia-gpu", "free"): 1,
++        ("ascend-npu", "allocated"): 0,
++        ("ascend-npu", "free"): 1,
++    }
++    runs = families["forgemesh_workflow_runs"]
++    assert {s.labels["status"]: s.value for s in runs.samples} == {
++        **dict.fromkeys((status.value for status in WorkflowStatus), 0),
++        "Pending": 1,
++        "Running": 1,
++    }
++    depth = families["forgemesh_controller_queue_depth"]
++    assert {s.labels["state"]: s.value for s in depth.samples} == {
++        "ready": 5,
++        "delayed": 0,
++        "processing": 0,
++    }
++    lock_wait_count = "forgemesh_registry_lock_wait_seconds_count"
++    assert families["forgemesh_registry_lock_wait_seconds"].value(lock_wait_count) == 2
++    for hidden in ("tenant-", NAMESPACE, "svc-", "uid-", "node-", "gpu-", "run-"):
++        assert hidden not in watched
++
++    after = parse(unwatched)
++    for name in (
++        "forgemesh_inference_services",
++        "forgemesh_allocations_active",
++        "forgemesh_accelerator_devices",
++        "forgemesh_workflow_runs",
++        "forgemesh_controller_queue_depth",
++    ):
++        assert after[name].samples == []
++    assert after["forgemesh_registry_lock_wait_seconds"].value(lock_wait_count) == 2
++
++
++@pytest.mark.unit
++def test_state_metrics_from_an_unavailable_registry_are_dropped(caplog) -> None:
++    async def scenario() -> tuple[str, str]:
++        registry = SQLiteRegistry()
++        metrics = ControlPlaneMetrics()
++        manager = ControllerManager(registry, StubReconciler(), metrics=metrics.controller)
++        await registry.put(_service("svc"))
++        metrics.watch(registry, manager)
++        available = await metrics.registry.scrape()
++        await registry.close()
++        return available, await metrics.registry.scrape()
++
++    with caplog.at_level(logging.WARNING, logger="forgemesh.controlplane.metrics"):
++        available, unavailable = _run(scenario())
++
++    assert parse(available)["forgemesh_inference_services"].value(phase="Pending") == 1
++    families = parse(unavailable)
++    assert families["forgemesh_inference_services"].samples == []
++    assert families["forgemesh_allocations_active"].samples == []
++    assert families["forgemesh_workflow_runs"].samples == []
++    assert families["forgemesh_controller_queue_depth"].value(state="ready") == 0
++    assert "metrics collector" in caplog.text
++
++
++@pytest.mark.unit
++def test_lock_wait_is_the_time_spent_waiting_for_the_registry_lock() -> None:
++    async def scenario() -> list[float]:
++        registry = SQLiteRegistry()
++        waits: list[float] = []
++        registry.set_lock_wait_observer(waits.append)
++        await registry.ping()
++        registry._lock.acquire()
++        try:
++            contended = asyncio.ensure_future(registry.ping())
++            await asyncio.sleep(0.05)
++        finally:
++            registry._lock.release()
++        await contended
++        registry.set_lock_wait_observer(None)
++        await registry.ping()
++        await registry.close()
++        return waits
++
++    uncontended, contended = _run(scenario())
++    assert 0 <= uncontended < contended
++    assert contended >= 0.03
+diff --git a/tests/unit/workflowruntime/test_store.py b/tests/unit/workflowruntime/test_store.py
+index cf65053..7fe569d 100644
+--- a/tests/unit/workflowruntime/test_store.py
++++ b/tests/unit/workflowruntime/test_store.py
+@@ -337,6 +337,18 @@ def test_file_database_uses_wal_and_old_files_gain_the_error_column(tmp_path) ->
+     check.close()
+ 
+ 
++@pytest.mark.unit
++def test_count_runs_by_status() -> None:
++    """按状态统计运行数；没有运行的状态不出现。"""
++    store = WorkflowStore()
++    defn = _make_definition()
++    first = asyncio_run(store.create_run(defn, {}, "key-1"))
++    asyncio_run(store.create_run(defn, {}, "key-2"))
++    asyncio_run(store.update_run_status(first.run_id, WorkflowStatus.RUNNING.value))
++
++    assert asyncio_run(store.count_runs_by_status()) == {"Pending": 1, "Running": 1}
++
++
+ # --------------------------------------------------------------------------- #
+ # 辅助
+ # --------------------------------------------------------------------------- #
+-- 
+2.43.0
+

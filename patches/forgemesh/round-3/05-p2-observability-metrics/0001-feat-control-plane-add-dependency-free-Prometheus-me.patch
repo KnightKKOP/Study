@@ -1,0 +1,822 @@
+From d13692a3e2550888c4e4f53f833703a79a6032c2 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 13 Oct 2026 02:22:11 +0000
+Subject: [PATCH 01/11] feat(control-plane): add dependency-free Prometheus
+ metrics primitives
+
+The control plane has no way to expose metrics: observability.py only
+keeps values in memory and nothing scrapes them. Add counters, gauges
+and histograms that render the Prometheus text format 0.0.4 using the
+standard library only, so no new dependency is needed.
+
+Label cardinality is bounded twice: callers only pass bounded label
+values, and each metric caps its series (default 200); new label sets
+beyond the cap are counted under an all-"overflow" series so totals
+stay correct. Gauges are replaced by collectors at scrape time, and a
+failing collector clears its gauges instead of exporting stale values.
+Updates are locked because registry calls run on worker threads.
+
+The tests include a strict exposition parser that later tests reuse.
+---
+ .../src/forgemesh/controlplane/metrics.py     | 395 ++++++++++++++++++
+ tests/unit/controlplane/exposition.py         | 139 ++++++
+ tests/unit/controlplane/test_metrics.py       | 239 +++++++++++
+ 3 files changed, 773 insertions(+)
+ create mode 100644 packages/control-plane/src/forgemesh/controlplane/metrics.py
+ create mode 100644 tests/unit/controlplane/exposition.py
+ create mode 100644 tests/unit/controlplane/test_metrics.py
+
+diff --git a/packages/control-plane/src/forgemesh/controlplane/metrics.py b/packages/control-plane/src/forgemesh/controlplane/metrics.py
+new file mode 100644
+index 0000000..7dcfdba
+--- /dev/null
++++ b/packages/control-plane/src/forgemesh/controlplane/metrics.py
+@@ -0,0 +1,395 @@
++"""不依赖第三方库的 Prometheus 指标：计数器、仪表盘与直方图，按文本格式 0.0.4 输出。
++
++* 指标名与标签名在创建时校验；每个指标的标签名固定，样本按标签取值区分序列，输出时
++  序列按标签取值排序。
++* 标签基数有上限：调用方只传取值有限的标签（路由模板、枚举、固定字符串），不传 uid、
++  名称、租户等。作为兜底，一个指标最多 ``max_series`` 个序列，之后出现的新标签组合计入
++  全部标签都取 :data:`OVERFLOW_LABEL_VALUE` 的溢出序列（总数仍然准确），并记录一次告警。
++* 线程安全：更新与读取都持锁（Registry 的数据库操作在工作线程中执行）。
++* 仪表盘反映抓取时的状态：由 :meth:`MetricsRegistry.add_collector` 登记的采集器在每次
++  :meth:`MetricsRegistry.scrape` 时以 :meth:`Gauge.replace` 整体替换取值；采集器失败时
++  记录告警，并清空它负责的仪表盘，不输出过时的取值。
++"""
++
++from __future__ import annotations
++
++import bisect
++import itertools
++import logging
++import math
++import re
++import threading
++from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
++from typing import ClassVar
++
++logger = logging.getLogger(__name__)
++
++#: ``/metrics`` 响应的 Content-Type（Prometheus 文本格式 0.0.4）。
++CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
++
++#: 默认的直方图桶上界（秒），与 Prometheus 客户端库的默认值相同。
++DEFAULT_BUCKETS: tuple[float, ...] = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10)
++
++#: 每个指标默认最多的序列数。
++DEFAULT_MAX_SERIES = 200
++
++#: 溢出序列的标签取值。
++OVERFLOW_LABEL_VALUE = "overflow"
++
++_METRIC_NAME = re.compile(r"[a-zA-Z_:][a-zA-Z0-9_:]*")
++_LABEL_NAME = re.compile(r"[a-zA-Z_][a-zA-Z0-9_]*")
++#: 直方图的 ``le`` 与 ``_bucket`` / ``_sum`` / ``_count`` 后缀由本模块生成，不能再用作标签名。
++_RESERVED_LABELS = frozenset({"le", "quantile"})
++
++Collector = Callable[[], Awaitable[None]]
++
++
++def format_value(value: float) -> str:
++    """把样本值写成文本格式：整数不带小数点，特殊值为 ``+Inf`` / ``-Inf`` / ``NaN``。"""
++    if isinstance(value, int):
++        return str(value)
++    if math.isnan(value):
++        return "NaN"
++    if math.isinf(value):
++        return "+Inf" if value > 0 else "-Inf"
++    if value.is_integer() and abs(value) < 1e15:
++        return str(int(value))
++    return repr(value)
++
++
++def _escape_label_value(value: str) -> str:
++    return value.replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
++
++
++def _escape_help(text: str) -> str:
++    return text.replace("\\", "\\\\").replace("\n", "\\n")
++
++
++def _labels_text(names: Sequence[str], values: Sequence[str]) -> str:
++    if not names:
++        return ""
++    pairs = ",".join(
++        f'{name}="{_escape_label_value(value)}"' for name, value in zip(names, values, strict=True)
++    )
++    return "{" + pairs + "}"
++
++
++class _Metric:
++    """单个指标：名称、说明、固定的标签名与按标签取值区分的序列。"""
++
++    kind: ClassVar[str]
++
++    def __init__(
++        self,
++        name: str,
++        documentation: str,
++        labelnames: Sequence[str] = (),
++        *,
++        max_series: int = DEFAULT_MAX_SERIES,
++    ) -> None:
++        if not _METRIC_NAME.fullmatch(name):
++            raise ValueError(f"invalid metric name {name!r}")
++        labelnames = tuple(labelnames)
++        for label in labelnames:
++            if not _LABEL_NAME.fullmatch(label) or label.startswith("__"):
++                raise ValueError(f"invalid label name {label!r} for metric {name}")
++            if label in _RESERVED_LABELS:
++                raise ValueError(f"label name {label!r} is reserved (metric {name})")
++        if len(set(labelnames)) != len(labelnames):
++            raise ValueError(f"duplicate label names for metric {name}: {labelnames}")
++        if max_series < 1:
++            raise ValueError(f"max_series must be >= 1, got {max_series}")
++        self.name = name
++        self.documentation = documentation
++        self.labelnames = labelnames
++        self._max_series = max_series
++        self._lock = threading.Lock()
++        self._overflow_logged = False
++
++    def _check(self, labelvalues: Sequence[str]) -> tuple[str, ...]:
++        if len(labelvalues) != len(self.labelnames):
++            raise ValueError(
++                f"metric {self.name} expects labels {self.labelnames}, got {tuple(labelvalues)}"
++            )
++        for value in labelvalues:
++            if not isinstance(value, str):
++                raise TypeError(f"label values of metric {self.name} must be str, got {value!r}")
++        return tuple(labelvalues)
++
++    def _bounded(
++        self, series: Mapping[tuple[str, ...], object], key: tuple[str, ...]
++    ) -> tuple[str, ...]:
++        """``key`` 已有序列或尚未达到上限时原样返回，否则返回溢出序列的键。调用方须持锁。"""
++        if key in series or len(series) < self._max_series:
++            return key
++        if not self._overflow_logged:
++            self._overflow_logged = True
++            logger.warning(
++                "metric %s reached %d label sets; new label sets are counted under %r",
++                self.name,
++                self._max_series,
++                OVERFLOW_LABEL_VALUE,
++            )
++        return (OVERFLOW_LABEL_VALUE,) * len(self.labelnames)
++
++    def render(self) -> list[str]:
++        """输出 ``# HELP`` / ``# TYPE`` 与全部样本行。"""
++        lines = [
++            f"# HELP {self.name} {_escape_help(self.documentation)}",
++            f"# TYPE {self.name} {self.kind}",
++        ]
++        lines.extend(self._sample_lines())
++        return lines
++
++    def _sample_lines(self) -> list[str]:
++        raise NotImplementedError
++
++
++class _ScalarMetric(_Metric):
++    """每个序列是一个数值的指标（计数器、仪表盘）。"""
++
++    def __init__(
++        self,
++        name: str,
++        documentation: str,
++        labelnames: Sequence[str] = (),
++        *,
++        max_series: int = DEFAULT_MAX_SERIES,
++    ) -> None:
++        super().__init__(name, documentation, labelnames, max_series=max_series)
++        self._values: dict[tuple[str, ...], float] = {}
++
++    def value(self, *labelvalues: str) -> float:
++        """序列的当前取值；序列不存在时为 0。"""
++        key = self._check(labelvalues)
++        with self._lock:
++            return self._values.get(key, 0)
++
++    def _sample_lines(self) -> list[str]:
++        with self._lock:
++            items = sorted(self._values.items())
++        return [
++            f"{self.name}{_labels_text(self.labelnames, key)} {format_value(value)}"
++            for key, value in items
++        ]
++
++
++class Counter(_ScalarMetric):
++    """只增不减的计数器（名称按约定以 ``_total`` 结尾）。"""
++
++    kind = "counter"
++
++    def inc(self, *labelvalues: str, amount: float = 1) -> None:
++        """序列加 ``amount``（不能为负）。"""
++        if amount < 0:
++            raise ValueError(f"counter {self.name} cannot decrease (amount={amount})")
++        key = self._check(labelvalues)
++        with self._lock:
++            key = self._bounded(self._values, key)
++            self._values[key] = self._values.get(key, 0) + amount
++
++
++class Gauge(_ScalarMetric):
++    """可增可减的仪表盘。"""
++
++    kind = "gauge"
++
++    def set(self, value: float, *labelvalues: str) -> None:
++        """设置序列的取值。"""
++        key = self._check(labelvalues)
++        with self._lock:
++            key = self._bounded(self._values, key)
++            self._values[key] = value
++
++    def replace(self, values: Mapping[tuple[str, ...], float]) -> None:
++        """以 ``values``（标签取值元组 → 取值）整体替换全部序列；溢出的序列取值相加。"""
++        checked = [(self._check(key), value) for key, value in values.items()]
++        fresh: dict[tuple[str, ...], float] = {}
++        with self._lock:
++            for key, value in checked:
++                bounded = self._bounded(fresh, key)
++                fresh[bounded] = fresh.get(bounded, 0) + value
++            self._values = fresh
++
++
++class _HistogramSeries:
++    __slots__ = ("buckets", "count", "sum")
++
++    def __init__(self, size: int) -> None:
++        self.buckets = [0] * size
++        self.count = 0
++        self.sum: float = 0
++
++
++class Histogram(_Metric):
++    """直方图：按桶上界累计观测次数，并记录总和与总次数。
++
++    Args:
++        buckets: 严格递增的有限桶上界；``+Inf`` 桶自动追加。
++    """
++
++    kind = "histogram"
++
++    def __init__(
++        self,
++        name: str,
++        documentation: str,
++        labelnames: Sequence[str] = (),
++        *,
++        buckets: Sequence[float] = DEFAULT_BUCKETS,
++        max_series: int = DEFAULT_MAX_SERIES,
++    ) -> None:
++        super().__init__(name, documentation, labelnames, max_series=max_series)
++        bounds = tuple(float(bound) for bound in buckets)
++        if not bounds:
++            raise ValueError(f"histogram {name} needs at least one bucket")
++        if any(not math.isfinite(bound) for bound in bounds):
++            raise ValueError(f"histogram {name} buckets must be finite (+Inf is implicit)")
++        if any(low >= high for low, high in itertools.pairwise(bounds)):
++            raise ValueError(f"histogram {name} buckets must be strictly increasing: {bounds}")
++        self.buckets = bounds
++        self._series: dict[tuple[str, ...], _HistogramSeries] = {}
++
++    def observe(self, value: float, *labelvalues: str) -> None:
++        """记录一次观测。"""
++        if math.isnan(value):
++            raise ValueError(f"histogram {self.name} cannot observe NaN")
++        key = self._check(labelvalues)
++        index = bisect.bisect_left(self.buckets, value)
++        with self._lock:
++            key = self._bounded(self._series, key)
++            series = self._series.get(key)
++            if series is None:
++                series = self._series[key] = _HistogramSeries(len(self.buckets) + 1)
++            series.buckets[index] += 1
++            series.count += 1
++            series.sum += value
++
++    def count(self, *labelvalues: str) -> int:
++        """序列的观测次数；序列不存在时为 0。"""
++        key = self._check(labelvalues)
++        with self._lock:
++            series = self._series.get(key)
++            return series.count if series is not None else 0
++
++    def _sample_lines(self) -> list[str]:
++        with self._lock:
++            items = sorted(
++                (key, list(series.buckets), series.sum, series.count)
++                for key, series in self._series.items()
++            )
++        bucket_labels = (*self.labelnames, "le")
++        lines: list[str] = []
++        for key, buckets, total, count in items:
++            cumulative = 0
++            for bound, observed in zip((*self.buckets, math.inf), buckets, strict=True):
++                cumulative += observed
++                labels = _labels_text(bucket_labels, (*key, format_value(bound)))
++                lines.append(f"{self.name}_bucket{labels} {cumulative}")
++            labels = _labels_text(self.labelnames, key)
++            lines.append(f"{self.name}_sum{labels} {format_value(total)}")
++            lines.append(f"{self.name}_count{labels} {count}")
++        return lines
++
++
++class MetricsRegistry:
++    """一组指标：按创建顺序输出，抓取前执行登记的采集器。"""
++
++    def __init__(self) -> None:
++        self._metrics: dict[str, _Metric] = {}
++        self._collectors: list[tuple[Collector, tuple[Gauge, ...]]] = []
++        self._lock = threading.Lock()
++
++    def _register[M: _Metric](self, metric: M) -> M:
++        with self._lock:
++            if metric.name in self._metrics:
++                raise ValueError(f"metric {metric.name} is already registered")
++            self._metrics[metric.name] = metric
++        return metric
++
++    def counter(
++        self,
++        name: str,
++        documentation: str,
++        labelnames: Sequence[str] = (),
++        *,
++        max_series: int = DEFAULT_MAX_SERIES,
++    ) -> Counter:
++        """创建并登记一个计数器。"""
++        return self._register(Counter(name, documentation, labelnames, max_series=max_series))
++
++    def gauge(
++        self,
++        name: str,
++        documentation: str,
++        labelnames: Sequence[str] = (),
++        *,
++        max_series: int = DEFAULT_MAX_SERIES,
++    ) -> Gauge:
++        """创建并登记一个仪表盘。"""
++        return self._register(Gauge(name, documentation, labelnames, max_series=max_series))
++
++    def histogram(
++        self,
++        name: str,
++        documentation: str,
++        labelnames: Sequence[str] = (),
++        *,
++        buckets: Sequence[float] = DEFAULT_BUCKETS,
++        max_series: int = DEFAULT_MAX_SERIES,
++    ) -> Histogram:
++        """创建并登记一个直方图。"""
++        return self._register(
++            Histogram(name, documentation, labelnames, buckets=buckets, max_series=max_series)
++        )
++
++    def add_collector(self, collector: Collector, gauges: Iterable[Gauge]) -> Callable[[], None]:
++        """登记抓取时执行的采集器，返回注销函数。
++
++        采集器负责替换 ``gauges`` 的取值；它抛出异常时记录告警并清空这些仪表盘。
++        """
++        entry = (collector, tuple(gauges))
++        with self._lock:
++            self._collectors.append(entry)
++
++        def remove() -> None:
++            with self._lock:
++                if entry in self._collectors:
++                    self._collectors.remove(entry)
++
++        return remove
++
++    def render(self) -> str:
++        """按文本格式输出全部指标的当前取值（不执行采集器）。"""
++        with self._lock:
++            metrics = list(self._metrics.values())
++        lines: list[str] = []
++        for metric in metrics:
++            lines.extend(metric.render())
++        return "\n".join(lines) + "\n"
++
++    async def scrape(self) -> str:
++        """依次执行采集器，再输出全部指标。"""
++        with self._lock:
++            collectors = list(self._collectors)
++        for collector, gauges in collectors:
++            try:
++                await collector()
++            except Exception:  # noqa: BLE001 - 一个采集器失败不影响其他指标
++                logger.warning("metrics collector %r failed", collector, exc_info=True)
++                for gauge in gauges:
++                    gauge.replace({})
++        return self.render()
++
++
++__all__ = [
++    "CONTENT_TYPE",
++    "DEFAULT_BUCKETS",
++    "DEFAULT_MAX_SERIES",
++    "OVERFLOW_LABEL_VALUE",
++    "Counter",
++    "Gauge",
++    "Histogram",
++    "MetricsRegistry",
++    "format_value",
++]
+diff --git a/tests/unit/controlplane/exposition.py b/tests/unit/controlplane/exposition.py
+new file mode 100644
+index 0000000..77b188c
+--- /dev/null
++++ b/tests/unit/controlplane/exposition.py
+@@ -0,0 +1,139 @@
++"""Prometheus 文本格式（0.0.4）的严格解析，供测试校验 ``/metrics`` 的输出。
++
++:func:`parse` 不合法时抛出 ``AssertionError``，检查：
++
++* 文本以换行结尾、没有空行；``# HELP`` / ``# TYPE`` 每个指标至多一次，且在它的样本之前；
++* 样本名属于已声明类型的指标（直方图为 ``_bucket`` / ``_sum`` / ``_count``），同一指标的
++  样本连续出现；指标名、标签名合法，标签名不重复，标签值的转义合法，取值是浮点数；
++* 同一序列（样本名 + 标签集合）只出现一次；
++* 直方图的每个序列：``le`` 严格递增并以 ``+Inf`` 结尾，桶计数累积不减，``+Inf`` 桶等于
++  ``_count``，且有 ``_sum``。
++"""
++
++from __future__ import annotations
++
++import math
++import re
++from dataclasses import dataclass, field
++
++_NAME = r"[a-zA-Z_:][a-zA-Z0-9_:]*"
++_HELP = re.compile(rf"^# HELP ({_NAME}) (.*)$")
++_TYPE = re.compile(rf"^# TYPE ({_NAME}) (counter|gauge|histogram|summary|untyped)$")
++_SAMPLE = re.compile(rf"^({_NAME})(?:\{{(.*)\}})? (\S+)$")
++_LABEL = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:[^"\\\n]|\\[\\"n])*)"(,|$)')
++_UNESCAPE = re.compile(r"\\([\\\"n])")
++
++
++@dataclass
++class Sample:
++    name: str
++    labels: dict[str, str]
++    value: float
++
++
++@dataclass
++class Family:
++    name: str
++    type: str = "untyped"
++    help: str | None = None
++    samples: list[Sample] = field(default_factory=list)
++
++    def value(self, sample_name: str | None = None, **labels: str) -> float:
++        """唯一匹配 ``labels`` 的样本取值（``sample_name`` 缺省为指标名）。"""
++        wanted = sample_name or self.name
++        matches = [s for s in self.samples if s.name == wanted and s.labels == labels]
++        assert len(matches) == 1, f"{wanted}{labels}: {len(matches)} samples in {self.samples}"
++        return matches[0].value
++
++
++def _parse_labels(text: str, line: str) -> dict[str, str]:
++    labels: dict[str, str] = {}
++    position = 0
++    while position < len(text):
++        match = _LABEL.match(text, position)
++        assert match, f"malformed labels in {line!r}"
++        name, raw, _ = match.groups()
++        assert name not in labels, f"duplicate label {name!r} in {line!r}"
++        labels[name] = _UNESCAPE.sub(lambda m: "\n" if m.group(1) == "n" else m.group(1), raw)
++        position = match.end()
++    return labels
++
++
++def _family_of(sample: str, families: dict[str, Family]) -> Family:
++    if sample in families and families[sample].type != "histogram":
++        return families[sample]
++    for suffix in ("_bucket", "_sum", "_count"):
++        base = sample.removesuffix(suffix)
++        if base != sample and families.get(base) is not None:
++            assert families[base].type == "histogram", f"{sample} for non-histogram {base}"
++            return families[base]
++    raise AssertionError(f"sample {sample} has no # TYPE line")
++
++
++def _check_histogram(family: Family) -> None:
++    series: dict[tuple[tuple[str, str], ...], dict[str, object]] = {}
++    for sample in family.samples:
++        labels = dict(sample.labels)
++        le = labels.pop("le", None)
++        entry = series.setdefault(tuple(sorted(labels.items())), {"buckets": []})
++        if sample.name.endswith("_bucket"):
++            assert le is not None, f"bucket without le: {sample}"
++            entry["buckets"].append((float(le), sample.value))
++        else:
++            assert le is None, f"le on {sample}"
++            entry[sample.name.rsplit("_", 1)[1]] = sample.value
++    for key, entry in series.items():
++        buckets = entry["buckets"]
++        assert buckets, f"{family.name}{key} has no buckets"
++        bounds = [bound for bound, _ in buckets]
++        counts = [count for _, count in buckets]
++        assert bounds == sorted(set(bounds)), f"{family.name}{key} le not increasing: {bounds}"
++        assert math.isinf(bounds[-1]), f"{family.name}{key} lacks the +Inf bucket"
++        assert counts == sorted(counts), f"{family.name}{key} buckets not cumulative: {counts}"
++        assert entry.get("count") == counts[-1], f"{family.name}{key} +Inf != _count"
++        assert "sum" in entry, f"{family.name}{key} lacks _sum"
++
++
++def parse(text: str) -> dict[str, Family]:
++    """解析并校验文本格式，返回 指标名 → :class:`Family`。"""
++    assert text.endswith("\n"), "exposition must end with a newline"
++    families: dict[str, Family] = {}
++    finished: set[str] = set()
++    current: str | None = None
++    seen: set[tuple[str, tuple[tuple[str, str], ...]]] = set()
++    for line in text[:-1].split("\n"):
++        assert line, "empty line in exposition"
++        if line.startswith("#"):
++            if match := _HELP.match(line):
++                name = match.group(1)
++                family = families.setdefault(name, Family(name))
++                assert family.help is None, f"second HELP for {name}"
++                assert not family.samples, f"HELP after samples of {name}"
++                family.help = match.group(2)
++            elif match := _TYPE.match(line):
++                name, kind = match.groups()
++                family = families.setdefault(name, Family(name))
++                assert family.type == "untyped" and not family.samples, f"late TYPE for {name}"
++                family.type = kind
++            else:
++                assert not line.startswith(("# HELP", "# TYPE")), f"malformed {line!r}"
++            continue
++        match = _SAMPLE.match(line)
++        assert match, f"malformed sample line {line!r}"
++        name, label_text, raw_value = match.groups()
++        family = _family_of(name, families)
++        if family.name != current:
++            assert family.name not in finished, f"samples of {family.name} are not contiguous"
++            if current is not None:
++                finished.add(current)
++            current = family.name
++        labels = _parse_labels(label_text or "", line)
++        key = (name, tuple(sorted(labels.items())))
++        assert key not in seen, f"duplicate series {line!r}"
++        seen.add(key)
++        value = float(raw_value)
++        family.samples.append(Sample(name, labels, value))
++    for family in families.values():
++        if family.type == "histogram":
++            _check_histogram(family)
++    return families
+diff --git a/tests/unit/controlplane/test_metrics.py b/tests/unit/controlplane/test_metrics.py
+new file mode 100644
+index 0000000..650c050
+--- /dev/null
++++ b/tests/unit/controlplane/test_metrics.py
+@@ -0,0 +1,239 @@
++"""Prometheus 指标原语：文本格式、计数器与直方图、标签基数上限、抓取时的采集器。"""
++
++from __future__ import annotations
++
++import asyncio
++import logging
++import math
++import threading
++
++import pytest
++from forgemesh.controlplane.metrics import (
++    CONTENT_TYPE,
++    OVERFLOW_LABEL_VALUE,
++    Counter,
++    Histogram,
++    MetricsRegistry,
++    format_value,
++)
++
++from .exposition import parse
++
++
++@pytest.mark.unit
++def test_counter_renders_help_type_and_sorted_series() -> None:
++    registry = MetricsRegistry()
++    requests = registry.counter("demo_requests_total", "Requests handled.", ("method", "code"))
++    requests.inc("POST", "201")
++    requests.inc("GET", "200", amount=2)
++    requests.inc("GET", "200")
++
++    text = registry.render()
++
++    assert text == (
++        "# HELP demo_requests_total Requests handled.\n"
++        "# TYPE demo_requests_total counter\n"
++        'demo_requests_total{method="GET",code="200"} 3\n'
++        'demo_requests_total{method="POST",code="201"} 1\n'
++    )
++    assert parse(text)["demo_requests_total"].value(method="GET", code="200") == 3
++    assert CONTENT_TYPE == "text/plain; version=0.0.4; charset=utf-8"
++
++
++@pytest.mark.unit
++def test_label_values_and_help_text_are_escaped() -> None:
++    registry = MetricsRegistry()
++    registry.counter("demo_total", 'Back\\slash and\nnewline "kept".', ("value",)).inc('a"b\\c\nd')
++
++    text = registry.render()
++
++    assert '# HELP demo_total Back\\\\slash and\\nnewline "kept".\n' in text
++    assert 'demo_total{value="a\\"b\\\\c\\nd"} 1\n' in text
++    assert parse(text)["demo_total"].value(value='a"b\\c\nd') == 1
++
++
++@pytest.mark.unit
++def test_histogram_buckets_are_cumulative_with_sum_and_count() -> None:
++    registry = MetricsRegistry()
++    latency = registry.histogram("demo_seconds", "Latency.", ("route",), buckets=(0.1, 1, 5))
++    for value in (0.05, 0.1, 0.7, 3, 60):
++        latency.observe(value, "/a")
++
++    family = parse(registry.render())["demo_seconds"]
++
++    assert family.type == "histogram"
++    buckets = {s.labels["le"]: s.value for s in family.samples if s.name == "demo_seconds_bucket"}
++    # 桶上界是闭区间：0.1 计入 le="0.1"。
++    assert buckets == {"0.1": 2, "1": 3, "5": 4, "+Inf": 5}
++    assert family.value("demo_seconds_count", route="/a") == 5
++    assert family.value("demo_seconds_sum", route="/a") == pytest.approx(63.85)
++    assert latency.count("/a") == 5
++    assert latency.count("/b") == 0
++
++
++@pytest.mark.unit
++def test_registry_output_is_valid_exposition_format() -> None:
++    registry = MetricsRegistry()
++    registry.counter("demo_total", "Counter.").inc()
++    registry.gauge("demo_items", "Gauge.", ("state",)).set(2, "ready")
++    registry.histogram("demo_seconds", "Histogram.", ("kind",)).observe(0.2, "a")
++    registry.histogram("demo_empty_seconds", "Histogram without samples.")
++
++    families = parse(registry.render())
++
++    assert [f.type for f in families.values()] == ["counter", "gauge", "histogram", "histogram"]
++    assert families["demo_total"].value() == 1
++    assert families["demo_items"].value(state="ready") == 2
++    assert families["demo_empty_seconds"].samples == []
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize(
++    ("value", "text"),
++    [
++        (3, "3"),
++        (2.0, "2"),
++        (0.25, "0.25"),
++        (1e-07, "1e-07"),
++        (math.inf, "+Inf"),
++        (-math.inf, "-Inf"),
++        (math.nan, "NaN"),
++    ],
++)
++def test_format_value(value: float, text: str) -> None:
++    assert format_value(value) == text
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize(
++    ("name", "labels"),
++    [
++        ("0starts_with_digit", ()),
++        ("has-dash", ()),
++        ("ok_total", ("bad-label",)),
++        ("ok_total", ("__reserved",)),
++        ("ok_total", ("le",)),
++        ("ok_total", ("dup", "dup")),
++    ],
++)
++def test_invalid_metric_and_label_names_are_rejected(name: str, labels: tuple[str, ...]) -> None:
++    with pytest.raises(ValueError):
++        Counter(name, "help", labels)
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize("buckets", [(), (1, 1), (2, 1), (1, math.inf), (math.nan,)])
++def test_invalid_histogram_buckets_are_rejected(buckets: tuple[float, ...]) -> None:
++    with pytest.raises(ValueError):
++        Histogram("demo_seconds", "help", buckets=buckets)
++
++
++@pytest.mark.unit
++def test_label_values_must_match_the_declared_labels() -> None:
++    counter = Counter("demo_total", "help", ("a", "b"))
++
++    with pytest.raises(ValueError):
++        counter.inc("only-one")
++    with pytest.raises(TypeError):
++        counter.inc("a", 200)  # type: ignore[arg-type]
++    with pytest.raises(ValueError):
++        counter.inc("a", "b", amount=-1)
++    with pytest.raises(ValueError):
++        Histogram("demo_seconds", "help").observe(math.nan)
++
++
++@pytest.mark.unit
++def test_duplicate_metric_names_are_rejected() -> None:
++    registry = MetricsRegistry()
++    registry.counter("demo_total", "help")
++
++    with pytest.raises(ValueError, match="already registered"):
++        registry.gauge("demo_total", "help")
++
++
++@pytest.mark.unit
++def test_new_label_sets_beyond_the_limit_go_to_the_overflow_series(caplog) -> None:
++    registry = MetricsRegistry()
++    counter = registry.counter("demo_total", "help", ("route", "code"), max_series=2)
++    latency = registry.histogram("demo_seconds", "help", ("route",), max_series=1)
++    caplog.set_level(logging.WARNING, logger="forgemesh.controlplane.metrics")
++
++    for index in range(5):
++        counter.inc(f"/r{index}", "200")
++        latency.observe(0.01, f"/r{index}")
++    counter.inc("/r0", "200")
++
++    family = parse(registry.render())["demo_total"]
++    assert {tuple(s.labels.values()): s.value for s in family.samples} == {
++        ("/r0", "200"): 2,
++        ("/r1", "200"): 1,
++        (OVERFLOW_LABEL_VALUE, OVERFLOW_LABEL_VALUE): 3,
++    }
++    assert latency.count("/r0") == 1
++    assert latency.count(OVERFLOW_LABEL_VALUE) == 4
++    warnings = [r for r in caplog.records if "reached" in r.getMessage()]
++    assert sorted(r.getMessage().split()[1] for r in warnings) == ["demo_seconds", "demo_total"]
++
++
++@pytest.mark.unit
++def test_gauge_replace_drops_vanished_series_and_sums_overflow() -> None:
++    gauge = MetricsRegistry().gauge("demo_items", "help", ("type",), max_series=2)
++    gauge.replace({("a",): 1, ("b",): 2})
++    gauge.replace({("b",): 5, ("c",): 7, ("d",): 1})
++
++    assert gauge.value("a") == 0
++    assert gauge.value("b") == 5
++    assert gauge.value("c") == 7
++    assert gauge.value(OVERFLOW_LABEL_VALUE) == 1
++
++
++@pytest.mark.unit
++def test_scrape_runs_collectors_and_clears_the_gauges_of_a_failing_one(caplog) -> None:
++    registry = MetricsRegistry()
++    healthy = registry.gauge("demo_healthy", "help", ("state",))
++    broken = registry.gauge("demo_broken", "help", ("state",))
++    calls = {"count": 0}
++
++    async def collect_healthy() -> None:
++        calls["count"] += 1
++        healthy.replace({("up",): calls["count"]})
++
++    async def collect_broken() -> None:
++        raise RuntimeError("database is gone")
++
++    registry.add_collector(collect_healthy, [healthy])
++    remove_broken = registry.add_collector(collect_broken, [broken])
++    broken.set(9, "stale")
++
++    families = parse(asyncio.run(registry.scrape()))
++
++    assert families["demo_healthy"].value(state="up") == 1
++    assert families["demo_broken"].samples == []
++    assert any("collector" in r.getMessage() for r in caplog.records)
++
++    remove_broken()
++    remove_broken()
++    broken.set(3, "fresh")
++    families = parse(asyncio.run(registry.scrape()))
++    assert families["demo_healthy"].value(state="up") == 2
++    assert families["demo_broken"].value(state="fresh") == 3
++
++
++@pytest.mark.unit
++def test_concurrent_updates_from_threads_are_not_lost() -> None:
++    counter = Counter("demo_total", "help", ("worker",))
++    histogram = Histogram("demo_seconds", "help")
++
++    def work() -> None:
++        for _ in range(2000):
++            counter.inc("w")
++            histogram.observe(0.001)
++
++    threads = [threading.Thread(target=work) for _ in range(8)]
++    for thread in threads:
++        thread.start()
++    for thread in threads:
++        thread.join()
++
++    assert counter.value("w") == 16000
++    assert histogram.count() == 16000
+-- 
+2.43.0
+

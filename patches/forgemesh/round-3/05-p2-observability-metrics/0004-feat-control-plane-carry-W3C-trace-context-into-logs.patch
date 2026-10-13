@@ -1,0 +1,1227 @@
+From e1a326ef6c8c6aa1572b3da3d15d4cfd78581cc4 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 13 Oct 2026 03:06:49 +0000
+Subject: [PATCH 04/11] feat(control-plane): carry W3C trace context into logs
+ and errors
+
+Requests reaching the control plane through the gateway carry a
+correlation id, but the control plane only echoed it in some error
+envelopes and wrote no structured logs, so a failing request could not
+be followed from the gateway into the control plane.
+
+A pure ASGI middleware now settles one correlation id (the first
+non-empty X-Correlation-Id, otherwise a generated one) and one W3C
+trace context per request: a single valid traceparent is kept, anything
+else starts a new unsampled trace and drops tracestate. Both ids are
+bound in contextvars for the duration of the request and written back
+into the request headers in place, so the 500 handler, which runs
+outside the middleware, reports the same ids.
+
+Error envelopes gain an optional traceId, documented in the OpenAPI
+Error schema (additive). The two route paths that minted a fresh
+correlation id for their envelope now use the request's id.
+
+main() configures the root logger from FORGEMESH_LOG_FORMAT (json by
+default, or text) and FORGEMESH_LOG_LEVEL (INFO by default), refuses to
+start on invalid values, and runs uvicorn with log_config=None so that
+uvicorn's error and access logs share the format and carry the ids.
+---
+ api/openapi/openapi.yaml                      |   6 +
+ .../src/forgemesh/controlplane/api/errors.py  |  26 +-
+ .../forgemesh/controlplane/api/middleware.py  |  63 ++++-
+ .../src/forgemesh/controlplane/api/routes.py  |   5 +-
+ .../src/forgemesh/controlplane/app.py         |  30 +-
+ .../src/forgemesh/controlplane/logs.py        | 160 +++++++++++
+ .../forgemesh/controlplane/tracecontext.py    | 123 ++++++++
+ tests/unit/controlplane/test_logs.py          | 180 ++++++++++++
+ .../unit/controlplane/test_request_context.py | 262 ++++++++++++++++++
+ tests/unit/controlplane/test_tracecontext.py  |  95 +++++++
+ 10 files changed, 933 insertions(+), 17 deletions(-)
+ create mode 100644 packages/control-plane/src/forgemesh/controlplane/logs.py
+ create mode 100644 packages/control-plane/src/forgemesh/controlplane/tracecontext.py
+ create mode 100644 tests/unit/controlplane/test_logs.py
+ create mode 100644 tests/unit/controlplane/test_request_context.py
+ create mode 100644 tests/unit/controlplane/test_tracecontext.py
+
+diff --git a/api/openapi/openapi.yaml b/api/openapi/openapi.yaml
+index 3f955ef..e16ca71 100644
+--- a/api/openapi/openapi.yaml
++++ b/api/openapi/openapi.yaml
+@@ -295,6 +295,12 @@ components:
+               additionalProperties: true
+             correlationId:
+               type: string
++            traceId:
++              type: string
++              pattern: "^[0-9a-f]{32}$"
++              description: >-
++                本次请求的 W3C trace-id（取自合法的 traceparent 请求头，否则由控制平面新生成），
++                与日志中的 trace_id 一致。
+     InferenceService:
+       type: object
+       description: "权威 Schema: api/schemas/inference-service.schema.json（此处为骨架摘要）。"
+diff --git a/packages/control-plane/src/forgemesh/controlplane/api/errors.py b/packages/control-plane/src/forgemesh/controlplane/api/errors.py
+index fcc9eed..685cd8a 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/api/errors.py
++++ b/packages/control-plane/src/forgemesh/controlplane/api/errors.py
+@@ -1,8 +1,12 @@
+ """API 错误：统一错误信封与全局异常处理。
+ 
+-所有错误响应都使用 ``{"error": {"code", "message", "correlationId", "details"}}``
++所有错误响应都使用 ``{"error": {"code", "message", "correlationId", "traceId", "details"}}``
+ 信封（对齐 OpenAPI ``Error`` schema），包括框架层面的 404/405、请求校验失败
+ （FastAPI 默认的 422 统一改为 400）以及未捕获的异常（500，不向客户端暴露内部细节）。
++
++关联 ID 与 trace-id 取自请求头：
++:class:`~forgemesh.controlplane.api.middleware.RequestContextMiddleware` 已把确定的取值写回
++请求头。``500`` 处理器运行在该中间件之外（此时请求上下文已解除绑定），因此也只能从请求头读取。
+ """
+ 
+ from __future__ import annotations
+@@ -19,6 +23,7 @@ from pydantic import ValidationError
+ from starlette.exceptions import HTTPException as StarletteHTTPException
+ 
+ from ..app import error_envelope
++from ..tracecontext import TRACEPARENT_HEADER, parse_traceparent
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -73,6 +78,12 @@ def correlation_id_of(request: Request) -> str:
+     return request.headers.get(CORRELATION_HEADER) or uuid4().hex
+ 
+ 
++def trace_id_of(request: Request) -> str | None:
++    """取请求 ``traceparent`` 中的 trace-id；缺失或不合法时为 ``None``。"""
++    context = parse_traceparent(request.headers.get(TRACEPARENT_HEADER, ""))
++    return None if context is None else context.trace_id
++
++
+ def validation_details(exc: ValidationError | RequestValidationError) -> list[dict[str, Any]]:
+     """提取校验错误摘要（loc/msg/type），剥离不可 JSON 序列化的 ``ctx``。"""
+     return [
+@@ -91,7 +102,11 @@ async def _http_exception_handler(request: Request, exc: StarletteHTTPException)
+     return JSONResponse(
+         status_code=exc.status_code,
+         content=error_envelope(
+-            code, message, correlation_id_of(request), getattr(exc, "details", None)
++            code,
++            message,
++            correlation_id_of(request),
++            getattr(exc, "details", None),
++            trace_id_of(request),
+         ),
+         headers=exc.headers,
+     )
+@@ -107,22 +122,27 @@ async def _validation_exception_handler(
+             "request validation failed",
+             correlation_id_of(request),
+             {"errors": validation_details(exc)},
++            trace_id_of(request),
+         ),
+     )
+ 
+ 
+ async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+     correlation_id = correlation_id_of(request)
++    trace_id = trace_id_of(request)
+     logger.error(
+         "unhandled error: correlation_id=%s method=%s path=%s",
+         correlation_id,
+         request.method,
+         request.url.path,
+         exc_info=exc,
++        extra={"correlation_id": correlation_id, "trace_id": trace_id},
+     )
+     return JSONResponse(
+         status_code=500,
+-        content=error_envelope("INTERNAL_ERROR", "internal server error", correlation_id),
++        content=error_envelope(
++            "INTERNAL_ERROR", "internal server error", correlation_id, trace_id=trace_id
++        ),
+     )
+ 
+ 
+diff --git a/packages/control-plane/src/forgemesh/controlplane/api/middleware.py b/packages/control-plane/src/forgemesh/controlplane/api/middleware.py
+index a2e5c82..905a91f 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/api/middleware.py
++++ b/packages/control-plane/src/forgemesh/controlplane/api/middleware.py
+@@ -1,21 +1,72 @@
+-"""请求遥测中间件（纯 ASGI）：记录每个 HTTP 请求的指标。
++"""请求中间件（纯 ASGI）：请求上下文（关联 ID 与 trace-id）与请求指标。
+ 
+-位于 Starlette 的 ``ServerErrorMiddleware`` 之内、路由之外：未捕获的异常穿过本中间件时
+-按 ``500`` 记录（随后由 ``ServerErrorMiddleware`` 返回 ``500`` 错误信封）。路由模板取自
+-路由器写入 scope 的 ``route``（405 时为路径匹配的路由），没有匹配路由时为空。
++两者都位于 Starlette 的 ``ServerErrorMiddleware`` 之内、路由之外：未捕获的异常穿过它们时，
++请求指标按 ``500`` 记录，随后由 ``ServerErrorMiddleware`` 的处理器返回 ``500`` 错误信封。
+ """
+ 
+ from __future__ import annotations
+ 
+ import time
++from uuid import uuid4
+ 
+ from starlette.types import ASGIApp, Message, Receive, Scope, Send
+ 
+ from ..telemetry import HTTPMetrics
++from ..tracecontext import (
++    TRACEPARENT_HEADER,
++    TRACESTATE_HEADER,
++    new_trace_context,
++    parse_traceparent,
++    request_context,
++)
++from .errors import CORRELATION_HEADER
++
++_CORRELATION = CORRELATION_HEADER.lower().encode("latin-1")
++_TRACEPARENT = TRACEPARENT_HEADER.encode("latin-1")
++_TRACESTATE = TRACESTATE_HEADER.encode("latin-1")
++
++
++class RequestContextMiddleware:
++    """确定每个 HTTP 请求的关联 ID 与追踪上下文，并在处理期间绑定。
++
++    * 关联 ID 取第一个非空的 ``X-Correlation-Id``（原样沿用），没有时生成；
++    * ``traceparent`` 恰好一个且合法时沿用其 trace-id，否则开始新的追踪并丢弃 ``tracestate``；
++    * 确定的取值写回 scope 的请求头（就地修改，两者各留一个）：路由读到的请求头与日志一致，
++      本中间件之外的 ``ServerErrorMiddleware`` 的 ``500`` 处理器也能读到。
++
++    响应不回写这两个头：经网关访问时由网关回写关联 ID，错误信封带有两者。
++    """
++
++    def __init__(self, app: ASGIApp) -> None:
++        self.app = app
++
++    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
++        if scope["type"] != "http":
++            await self.app(scope, receive, send)
++            return
++        headers: list[tuple[bytes, bytes]] = scope["headers"]
++        inbound = next((v for n, v in headers if n == _CORRELATION and v), b"")
++        correlation_id = inbound.decode("latin-1") or uuid4().hex
++        traceparents = [v.decode("latin-1") for n, v in headers if n == _TRACEPARENT]
++        context = parse_traceparent(traceparents[0]) if len(traceparents) == 1 else None
++        dropped = {_CORRELATION, _TRACEPARENT}
++        if context is None:
++            context = new_trace_context()
++            dropped.add(_TRACESTATE)
++        scope["headers"] = [
++            *((n, v) for n, v in headers if n not in dropped),
++            (_CORRELATION, correlation_id.encode("latin-1")),
++            (_TRACEPARENT, context.traceparent.encode("latin-1")),
++        ]
++        with request_context(correlation_id, context.trace_id):
++            await self.app(scope, receive, send)
+ 
+ 
+ class TelemetryMiddleware:
+-    """记录 HTTP 请求的计数与耗时（见 :class:`~forgemesh.controlplane.telemetry.HTTPMetrics`）。"""
++    """记录 HTTP 请求的计数与耗时（见 :class:`~forgemesh.controlplane.telemetry.HTTPMetrics`）。
++
++    路由模板取自路由器写入 scope 的 ``route``（405 时为路径匹配的路由），没有匹配路由时为空。
++    """
+ 
+     def __init__(self, app: ASGIApp, *, metrics: HTTPMetrics) -> None:
+         self.app = app
+@@ -41,4 +92,4 @@ class TelemetryMiddleware:
+             self._metrics.observe(scope["method"], route, status, time.perf_counter() - started)
+ 
+ 
+-__all__ = ["TelemetryMiddleware"]
++__all__ = ["RequestContextMiddleware", "TelemetryMiddleware"]
+diff --git a/packages/control-plane/src/forgemesh/controlplane/api/routes.py b/packages/control-plane/src/forgemesh/controlplane/api/routes.py
+index 3b5a0b4..faacdb4 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/api/routes.py
++++ b/packages/control-plane/src/forgemesh/controlplane/api/routes.py
+@@ -36,6 +36,7 @@ from forgemesh.workflow.runtime import WorkflowDefinition
+ from pydantic import BaseModel, ConfigDict, Field, ValidationError
+ 
+ from ..app import error_envelope
++from ..tracecontext import current_correlation_id
+ from .dependencies import (
+     ComponentNotReadyError,
+     get_decision_router,
+@@ -101,7 +102,7 @@ def _invalid_limit(limit: int) -> JSONResponse | None:
+         400,
+         "BAD_REQUEST",
+         f"limit must be between 1 and {MAX_LIST_LIMIT}, got {limit}",
+-        uuid4().hex,
++        current_correlation_id() or uuid4().hex,
+     )
+ 
+ 
+@@ -192,7 +193,7 @@ async def delete_inference_service(
+     except NotFoundError as exc:
+         raise HTTPException(status_code=404, detail=f"InferenceService '{name}' not found") from exc
+     except ConflictError as exc:
+-        return _error_response(409, "CONFLICT", str(exc), uuid4().hex)
++        return _error_response(409, "CONFLICT", str(exc), current_correlation_id() or uuid4().hex)
+     if result.deleted:
+         return Response(status_code=204)
+     return JSONResponse(status_code=202, content={"name": name, "phase": "Terminating"})
+diff --git a/packages/control-plane/src/forgemesh/controlplane/app.py b/packages/control-plane/src/forgemesh/controlplane/app.py
+index ae3f13a..8852c12 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/app.py
++++ b/packages/control-plane/src/forgemesh/controlplane/app.py
+@@ -4,7 +4,7 @@
+ --------
+ * **真实路由**：挂载 :func:`forgemesh.controlplane.api.create_api_router`
+   （资源 CRUD / 工作流 / 决策），错误统一使用
+-  ``{"error": {"code", "message", "correlationId"}}`` 信封，与
++  ``{"error": {"code", "message", "correlationId", "traceId"}}`` 信封，与
+   ``api/openapi/openapi.yaml`` 一致。
+ * **配置**：权威存储路径取自环境变量 ``FORGEMESH_DB_PATH``（默认
+   ``forgemesh.db``）；监听地址取自 ``FORGEMESH_HOST`` / ``FORGEMESH_PORT``
+@@ -35,6 +35,9 @@
+ * **探针与指标**：``/healthz``（存活）恒为 ok；``/readyz``（就绪）探测权威存储可用；
+   ``/metrics`` 以 Prometheus 文本格式输出聚合指标（见 :mod:`forgemesh.controlplane.telemetry`）。
+   三者都不要求认证。
++* **追踪上下文与日志**：每个请求沿用合法的 W3C ``traceparent``（否则开始新的追踪）与
++  ``X-Correlation-Id``（缺失时生成），日志与错误信封都带上 trace-id 与关联 ID（见
++  :mod:`forgemesh.controlplane.tracecontext`）；日志格式与级别见 :mod:`forgemesh.controlplane.logs`。
+ * **FastAPI 可选兜底**：若运行环境未安装 FastAPI，回退到纯标准库
+   ``http.server``，仅提供探针与 501 占位。
+ 
+@@ -76,11 +79,13 @@ from .deployment import (
+     launcher_from_env,
+     mark_lost_instances,
+ )
++from .logs import LogConfigError, configure_logging, log_settings_from_env
+ from .metrics import CONTENT_TYPE
+ from .reconciler import ProcessedKeyStore, ReconciliationController
+ from .scheduler import INVENTORY_FILE_ENV, FirstFitScheduler, inventory_from_env
+ from .sqlite import workflow_db_path
+ from .telemetry import ControllerMetrics, ControlPlaneMetrics
++from .tracecontext import current_correlation_id, current_trace_id
+ 
+ if TYPE_CHECKING:  # pragma: no cover - 仅静态类型检查使用
+     from .auth import Authenticator
+@@ -132,18 +137,26 @@ def error_envelope(
+     message: str,
+     correlation_id: str | None = None,
+     details: dict[str, Any] | None = None,
++    trace_id: str | None = None,
+ ) -> dict[str, Any]:
+     """构造统一错误信封。
+ 
+     Args:
+         code: 机器可读错误码（如 ``NOT_IMPLEMENTED`` / ``CONFLICT``）。
+         message: 人类可读说明。
+-        correlation_id: 全链路关联 ID（INV-4），可为空。
++        correlation_id: 全链路关联 ID（INV-4）；为空时取当前请求的关联 ID，不在请求中时省略。
+         details: 附加结构化信息，可为空。
++        trace_id: W3C trace-id；为空时取当前请求的 trace-id，不在请求中时省略。
+     """
+     error: dict[str, Any] = {"code": code, "message": message}
++    if correlation_id is None:
++        correlation_id = current_correlation_id()
+     if correlation_id is not None:
+         error["correlationId"] = correlation_id
++    if trace_id is None:
++        trace_id = current_trace_id()
++    if trace_id is not None:
++        error["traceId"] = trace_id
+     if details is not None:
+         error["details"] = details
+     return {"error": error}
+@@ -231,7 +244,7 @@ if _FASTAPI_AVAILABLE:
+             reset_authenticator,
+         )
+         from .api.errors import install_exception_handlers
+-        from .api.middleware import TelemetryMiddleware
++        from .api.middleware import RequestContextMiddleware, TelemetryMiddleware
+ 
+         metrics = ControlPlaneMetrics()
+ 
+@@ -301,6 +314,7 @@ if _FASTAPI_AVAILABLE:
+             lifespan=lifespan,
+         )
+         application.add_middleware(TelemetryMiddleware, metrics=metrics.http)
++        application.add_middleware(RequestContextMiddleware)
+ 
+         @application.get("/healthz", response_model=HealthResponse, tags=["probes"])
+         async def healthz() -> HealthResponse:
+@@ -391,23 +405,27 @@ def _is_loopback(host: str) -> bool:
+ def main() -> None:
+     """命令行入口：监听地址取自 ``FORGEMESH_HOST`` / ``FORGEMESH_PORT``。
+ 
+-    ``FORGEMESH_AUTH_MODE=dev`` 时只允许监听回环地址，否则拒绝启动。
++    ``FORGEMESH_AUTH_MODE=dev`` 时只允许监听回环地址，否则拒绝启动。日志按
++    ``FORGEMESH_LOG_FORMAT`` / ``FORGEMESH_LOG_LEVEL`` 配置（见 :mod:`forgemesh.controlplane.logs`），
++    uvicorn 不再另行配置日志。
+     """
+     host = os.environ.get(HOST_ENV, DEFAULT_HOST)
+     port = int(os.environ.get(PORT_ENV, str(DEFAULT_PORT)))
+     try:
+         mode = auth_mode_from_env()
+-    except AuthConfigError as exc:
++        log_settings = log_settings_from_env()
++    except (AuthConfigError, LogConfigError) as exc:
+         raise SystemExit(str(exc)) from exc
+     if mode == AUTH_MODE_DEV and not _is_loopback(host):
+         raise SystemExit(
+             f"{AUTH_MODE_ENV}={AUTH_MODE_DEV} trusts the X-Tenant-Id header and may only listen "
+             f"on a loopback address, but {HOST_ENV}={host}"
+         )
++    configure_logging(log_settings)
+     if _FASTAPI_AVAILABLE:  # pragma: no cover - 依赖运行时环境
+         import uvicorn
+ 
+-        uvicorn.run(app, host=host, port=port)
++        uvicorn.run(app, host=host, port=port, log_config=None)
+         return
+     run_fallback_server(host, port)  # pragma: no cover
+ 
+diff --git a/packages/control-plane/src/forgemesh/controlplane/logs.py b/packages/control-plane/src/forgemesh/controlplane/logs.py
+new file mode 100644
+index 0000000..2dd532c
+--- /dev/null
++++ b/packages/control-plane/src/forgemesh/controlplane/logs.py
+@@ -0,0 +1,160 @@
++"""控制平面的日志输出：JSON（默认）或文本，每条记录带上当前请求的 trace-id 与关联 ID。
++
++:func:`~forgemesh.controlplane.app.main` 在启动 uvicorn 之前调用 :func:`configure_logging`，
++并以 ``log_config=None`` 启动 uvicorn，使 uvicorn 的日志（含访问日志）也经过根 logger。
++配置来自环境变量，非法时拒绝启动：
++
++* ``FORGEMESH_LOG_FORMAT``：``json``（默认）或 ``text``；
++* ``FORGEMESH_LOG_LEVEL``：``DEBUG`` / ``INFO``（默认）/ ``WARNING`` / ``ERROR``，作用于根 logger。
++
++JSON 格式每行一个对象：``time``（UTC，ISO 8601，毫秒）、``level``、``logger``、``message``；
++在请求中记录的日志加 ``trace_id`` 与 ``correlation_id``（见
++:mod:`forgemesh.controlplane.tracecontext`），带异常时加 ``exception``。文本格式为
++``时间 级别 logger trace=<trace-id> corr=<关联 ID> 消息``，缺失的 ID 记为 ``-``。
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import os
++import time
++from collections.abc import Mapping
++from dataclasses import dataclass
++from datetime import UTC, datetime
++from typing import Any, TextIO
++
++from .tracecontext import current_correlation_id, current_trace_id
++
++LOG_FORMAT_ENV = "FORGEMESH_LOG_FORMAT"
++LOG_LEVEL_ENV = "FORGEMESH_LOG_LEVEL"
++LOG_FORMAT_JSON = "json"
++LOG_FORMAT_TEXT = "text"
++DEFAULT_LOG_FORMAT = LOG_FORMAT_JSON
++DEFAULT_LOG_LEVEL = "INFO"
++LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
++
++_CONTEXT_FIELDS = ("trace_id", "correlation_id")
++
++
++class LogConfigError(ValueError):
++    """日志配置非法；服务应拒绝启动。"""
++
++
++@dataclass(frozen=True)
++class LogSettings:
++    """日志配置。
++
++    Attributes:
++        format: ``json`` 或 ``text``。
++        level: 根 logger 的级别。
++    """
++
++    format: str = DEFAULT_LOG_FORMAT
++    level: str = DEFAULT_LOG_LEVEL
++
++
++def log_settings_from_env(environ: Mapping[str, str] | None = None) -> LogSettings:
++    """读取 ``FORGEMESH_LOG_FORMAT`` 与 ``FORGEMESH_LOG_LEVEL``。
++
++    Raises:
++        LogConfigError: 取值不在允许的范围内。
++    """
++    env = os.environ if environ is None else environ
++    log_format = (env.get(LOG_FORMAT_ENV) or DEFAULT_LOG_FORMAT).strip().lower()
++    if log_format not in (LOG_FORMAT_JSON, LOG_FORMAT_TEXT):
++        raise LogConfigError(
++            f"unsupported {LOG_FORMAT_ENV}={log_format!r}; "
++            f"expected {LOG_FORMAT_JSON!r} or {LOG_FORMAT_TEXT!r}"
++        )
++    level = (env.get(LOG_LEVEL_ENV) or DEFAULT_LOG_LEVEL).strip().upper()
++    if level not in LOG_LEVELS:
++        raise LogConfigError(f"unsupported {LOG_LEVEL_ENV}={level!r}; expected one of {LOG_LEVELS}")
++    return LogSettings(format=log_format, level=level)
++
++
++class ContextFilter(logging.Filter):
++    """为记录补上当前请求的 ``trace_id`` 与 ``correlation_id``（记录已带的取值保留）。"""
++
++    def filter(self, record: logging.LogRecord) -> bool:
++        if getattr(record, "trace_id", None) is None:
++            record.trace_id = current_trace_id()
++        if getattr(record, "correlation_id", None) is None:
++            record.correlation_id = current_correlation_id()
++        return True
++
++
++class JsonFormatter(logging.Formatter):
++    """每条记录一行 JSON。"""
++
++    def format(self, record: logging.LogRecord) -> str:
++        created = datetime.fromtimestamp(record.created, UTC)
++        entry: dict[str, Any] = {
++            "time": created.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
++            "level": record.levelname,
++            "logger": record.name,
++            "message": record.getMessage(),
++        }
++        for name in _CONTEXT_FIELDS:
++            value = getattr(record, name, None)
++            if value is not None:
++                entry[name] = value
++        if record.exc_info:
++            entry["exception"] = self.formatException(record.exc_info)
++        if record.stack_info:
++            entry["stack"] = self.formatStack(record.stack_info)
++        return json.dumps(entry, ensure_ascii=False, default=str)
++
++
++class TextFormatter(logging.Formatter):
++    """``时间 级别 logger trace=<trace-id> corr=<关联 ID> 消息``（UTC 时间）。"""
++
++    converter = time.gmtime
++
++    def __init__(self) -> None:
++        super().__init__(
++            "%(asctime)s %(levelname)s %(name)s trace=%(trace)s corr=%(corr)s %(message)s"
++        )
++
++    def format(self, record: logging.LogRecord) -> str:
++        record.trace = getattr(record, "trace_id", None) or "-"
++        record.corr = getattr(record, "correlation_id", None) or "-"
++        return super().format(record)
++
++
++class _ForgeMeshHandler(logging.StreamHandler):
++    """:func:`configure_logging` 安装的处理器（再次配置时据此替换）。"""
++
++
++def configure_logging(settings: LogSettings, stream: TextIO | None = None) -> logging.Handler:
++    """在根 logger 上安装写到 ``stream``（默认标准错误）的处理器并设置级别。
++
++    之前由本函数安装的处理器被替换，其他处理器不受影响。返回新安装的处理器。
++    """
++    root = logging.getLogger()
++    for handler in [h for h in root.handlers if isinstance(h, _ForgeMeshHandler)]:
++        root.removeHandler(handler)
++    handler = _ForgeMeshHandler(stream)
++    handler.addFilter(ContextFilter())
++    handler.setFormatter(JsonFormatter() if settings.format == LOG_FORMAT_JSON else TextFormatter())
++    root.addHandler(handler)
++    root.setLevel(settings.level)
++    return handler
++
++
++__all__ = [
++    "DEFAULT_LOG_FORMAT",
++    "DEFAULT_LOG_LEVEL",
++    "LOG_FORMAT_ENV",
++    "LOG_FORMAT_JSON",
++    "LOG_FORMAT_TEXT",
++    "LOG_LEVELS",
++    "LOG_LEVEL_ENV",
++    "ContextFilter",
++    "JsonFormatter",
++    "LogConfigError",
++    "LogSettings",
++    "TextFormatter",
++    "configure_logging",
++    "log_settings_from_env",
++]
+diff --git a/packages/control-plane/src/forgemesh/controlplane/tracecontext.py b/packages/control-plane/src/forgemesh/controlplane/tracecontext.py
+new file mode 100644
+index 0000000..079174f
+--- /dev/null
++++ b/packages/control-plane/src/forgemesh/controlplane/tracecontext.py
+@@ -0,0 +1,123 @@
++"""W3C Trace Context（``traceparent``）与请求上下文。
++
++控制平面不记录 span，也不导出追踪（OTLP 导出留到后续）：它只读取请求携带的 trace-id，
++写进日志与错误信封，使一次请求在网关与控制平面的日志中可以按 trace-id 与关联 ID 对上。
++
++* :func:`parse_traceparent` 按 W3C Trace Context 解析 ``traceparent``（只接受小写十六进制；
++  trace-id / parent-id 全零、版本 ``ff`` 都不合法；版本 ``00`` 必须恰好 55 个字符，更高的
++  版本按前 55 个字符解析，之后若还有内容须以 ``-`` 分隔）。不合法时调用方开始新的追踪，并
++  丢弃 ``tracestate``。
++* :func:`new_trace_context` 生成新的追踪上下文：随机的 trace-id 与 parent-id，flags 为
++  ``00``（未采样：网关与控制平面都不记录 span）。
++* :func:`request_context` 在一次请求内绑定关联 ID 与 trace-id（:mod:`contextvars`），
++  :func:`current_correlation_id` / :func:`current_trace_id` 读取，供日志与错误信封使用。
++  关联 ID 与 :class:`~forgemesh.controlplane.observability.CorrelationContext` 共用。
++"""
++
++from __future__ import annotations
++
++import contextlib
++import re
++import secrets
++from collections.abc import Iterator
++from contextvars import ContextVar
++from dataclasses import dataclass
++
++from .observability import CorrelationContext
++
++#: 承载追踪上下文的请求头（HTTP 头大小写不敏感）。
++TRACEPARENT_HEADER = "traceparent"
++#: 随 ``traceparent`` 传递的厂商追踪状态；开始新的追踪时丢弃。
++TRACESTATE_HEADER = "tracestate"
++
++_TRACEPARENT = re.compile(r"([0-9a-f]{2})-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})")
++_VERSION_00_LENGTH = 55
++_INVALID_VERSION = "ff"
++_INVALID_TRACE_ID = "0" * 32
++_INVALID_PARENT_ID = "0" * 16
++_NOT_SAMPLED = "00"
++
++_trace_id_var: ContextVar[str | None] = ContextVar("forgemesh_trace_id", default=None)
++
++
++@dataclass(frozen=True)
++class TraceContext:
++    """一个 ``traceparent`` 的内容。
++
++    Attributes:
++        trace_id: 32 个小写十六进制字符的 trace-id。
++        parent_id: 16 个小写十六进制字符的 parent-id（调用方的 span id）。
++        flags: 2 个小写十六进制字符的 trace-flags。
++    """
++
++    trace_id: str
++    parent_id: str
++    flags: str = _NOT_SAMPLED
++
++    @property
++    def traceparent(self) -> str:
++        """以版本 ``00`` 写成的 ``traceparent``。"""
++        return f"00-{self.trace_id}-{self.parent_id}-{self.flags}"
++
++
++def parse_traceparent(value: str) -> TraceContext | None:
++    """解析 ``traceparent``；不合法时返回 ``None``。"""
++    match = _TRACEPARENT.match(value)
++    if match is None:
++        return None
++    version, trace_id, parent_id, flags = match.groups()
++    if version == "00":
++        well_formed = len(value) == _VERSION_00_LENGTH
++    else:
++        well_formed = version != _INVALID_VERSION and (
++            len(value) == _VERSION_00_LENGTH or value[_VERSION_00_LENGTH] == "-"
++        )
++    if not well_formed or trace_id == _INVALID_TRACE_ID or parent_id == _INVALID_PARENT_ID:
++        return None
++    return TraceContext(trace_id, parent_id, flags)
++
++
++def _random_hex(nbytes: int) -> str:
++    while True:
++        value = secrets.token_hex(nbytes)
++        if value.strip("0"):
++            return value
++
++
++def new_trace_context() -> TraceContext:
++    """生成新的追踪上下文（未采样）。"""
++    return TraceContext(_random_hex(16), _random_hex(8))
++
++
++def current_trace_id() -> str | None:
++    """当前请求的 trace-id；不在请求中时为 ``None``。"""
++    return _trace_id_var.get()
++
++
++def current_correlation_id() -> str | None:
++    """当前请求的关联 ID；不在请求中时为 ``None``。"""
++    return CorrelationContext.get_correlation_id()
++
++
++@contextlib.contextmanager
++def request_context(correlation_id: str, trace_id: str) -> Iterator[None]:
++    """在当前上下文中绑定关联 ID 与 trace-id，退出时恢复。"""
++    tokens = CorrelationContext.set(correlation_id=correlation_id)
++    trace_token = _trace_id_var.set(trace_id)
++    try:
++        yield
++    finally:
++        _trace_id_var.reset(trace_token)
++        CorrelationContext.reset(tokens)
++
++
++__all__ = [
++    "TRACEPARENT_HEADER",
++    "TRACESTATE_HEADER",
++    "TraceContext",
++    "current_correlation_id",
++    "current_trace_id",
++    "new_trace_context",
++    "parse_traceparent",
++    "request_context",
++]
+diff --git a/tests/unit/controlplane/test_logs.py b/tests/unit/controlplane/test_logs.py
+new file mode 100644
+index 0000000..91c853c
+--- /dev/null
++++ b/tests/unit/controlplane/test_logs.py
+@@ -0,0 +1,180 @@
++"""控制平面日志：配置取自环境变量（非法时拒绝启动）、JSON / 文本格式、记录带上请求的 ID。"""
++
++from __future__ import annotations
++
++import io
++import json
++import logging
++
++import pytest
++from forgemesh.controlplane import app as app_module
++from forgemesh.controlplane.auth import AUTH_MODE_DEV, AUTH_MODE_ENV
++from forgemesh.controlplane.logs import (
++    LOG_FORMAT_ENV,
++    LOG_LEVEL_ENV,
++    JsonFormatter,
++    LogConfigError,
++    LogSettings,
++    TextFormatter,
++    configure_logging,
++    log_settings_from_env,
++)
++from forgemesh.controlplane.tracecontext import request_context
++
++TRACE_ID = "4bf92f3577b34da6a3ce929d0e0e4736"
++
++
++@pytest.fixture
++def root_logger():
++    root = logging.getLogger()
++    handlers, level = list(root.handlers), root.level
++    yield root
++    for handler in [h for h in root.handlers if h not in handlers]:
++        root.removeHandler(handler)
++    root.setLevel(level)
++
++
++def _epoch_record(message: str) -> logging.LogRecord:
++    record = logging.LogRecord("forgemesh.test", logging.INFO, __file__, 1, message, None, None)
++    record.created, record.msecs = 0.0, 0.0
++    return record
++
++
++@pytest.mark.unit
++def test_log_settings_default_to_json_at_info() -> None:
++    assert log_settings_from_env({}) == LogSettings(format="json", level="INFO")
++    assert log_settings_from_env({LOG_FORMAT_ENV: "", LOG_LEVEL_ENV: ""}) == LogSettings()
++
++
++@pytest.mark.unit
++def test_log_settings_ignore_case_and_surrounding_spaces() -> None:
++    settings = log_settings_from_env({LOG_FORMAT_ENV: " Text ", LOG_LEVEL_ENV: "debug"})
++
++    assert settings == LogSettings(format="text", level="DEBUG")
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize(("name", "value"), [(LOG_FORMAT_ENV, "xml"), (LOG_LEVEL_ENV, "TRACE")])
++def test_invalid_log_settings_are_rejected(name: str, value: str) -> None:
++    with pytest.raises(LogConfigError, match=name):
++        log_settings_from_env({name: value})
++
++
++@pytest.mark.unit
++def test_formatters_write_utc_timestamps() -> None:
++    assert json.loads(JsonFormatter().format(_epoch_record("hello"))) == {
++        "time": "1970-01-01T00:00:00.000Z",
++        "level": "INFO",
++        "logger": "forgemesh.test",
++        "message": "hello",
++    }
++    assert TextFormatter().format(_epoch_record("hello")) == (
++        "1970-01-01 00:00:00,000 INFO forgemesh.test trace=- corr=- hello"
++    )
++
++
++@pytest.mark.unit
++def test_json_lines_carry_the_ids_of_the_current_request(root_logger) -> None:
++    stream = io.StringIO()
++    configure_logging(LogSettings(format="json", level="INFO"), stream)
++    logger = logging.getLogger("forgemesh.test")
++
++    logger.info("outside %s", "request")
++    with request_context("corr-1", TRACE_ID):
++        logger.warning("请求内")
++
++    outside, inside = (json.loads(line) for line in stream.getvalue().splitlines())
++    assert outside["message"] == "outside request"
++    assert "trace_id" not in outside
++    assert "correlation_id" not in outside
++    assert inside["level"] == "WARNING"
++    assert inside["message"] == "请求内"
++    assert (inside["trace_id"], inside["correlation_id"]) == (TRACE_ID, "corr-1")
++    assert "请求内" in stream.getvalue()
++
++
++@pytest.mark.unit
++def test_explicit_ids_and_exceptions_are_written(root_logger) -> None:
++    stream = io.StringIO()
++    configure_logging(LogSettings(), stream)
++
++    with request_context("corr-context", "a" * 32):
++        try:
++            raise RuntimeError("boom")
++        except RuntimeError:
++            logging.getLogger("forgemesh.test").exception(
++                "failed", extra={"correlation_id": "corr-explicit", "trace_id": TRACE_ID}
++            )
++
++    entry = json.loads(stream.getvalue())
++    assert (entry["trace_id"], entry["correlation_id"]) == (TRACE_ID, "corr-explicit")
++    assert entry["level"] == "ERROR"
++    assert "RuntimeError: boom" in entry["exception"]
++
++
++@pytest.mark.unit
++def test_text_lines_show_the_ids_or_dashes(root_logger) -> None:
++    stream = io.StringIO()
++    configure_logging(LogSettings(format="text", level="INFO"), stream)
++    logger = logging.getLogger("forgemesh.test")
++
++    logger.debug("hidden")
++    logger.info("outside")
++    with request_context("corr-1", TRACE_ID):
++        logger.info("inside")
++
++    outside, inside = stream.getvalue().splitlines()
++    assert outside.endswith(" INFO forgemesh.test trace=- corr=- outside")
++    assert inside.endswith(f" INFO forgemesh.test trace={TRACE_ID} corr=corr-1 inside")
++
++
++@pytest.mark.unit
++def test_configure_logging_replaces_only_its_own_handler(root_logger) -> None:
++    other = logging.NullHandler()
++    root_logger.addHandler(other)
++
++    first = configure_logging(LogSettings(level="DEBUG"), io.StringIO())
++    second = configure_logging(LogSettings(level="WARNING"), io.StringIO())
++
++    assert other in root_logger.handlers
++    assert second in root_logger.handlers
++    assert first not in root_logger.handlers
++    assert root_logger.level == logging.WARNING
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize(("name", "value"), [(LOG_FORMAT_ENV, "xml"), (LOG_LEVEL_ENV, "loud")])
++def test_main_refuses_invalid_log_configuration(monkeypatch, name: str, value: str) -> None:
++    def fail_if_started(*args, **kwargs):
++        raise AssertionError("server must not start")
++
++    monkeypatch.setenv(AUTH_MODE_ENV, AUTH_MODE_DEV)
++    monkeypatch.delenv(app_module.HOST_ENV, raising=False)
++    monkeypatch.setenv(name, value)
++    monkeypatch.setattr("uvicorn.run", fail_if_started)
++
++    with pytest.raises(SystemExit, match=name):
++        app_module.main()
++
++
++@pytest.mark.unit
++def test_main_configures_logging_before_starting_uvicorn(monkeypatch, root_logger) -> None:
++    started: dict[str, object] = {}
++
++    def run(app, **kwargs):
++        started["log_config"] = kwargs["log_config"]
++        started["formatters"] = [type(h.formatter) for h in root_logger.handlers]
++        started["level"] = root_logger.level
++
++    monkeypatch.setenv(AUTH_MODE_ENV, AUTH_MODE_DEV)
++    monkeypatch.delenv(app_module.HOST_ENV, raising=False)
++    monkeypatch.delenv(app_module.PORT_ENV, raising=False)
++    monkeypatch.setenv(LOG_FORMAT_ENV, "text")
++    monkeypatch.setenv(LOG_LEVEL_ENV, "warning")
++    monkeypatch.setattr("uvicorn.run", run)
++
++    app_module.main()
++
++    assert started["log_config"] is None
++    assert started["formatters"].count(TextFormatter) == 1
++    assert started["level"] == logging.WARNING
+diff --git a/tests/unit/controlplane/test_request_context.py b/tests/unit/controlplane/test_request_context.py
+new file mode 100644
+index 0000000..b827ced
+--- /dev/null
++++ b/tests/unit/controlplane/test_request_context.py
+@@ -0,0 +1,262 @@
++"""请求上下文：中间件沿用或生成关联 ID 与 trace-id，错误信封与日志带上同一对 ID。"""
++
++from __future__ import annotations
++
++import asyncio
++import io
++import json
++import logging
++import re
++from pathlib import Path
++from typing import Any
++
++import pytest
++import yaml
++from fastapi.testclient import TestClient
++from forgemesh.controlplane.api.dependencies import get_registry, reset_runtime_components
++from forgemesh.controlplane.api.middleware import RequestContextMiddleware
++from forgemesh.controlplane.app import create_app, error_envelope
++from forgemesh.controlplane.auth import HeaderAuthenticator
++from forgemesh.controlplane.deployment import RUNTIME_LAUNCHER_ENV
++from forgemesh.controlplane.logs import LogSettings, configure_logging
++from forgemesh.controlplane.scheduler import INVENTORY_FILE_ENV
++from forgemesh.controlplane.tracecontext import (
++    current_correlation_id,
++    current_trace_id,
++    parse_traceparent,
++    request_context,
++)
++from forgemesh.core.errors import ConflictError
++from jsonschema import Draft202012Validator
++
++OPENAPI = Path(__file__).resolve().parents[3] / "api" / "openapi" / "openapi.yaml"
++TRACE_ID = "4bf92f3577b34da6a3ce929d0e0e4736"
++VALID = f"00-{TRACE_ID}-00f067aa0ba902b7-01"
++HEX32 = re.compile(r"[0-9a-f]{32}")
++HEADERS = {"X-Tenant-Id": "acme"}
++
++
++@pytest.fixture(autouse=True)
++def _reset_components(monkeypatch):
++    monkeypatch.delenv(INVENTORY_FILE_ENV, raising=False)
++    monkeypatch.delenv(RUNTIME_LAUNCHER_ENV, raising=False)
++    yield
++    reset_runtime_components()
++
++
++@pytest.fixture
++def log_entries():
++    root = logging.getLogger()
++    level = root.level
++    stream = io.StringIO()
++    handler = configure_logging(LogSettings(), stream)
++    yield lambda: [json.loads(line) for line in stream.getvalue().splitlines()]
++    root.removeHandler(handler)
++    root.setLevel(level)
++
++
++async def _receive() -> dict[str, Any]:
++    raise AssertionError("the request body must not be read")
++
++
++async def _send(message: dict[str, Any]) -> None:
++    raise AssertionError(f"unexpected message {message}")
++
++
++def _through_middleware(headers: list[tuple[bytes, bytes]]) -> dict[str, Any]:
++    """返回内层应用看到的请求头与上下文，以及请求结束后的上下文。"""
++    seen: dict[str, Any] = {}
++
++    async def inner(scope, receive, send) -> None:
++        seen["headers"] = list(scope["headers"])
++        seen["context"] = (current_correlation_id(), current_trace_id())
++
++    async def request() -> None:
++        scope = {"type": "http", "method": "GET", "path": "/", "headers": headers}
++        await RequestContextMiddleware(inner)(scope, _receive, _send)
++        seen["after"] = (current_correlation_id(), current_trace_id())
++
++    asyncio.run(request())
++    return seen
++
++
++def _values(headers: list[tuple[bytes, bytes]], name: bytes) -> list[str]:
++    return [value.decode("latin-1") for key, value in headers if key == name]
++
++
++def _dev_app(tmp_path):
++    return create_app(db_path=str(tmp_path / "cp.db"), authenticator=HeaderAuthenticator())
++
++
++def _error_validator() -> Draft202012Validator:
++    """按 OpenAPI ``Error`` schema 校验，错误对象收紧为不允许未声明的字段。"""
++    spec = yaml.safe_load(OPENAPI.read_text(encoding="utf-8"))
++    schema = spec["components"]["schemas"]["Error"]
++    schema["properties"]["error"]["additionalProperties"] = False
++    return Draft202012Validator(schema)
++
++
++@pytest.mark.unit
++def test_valid_trace_context_and_correlation_id_are_kept() -> None:
++    seen = _through_middleware(
++        [
++            (b"x-tenant-id", b"acme"),
++            (b"traceparent", VALID.encode()),
++            (b"tracestate", b"vendor=1"),
++            (b"x-correlation-id", b"corr-1"),
++        ]
++    )
++
++    assert seen["headers"] == [
++        (b"x-tenant-id", b"acme"),
++        (b"tracestate", b"vendor=1"),
++        (b"x-correlation-id", b"corr-1"),
++        (b"traceparent", VALID.encode()),
++    ]
++    assert seen["context"] == ("corr-1", TRACE_ID)
++    assert seen["after"] == (None, None)
++
++
++@pytest.mark.unit
++def test_missing_ids_are_generated_and_tracestate_is_dropped() -> None:
++    seen = _through_middleware([(b"tracestate", b"vendor=1")])
++
++    (correlation_id,) = _values(seen["headers"], b"x-correlation-id")
++    (traceparent,) = _values(seen["headers"], b"traceparent")
++    context = parse_traceparent(traceparent)
++    assert HEX32.fullmatch(correlation_id)
++    assert context is not None
++    assert context.flags == "00"
++    assert _values(seen["headers"], b"tracestate") == []
++    assert seen["context"] == (correlation_id, context.trace_id)
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize(
++    "traceparents",
++    [[VALID.replace("4bf9", "4BF9")], [f"ff{VALID[2:]}"], [VALID, VALID]],
++    ids=["uppercase", "version-ff", "repeated"],
++)
++def test_invalid_or_repeated_traceparent_starts_a_new_trace(traceparents: list[str]) -> None:
++    headers = [(b"traceparent", value.encode()) for value in traceparents]
++    seen = _through_middleware([*headers, (b"tracestate", b"vendor=1")])
++
++    (traceparent,) = _values(seen["headers"], b"traceparent")
++    context = parse_traceparent(traceparent)
++    assert context is not None
++    assert context.trace_id != TRACE_ID
++    assert _values(seen["headers"], b"tracestate") == []
++    assert seen["context"][1] == context.trace_id
++
++
++@pytest.mark.unit
++def test_first_non_empty_correlation_id_wins() -> None:
++    seen = _through_middleware(
++        [
++            (b"x-correlation-id", b""),
++            (b"x-correlation-id", b"corr-2"),
++            (b"x-correlation-id", b"corr-3"),
++        ]
++    )
++
++    assert _values(seen["headers"], b"x-correlation-id") == ["corr-2"]
++    assert seen["context"][0] == "corr-2"
++
++
++@pytest.mark.unit
++def test_context_is_unbound_when_the_application_raises() -> None:
++    async def inner(scope, receive, send) -> None:
++        raise RuntimeError("boom")
++
++    async def request() -> tuple[str | None, str | None]:
++        with pytest.raises(RuntimeError):
++            await RequestContextMiddleware(inner)({"type": "http", "headers": []}, _receive, _send)
++        return current_correlation_id(), current_trace_id()
++
++    assert asyncio.run(request()) == (None, None)
++
++
++@pytest.mark.unit
++def test_non_http_scopes_pass_through_untouched() -> None:
++    seen: dict[str, Any] = {}
++
++    async def inner(scope, receive, send) -> None:
++        seen["scope"] = scope
++        seen["context"] = (current_correlation_id(), current_trace_id())
++
++    asyncio.run(RequestContextMiddleware(inner)({"type": "lifespan"}, _receive, _send))
++
++    assert seen == {"scope": {"type": "lifespan"}, "context": (None, None)}
++
++
++@pytest.mark.unit
++def test_error_envelope_falls_back_to_the_request_context() -> None:
++    assert error_envelope("CONFLICT", "m") == {"error": {"code": "CONFLICT", "message": "m"}}
++
++    with request_context("corr-1", TRACE_ID):
++        implicit = error_envelope("CONFLICT", "m")
++        explicit = error_envelope("CONFLICT", "m", "corr-2", trace_id="b" * 32)
++
++    assert implicit["error"] == {
++        "code": "CONFLICT",
++        "message": "m",
++        "correlationId": "corr-1",
++        "traceId": TRACE_ID,
++    }
++    assert explicit["error"]["correlationId"] == "corr-2"
++    assert explicit["error"]["traceId"] == "b" * 32
++
++
++@pytest.mark.unit
++def test_error_envelopes_and_logs_carry_the_inbound_ids(tmp_path, monkeypatch, log_entries) -> None:
++    async def conflicting_delete(*args, **kwargs):
++        logging.getLogger("forgemesh.test").warning("delete conflicted")
++        raise ConflictError("changed concurrently")
++
++    headers = {**HEADERS, "traceparent": VALID, "X-Correlation-Id": "corr-1"}
++    with TestClient(_dev_app(tmp_path)) as client:
++        monkeypatch.setattr(get_registry(), "request_delete", conflicting_delete)
++        responses = [
++            client.get("/api/v1/inference-services/missing", headers=headers),
++            client.get("/api/v1/inference-services", params={"limit": 0}, headers=headers),
++            client.get("/api/v1/inference-services", params={"limit": "many"}, headers=headers),
++            client.delete("/api/v1/inference-services/llama", headers=headers),
++            client.put("/healthz", headers=headers),
++        ]
++
++    assert [response.status_code for response in responses] == [404, 400, 400, 409, 405]
++    validator = _error_validator()
++    for response in responses:
++        validator.validate(response.json())
++        error = response.json()["error"]
++        assert (error["traceId"], error["correlationId"]) == (TRACE_ID, "corr-1")
++    (logged,) = [entry for entry in log_entries() if entry["message"] == "delete conflicted"]
++    assert (logged["trace_id"], logged["correlation_id"]) == (TRACE_ID, "corr-1")
++
++
++@pytest.mark.unit
++def test_generated_ids_match_between_logs_and_the_500_envelope(
++    tmp_path, monkeypatch, log_entries
++) -> None:
++    async def failing_list(*args, **kwargs):
++        logging.getLogger("forgemesh.test").warning("listing failed")
++        raise RuntimeError("secret internal detail")
++
++    with TestClient(_dev_app(tmp_path), raise_server_exceptions=False) as client:
++        monkeypatch.setattr(get_registry(), "list", failing_list)
++        response = client.get("/api/v1/inference-services", headers=HEADERS)
++
++    assert response.status_code == 500
++    _error_validator().validate(response.json())
++    error = response.json()["error"]
++    assert HEX32.fullmatch(error["traceId"])
++    assert HEX32.fullmatch(error["correlationId"])
++    entries = log_entries()
++    (inside,) = [entry for entry in entries if entry["message"] == "listing failed"]
++    (unhandled,) = [entry for entry in entries if entry["message"].startswith("unhandled error")]
++    for entry in (inside, unhandled):
++        assert (entry["trace_id"], entry["correlation_id"]) == (
++            error["traceId"],
++            error["correlationId"],
++        )
++    assert "secret internal detail" in unhandled["exception"]
+diff --git a/tests/unit/controlplane/test_tracecontext.py b/tests/unit/controlplane/test_tracecontext.py
+new file mode 100644
+index 0000000..aefa194
+--- /dev/null
++++ b/tests/unit/controlplane/test_tracecontext.py
+@@ -0,0 +1,95 @@
++"""W3C ``traceparent`` 的解析与生成，以及请求上下文的绑定与恢复。"""
++
++from __future__ import annotations
++
++from types import SimpleNamespace
++
++import pytest
++from forgemesh.controlplane import tracecontext
++from forgemesh.controlplane.tracecontext import (
++    TraceContext,
++    current_correlation_id,
++    current_trace_id,
++    new_trace_context,
++    parse_traceparent,
++    request_context,
++)
++
++TRACE_ID = "4bf92f3577b34da6a3ce929d0e0e4736"
++PARENT_ID = "00f067aa0ba902b7"
++VALID = f"00-{TRACE_ID}-{PARENT_ID}-01"
++
++
++@pytest.mark.unit
++def test_parses_a_valid_traceparent() -> None:
++    context = parse_traceparent(VALID)
++
++    assert context == TraceContext(TRACE_ID, PARENT_ID, "01")
++    assert context.traceparent == VALID
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize(
++    "value",
++    [
++        "",
++        VALID[:-1],
++        f" {VALID}",
++        f"00-{TRACE_ID.upper()}-{PARENT_ID}-01",
++        f"00-{TRACE_ID}-{PARENT_ID.upper()}-01",
++        f"00-{TRACE_ID}-{PARENT_ID}-0A",
++        f"00-{TRACE_ID[:-1]}g-{PARENT_ID}-01",
++        f"00_{TRACE_ID}_{PARENT_ID}_01",
++        f"00-{'0' * 32}-{PARENT_ID}-01",
++        f"00-{TRACE_ID}-{'0' * 16}-01",
++        f"ff-{TRACE_ID}-{PARENT_ID}-01",
++        f"00-{TRACE_ID}-{PARENT_ID}-01-",
++        f"00-{TRACE_ID}-{PARENT_ID}-01-future",
++        f"cc-{TRACE_ID}-{PARENT_ID}-01x",
++    ],
++)
++def test_rejects_invalid_traceparents(value: str) -> None:
++    assert parse_traceparent(value) is None
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize("suffix", ["", "-future-field"])
++def test_parses_future_versions_by_their_version_00_prefix(suffix: str) -> None:
++    context = parse_traceparent(f"cc-{TRACE_ID}-{PARENT_ID}-01{suffix}")
++
++    assert context == TraceContext(TRACE_ID, PARENT_ID, "01")
++    assert context.traceparent == VALID
++
++
++@pytest.mark.unit
++def test_new_trace_contexts_are_valid_unsampled_and_distinct() -> None:
++    first, second = new_trace_context(), new_trace_context()
++
++    assert parse_traceparent(first.traceparent) == first
++    assert first.flags == "00"
++    assert first.trace_id != second.trace_id
++    assert first.parent_id != second.parent_id
++
++
++@pytest.mark.unit
++def test_new_trace_context_never_uses_all_zero_ids(monkeypatch) -> None:
++    values = {16: iter(["0" * 32, TRACE_ID]), 8: iter(["0" * 16, PARENT_ID])}
++    monkeypatch.setattr(
++        tracecontext, "secrets", SimpleNamespace(token_hex=lambda nbytes: next(values[nbytes]))
++    )
++
++    assert new_trace_context() == TraceContext(TRACE_ID, PARENT_ID)
++
++
++@pytest.mark.unit
++def test_request_context_binds_the_ids_and_restores_the_previous_ones() -> None:
++    assert (current_correlation_id(), current_trace_id()) == (None, None)
++
++    with request_context("corr-1", TRACE_ID):
++        assert (current_correlation_id(), current_trace_id()) == ("corr-1", TRACE_ID)
++        with pytest.raises(RuntimeError), request_context("corr-2", "f" * 32):
++            assert (current_correlation_id(), current_trace_id()) == ("corr-2", "f" * 32)
++            raise RuntimeError("boom")
++        assert (current_correlation_id(), current_trace_id()) == ("corr-1", TRACE_ID)
++
++    assert (current_correlation_id(), current_trace_id()) == (None, None)
+-- 
+2.43.0
+
