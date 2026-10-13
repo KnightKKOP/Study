@@ -1,0 +1,29 @@
+From 8bc196e12e5f6700e36cbdf8a4a5c27fd1b2d699 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 13 Oct 2026 02:40:41 +0000
+Subject: [PATCH 2/8] ci: count ADR files with find instead of ls
+
+actionlint runs shellcheck on every run: block, and the ADR
+completeness check failed it with SC2012 (parsing ls output). Count
+the files with find, which gives the same number and keeps the
+workflow lint-clean before more jobs are added.
+---
+ .github/workflows/ci.yml | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 1bd6108..787e530 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -167,7 +167,7 @@ jobs:
+             echo "ERROR: $missing ADR file(s) missing"
+             exit 1
+           fi
+-          file_count=$(ls "$adr_dir"/adr-*.md | wc -l | tr -d ' ')
++          file_count=$(find "$adr_dir" -maxdepth 1 -name 'adr-*.md' -type f | wc -l | tr -d ' ')
+           if [ "$file_count" -lt "$indexed_count" ]; then
+             echo "ERROR: $file_count ADR file(s) on disk but $indexed_count referenced in README.md"
+             exit 1
+-- 
+2.43.0
+
