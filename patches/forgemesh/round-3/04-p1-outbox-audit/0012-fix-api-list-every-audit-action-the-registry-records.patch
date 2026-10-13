@@ -1,0 +1,125 @@
+From 73f91dc66848efc3e52609bd511fb71f09c7e1e5 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 13 Oct 2026 04:23:08 +0000
+Subject: [PATCH 12/12] fix(api): list every audit action the registry records
+ in OpenAPI
+
+The registry records "update" when a write that carries a principal
+updates a resource, but the OpenAPI AuditEvent described action only
+as create or delete, so a client following the contract would not
+expect it. No endpoint updates resources yet; documenting the value
+now keeps the response contract stable when one is added, instead of
+surprising strict clients with a new value later.
+
+action is now an enum of create, update and delete, and the details
+description lists the updated change. The registry no longer maps
+status writes to an "update_status" action: status writes never carry
+a principal, so that value could not be recorded. A test runs every
+registry write that takes a principal and checks that the recorded
+actions are exactly the OpenAPI enum.
+---
+ CHANGELOG.md                                  |  2 +-
+ api/openapi/openapi.yaml                      |  5 +++--
+ .../forgemesh/controlplane/registry/store.py  |  4 ++--
+ .../unit/controlplane/test_registry_audit.py  | 21 +++++++++++++++++++
+ 4 files changed, 27 insertions(+), 5 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index ec422f1..67da469 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -48,7 +48,7 @@
+ - 资源变更事件（事务性 Outbox，ADR-008）：`SQLiteRegistry` 对资源对象的每次写入（创建、更新、status 写入、请求删除、删除）在写入资源的同一个事务中，经共用连接的 Outbox 写入一条领域事件，任何一步失败都一起回滚；分配记录（`allocations`）的写入不产生事件。信封符合 `api/schemas/event.schema.json`（`forgemesh.controlplane.events`）：`eventId` 即 Outbox 事件 id；`eventType` 为 `<kind>.<change>`，kind 按单词拆成小写并以点连接（`inference.service.created` / `.updated` / `.status_updated` / `.terminating` / `.deleted`）；`data` 含资源身份、`phase` 与写入之后的资源表示（`deleted` 为删除前最后的状态）；同一资源（`resourceUid`）的事件以 `resourceVersion` 判断新旧。API 写入使用请求的 `X-Correlation-Id`（缺省时生成），控制器同一轮协调的 status 写入与移除 finalizer 共用一个 correlation id。
+ - 控制平面在应用启动（lifespan）时运行 Outbox 的 `Dispatcher`（每 0.5 秒查询一次到期事件）发布资源变更事件：至少投递一次，接收方按 `eventId` 去重，顺序只是尽力按写入顺序。发布器由 `forgemesh.controlplane.publishers.publisher_from_env` 按环境变量选择：默认 `LogPublisher`，每个事件写一行 JSON 日志（logger `forgemesh.events`；进程没有配置 logging 时写标准输出，以 `forgemesh-control-plane` 运行即是如此）；设置 `FORGEMESH_EVENT_WEBHOOK_URL`（`http` / `https`）后为 `WebhookPublisher`，把信封以 JSON `POST` 到该地址，请求头带 `X-Forgemesh-Event-Id`，设置了 `FORGEMESH_EVENT_WEBHOOK_TOKEN` 时带 `Authorization: Bearer <token>`；2xx 视为送达，其余状态码（不跟随重定向）、超时与连接错误视为失败，每次发送的超时为 `FORGEMESH_EVENT_WEBHOOK_TIMEOUT_SECONDS`（默认 `5`，大于 0、不超过 `60`），遵循 `HTTPS_PROXY` 等代理环境变量。取值非法（如地址含用户信息或片段、token 含空白或非 ASCII 字符）或没有设置地址却设置了 token / 超时时抛出 `EventConfigError`，控制平面在打开数据库之前拒绝启动。关闭时 Dispatcher 在控制器之后、关闭数据库之前停止，仍待发布的事件在下次启动后发布。`create_app` 新增参数 `event_publisher`，供嵌入方注入发布器。变量见 README「运行控制平面」。
+ - Outbox 失败重试与 `dead`：发布失败按指数退避重试（`RetryPolicy`：1 秒起翻倍、最长 300 秒，默认最多 10 次，前后约 8.5 分钟），失败次数 `attempts`、最近一次错误 `last_error`（异常类型与消息）与下次发布时间 `next_attempt_at` 记在数据库中，重启后继续；达到上限后事件进入 `dead` 并记一条 ERROR 日志，`list_dead()` 列出，`redrive()` 放回待发布队列（命令见 [docs/operations/backup-restore.md](docs/operations/backup-restore.md) 第 5 节）。`Dispatcher` 只按数据库状态取到期的事件，一轮中遇到失败即结束本轮（目标不可用时不会对每个事件各等一次超时），已发布的事件保留 7 天后删除；新增 `start()` / `shutdown()` 以后台任务运行，循环中的数据库错误不会使它退出。另新增 `Outbox.get()`（按 id 查询任意状态的事件）、`due()` 与 `purge_published()`。
+-- 审计记录：经 API 创建与删除资源（`POST` / `DELETE /api/v1/inference-services`）时，在写入资源与事件的同一个事务中写入一条审计记录，含租户、主体（`actor`）、API key id（`key_id`，`dev` 模式为空）、correlation id（与事件相同）、命名空间、`action`（`create` / `delete`）与 `outcome`（`success`），`details` 记录变更类型、资源 uid、`resourceVersion` 与对应事件的 `eventId`。被拒绝或失败的请求、对已在 `Terminating` 的资源重复的删除请求以及控制器的写入不产生审计记录。`SQLiteRegistry.put` / `delete` / `request_delete` 新增仅限关键字参数 `principal`（凭证的租户与资源不一致时在写入任何数据之前拒绝），`update_status` 新增 `correlation_id`，`audit_log` 属性返回共用连接的审计日志；`Principal` 新增 `key_id`；`AuditEvent` 新增 `key_id` / `namespace`（打开旧库时自动补列）；`AuditLog.put()` 在调用方的事务中写入，不自行提交。
++- 审计记录：经 API 创建与删除资源（`POST` / `DELETE /api/v1/inference-services`）时，在写入资源与事件的同一个事务中写入一条审计记录，含租户、主体（`actor`）、API key id（`key_id`，`dev` 模式为空）、correlation id（与事件相同）、命名空间、`action`（`create` / `delete`；`SQLiteRegistry.put` 带 `principal` 更新资源时为 `update`，目前没有更新资源的 API 端点）与 `outcome`（`success`），`details` 记录变更类型、资源 uid、`resourceVersion` 与对应事件的 `eventId`。被拒绝或失败的请求、对已在 `Terminating` 的资源重复的删除请求以及控制器的写入不产生审计记录。`SQLiteRegistry.put` / `delete` / `request_delete` 新增仅限关键字参数 `principal`（凭证的租户与资源不一致时在写入任何数据之前拒绝），`update_status` 新增 `correlation_id`，`audit_log` 属性返回共用连接的审计日志；`Principal` 新增 `key_id`；`AuditEvent` 新增 `key_id` / `namespace`（打开旧库时自动补列）；`AuditLog.put()` 在调用方的事务中写入，不自行提交。
+ - 审计查询 `GET /api/v1/audit-events`：返回凭证所属租户的审计记录，最新的在前，需要 `read` scope；参数 `limit`（1–1000，默认 100，与列表接口一致）、`pageToken` 与可选的 `correlationId`，响应为 `{items, count, nextPageToken}`，还有下一页时才有 `nextPageToken`。按位置（时间戳、记录 id）分页（`AuditLog.list_page`），翻页期间写入的新记录不会使后面的页重复或遗漏；分页令牌绑定租户与过滤条件，为其他租户或条件签发、或无法解析的令牌返回 `400`。OpenAPI 新增该操作与 `AuditEvent` / `AuditEventList`。Go 网关转发这个路径，与其他资源路由相同：校验 API key、按已验证租户限流、透传关联 ID 与查询串，`read` scope 由控制平面检查。
+ - `forgemesh.controlplane.sqlite.Database`：一个 SQLite 连接加一把可重入锁。Registry、Outbox 与审计日志共用一个实例，资源写入与它的事件、审计记录在同一个事务中提交或回滚（ADR-008 的工作单元）：`transaction()` 以 `BEGIN IMMEDIATE` 开始，`call()` / `run()` 在函数抛出异常时回滚它未提交的写入，并拒绝留下未结束的事务。`TaskStore`、`AuditLog` 与 `IdempotentConsumer` 都可以经 `database=` 共用连接。
+ 
+diff --git a/api/openapi/openapi.yaml b/api/openapi/openapi.yaml
+index 7f84f0a..0d9dbf3 100644
+--- a/api/openapi/openapi.yaml
++++ b/api/openapi/openapi.yaml
+@@ -504,7 +504,8 @@ components:
+             correlationId 相同。
+         action:
+           type: string
+-          description: 操作：create（创建资源）或 delete（受理删除，含置为 Terminating）。
++          enum: [create, update, delete]
++          description: 操作：create（创建资源）、update（更新资源）或 delete（受理删除，含置为 Terminating）。
+         resourceType:
+           type: string
+           description: 资源的 kind，如 InferenceService。
+@@ -520,7 +521,7 @@ components:
+           type: [object, "null"]
+           additionalProperties: true
+           description: >-
+-            资源写入的记录含 change（created / terminating / deleted）、resourceUid、
++            资源写入的记录含 change（created / updated / terminating / deleted）、resourceUid、
+             resourceVersion 与 eventId（同一次写入产生的资源变更事件）。
+     AuditEventList:
+       type: object
+diff --git a/packages/control-plane/src/forgemesh/controlplane/registry/store.py b/packages/control-plane/src/forgemesh/controlplane/registry/store.py
+index fdf023e..c959a65 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/registry/store.py
++++ b/packages/control-plane/src/forgemesh/controlplane/registry/store.py
+@@ -207,11 +207,11 @@ _EVENT_CHANGES = {
+     ChangeType.DELETED: ResourceEventChange.DELETED,
+ }
+ 
+-#: 变更记录类型 → 审计记录的 ``action``（受理的删除请求与物理删除都是 ``delete``）。
++#: 变更记录类型 → 审计记录的 ``action``（受理的删除请求与物理删除都是 ``delete``）。status
++#: 写入不带调用主体，不产生审计记录。取值须与 OpenAPI ``AuditEvent.action`` 的枚举一致。
+ _AUDIT_ACTIONS = {
+     ChangeType.CREATED: "create",
+     ChangeType.UPDATED: "update",
+-    ChangeType.STATUS: "update_status",
+     ChangeType.TERMINATING: "delete",
+     ChangeType.DELETED: "delete",
+ }
+diff --git a/tests/unit/controlplane/test_registry_audit.py b/tests/unit/controlplane/test_registry_audit.py
+index 18807a0..a1f62ff 100644
+--- a/tests/unit/controlplane/test_registry_audit.py
++++ b/tests/unit/controlplane/test_registry_audit.py
+@@ -5,9 +5,11 @@ from __future__ import annotations
+ import asyncio
+ import sqlite3
+ from collections.abc import Callable, Coroutine
++from pathlib import Path
+ from typing import Any
+ 
+ import pytest
++import yaml
+ from forgemesh.controlplane.audit import AuditEvent
+ from forgemesh.controlplane.auth import Principal
+ from forgemesh.controlplane.registry import SQLiteRegistry
+@@ -110,6 +112,25 @@ def test_api_writes_record_the_principal_with_the_event(write: str) -> None:
+     assert record.timestamp == event.created_at
+ 
+ 
++@pytest.mark.unit
++def test_the_recorded_actions_are_the_openapi_enum() -> None:
++    """带调用主体的各种写入记下的 action 恰好是 OpenAPI ``AuditEvent.action`` 的枚举值。"""
++    openapi = yaml.safe_load(
++        (Path(__file__).resolve().parents[3] / "api" / "openapi" / "openapi.yaml").read_text(
++            encoding="utf-8"
++        )
++    )
++    actions = set()
++    for write in _WRITES.values():
++        reg = _registry()
++        _run(write(reg, ALICE))
++        actions.update(record.action for record in _audit(reg))
++
++    assert actions == set(
++        openapi["components"]["schemas"]["AuditEvent"]["properties"]["action"]["enum"]
++    )
++
++
+ @pytest.mark.unit
+ def test_api_writes_without_a_correlation_id_share_a_generated_one() -> None:
+     reg = SQLiteRegistry()
+-- 
+2.43.0
+

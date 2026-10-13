@@ -1,0 +1,365 @@
+From 1cca1d7ce6dfcd83a0c0cf7f92c9859ab37e57df Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 13 Oct 2026 02:45:07 +0000
+Subject: [PATCH 02/12] fix(outbox): write events inside the caller's
+ transaction
+
+Outbox.put committed on its own, so an event could never be part of the
+business transaction it describes: a put in the middle of a unit of
+work committed everything written so far, and a business write failing
+after the put left an orphaned event behind (improvement plan 5.4).
+
+put now only inserts the row and refuses to run outside an open
+transaction, so a stray call cannot leave an uncommitted event for some
+later commit to pick up. Callers commit or roll back the event together
+with their own writes, e.g. inside Database.transaction().
+
+The contract test that documented the auto-commit gap now asserts the
+rollback, and the rollback test uses put itself instead of an
+equivalent hand-written INSERT.
+---
+ .../src/forgemesh/controlplane/outbox.py      | 42 ++++----
+ tests/contract/test_outbox_semantics.py       | 98 ++++++++-----------
+ tests/unit/controlplane/test_outbox.py        | 40 +++++---
+ 3 files changed, 95 insertions(+), 85 deletions(-)
+
+diff --git a/packages/control-plane/src/forgemesh/controlplane/outbox.py b/packages/control-plane/src/forgemesh/controlplane/outbox.py
+index a482f55..b2cf21a 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/outbox.py
++++ b/packages/control-plane/src/forgemesh/controlplane/outbox.py
+@@ -91,26 +91,32 @@ class Outbox:
+         return self._db
+ 
+     def put(self, event: OutboxEvent) -> None:
+-        """写入事件并提交。"""
++        """在调用方的事务中写入事件，不提交：事件随业务写入一起提交或回滚。
+ 
+-        def _put() -> None:
+-            self._conn.execute(
+-                "INSERT INTO outbox_events (event_id, aggregate_type, aggregate_id, "
+-                "event_type, payload, created_at, status) "
+-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+-                (
+-                    event.event_id,
+-                    event.aggregate_type,
+-                    event.aggregate_id,
+-                    event.event_type,
+-                    json.dumps(event.payload, ensure_ascii=False),
+-                    event.created_at,
+-                    event.status,
+-                ),
+-            )
+-            self._conn.commit()
++        调用方须持有 :attr:`database` 的锁并已开启事务，例如在
++        :meth:`Database.transaction <forgemesh.controlplane.sqlite.Database.transaction>`
++        中，或在 :meth:`Database.call <forgemesh.controlplane.sqlite.Database.call>`
++        执行的写入函数里、业务写入之后。
+ 
+-        self._db.call(_put)
++        Raises:
++            RuntimeError: 连接上没有进行中的事务（事件不会写入）。
++        """
++        if not self._conn.in_transaction:
++            raise RuntimeError("Outbox.put must run inside the caller's transaction")
++        self._conn.execute(
++            "INSERT INTO outbox_events (event_id, aggregate_type, aggregate_id, "
++            "event_type, payload, created_at, status) "
++            "VALUES (?, ?, ?, ?, ?, ?, ?)",
++            (
++                event.event_id,
++                event.aggregate_type,
++                event.aggregate_id,
++                event.event_type,
++                json.dumps(event.payload, ensure_ascii=False),
++                event.created_at,
++                event.status,
++            ),
++        )
+ 
+     def get_pending(self, limit: int = 100) -> list[OutboxEvent]:
+         """获取待发布事件，按创建时间升序排列。"""
+diff --git a/tests/contract/test_outbox_semantics.py b/tests/contract/test_outbox_semantics.py
+index 74b2e8b..718e9b8 100644
+--- a/tests/contract/test_outbox_semantics.py
++++ b/tests/contract/test_outbox_semantics.py
+@@ -10,17 +10,13 @@
+ * 死信/重放：发布失败的记录进入持久失败状态（事实上的死信态）、可查询、
+   不再被自动重试，且可通过重置状态手动重放。
+ 
+-记录性测试：实现当前存在两处与 Outbox 模式理想语义的差距，按任务约定
+-不改源码，仅以测试固化当前行为并在 docstring 标注 v1.1 后续期望：
+-（1）``Outbox.put`` 内部自动 commit，使外部事务的 rollback 失效；
+-（2）``IdempotentConsumer`` 去重状态仅存内存，进程重启后重复投递会
+-产生重复副作用。
++记录性测试：``IdempotentConsumer`` 去重状态仅存内存，进程重启后重复投递会
++产生重复副作用；以测试固化当前行为并在 docstring 标注 v1.1 后续期望。
+ """
+ 
+ from __future__ import annotations
+ 
+ import asyncio
+-import json
+ import sqlite3
+ 
+ import pytest
+@@ -55,6 +51,12 @@ def _make_event(
+     )
+ 
+ 
++def _put(outbox: Outbox, event: OutboxEvent) -> None:
++    """单独写入一个事件（put 不自行提交，由事务提交）。"""
++    with outbox.database.transaction():
++        outbox.put(event)
++
++
+ def _open_shared_outbox(db_file) -> tuple[Outbox, sqlite3.Connection]:
+     """打开共享连接的 Outbox 并初始化业务表。
+ 
+@@ -81,15 +83,14 @@ def test_commit_path_business_and_event_same_transaction(tmp_path) -> None:
+     outbox, conn = _open_shared_outbox(tmp_path / "outbox-commit.db")
+     reader = sqlite3.connect(str(tmp_path / "outbox-commit.db"))
+ 
+-    # 业务事务：先写业务状态，再经共享连接写入事件；put 的 commit 是
+-    # 唯一提交点，两者在同一个事务中提交。
+-    conn.execute("BEGIN")
+-    conn.execute("INSERT INTO biz_services (id, status) VALUES ('svc-1', 'Active')")
++    # 业务事务：先写业务状态，再经共享连接写入事件；事务结束是唯一提交点。
++    with outbox.database.transaction():
++        conn.execute("INSERT INTO biz_services (id, status) VALUES ('svc-1', 'Active')")
++        outbox.put(_make_event("evt-commit"))
+ 
+-    # 提交点之前：业务变更对外部连接不可见（仍在事务中）。
+-    assert reader.execute("SELECT COUNT(*) FROM biz_services").fetchone()[0] == 0
+-
+-    outbox.put(_make_event("evt-commit"))
++        # 提交点之前：业务变更与事件对外部连接都不可见（仍在事务中）。
++        assert reader.execute("SELECT COUNT(*) FROM biz_services").fetchone()[0] == 0
++        assert reader.execute("SELECT COUNT(*) FROM outbox_events").fetchone()[0] == 0
+ 
+     # 提交点之后：业务状态与事件同时对同一数据库的其他连接可见。
+     assert reader.execute("SELECT COUNT(*) FROM biz_services").fetchone()[0] == 1
+@@ -101,33 +102,14 @@ def test_commit_path_business_and_event_same_transaction(tmp_path) -> None:
+ 
+ @pytest.mark.contract
+ def test_rollback_path_no_residual_event(tmp_path) -> None:
+-    """同事务回滚：业务回滚时 Outbox 记录不残留。
+-
+-    说明：``put`` 自带 commit，无法参与外部事务回滚（见
+-    ``test_put_auto_commit_commits_ambient_transaction`` 的记录性断言），
+-    故此处按实现提供的共享连接 + 事务上下文，以与 ``put`` 等价的写入
+-    语义构造同一事务，验证 Outbox 模式的核心不变量。
+-    """
++    """同事务回滚：业务写入在事件之后失败时，业务状态与事件记录一并撤销。"""
+     outbox, conn = _open_shared_outbox(tmp_path / "outbox-rollback.db")
+ 
+-    conn.execute("BEGIN")
+-    conn.execute("INSERT INTO biz_services (id, status) VALUES ('svc-2', 'Active')")
+-    event = _make_event("evt-rollback")
+-    conn.execute(
+-        "INSERT INTO outbox_events (event_id, aggregate_type, aggregate_id, "
+-        "event_type, payload, created_at, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
+-        (
+-            event.event_id,
+-            event.aggregate_type,
+-            event.aggregate_id,
+-            event.event_type,
+-            json.dumps(event.payload, ensure_ascii=False),
+-            event.created_at,
+-            event.status,
+-        ),
+-    )
+-    # 业务侧失败：整体回滚，业务状态与事件记录一并撤销。
+-    conn.rollback()
++    with pytest.raises(sqlite3.IntegrityError), outbox.database.transaction():
++        conn.execute("INSERT INTO biz_services (id, status) VALUES ('svc-2', 'Active')")
++        outbox.put(_make_event("evt-rollback"))
++        # 业务侧失败（主键冲突）：整个事务回滚。
++        conn.execute("INSERT INTO biz_services (id, status) VALUES ('svc-2', 'Active')")
+ 
+     assert conn.execute("SELECT COUNT(*) FROM biz_services").fetchone()[0] == 0
+     assert outbox.get_pending() == []  # Outbox 记录不残留
+@@ -136,25 +118,31 @@ def test_rollback_path_no_residual_event(tmp_path) -> None:
+ 
+ 
+ @pytest.mark.contract
+-def test_put_auto_commit_commits_ambient_transaction(tmp_path) -> None:
+-    """记录性测试：put 内部自动 commit，使外部事务的 rollback 失效。
+-
+-    Outbox 模式要求事件与业务状态在同一事务中原子提交/回滚；当前 ``put``
+-    的实现会在业务事务中途创建提交点，之后调用方 rollback 无法撤销业务
+-    变更或事件（两者均残留）。v1.1 期望 ``put`` 支持由调用方控制事务边界
+-    （如去内部 commit / 提供 savepoint 语义），使本测试可改为断言回滚成功。
+-    """
++def test_put_leaves_the_commit_to_the_caller(tmp_path) -> None:
++    """put 不在业务事务中途提交：调用方 rollback 同时撤销业务变更与事件。"""
+     outbox, conn = _open_shared_outbox(tmp_path / "outbox-put.db")
+ 
+     conn.execute("BEGIN")
+     conn.execute("INSERT INTO biz_services (id, status) VALUES ('svc-3', 'Active')")
+     outbox.put(_make_event("evt-put"))
+-    conn.rollback()  # 模拟业务侧失败，尝试整体回滚
++    assert conn.in_transaction
++    conn.rollback()  # 模拟业务侧失败，整体回滚
++
++    assert conn.execute("SELECT COUNT(*) FROM biz_services").fetchone()[0] == 0
++    assert outbox.get_pending() == []
++    conn.close()
++
++
++@pytest.mark.contract
++def test_put_outside_a_transaction_is_rejected(tmp_path) -> None:
++    """事务之外的 put 被拒绝：不会留下无人提交、随后被别的提交连带提交的事件。"""
++    outbox, conn = _open_shared_outbox(tmp_path / "outbox-no-tx.db")
++
++    with pytest.raises(RuntimeError, match="inside the caller's transaction"):
++        outbox.put(_make_event("evt-orphan"))
+ 
+-    # 当前行为：put 的内部 commit 已提交整个事务，rollback 无效，
+-    # 业务变更与事件均残留。
+-    assert conn.execute("SELECT COUNT(*) FROM biz_services").fetchone()[0] == 1
+-    assert [e.event_id for e in outbox.get_pending()] == ["evt-put"]
++    assert not conn.in_transaction
++    assert outbox.get_stats() == {}
+     conn.close()
+ 
+ 
+@@ -168,7 +156,7 @@ def test_duplicate_publish_consumer_idempotent(tmp_path) -> None:
+     """重复发布：同一记录发布两次（发布后标记前崩溃重试），副作用仅一次。"""
+     outbox = Outbox(str(tmp_path / "outbox-dup.db"))
+     event = _make_event("evt-dup")
+-    outbox.put(event)
++    _put(outbox, event)
+ 
+     consumer = IdempotentConsumer()
+     deliveries: list[str] = []  # 投递记录（publisher 被调用即记一次）
+@@ -265,7 +253,7 @@ def test_failed_event_is_dead_and_queryable(tmp_path) -> None:
+     死信状态。v1.1 期望按最大重试次数退避重试、超限后进入显式死信队列。
+     """
+     outbox = Outbox(str(tmp_path / "outbox-dead.db"))
+-    outbox.put(_make_event("evt-dead"))
++    _put(outbox, _make_event("evt-dead"))
+     attempts: list[str] = []
+ 
+     def broken_publisher(ev: OutboxEvent) -> None:
+@@ -294,7 +282,7 @@ def test_manual_replay_failed_event(tmp_path) -> None:
+     API；届时本测试应改用正式接口。
+     """
+     outbox = Outbox(str(tmp_path / "outbox-replay.db"))
+-    outbox.put(_make_event("evt-replay"))
++    _put(outbox, _make_event("evt-replay"))
+ 
+     consumer = IdempotentConsumer()
+     deliveries: list[str] = []
+diff --git a/tests/unit/controlplane/test_outbox.py b/tests/unit/controlplane/test_outbox.py
+index 4543da7..1c66959 100644
+--- a/tests/unit/controlplane/test_outbox.py
++++ b/tests/unit/controlplane/test_outbox.py
+@@ -48,17 +48,33 @@ def _make_event(
+     )
+ 
+ 
++def _put(outbox: Outbox, *events: OutboxEvent) -> None:
++    """在一个事务中写入事件（put 不自行提交）。"""
++    with outbox.database.transaction():
++        for event in events:
++            outbox.put(event)
++
++
+ # ---------------------------------------------------------------------- #
+ # Outbox 基本操作
+ # ---------------------------------------------------------------------- #
+ 
+ 
++@pytest.mark.unit
++def test_put_requires_the_callers_transaction() -> None:
++    """put 不自行提交：事务之外调用被拒绝，不写入事件。"""
++    outbox = Outbox()
++    with pytest.raises(RuntimeError, match="inside the caller's transaction"):
++        outbox.put(_make_event())
++    assert outbox.get_stats() == {}
++
++
+ @pytest.mark.unit
+ def test_put_and_get_pending() -> None:
+     """写入事件后可查到 pending。"""
+     outbox = Outbox()
+     event = _make_event()
+-    outbox.put(event)
++    _put(outbox, event)
+ 
+     pending = outbox.get_pending()
+     assert len(pending) == 1
+@@ -72,7 +88,7 @@ def test_put_and_get_pending() -> None:
+ def test_mark_published() -> None:
+     """标记后 status 变为 published。"""
+     outbox = Outbox()
+-    outbox.put(_make_event())
++    _put(outbox, _make_event())
+ 
+     outbox.mark_published("evt-1")
+ 
+@@ -86,7 +102,7 @@ def test_mark_published() -> None:
+ def test_mark_published_already_published() -> None:
+     """重复标记抛 ValueError。"""
+     outbox = Outbox()
+-    outbox.put(_make_event())
++    _put(outbox, _make_event())
+     outbox.mark_published("evt-1")
+ 
+     with pytest.raises(ValueError, match="already published"):
+@@ -97,7 +113,7 @@ def test_mark_published_already_published() -> None:
+ def test_mark_failed() -> None:
+     """标记失败。"""
+     outbox = Outbox()
+-    outbox.put(_make_event())
++    _put(outbox, _make_event())
+ 
+     outbox.mark_failed("evt-1", reason="connection refused")
+ 
+@@ -111,9 +127,9 @@ def test_mark_failed() -> None:
+ def test_get_stats() -> None:
+     """统计各状态数量。"""
+     outbox = Outbox()
+-    outbox.put(_make_event("evt-1"))
+-    outbox.put(_make_event("evt-2"))
+-    outbox.put(_make_event("evt-3"))
++    _put(outbox, _make_event("evt-1"))
++    _put(outbox, _make_event("evt-2"))
++    _put(outbox, _make_event("evt-3"))
+ 
+     outbox.mark_published("evt-1")
+     outbox.mark_failed("evt-2")
+@@ -133,8 +149,8 @@ def test_get_stats() -> None:
+ def test_dispatcher_dispatch_once() -> None:
+     """Dispatcher 发布事件并标记。"""
+     outbox = Outbox()
+-    outbox.put(_make_event("evt-1"))
+-    outbox.put(_make_event("evt-2"))
++    _put(outbox, _make_event("evt-1"))
++    _put(outbox, _make_event("evt-2"))
+ 
+     published: list[str] = []
+ 
+@@ -153,7 +169,7 @@ def test_dispatcher_dispatch_once() -> None:
+ def test_dispatcher_idempotent() -> None:
+     """重复 dispatch 不重复处理。"""
+     outbox = Outbox()
+-    outbox.put(_make_event("evt-1"))
++    _put(outbox, _make_event("evt-1"))
+ 
+     call_count = 0
+ 
+@@ -174,8 +190,8 @@ def test_dispatcher_idempotent() -> None:
+ def test_dispatcher_with_async_publisher() -> None:
+     """异步 publisher 回调。"""
+     outbox = Outbox()
+-    outbox.put(_make_event("evt-1"))
+-    outbox.put(_make_event("evt-2"))
++    _put(outbox, _make_event("evt-1"))
++    _put(outbox, _make_event("evt-2"))
+ 
+     published: list[str] = []
+ 
+-- 
+2.43.0
+

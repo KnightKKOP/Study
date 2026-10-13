@@ -1,0 +1,1077 @@
+From a22b2f9885b3f8bd45948530426f83fb80e4d5c1 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 13 Oct 2026 03:19:04 +0000
+Subject: [PATCH 06/12] feat(audit): record API writes with the principal in
+ the write transaction
+
+AuditLog now works on a shared Database like the outbox: put() writes a
+record inside the caller's transaction without committing, record()
+writes and commits one record on its own. Records gain key_id (the API
+key id) and namespace; opening an existing database adds both columns.
+
+SQLiteRegistry owns an AuditLog on its connection (audit_log property).
+put, delete and request_delete take a keyword-only principal; when it
+is given, the same transaction that writes the resource and its outbox
+event also writes an audit record with the tenant, subject, key id and
+correlation id (shared with the event; generated when missing), action
+create/update/delete, outcome success and details linking the event id
+and resource version. A principal of another tenant is rejected before
+anything is written; writes without a principal (controller,
+reconciler) are not audited.
+
+Principal gains key_id, set by the API key authenticator (None in dev
+mode). The create and delete routes pass the principal and the request
+correlation id (delete now reads X-Correlation-Id as well, and its 409
+envelope reuses that id).
+---
+ .../src/forgemesh/controlplane/api/routes.py  |  24 ++-
+ .../src/forgemesh/controlplane/audit.py       | 101 ++++++---
+ .../src/forgemesh/controlplane/auth.py        |   8 +-
+ .../forgemesh/controlplane/registry/store.py  | 135 ++++++++++--
+ tests/unit/controlplane/test_api.py           |  22 ++
+ tests/unit/controlplane/test_audit.py         |  87 +++++++-
+ tests/unit/controlplane/test_auth.py          |  58 ++++-
+ .../unit/controlplane/test_registry_audit.py  | 202 ++++++++++++++++++
+ 8 files changed, 583 insertions(+), 54 deletions(-)
+ create mode 100644 tests/unit/controlplane/test_registry_audit.py
+
+diff --git a/packages/control-plane/src/forgemesh/controlplane/api/routes.py b/packages/control-plane/src/forgemesh/controlplane/api/routes.py
+index 3b5a0b4..ef2f7a9 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/api/routes.py
++++ b/packages/control-plane/src/forgemesh/controlplane/api/routes.py
+@@ -36,9 +36,11 @@ from forgemesh.workflow.runtime import WorkflowDefinition
+ from pydantic import BaseModel, ConfigDict, Field, ValidationError
+ 
+ from ..app import error_envelope
++from ..auth import Principal
+ from .dependencies import (
+     ComponentNotReadyError,
+     get_decision_router,
++    get_principal,
+     get_registry,
+     get_tenant_id,
+     get_workflow_runtime,
+@@ -114,11 +116,13 @@ def _invalid_limit(limit: int) -> JSONResponse | None:
+ async def create_inference_service(
+     body: dict[str, Any],
+     tenant_id: str = Depends(get_tenant_id),
++    principal: Principal = Depends(get_principal),
+     x_correlation_id: str | None = Header(default=None, alias="X-Correlation-Id"),
+ ) -> Any:
+     """创建推理服务（201）。
+ 
+     请求体不合法（缺少 ``spec``、kind 不匹配等）返回 400；同名资源已存在返回 409。
++    创建成功时在同一事务中写入资源变更事件与审计记录（调用主体与关联 ID）。
+     """
+     correlation_id = x_correlation_id or uuid4().hex
+     try:
+@@ -134,7 +138,9 @@ async def create_inference_service(
+     except ValueError as exc:
+         return _error_response(400, "BAD_REQUEST", str(exc), correlation_id)
+     try:
+-        created = await get_registry().put(resource)
++        created = await get_registry().put(
++            resource, correlation_id=correlation_id, principal=principal
++        )
+     except ConflictError as exc:
+         return _error_response(409, "CONFLICT", str(exc), correlation_id)
+     return JSONResponse(status_code=201, content=created.model_dump(by_alias=True, mode="json"))
+@@ -174,6 +180,8 @@ async def delete_inference_service(
+     name: str,
+     tenant_id: str = Depends(get_tenant_id),
+     namespace: str | None = None,
++    principal: Principal = Depends(get_principal),
++    x_correlation_id: str | None = Header(default=None, alias="X-Correlation-Id"),
+ ) -> Any:
+     """删除推理服务（受控删除语义，对齐 development-plan 第 7 章除闭环）。
+ 
+@@ -184,15 +192,23 @@ async def delete_inference_service(
+       → 清空 finalizer → 释放分配 → 物理删除」；响应体
+       ``{"name": ..., "phase": "Terminating"}``。
+ 
+-    不存在时返回 HTTP 404（不变）。
++    不存在时返回 HTTP 404（不变）。受理时在同一事务中写入资源变更事件与审计记录。
+     """
++    correlation_id = x_correlation_id or uuid4().hex
+     registry = get_registry()
+     try:
+-        result = await registry.request_delete("InferenceService", namespace, name, tenant_id)
++        result = await registry.request_delete(
++            "InferenceService",
++            namespace,
++            name,
++            tenant_id,
++            correlation_id=correlation_id,
++            principal=principal,
++        )
+     except NotFoundError as exc:
+         raise HTTPException(status_code=404, detail=f"InferenceService '{name}' not found") from exc
+     except ConflictError as exc:
+-        return _error_response(409, "CONFLICT", str(exc), uuid4().hex)
++        return _error_response(409, "CONFLICT", str(exc), correlation_id)
+     if result.deleted:
+         return Response(status_code=204)
+     return JSONResponse(status_code=202, content={"name": name, "phase": "Terminating"})
+diff --git a/packages/control-plane/src/forgemesh/controlplane/audit.py b/packages/control-plane/src/forgemesh/controlplane/audit.py
+index 4481ac3..65a218e 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/audit.py
++++ b/packages/control-plane/src/forgemesh/controlplane/audit.py
+@@ -1,12 +1,17 @@
+-"""审计事件与关联 ID 追踪。
++"""审计记录与关联 ID 追踪。
+ 
+-对齐 development-plan 5.5 / INV-4。审计事件记录关键操作，
++对齐 development-plan 5.5 / INV-4。审计记录关键操作，
+ correlation_id 全链路贯穿，支持调用链查询。
++
++资源注册表在 API 写入资源的同一个事务中写入审计记录（:meth:`AuditLog.put`），记录调用
++主体（租户、主体、凭证 id）与关联 ID：资源写入失败时不会留下审计记录。
++:meth:`AuditLog.record` 单独写入并提交一条记录。
+ """
+ 
+ from __future__ import annotations
+ 
+ import json
++import logging
+ import sqlite3
+ import time
+ import uuid
+@@ -14,7 +19,9 @@ from typing import Any
+ 
+ from pydantic import BaseModel, ConfigDict, Field
+ 
+-from .sqlite import connect
++from .sqlite import Database
++
++logger = logging.getLogger(__name__)
+ 
+ _SCHEMA_SQL = """\
+ CREATE TABLE IF NOT EXISTS audit_events (
+@@ -22,8 +29,10 @@ CREATE TABLE IF NOT EXISTS audit_events (
+     correlation_id TEXT NOT NULL,
+     tenant_id TEXT NOT NULL,
+     actor TEXT,
++    key_id TEXT,
+     action TEXT NOT NULL,
+     resource_type TEXT NOT NULL,
++    namespace TEXT,
+     resource_id TEXT NOT NULL,
+     outcome TEXT NOT NULL,
+     details TEXT,
+@@ -33,6 +42,12 @@ CREATE INDEX IF NOT EXISTS idx_audit_correlation ON audit_events(correlation_id)
+ CREATE INDEX IF NOT EXISTS idx_audit_tenant ON audit_events(tenant_id, timestamp);
+ """
+ 
++#: v1.0.0 的 ``audit_events`` 没有的列（打开存量库时补齐）。
++_ADDED_COLUMNS = (
++    ("key_id", "key_id TEXT"),
++    ("namespace", "namespace TEXT"),
++)
++
+ 
+ class AuditEvent(BaseModel):
+     """审计事件。
+@@ -42,8 +57,10 @@ class AuditEvent(BaseModel):
+         correlation_id: 关联 ID，全链路贯穿，用于调用链查询。
+         tenant_id: 租户标识。
+         actor: 操作发起者（用户/服务账号），可为 None。
++        key_id: 发起者使用的凭证标识（API key 的 ``id``），可为 None。
+         action: 操作类型（如 create/allocate/deploy）。
+         resource_type: 资源类型。
++        namespace: 资源的命名空间，可为 None。
+         resource_id: 资源标识。
+         outcome: 操作结果（success/failure/denied）。
+         details: 附加详情（JSON 可序列化字典），可为 None。
+@@ -56,8 +73,10 @@ class AuditEvent(BaseModel):
+     correlation_id: str
+     tenant_id: str
+     actor: str | None = None
++    key_id: str | None = None
+     action: str
+     resource_type: str
++    namespace: str | None = None
+     resource_id: str
+     outcome: str  # success / failure / denied
+     details: dict[str, Any] | None = None
+@@ -69,55 +88,86 @@ class AuditLog:
+ 
+     Args:
+         db_path: SQLite 数据库路径，默认 :memory:。
++        database: 与业务存储共用的数据库；给出时忽略 ``db_path``，:meth:`close`
++            不关闭它（由创建者关闭）。
+     """
+ 
+-    def __init__(self, db_path: str = ":memory:") -> None:
+-        self._conn = connect(db_path)
+-        self._conn.row_factory = sqlite3.Row
++    def __init__(self, db_path: str = ":memory:", *, database: Database | None = None) -> None:
++        self._owns_db = database is None
++        self._db = database if database is not None else Database(db_path)
++        self._conn = self._db.conn
+         self._init_schema()
+ 
+     def _init_schema(self) -> None:
+-        """创建表与索引（幂等）。"""
+-        self._conn.executescript(_SCHEMA_SQL)
+-        self._conn.commit()
+-
+-    def record(self, event: AuditEvent) -> str:
+-        """记录审计事件，返回 audit_id。"""
++        """创建表与索引（幂等），并为存量库补齐新增的列。"""
++        with self._db.lock:
++            self._conn.executescript(_SCHEMA_SQL)
++            columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(audit_events)")}
++            for name, ddl in _ADDED_COLUMNS:
++                if name not in columns:
++                    self._conn.execute(f"ALTER TABLE audit_events ADD COLUMN {ddl}")
++                    logger.info("migrated audit_events: added column %r", name)
++            self._conn.commit()
++
++    @property
++    def database(self) -> Database:
++        """审计表所在的数据库，供业务写入与审计记录共用同一个连接和锁。"""
++        return self._db
++
++    def put(self, event: AuditEvent) -> None:
++        """在调用方的事务中写入一条审计记录，不提交：记录随业务写入一起提交或回滚。
++
++        调用方须持有 :attr:`database` 的锁并已开启事务（同 :meth:`Outbox.put
++        <forgemesh.controlplane.outbox.Outbox.put>`）。
++
++        Raises:
++            RuntimeError: 连接上没有进行中的事务（记录不会写入）。
++        """
++        if not self._conn.in_transaction:
++            raise RuntimeError("AuditLog.put must run inside the caller's transaction")
+         self._conn.execute(
+-            "INSERT INTO audit_events (audit_id, correlation_id, tenant_id, actor, action, "
+-            "resource_type, resource_id, outcome, details, timestamp) "
+-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
++            "INSERT INTO audit_events (audit_id, correlation_id, tenant_id, actor, key_id, "
++            "action, resource_type, namespace, resource_id, outcome, details, timestamp) "
++            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             (
+                 event.audit_id,
+                 event.correlation_id,
+                 event.tenant_id,
+                 event.actor,
++                event.key_id,
+                 event.action,
+                 event.resource_type,
++                event.namespace,
+                 event.resource_id,
+                 event.outcome,
+                 json.dumps(event.details, ensure_ascii=False) if event.details else None,
+                 event.timestamp,
+             ),
+         )
+-        self._conn.commit()
++
++    def record(self, event: AuditEvent) -> str:
++        """单独写入并提交一条审计记录，返回 audit_id。"""
++        with self._db.transaction():
++            self.put(event)
+         return event.audit_id
+ 
++    def _query(self, sql: str, params: tuple[Any, ...]) -> list[AuditEvent]:
++        rows = self._db.call(lambda: self._conn.execute(sql, params).fetchall())
++        return [self._row_to_event(row) for row in rows]
++
+     def query_by_correlation(self, correlation_id: str) -> list[AuditEvent]:
+         """按 correlation_id 查询调用链，按时间升序排列。"""
+-        rows = self._conn.execute(
++        return self._query(
+             "SELECT * FROM audit_events WHERE correlation_id = ? ORDER BY timestamp",
+             (correlation_id,),
+-        ).fetchall()
+-        return [self._row_to_event(r) for r in rows]
++        )
+ 
+     def query_by_tenant(self, tenant_id: str, limit: int = 100) -> list[AuditEvent]:
+         """按租户查询审计记录，按时间降序排列。"""
+-        rows = self._conn.execute(
++        return self._query(
+             "SELECT * FROM audit_events WHERE tenant_id = ? ORDER BY timestamp DESC LIMIT ?",
+             (tenant_id, limit),
+-        ).fetchall()
+-        return [self._row_to_event(r) for r in rows]
++        )
+ 
+     @staticmethod
+     def _row_to_event(row: sqlite3.Row) -> AuditEvent:
+@@ -127,8 +177,10 @@ class AuditLog:
+             correlation_id=row["correlation_id"],
+             tenant_id=row["tenant_id"],
+             actor=row["actor"],
++            key_id=row["key_id"],
+             action=row["action"],
+             resource_type=row["resource_type"],
++            namespace=row["namespace"],
+             resource_id=row["resource_id"],
+             outcome=row["outcome"],
+             details=json.loads(row["details"]) if row["details"] else None,
+@@ -136,8 +188,9 @@ class AuditLog:
+         )
+ 
+     def close(self) -> None:
+-        """关闭数据库连接。"""
+-        self._conn.close()
++        """关闭自己打开的数据库连接；共用的数据库由创建者关闭。"""
++        if self._owns_db:
++            self._db.close()
+ 
+ 
+ __all__ = ["AuditEvent", "AuditLog"]
+diff --git a/packages/control-plane/src/forgemesh/controlplane/auth.py b/packages/control-plane/src/forgemesh/controlplane/auth.py
+index ebc6bdd..088cf5b 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/auth.py
++++ b/packages/control-plane/src/forgemesh/controlplane/auth.py
+@@ -70,6 +70,8 @@ class Principal(BaseModel):
+         subject: 主体标识（服务账号、用户等）。
+         tenant_id: 凭证绑定的租户，多租户隔离的权威来源。
+         scopes: 授予的 scope；``*`` 表示全部。
++        key_id: 凭证标识（key 文件中的 ``id``，记入审计记录）；``dev`` 模式没有凭证，为
++            ``None``。
+     """
+ 
+     model_config = ConfigDict(frozen=True)
+@@ -77,6 +79,7 @@ class Principal(BaseModel):
+     subject: str
+     tenant_id: str
+     scopes: frozenset[str] = frozenset()
++    key_id: str | None = None
+ 
+     def has_scope(self, scope: str) -> bool:
+         """是否持有 ``scope``（持有 ``*`` 视为持有全部 scope）。"""
+@@ -232,7 +235,10 @@ class ApiKeyAuthenticator:
+                 f"{self._tenant_header} does not match the tenant bound to the credentials"
+             )
+         return Principal(
+-            subject=entry.subject, tenant_id=entry.tenant_id, scopes=frozenset(entry.scopes)
++            subject=entry.subject,
++            tenant_id=entry.tenant_id,
++            scopes=frozenset(entry.scopes),
++            key_id=entry.id,
+         )
+ 
+ 
+diff --git a/packages/control-plane/src/forgemesh/controlplane/registry/store.py b/packages/control-plane/src/forgemesh/controlplane/registry/store.py
+index c8e2517..fdf023e 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/registry/store.py
++++ b/packages/control-plane/src/forgemesh/controlplane/registry/store.py
+@@ -59,8 +59,10 @@ Allocation 持久化
+ :meth:`SQLiteRegistry.prune_changes` 清理。
+ 
+ 同一事务中还向 :attr:`SQLiteRegistry.outbox` 写入一条资源变更事件（ADR-008 事务性
+-Outbox，信封与事件类型见 :mod:`forgemesh.controlplane.events`）：资源写入失败时不会
+-留下事件，事件写入失败时资源写入一并回滚。
++Outbox，信封与事件类型见 :mod:`forgemesh.controlplane.events`）；API 写入（``put`` /
++``delete`` / ``request_delete`` 给出调用主体 ``principal``）再向
++:attr:`SQLiteRegistry.audit_log` 写入一条审计记录。资源写入失败时不会留下事件与审计
++记录，二者写入失败时资源写入一并回滚。
+ 
+ 租户隔离
+ --------
+@@ -97,6 +99,8 @@ from forgemesh.resource.inference import Endpoint, InferenceService
+ from forgemesh.resource.states import ALLOCATION_STATE_MACHINE, INFERENCE_STATE_MACHINE
+ from pydantic import ValidationError
+ 
++from ..audit import AuditEvent, AuditLog
++from ..auth import Principal
+ from ..events import ResourceEventChange, resource_event
+ from ..outbox import Outbox
+ from ..sqlite import Database
+@@ -203,6 +207,15 @@ _EVENT_CHANGES = {
+     ChangeType.DELETED: ResourceEventChange.DELETED,
+ }
+ 
++#: 变更记录类型 → 审计记录的 ``action``（受理的删除请求与物理删除都是 ``delete``）。
++_AUDIT_ACTIONS = {
++    ChangeType.CREATED: "create",
++    ChangeType.UPDATED: "update",
++    ChangeType.STATUS: "update_status",
++    ChangeType.TERMINATING: "delete",
++    ChangeType.DELETED: "delete",
++}
++
+ 
+ @dataclass(frozen=True)
+ class ResourceKey:
+@@ -282,12 +295,18 @@ class SQLiteRegistry(ResourceRegistry):
+         self._lock = self._db.lock
+         self._init_schema()
+         self._outbox = Outbox(database=self._db)
++        self._audit = AuditLog(database=self._db)
+ 
+     @property
+     def outbox(self) -> Outbox:
+         """资源变更事件所在的 Outbox（与注册表共用连接），供事件分发器发布。"""
+         return self._outbox
+ 
++    @property
++    def audit_log(self) -> AuditLog:
++        """API 写入的审计记录（与注册表共用连接）。"""
++        return self._audit
++
+     # ------------------------------------------------------------------ #
+     # 内部辅助
+     # ------------------------------------------------------------------ #
+@@ -321,27 +340,60 @@ class SQLiteRegistry(ResourceRegistry):
+         version: int,
+         phase: str | None,
+         correlation_id: str | None,
++        principal: Principal | None = None,
+     ) -> None:
+-        """在调用方的事务中写入一条资源变更事件（随调用方一起提交或回滚）。
++        """在调用方的事务中写入一条资源变更事件；给出 ``principal``（API 写入）时再写入一条
++        审计记录。二者随调用方一起提交或回滚，使用同一个关联 ID（为空时生成一个新的）。
+ 
+         ``body`` / ``version`` / ``phase`` 描述写入之后的资源；删除时为删除前最后的状态。
+         """
++        correlation_id = correlation_id or uuid4().hex
+         resource = self._body_to_resource(body)
+-        self._outbox.put(
+-            resource_event(
++        event = resource_event(
++            tenant_id=key.tenant_id,
++            kind=key.kind,
++            namespace=key.namespace,
++            name=key.name,
++            change=_EVENT_CHANGES[change],
++            resource=resource.model_dump(mode="json", by_alias=True),
++            version=version,
++            phase=phase,
++            uid=resource.metadata.uid,
++            correlation_id=correlation_id,
++        )
++        self._outbox.put(event)
++        if principal is None:
++            return
++        self._audit.put(
++            AuditEvent(
++                correlation_id=correlation_id,
+                 tenant_id=key.tenant_id,
+-                kind=key.kind,
++                actor=principal.subject,
++                key_id=principal.key_id,
++                action=_AUDIT_ACTIONS[change],
++                resource_type=key.kind,
+                 namespace=key.namespace,
+-                name=key.name,
+-                change=_EVENT_CHANGES[change],
+-                resource=resource.model_dump(mode="json", by_alias=True),
+-                version=version,
+-                phase=phase,
+-                uid=resource.metadata.uid,
+-                correlation_id=correlation_id,
++                resource_id=key.name,
++                outcome="success",
++                details={
++                    "change": _EVENT_CHANGES[change].value,
++                    "resourceUid": resource.metadata.uid,
++                    "resourceVersion": version,
++                    "eventId": event.event_id,
++                },
++                timestamp=event.created_at,
+             )
+         )
+ 
++    @staticmethod
++    def _check_principal(principal: Principal | None, tenant_id: str) -> None:
++        """审计记录的主体须属于被写入资源的租户。"""
++        if principal is not None and principal.tenant_id != tenant_id:
++            raise ValueError(
++                f"principal of tenant {principal.tenant_id!r} cannot write resources of "
++                f"tenant {tenant_id!r}"
++            )
++
+     @contextlib.contextmanager
+     def _immediate_transaction(self) -> Iterator[sqlite3.Cursor]:
+         """``BEGIN IMMEDIATE`` 事务：开始即持有写锁，事务内的检查不会被其他连接的
+@@ -564,6 +616,8 @@ class SQLiteRegistry(ResourceRegistry):
+         expected_version: str | None = None,
+         actor: str | None = None,
+         correlation_id: str | None = None,
++        *,
++        principal: Principal | None = None,
+     ) -> Resource:
+         """写入（Create 或 Update-CAS）资源，返回写入后的最新对象。
+ 
+@@ -571,13 +625,17 @@ class SQLiteRegistry(ResourceRegistry):
+         * ``expected_version`` 非 ``None`` → Update-CAS；版本不匹配或资源不存在抛
+           ConflictError。成功后 ``resource_version`` 递增。
+ 
+-        ``correlation_id`` 写入同一事务中的资源变更事件（为空时生成一个新的）；
+-        ``actor`` 保留用于审计。
++        同一事务中写入资源变更事件（``correlation_id`` 为空时生成一个新的）；给出
++        ``principal``（API 写入的调用主体）时再写入一条审计记录。``actor`` 不入库。
++
++        Raises:
++            ValueError: ``principal`` 不属于资源的租户。
+         """
+         meta = resource.metadata
+         tenant_id = meta.tenant_id
+         if tenant_id is None:
+             raise ConflictError("metadata.tenant_id (tenantId) must not be empty")
++        self._check_principal(principal, tenant_id)
+         namespace = meta.namespace
+         name = meta.name
+         kind = resource.kind
+@@ -618,7 +676,15 @@ class SQLiteRegistry(ResourceRegistry):
+                         ),
+                     )
+                     self._record_change(cur, tenant_id, kind, namespace, name, ChangeType.CREATED)
+-                    self._emit(key, ChangeType.CREATED, body, new_version, phase, correlation_id)
++                    self._emit(
++                        key,
++                        ChangeType.CREATED,
++                        body,
++                        new_version,
++                        phase,
++                        correlation_id,
++                        principal,
++                    )
+                     self._conn.commit()
+                     return stored
+                 # ---- Update-CAS ----
+@@ -665,7 +731,9 @@ class SQLiteRegistry(ResourceRegistry):
+                         f"(kind={kind} namespace={namespace!r} name={name})",
+                     )
+                 self._record_change(cur, tenant_id, kind, namespace, name, ChangeType.UPDATED)
+-                self._emit(key, ChangeType.UPDATED, body, new_version, phase, correlation_id)
++                self._emit(
++                    key, ChangeType.UPDATED, body, new_version, phase, correlation_id, principal
++                )
+                 self._conn.commit()
+                 return stored
+             except sqlite3.IntegrityError as exc:
+@@ -736,11 +804,14 @@ class SQLiteRegistry(ResourceRegistry):
+         tenant_id: str,
+         actor: str | None = None,
+         correlation_id: str | None = None,
++        *,
++        principal: Principal | None = None,
+     ) -> None:
+         """删除资源；不存在或跨租户时抛 :class:`NotFoundError`。
+ 
+-        ``correlation_id`` 写入同一事务中的资源变更事件（为空时生成一个新的）。
++        同一事务中写入资源变更事件与（给出 ``principal`` 时）审计记录，同 :meth:`put`。
+         """
++        self._check_principal(principal, tenant_id)
+         key = ResourceKey(tenant_id, kind, namespace, name)
+ 
+         def _delete() -> None:
+@@ -770,6 +841,7 @@ class SQLiteRegistry(ResourceRegistry):
+                 row["resource_version"],
+                 row["phase"],
+                 correlation_id,
++                principal,
+             )
+             self._conn.commit()
+ 
+@@ -783,6 +855,8 @@ class SQLiteRegistry(ResourceRegistry):
+         tenant_id: str,
+         actor: str | None = None,
+         correlation_id: str | None = None,
++        *,
++        principal: Principal | None = None,
+     ) -> RequestDeleteResult:
+         """受控删除入口：finalizer 非空 → ``Terminating``；为空 → 物理 DELETE。
+ 
+@@ -808,8 +882,11 @@ class SQLiteRegistry(ResourceRegistry):
+             namespace: 命名空间（可为 ``None``）。
+             name: 资源名。
+             tenant_id: 租户标识（多租户边界）。
+-            actor: 操作发起者标识（审计用）。
+-            correlation_id: 关联追踪标识，写入同一事务中的资源变更事件（为空时生成一个新的）。
++            actor: 操作发起者标识（只用于日志）。
++            correlation_id: 关联追踪标识，写入同一事务中的资源变更事件与审计记录（为空时
++                生成一个新的）。
++            principal: API 写入的调用主体；给出时同一事务中写入一条审计记录。幂等返回
++                （已处于 ``Terminating``）时不写入任何记录。
+ 
+         Returns:
+             :class:`RequestDeleteResult`：``deleted=True`` 已物理删除；
+@@ -820,7 +897,9 @@ class SQLiteRegistry(ResourceRegistry):
+             InvalidStateTransition: 当前 phase 不允许转移到 ``Terminating``。
+             ConflictError: 读取后资源被并发修改（``resource_version`` 已变化）或
+                 并发获得了分配，调用方应重新读取后重试。
++            ValueError: ``principal`` 不属于资源的租户。
+         """
++        self._check_principal(principal, tenant_id)
+         terminating = "Terminating"
+         active = AllocationStatus.ACTIVE.value
+         key = ResourceKey(tenant_id, kind, namespace, name)
+@@ -867,7 +946,13 @@ class SQLiteRegistry(ResourceRegistry):
+                     )
+                 self._record_change(cur, tenant_id, kind, namespace, name, ChangeType.DELETED)
+                 self._emit(
+-                    key, ChangeType.DELETED, row["body"], read_version, phase, correlation_id
++                    key,
++                    ChangeType.DELETED,
++                    row["body"],
++                    read_version,
++                    phase,
++                    correlation_id,
++                    principal,
+                 )
+                 self._conn.commit()
+                 return RequestDeleteResult(True, [])
+@@ -911,7 +996,13 @@ class SQLiteRegistry(ResourceRegistry):
+                 )
+             self._record_change(cur, tenant_id, kind, namespace, name, ChangeType.TERMINATING)
+             self._emit(
+-                key, ChangeType.TERMINATING, new_body, new_version, terminating, correlation_id
++                key,
++                ChangeType.TERMINATING,
++                new_body,
++                new_version,
++                terminating,
++                correlation_id,
++                principal,
+             )
+             self._conn.commit()
+             logger.info(
+diff --git a/tests/unit/controlplane/test_api.py b/tests/unit/controlplane/test_api.py
+index fc29736..ca493fd 100644
+--- a/tests/unit/controlplane/test_api.py
++++ b/tests/unit/controlplane/test_api.py
+@@ -169,6 +169,28 @@ def test_delete_pending_service_holding_an_allocation_returns_202(client: TestCl
+     assert resp.json() == {"name": "svc-1", "phase": "Terminating"}
+ 
+ 
++def test_terminating_delete_is_audited_with_the_dev_principal(client: TestClient) -> None:
++    """dev 模式的调用主体为 ``dev:<租户>``，没有凭证 id；受理的删除请求记为 ``delete``。"""
++    created = client.post("/api/v1/inference-services", json=_payload(), headers=TENANT_HEADERS)
++    uid = created.json()["metadata"]["uid"]
++    owner = ResourceRef(kind="InferenceService", namespace="default", name="svc-1", uid=uid)
++    device = AllocatedDevice(node_id="node-a", device_id="gpu-0")
++    asyncio.run(get_registry().create_allocation("tenant-a", owner, f"{uid}:1", [device]))
++
++    resp = client.delete(
++        "/api/v1/inference-services/svc-1",
++        headers={**TENANT_HEADERS, "X-Correlation-Id": "corr-delete"},
++        params={"namespace": "default"},
++    )
++
++    assert resp.status_code == 202, resp.text
++    records = get_registry().audit_log.query_by_tenant("tenant-a")
++    delete, create = records
++    assert (create.action, create.actor, create.key_id) == ("create", "dev:tenant-a", None)
++    assert (delete.action, delete.correlation_id) == ("delete", "corr-delete")
++    assert delete.details is not None and delete.details["change"] == "terminating"
++
++
+ def test_list_inference_services(client: TestClient) -> None:
+     """创建多个 → LIST 返回列表。"""
+     for i in range(3):
+diff --git a/tests/unit/controlplane/test_audit.py b/tests/unit/controlplane/test_audit.py
+index e5569ae..50855a7 100644
+--- a/tests/unit/controlplane/test_audit.py
++++ b/tests/unit/controlplane/test_audit.py
+@@ -7,14 +7,18 @@
+ * 按租户查询；
+ * limit 生效；
+ * 审计事件包含全字段（actor/action/outcome/details）；
+-* correlation_id 全链路贯穿：create→allocate→deploy 完整链可查。
++* correlation_id 全链路贯穿：create→allocate→deploy 完整链可查；
++* ``put`` 只在调用方的事务中写入，``record`` 自行提交；与业务存储共用数据库；
++* 存量库补齐 ``key_id`` / ``namespace`` 列。
+ """
+ from __future__ import annotations
+ 
++import sqlite3
+ import time
+ 
+ import pytest
+ from forgemesh.controlplane.audit import AuditEvent, AuditLog
++from forgemesh.controlplane.sqlite import Database
+ 
+ TENANT_A = "tenant-a"
+ CORRELATION_ID = "corr-1234"
+@@ -216,3 +220,84 @@ def test_correlation_id_tracing() -> None:
+     assert chain[0].details == {"replicas": 2}
+     assert chain[1].details == {"allocated": 2, "device": "A100"}
+     assert chain[2].details == {"image": "vllm:v0.6", "port": 8080}
++
++
++# ---------------------------------------------------------------------- #
++# 事务与共用数据库
++# ---------------------------------------------------------------------- #
++
++
++@pytest.mark.unit
++def test_put_requires_the_callers_transaction() -> None:
++    """put 不自行提交：没有进行中的事务时拒绝写入。"""
++    log = AuditLog()
++    with pytest.raises(RuntimeError, match="transaction"):
++        log.put(_make_event())
++    assert log.query_by_tenant(TENANT_A) == []
++
++
++@pytest.mark.unit
++def test_put_commits_or_rolls_back_with_the_caller() -> None:
++    """put 的记录随调用方的事务一起提交或回滚。"""
++    log = AuditLog()
++    kept, dropped = _make_event(action="create"), _make_event(action="delete")
++    with log.database.transaction():
++        log.put(kept)
++    with pytest.raises(RuntimeError, match="boom"), log.database.transaction():
++        log.put(dropped)
++        raise RuntimeError("boom")
++
++    assert [e.audit_id for e in log.query_by_tenant(TENANT_A)] == [kept.audit_id]
++
++
++@pytest.mark.unit
++def test_principal_fields_round_trip() -> None:
++    """凭证 id 与命名空间随记录保存。"""
++    log = AuditLog()
++    log.record(_make_event().model_copy(update={"key_id": "key-a", "namespace": "team-a"}))
++
++    [got] = log.query_by_correlation(CORRELATION_ID)
++    assert (got.key_id, got.namespace) == ("key-a", "team-a")
++
++
++@pytest.mark.unit
++def test_shared_database_is_closed_by_its_owner() -> None:
++    """共用的数据库由创建者关闭：AuditLog.close 不关闭它。"""
++    database = Database()
++    log = AuditLog(database=database)
++    log.record(_make_event())
++    log.close()
++
++    assert database.conn.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0] == 1
++    database.close()
++
++
++@pytest.mark.unit
++def test_legacy_table_gets_the_new_columns(tmp_path) -> None:
++    """v1.0.0 的 audit_events 没有 key_id / namespace：打开时补齐，旧记录保留。"""
++    path = str(tmp_path / "audit.db")
++    conn = sqlite3.connect(path)
++    conn.executescript(
++        """
++        CREATE TABLE audit_events (
++            audit_id TEXT PRIMARY KEY, correlation_id TEXT NOT NULL, tenant_id TEXT NOT NULL,
++            actor TEXT, action TEXT NOT NULL, resource_type TEXT NOT NULL,
++            resource_id TEXT NOT NULL, outcome TEXT NOT NULL, details TEXT,
++            timestamp REAL NOT NULL
++        );
++        INSERT INTO audit_events VALUES
++            ('old', 'corr-old', 'tenant-a', 'bob', 'create', 'InferenceService', 'svc',
++             'success', NULL, 1.0);
++        """
++    )
++    conn.close()
++
++    log = AuditLog(path)
++    log.record(_make_event().model_copy(update={"key_id": "key-a", "namespace": "team-a"}))
++    reopened = AuditLog(path)
++
++    old, new = sorted(reopened.query_by_tenant(TENANT_A), key=lambda e: e.timestamp)
++    assert (old.audit_id, old.actor, old.key_id, old.namespace) == ("old", "bob", None, None)
++    assert (new.key_id, new.namespace) == ("key-a", "team-a")
++    log.close()
++    reopened.close()
+diff --git a/tests/unit/controlplane/test_auth.py b/tests/unit/controlplane/test_auth.py
+index 31a8200..5cc8080 100644
+--- a/tests/unit/controlplane/test_auth.py
++++ b/tests/unit/controlplane/test_auth.py
+@@ -9,7 +9,11 @@ from fastapi import FastAPI
+ from fastapi.testclient import TestClient
+ from forgemesh.controlplane import app as app_module
+ from forgemesh.controlplane.api import create_api_router
+-from forgemesh.controlplane.api.dependencies import init_registry, reset_authenticator
++from forgemesh.controlplane.api.dependencies import (
++    get_registry,
++    init_registry,
++    reset_authenticator,
++)
+ from forgemesh.controlplane.api.errors import install_exception_handlers
+ from forgemesh.controlplane.app import create_app
+ from forgemesh.controlplane.auth import (
+@@ -77,6 +81,7 @@ def test_header_authenticator_requires_a_tenant() -> None:
+     principal = HeaderAuthenticator().authenticate({"x-tenant-id": " acme "})
+     assert principal.tenant_id == "acme"
+     assert principal.has_scope("write")
++    assert principal.key_id is None
+ 
+ 
+ @pytest.mark.unit
+@@ -86,7 +91,7 @@ def test_api_key_binds_tenant_subject_and_scopes() -> None:
+     principal = authenticator.authenticate(_bearer(KEY_A))
+     read_only = authenticator.authenticate(_bearer(KEY_READ_ONLY))
+ 
+-    assert (principal.tenant_id, principal.subject) == ("tenant-a", "alice")
++    assert (principal.tenant_id, principal.subject, principal.key_id) == ("tenant-a", "alice", "a")
+     assert principal.has_scope("read") and principal.has_scope("write")
+     assert read_only.has_scope("read") and not read_only.has_scope("write")
+ 
+@@ -287,6 +292,55 @@ def test_read_only_credentials_cannot_write(api_client) -> None:
+     assert api_client.get("/api/v1/inference-services", headers=_bearer(KEY_A)).json()["count"] == 1
+ 
+ 
++@pytest.mark.unit
++def test_api_writes_are_audited_with_the_principal(api_client) -> None:
++    created = api_client.post(
++        "/api/v1/inference-services",
++        json=BODY,
++        headers=_bearer(KEY_A, **{"X-Correlation-Id": "corr-create"}),
++    )
++    deleted = api_client.delete(
++        "/api/v1/inference-services/llama",
++        params={"namespace": "default"},
++        headers=_bearer(KEY_A, **{"X-Correlation-Id": "corr-delete"}),
++    )
++
++    assert (created.status_code, deleted.status_code) == (201, 204)
++    registry = get_registry()
++    records = sorted(registry.audit_log.query_by_tenant("tenant-a"), key=lambda e: e.timestamp)
++    events = registry.outbox.get_pending()
++    assert [(r.action, r.correlation_id) for r in records] == [
++        ("create", "corr-create"),
++        ("delete", "corr-delete"),
++    ]
++    for record, event in zip(records, events, strict=True):
++        assert (record.tenant_id, record.actor, record.key_id) == ("tenant-a", "alice", "a")
++        assert (record.resource_type, record.namespace, record.resource_id) == (
++            "InferenceService",
++            "default",
++            "llama",
++        )
++        assert record.details["eventId"] == event.event_id
++        assert event.payload["correlationId"] == record.correlation_id
++    assert registry.audit_log.query_by_tenant("tenant-b") == []
++
++
++@pytest.mark.unit
++def test_rejected_api_writes_are_not_audited(api_client) -> None:
++    path = "/api/v1/inference-services"
++    api_client.post(path, json=BODY, headers=_bearer(KEY_A))
++
++    duplicate = api_client.post(path, json=BODY, headers=_bearer(KEY_A))
++    read_only = api_client.delete(
++        f"{path}/llama", params={"namespace": "default"}, headers=_bearer(KEY_READ_ONLY)
++    )
++    missing = api_client.delete(f"{path}/missing", headers=_bearer(KEY_A))
++
++    assert (duplicate.status_code, read_only.status_code, missing.status_code) == (409, 403, 404)
++    [record] = get_registry().audit_log.query_by_tenant("tenant-a")
++    assert (record.action, record.actor) == ("create", "alice")
++
++
+ @pytest.mark.unit
+ def test_missing_authenticator_fails_closed() -> None:
+     init_registry(":memory:")
+diff --git a/tests/unit/controlplane/test_registry_audit.py b/tests/unit/controlplane/test_registry_audit.py
+new file mode 100644
+index 0000000..18807a0
+--- /dev/null
++++ b/tests/unit/controlplane/test_registry_audit.py
+@@ -0,0 +1,202 @@
++"""资源注册表的审计记录：API 写入在资源写入的同一事务中记录调用主体。"""
++
++from __future__ import annotations
++
++import asyncio
++import sqlite3
++from collections.abc import Callable, Coroutine
++from typing import Any
++
++import pytest
++from forgemesh.controlplane.audit import AuditEvent
++from forgemesh.controlplane.auth import Principal
++from forgemesh.controlplane.registry import SQLiteRegistry
++from forgemesh.core.objects import ObjectMeta
++from forgemesh.resource.inference import (
++    AcceleratorSpec,
++    InferencePhase,
++    InferenceService,
++    InferenceServiceSpec,
++    InferenceServiceStatus,
++    ModelRef,
++    ResourcesSpec,
++    RuntimeRef,
++)
++
++KIND = "InferenceService"
++TENANT = "tenant-a"
++NAMESPACE = "team-a"
++ALICE = Principal(subject="alice", tenant_id=TENANT, scopes=frozenset({"write"}), key_id="key-a")
++
++
++def _run(coro):
++    """在同步测试中驱动协程（不依赖 pytest-asyncio）。"""
++    return asyncio.run(coro)
++
++
++def _service(name: str = "svc", phase: InferencePhase = InferencePhase.PENDING) -> InferenceService:
++    return InferenceService(
++        metadata=ObjectMeta(name=name, namespace=NAMESPACE, tenant_id=TENANT, uid=f"uid-{name}"),
++        spec=InferenceServiceSpec(
++            model=ModelRef(reference="models/llama"),
++            runtime=RuntimeRef(provider="vllm"),
++            resources=ResourcesSpec(
++                accelerator=AcceleratorSpec(type="nvidia-gpu", minMemoryGiB=16)
++            ),
++        ),
++        status=InferenceServiceStatus(phase=phase),
++    )
++
++
++def _audit(reg: SQLiteRegistry) -> list[AuditEvent]:
++    """按写入顺序返回租户的全部审计记录。"""
++    return sorted(reg.audit_log.query_by_tenant(TENANT, limit=1000), key=lambda e: e.timestamp)
++
++
++#: 每种 API 写入（带调用主体）：在已有 ``svc``（Pending）与 ``ready``（Ready）的注册表上执行。
++_WRITES: dict[str, Callable[[SQLiteRegistry, Principal], Coroutine[Any, Any, Any]]] = {
++    "create": lambda reg, who: reg.put(_service("new"), correlation_id="corr", principal=who),
++    "update": lambda reg, who: reg.put(
++        _service(), expected_version="0", correlation_id="corr", principal=who
++    ),
++    "request-delete": lambda reg, who: reg.request_delete(
++        KIND, NAMESPACE, "svc", TENANT, correlation_id="corr", principal=who
++    ),
++    "terminate": lambda reg, who: reg.request_delete(
++        KIND, NAMESPACE, "ready", TENANT, correlation_id="corr", principal=who
++    ),
++    "delete": lambda reg, who: reg.delete(
++        KIND, NAMESPACE, "svc", TENANT, correlation_id="corr", principal=who
++    ),
++}
++
++#: 写入 → (审计 action, 资源名, data.change)。
++_EXPECTED = {
++    "create": ("create", "new", "created"),
++    "update": ("update", "svc", "updated"),
++    "request-delete": ("delete", "svc", "deleted"),
++    "terminate": ("delete", "ready", "terminating"),
++    "delete": ("delete", "svc", "deleted"),
++}
++
++
++def _registry() -> SQLiteRegistry:
++    reg = SQLiteRegistry()
++    _run(reg.put(_service()))
++    _run(reg.put(_service("ready", phase=InferencePhase.READY)))
++    return reg
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize("write", sorted(_WRITES))
++def test_api_writes_record_the_principal_with_the_event(write: str) -> None:
++    reg = _registry()
++    _run(_WRITES[write](reg, ALICE))
++
++    [record] = _audit(reg)
++    *_, event = reg.outbox.get_pending()
++    action, name, change = _EXPECTED[write]
++    assert (record.tenant_id, record.actor, record.key_id) == (TENANT, "alice", "key-a")
++    assert record.correlation_id == event.payload["correlationId"] == "corr"
++    assert (record.action, record.outcome) == (action, "success")
++    assert (record.resource_type, record.namespace, record.resource_id) == (KIND, NAMESPACE, name)
++    assert record.details == {
++        "change": change,
++        "resourceUid": f"uid-{name}",
++        "resourceVersion": event.payload["resourceVersion"],
++        "eventId": event.event_id,
++    }
++    assert event.payload["data"]["change"] == change
++    assert record.timestamp == event.created_at
++
++
++@pytest.mark.unit
++def test_api_writes_without_a_correlation_id_share_a_generated_one() -> None:
++    reg = SQLiteRegistry()
++    _run(reg.put(_service(), principal=ALICE))
++
++    [record] = _audit(reg)
++    [event] = reg.outbox.get_pending()
++    assert record.correlation_id
++    assert record.correlation_id == event.payload["correlationId"]
++
++
++@pytest.mark.unit
++def test_internal_writes_are_not_audited() -> None:
++    reg = _registry()
++    _run(reg.update_status(KIND, NAMESPACE, "svc", TENANT, {"phase": "Scheduling"}))
++    _run(reg.delete(KIND, NAMESPACE, "svc", TENANT, actor="reconciler"))
++
++    assert _audit(reg) == []
++    assert len(reg.outbox.get_pending()) == 4
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize("write", sorted(_WRITES))
++def test_a_principal_of_another_tenant_cannot_write(write: str) -> None:
++    reg = _registry()
++    before = reg.outbox.get_stats()
++    mallory = Principal(subject="mallory", tenant_id="tenant-b", key_id="key-b")
++
++    with pytest.raises(ValueError, match="tenant-b"):
++        _run(_WRITES[write](reg, mallory))
++
++    assert _audit(reg) == []
++    assert reg.outbox.get_stats() == before
++    assert reg.audit_log.query_by_tenant("tenant-b") == []
++
++
++def _state(reg: SQLiteRegistry) -> tuple[list[tuple[Any, ...]], ...]:
++    """资源、变更记录、事件与审计记录四张表的全部内容。"""
++    return tuple(
++        [tuple(row) for row in reg._conn.execute(sql)]
++        for sql in (
++            "SELECT * FROM resources ORDER BY name",
++            "SELECT * FROM resource_changes ORDER BY seq",
++            "SELECT * FROM outbox_events ORDER BY event_id",
++            "SELECT * FROM audit_events ORDER BY audit_id",
++        )
++    )
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize("write", sorted(_WRITES))
++def test_a_write_failing_after_the_audit_record_leaves_nothing_behind(
++    monkeypatch: pytest.MonkeyPatch, write: str
++) -> None:
++    reg = _registry()
++    before = _state(reg)
++    original = reg._emit
++
++    def emit_then_fail(*args: Any, **kwargs: Any) -> None:
++        original(*args, **kwargs)
++        assert reg._conn.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0] == 1
++        raise RuntimeError("disk I/O error")
++
++    monkeypatch.setattr(reg, "_emit", emit_then_fail)
++    with pytest.raises(RuntimeError, match="disk I/O error"):
++        _run(_WRITES[write](reg, ALICE))
++    monkeypatch.undo()
++
++    assert _state(reg) == before
++    _run(_WRITES[write](reg, ALICE))
++    assert len(_audit(reg)) == 1
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize("write", sorted(_WRITES))
++def test_an_audit_write_failure_rolls_back_the_resource_and_the_event(
++    monkeypatch: pytest.MonkeyPatch, write: str
++) -> None:
++    reg = _registry()
++    before = _state(reg)
++
++    def unavailable(event: AuditEvent) -> None:
++        raise sqlite3.OperationalError("database or disk is full")
++
++    monkeypatch.setattr(reg.audit_log, "put", unavailable)
++    with pytest.raises(sqlite3.OperationalError):
++        _run(_WRITES[write](reg, ALICE))
++    monkeypatch.undo()
++
++    assert _state(reg) == before
+-- 
+2.43.0
+

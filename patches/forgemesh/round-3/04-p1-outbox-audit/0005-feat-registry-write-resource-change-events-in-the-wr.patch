@@ -1,0 +1,1083 @@
+From 71a5ddd5c1b01de12386e4fe59f7eef965761e43 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 13 Oct 2026 03:11:59 +0000
+Subject: [PATCH 05/12] feat(registry): write resource change events in the
+ write transaction
+
+Every resource write of SQLiteRegistry (create, update, status write,
+delete request, delete) now also writes a DomainEvent into the outbox
+that shares the registry's connection, inside the same transaction as
+the resource row and its change record: a failed write leaves no event,
+and a failed event write rolls the resource write back.
+
+The envelope follows api/schemas/event.schema.json. eventType is
+"<kind as dotted words>.<change>" (inference.service.created, .updated,
+.status_updated, .terminating, .deleted); data carries the kind, the
+resource identity, the phase and the resource representation after the
+write (deleted: the last state before the delete). Writes without a
+correlation id get a generated one.
+
+The controller passes the correlation id of a reconcile to its status
+writes, and the reconciler passes it (and actor "reconciler") when it
+removes the release finalizer, so all events of one reconcile share it.
+
+delete() now reads the row under BEGIN IMMEDIATE before deleting it to
+capture the last state. CONTROL_PLANE_VERSION moves to a dependency-free
+version module (still re-exported by app) so the registry can use it as
+producer.version without an import cycle.
+---
+ .../src/forgemesh/controlplane/app.py         |   4 +-
+ .../controlplane/controller/manager.py        |  12 +-
+ .../src/forgemesh/controlplane/events.py      | 179 ++++++++
+ .../forgemesh/controlplane/reconciler/core.py |   7 +-
+ .../forgemesh/controlplane/registry/store.py  | 104 ++++-
+ .../src/forgemesh/controlplane/version.py     |  11 +
+ .../controlplane/test_controller_manager.py   |  65 ++-
+ .../unit/controlplane/test_registry_events.py | 392 ++++++++++++++++++
+ 8 files changed, 757 insertions(+), 17 deletions(-)
+ create mode 100644 packages/control-plane/src/forgemesh/controlplane/events.py
+ create mode 100644 packages/control-plane/src/forgemesh/controlplane/version.py
+ create mode 100644 tests/unit/controlplane/test_registry_events.py
+
+diff --git a/packages/control-plane/src/forgemesh/controlplane/app.py b/packages/control-plane/src/forgemesh/controlplane/app.py
+index e735f6a..f233dca 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/app.py
++++ b/packages/control-plane/src/forgemesh/controlplane/app.py
+@@ -77,6 +77,7 @@ from .deployment import (
+ from .reconciler import ProcessedKeyStore, ReconciliationController
+ from .scheduler import INVENTORY_FILE_ENV, FirstFitScheduler, inventory_from_env
+ from .sqlite import workflow_db_path
++from .version import CONTROL_PLANE_VERSION
+ 
+ if TYPE_CHECKING:  # pragma: no cover - 仅静态类型检查使用
+     from .auth import Authenticator
+@@ -100,9 +101,6 @@ API_PREFIX = "/api/v1"
+ #: 兜底服务（无 FastAPI）的占位错误码。
+ NOT_IMPLEMENTED_CODE = "NOT_IMPLEMENTED"
+ 
+-#: 控制平面版本（用于探针与事件 producer.version）。
+-CONTROL_PLANE_VERSION = "0.0.1"
+-
+ DB_PATH_ENV = "FORGEMESH_DB_PATH"
+ DEFAULT_DB_PATH = "forgemesh.db"
+ HOST_ENV = "FORGEMESH_HOST"
+diff --git a/packages/control-plane/src/forgemesh/controlplane/controller/manager.py b/packages/control-plane/src/forgemesh/controlplane/controller/manager.py
+index f37f0bf..d7af3e1 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/controller/manager.py
++++ b/packages/control-plane/src/forgemesh/controlplane/controller/manager.py
+@@ -172,17 +172,18 @@ class ControllerManager:
+         dedup_key = compute_dedup_key(
+             key.kind, key.namespace, key.name, meta.uid, meta.generation, operation
+         ).key
++        correlation_id = uuid4().hex
+         result = await self._reconciler.reconcile(
+             ReconcileContext(
+                 resource=resource,
+                 observed={"phase": phase} if phase is not None else {},
+-                correlation_id=uuid4().hex,
++                correlation_id=correlation_id,
+                 tenant_id=key.tenant_id,
+                 dedup_key=dedup_key,
+             )
+         )
+         if result.status_patch and not await self._write_status(
+-            key, resource, operation, result.status_patch
++            key, resource, operation, result.status_patch, correlation_id
+         ):
+             self._queue.add(key)
+             return
+@@ -198,8 +199,12 @@ class ControllerManager:
+         resource: Resource,
+         operation: str,
+         patch: dict[str, Any],
++        correlation_id: str,
+     ) -> bool:
+-        """以协调前读到的版本 CAS 写入 status；资源已变得不适用这次结果时返回 ``False``。"""
++        """以协调前读到的版本 CAS 写入 status；资源已变得不适用这次结果时返回 ``False``。
++
++        ``correlation_id`` 是这次协调的关联 ID，随 status 写入的资源变更事件送出。
++        """
+         target = (resource.metadata.uid, resource.metadata.generation, operation)
+         expected_version = resource.metadata.resourceVersion
+         for _ in range(self._status_write_attempts):
+@@ -212,6 +217,7 @@ class ControllerManager:
+                     patch,
+                     observed_generation=resource.metadata.generation,
+                     expected_version=expected_version,
++                    correlation_id=correlation_id,
+                 )
+                 return True
+             except NotFoundError:
+diff --git a/packages/control-plane/src/forgemesh/controlplane/events.py b/packages/control-plane/src/forgemesh/controlplane/events.py
+new file mode 100644
+index 0000000..8021009
+--- /dev/null
++++ b/packages/control-plane/src/forgemesh/controlplane/events.py
+@@ -0,0 +1,179 @@
++"""领域事件信封与资源变更事件。
++
++信封字段与 ``api/schemas/event.schema.json``（DomainEvent）一致。资源注册表在写入资源的
++同一个事务中，经 :class:`~forgemesh.controlplane.outbox.Outbox` 写入一条资源变更事件
++（ADR-008，architecture §12.3 / §13.2）：Outbox 事件的 ``payload`` 就是信封，``event_id``
++与信封的 ``eventId`` 相同。
++
++资源变更事件
++------------
++``eventType`` 为 ``<kind>.<change>``：kind 按单词拆成小写并以点连接
++（``InferenceService`` → ``inference.service``），change 见 :class:`ResourceEventChange`。
++
++``data`` 含 ``kind`` / ``namespace`` / ``name`` / ``change``、``phase``（生命周期阶段，
++资源没有 phase 时为 ``null``）与 ``resource``（资源表示，与 API 返回的相同）。``phase``、
++``resource`` 与 ``resourceVersion`` 描述写入之后的资源；``deleted`` 事件描述资源删除前
++最后的状态，因此它的 ``resourceVersion`` 与删除前最后一次写入的事件相同。
++``schemaVersion`` 为 ``v1``，``producer`` 为 ``control-plane`` 与控制平面版本。
++
++事件至少投递一次：消费方按 ``eventId`` 去重；投递顺序只是尽力按写入顺序，同一资源
++（``resourceUid``）的事件以 ``resourceVersion`` 判断新旧。
++"""
++
++from __future__ import annotations
++
++import re
++import time
++from datetime import UTC, datetime
++from enum import StrEnum
++from typing import Any
++from uuid import uuid4
++
++from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator
++
++from .outbox import OutboxEvent
++from .version import CONTROL_PLANE_VERSION
++
++#: 资源变更事件 ``data`` 的版本（信封的 ``schemaVersion``）。
++RESOURCE_EVENT_SCHEMA_VERSION = "v1"
++
++#: 控制平面产生的事件的 ``producer.component``。
++PRODUCER_COMPONENT = "control-plane"
++
++#: kind 中的一个单词：连续大写的缩写（如 ``GPU``）或首字母大写的小写串，数字随前一个单词。
++_KIND_WORD = re.compile(r"[A-Z]+[0-9]*(?![a-z])|[A-Z]?[a-z0-9]+")
++
++
++class ResourceEventChange(StrEnum):
++    """资源变更事件的变更类型（``eventType`` 的最后一段与 ``data.change``）。"""
++
++    CREATED = "created"
++    """创建资源。"""
++    UPDATED = "updated"
++    """更新资源（含协调器移除 finalizer）。"""
++    STATUS_UPDATED = "status_updated"
++    """status 子资源写入：控制器回写状态条件、phase 与实例地址。"""
++    TERMINATING = "terminating"
++    """删除请求已受理：资源进入 ``Terminating``，等待受控释放。"""
++    DELETED = "deleted"
++    """资源已被物理删除。"""
++
++
++class EventProducer(BaseModel):
++    """事件生产者（信封的 ``producer``）。"""
++
++    model_config = ConfigDict(extra="forbid", frozen=True)
++
++    component: str = Field(min_length=1)
++    version: str = Field(min_length=1)
++
++
++class DomainEvent(BaseModel):
++    """领域事件信封，以别名（驼峰）序列化后符合 ``api/schemas/event.schema.json``。"""
++
++    model_config = ConfigDict(extra="forbid", populate_by_name=True)
++
++    event_id: str = Field(default_factory=lambda: str(uuid4()), alias="eventId", min_length=1)
++    event_type: str = Field(alias="eventType", min_length=1)
++    schema_version: str = Field(alias="schemaVersion", min_length=1)
++    occurred_at: AwareDatetime = Field(alias="occurredAt")
++    tenant_id: str = Field(alias="tenantId", min_length=1)
++    resource_id: str = Field(alias="resourceId", min_length=1)
++    resource_uid: str | None = Field(default=None, alias="resourceUid")
++    resource_version: int | None = Field(default=None, alias="resourceVersion", ge=0)
++    correlation_id: str = Field(alias="correlationId", min_length=1)
++    producer: EventProducer
++    data: dict[str, Any] = Field(default_factory=dict)
++
++    @field_validator("occurred_at")
++    @classmethod
++    def _to_utc(cls, value: datetime) -> datetime:
++        return value.astimezone(UTC)
++
++    def to_payload(self) -> dict[str, Any]:
++        """JSON 载荷：驼峰字段名，省略为空的可选字段（Schema 不允许它们为 ``null``）。"""
++        payload = self.model_dump(mode="json", by_alias=True)
++        for key in ("resourceUid", "resourceVersion"):
++            if payload[key] is None:
++                del payload[key]
++        return payload
++
++
++def event_type_prefix(kind: str) -> str:
++    """kind 对应的事件类型前缀：按单词拆成小写并以点连接。
++
++    ``InferenceService`` → ``inference.service``，``GPUNode`` → ``gpu.node``；kind 中没有
++    字母和数字时为 ``resource``。
++    """
++    return ".".join(word.lower() for word in _KIND_WORD.findall(kind)) or "resource"
++
++
++def resource_event(
++    *,
++    tenant_id: str,
++    kind: str,
++    namespace: str | None,
++    name: str,
++    change: ResourceEventChange,
++    resource: dict[str, Any],
++    version: int,
++    phase: str | None,
++    uid: str | None = None,
++    correlation_id: str | None = None,
++    occurred_at: float | None = None,
++) -> OutboxEvent:
++    """构造一条资源变更事件：``payload`` 为 :class:`DomainEvent` 信封的 Outbox 事件。
++
++    Args:
++        tenant_id: 资源所属租户。
++        kind: 资源类型。
++        namespace: 命名空间（可为 ``None``）。
++        name: 资源名（信封的 ``resourceId``）。
++        change: 变更类型。
++        resource: 事件描述的资源表示。
++        version: 事件描述的资源版本。
++        phase: 事件描述的生命周期阶段。
++        uid: 资源 uid；为空时信封不含 ``resourceUid``。
++        correlation_id: 关联 ID；为空时生成一个新的。
++        occurred_at: 发生时间戳（秒），默认当前时间。
++    """
++    created_at = time.time() if occurred_at is None else occurred_at
++    event_type = f"{event_type_prefix(kind)}.{change.value}"
++    envelope = DomainEvent(
++        event_type=event_type,
++        schema_version=RESOURCE_EVENT_SCHEMA_VERSION,
++        occurred_at=datetime.fromtimestamp(created_at, UTC),
++        tenant_id=tenant_id,
++        resource_id=name,
++        resource_uid=uid or None,
++        resource_version=version,
++        correlation_id=correlation_id or uuid4().hex,
++        producer=EventProducer(component=PRODUCER_COMPONENT, version=CONTROL_PLANE_VERSION),
++        data={
++            "kind": kind,
++            "namespace": namespace,
++            "name": name,
++            "change": change.value,
++            "phase": phase,
++            "resource": resource,
++        },
++    )
++    return OutboxEvent(
++        event_id=envelope.event_id,
++        aggregate_type=kind,
++        aggregate_id=f"{tenant_id}/{namespace or ''}/{name}",
++        event_type=event_type,
++        payload=envelope.to_payload(),
++        created_at=created_at,
++    )
++
++
++__all__ = [
++    "PRODUCER_COMPONENT",
++    "RESOURCE_EVENT_SCHEMA_VERSION",
++    "DomainEvent",
++    "EventProducer",
++    "ResourceEventChange",
++    "event_type_prefix",
++    "resource_event",
++]
+diff --git a/packages/control-plane/src/forgemesh/controlplane/reconciler/core.py b/packages/control-plane/src/forgemesh/controlplane/reconciler/core.py
+index b8b170c..1720ba6 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/reconciler/core.py
++++ b/packages/control-plane/src/forgemesh/controlplane/reconciler/core.py
+@@ -698,7 +698,12 @@ class ReconciliationController(Reconciler):
+         if current.finalizers:
+             # 仍有其他 finalizer 持有方未完成清理：写回并等待。
+             try:
+-                await self._registry.put(current, expected_version=current.metadata.resourceVersion)
++                await self._registry.put(
++                    current,
++                    expected_version=current.metadata.resourceVersion,
++                    actor="reconciler",
++                    correlation_id=ctx.correlation_id,
++                )
+             except ConflictError:
+                 # 版本漂移：下轮重读重试。
+                 return ReconcileResult(done=False, requeue_after=5.0)
+diff --git a/packages/control-plane/src/forgemesh/controlplane/registry/store.py b/packages/control-plane/src/forgemesh/controlplane/registry/store.py
+index 4b101f3..c8e2517 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/registry/store.py
++++ b/packages/control-plane/src/forgemesh/controlplane/registry/store.py
+@@ -58,6 +58,10 @@ Allocation 持久化
+ （不依赖 PostgreSQL ``LISTEN/NOTIFY``，见 ADR-013），处理完后调用
+ :meth:`SQLiteRegistry.prune_changes` 清理。
+ 
++同一事务中还向 :attr:`SQLiteRegistry.outbox` 写入一条资源变更事件（ADR-008 事务性
++Outbox，信封与事件类型见 :mod:`forgemesh.controlplane.events`）：资源写入失败时不会
++留下事件，事件写入失败时资源写入一并回滚。
++
+ 租户隔离
+ --------
+ 面向租户的查询均以 ``tenant_id`` 作为首要过滤条件；跨租户访问一律视为
+@@ -93,6 +97,8 @@ from forgemesh.resource.inference import Endpoint, InferenceService
+ from forgemesh.resource.states import ALLOCATION_STATE_MACHINE, INFERENCE_STATE_MACHINE
+ from pydantic import ValidationError
+ 
++from ..events import ResourceEventChange, resource_event
++from ..outbox import Outbox
+ from ..sqlite import Database
+ 
+ logger = logging.getLogger(__name__)
+@@ -188,6 +194,16 @@ class ChangeType(StrEnum):
+     DELETED = "deleted"
+ 
+ 
++#: 变更记录类型 → 资源变更事件的变更类型。
++_EVENT_CHANGES = {
++    ChangeType.CREATED: ResourceEventChange.CREATED,
++    ChangeType.UPDATED: ResourceEventChange.UPDATED,
++    ChangeType.STATUS: ResourceEventChange.STATUS_UPDATED,
++    ChangeType.TERMINATING: ResourceEventChange.TERMINATING,
++    ChangeType.DELETED: ResourceEventChange.DELETED,
++}
++
++
+ @dataclass(frozen=True)
+ class ResourceKey:
+     """跨租户唯一定位一个资源。"""
+@@ -265,6 +281,12 @@ class SQLiteRegistry(ResourceRegistry):
+         self._conn = self._db.conn
+         self._lock = self._db.lock
+         self._init_schema()
++        self._outbox = Outbox(database=self._db)
++
++    @property
++    def outbox(self) -> Outbox:
++        """资源变更事件所在的 Outbox（与注册表共用连接），供事件分发器发布。"""
++        return self._outbox
+ 
+     # ------------------------------------------------------------------ #
+     # 内部辅助
+@@ -291,6 +313,35 @@ class SQLiteRegistry(ResourceRegistry):
+             (tenant_id, kind, namespace, name, change.value),
+         )
+ 
++    def _emit(
++        self,
++        key: ResourceKey,
++        change: ChangeType,
++        body: str,
++        version: int,
++        phase: str | None,
++        correlation_id: str | None,
++    ) -> None:
++        """在调用方的事务中写入一条资源变更事件（随调用方一起提交或回滚）。
++
++        ``body`` / ``version`` / ``phase`` 描述写入之后的资源；删除时为删除前最后的状态。
++        """
++        resource = self._body_to_resource(body)
++        self._outbox.put(
++            resource_event(
++                tenant_id=key.tenant_id,
++                kind=key.kind,
++                namespace=key.namespace,
++                name=key.name,
++                change=_EVENT_CHANGES[change],
++                resource=resource.model_dump(mode="json", by_alias=True),
++                version=version,
++                phase=phase,
++                uid=resource.metadata.uid,
++                correlation_id=correlation_id,
++            )
++        )
++
+     @contextlib.contextmanager
+     def _immediate_transaction(self) -> Iterator[sqlite3.Cursor]:
+         """``BEGIN IMMEDIATE`` 事务：开始即持有写锁，事务内的检查不会被其他连接的
+@@ -520,7 +571,8 @@ class SQLiteRegistry(ResourceRegistry):
+         * ``expected_version`` 非 ``None`` → Update-CAS；版本不匹配或资源不存在抛
+           ConflictError。成功后 ``resource_version`` 递增。
+ 
+-        ``actor`` / ``correlation_id`` 保留用于审计（P1 暂不落审计表）。
++        ``correlation_id`` 写入同一事务中的资源变更事件（为空时生成一个新的）；
++        ``actor`` 保留用于审计。
+         """
+         meta = resource.metadata
+         tenant_id = meta.tenant_id
+@@ -529,6 +581,7 @@ class SQLiteRegistry(ResourceRegistry):
+         namespace = meta.namespace
+         name = meta.name
+         kind = resource.kind
++        key = ResourceKey(tenant_id, kind, namespace, name)
+         generation = meta.generation
+         observed_generation = meta.observed_generation
+         phase = self._extract_phase(resource)
+@@ -565,6 +618,7 @@ class SQLiteRegistry(ResourceRegistry):
+                         ),
+                     )
+                     self._record_change(cur, tenant_id, kind, namespace, name, ChangeType.CREATED)
++                    self._emit(key, ChangeType.CREATED, body, new_version, phase, correlation_id)
+                     self._conn.commit()
+                     return stored
+                 # ---- Update-CAS ----
+@@ -611,6 +665,7 @@ class SQLiteRegistry(ResourceRegistry):
+                         f"(kind={kind} namespace={namespace!r} name={name})",
+                     )
+                 self._record_change(cur, tenant_id, kind, namespace, name, ChangeType.UPDATED)
++                self._emit(key, ChangeType.UPDATED, body, new_version, phase, correlation_id)
+                 self._conn.commit()
+                 return stored
+             except sqlite3.IntegrityError as exc:
+@@ -682,21 +737,40 @@ class SQLiteRegistry(ResourceRegistry):
+         actor: str | None = None,
+         correlation_id: str | None = None,
+     ) -> None:
+-        """删除资源；不存在或跨租户时抛 :class:`NotFoundError`。"""
++        """删除资源；不存在或跨租户时抛 :class:`NotFoundError`。
++
++        ``correlation_id`` 写入同一事务中的资源变更事件（为空时生成一个新的）。
++        """
++        key = ResourceKey(tenant_id, kind, namespace, name)
+ 
+         def _delete() -> None:
+             cur = self._conn.cursor()
+-            cur.execute(
+-                "DELETE FROM resources WHERE tenant_id=? AND kind=? AND namespace IS ? AND name=?",
++            # 先持有写锁再读取删除前的状态（事件载荷），读取与删除之间不会穿插其他连接的写入。
++            cur.execute("BEGIN IMMEDIATE")
++            row = cur.execute(
++                "SELECT body, phase, resource_version FROM resources "
++                "WHERE tenant_id=? AND kind=? AND namespace IS ? AND name=?",
+                 (tenant_id, kind, namespace, name),
+-            )
+-            if cur.rowcount == 0:
++            ).fetchone()
++            if row is None:
+                 self._conn.rollback()
+                 raise NotFoundError(
+                     f"resource not found: kind={kind} "
+                     f"namespace={namespace!r} name={name} tenant_id={tenant_id}",
+                 )
++            cur.execute(
++                "DELETE FROM resources WHERE tenant_id=? AND kind=? AND namespace IS ? AND name=?",
++                (tenant_id, kind, namespace, name),
++            )
+             self._record_change(cur, tenant_id, kind, namespace, name, ChangeType.DELETED)
++            self._emit(
++                key,
++                ChangeType.DELETED,
++                row["body"],
++                row["resource_version"],
++                row["phase"],
++                correlation_id,
++            )
+             self._conn.commit()
+ 
+         await self._run(_delete)
+@@ -735,7 +809,7 @@ class SQLiteRegistry(ResourceRegistry):
+             name: 资源名。
+             tenant_id: 租户标识（多租户边界）。
+             actor: 操作发起者标识（审计用）。
+-            correlation_id: 关联追踪标识（审计用）。
++            correlation_id: 关联追踪标识，写入同一事务中的资源变更事件（为空时生成一个新的）。
+ 
+         Returns:
+             :class:`RequestDeleteResult`：``deleted=True`` 已物理删除；
+@@ -749,6 +823,7 @@ class SQLiteRegistry(ResourceRegistry):
+         """
+         terminating = "Terminating"
+         active = AllocationStatus.ACTIVE.value
++        key = ResourceKey(tenant_id, kind, namespace, name)
+ 
+         def _request_delete() -> RequestDeleteResult:
+             cur = self._conn.cursor()
+@@ -791,6 +866,9 @@ class SQLiteRegistry(ResourceRegistry):
+                         f"namespace={namespace!r} name={name} tenant_id={tenant_id}",
+                     )
+                 self._record_change(cur, tenant_id, kind, namespace, name, ChangeType.DELETED)
++                self._emit(
++                    key, ChangeType.DELETED, row["body"], read_version, phase, correlation_id
++                )
+                 self._conn.commit()
+                 return RequestDeleteResult(True, [])
+             # finalizer 非空（或自动追加）→ 受控删除：置 Terminating。
+@@ -807,13 +885,14 @@ class SQLiteRegistry(ResourceRegistry):
+             metadata = body.get("metadata")
+             if isinstance(metadata, dict):
+                 metadata["resourceVersion"] = str(new_version)
++            new_body = json.dumps(body, ensure_ascii=False)
+             cur.execute(
+                 "UPDATE resources SET body=?, phase=?, finalizers=?, "
+                 " resource_version=?, updated_at=datetime('now') "
+                 "WHERE tenant_id=? AND kind=? AND namespace IS ? AND name=? "
+                 " AND resource_version=?",
+                 (
+-                    json.dumps(body, ensure_ascii=False),
++                    new_body,
+                     terminating,
+                     json.dumps(effective),
+                     new_version,
+@@ -831,6 +910,9 @@ class SQLiteRegistry(ResourceRegistry):
+                     f"namespace={namespace!r} name={name} tenant_id={tenant_id}",
+                 )
+             self._record_change(cur, tenant_id, kind, namespace, name, ChangeType.TERMINATING)
++            self._emit(
++                key, ChangeType.TERMINATING, new_body, new_version, terminating, correlation_id
++            )
+             self._conn.commit()
+             logger.info(
+                 "delete requested: kind=%s name=%s tenant_id=%s → Terminating "
+@@ -856,6 +938,7 @@ class SQLiteRegistry(ResourceRegistry):
+         *,
+         observed_generation: int | None = None,
+         expected_version: str | None = None,
++        correlation_id: str | None = None,
+     ) -> Resource:
+         """status 子资源写入：只修改状态条件、phase、实例地址与 observedGeneration。
+ 
+@@ -872,7 +955,8 @@ class SQLiteRegistry(ResourceRegistry):
+         * ``observed_generation`` 写入元数据列与 ``metadata.observedGeneration``，
+           payload 已有 ``status.observedGeneration`` 时一并更新；
+         * ``expected_version`` 非空时做 CAS，冲突语义与 :meth:`put` 相同；
+-        * 合并后没有任何变化时不写库，``resource_version`` 不变，也不追加变更记录。
++        * 合并后没有任何变化时不写库，``resource_version`` 不变，也不追加变更记录与事件；
++        * ``correlation_id`` 写入同一事务中的资源变更事件（为空时生成一个新的）。
+ 
+         Returns:
+             写入后的资源；没有变化时为当前资源。
+@@ -896,6 +980,7 @@ class SQLiteRegistry(ResourceRegistry):
+             if raw_endpoints is not None
+             else None
+         )
++        key = ResourceKey(tenant_id, kind, namespace, name)
+ 
+         def _update_status() -> Resource:
+             cur = self._conn.cursor()
+@@ -973,6 +1058,7 @@ class SQLiteRegistry(ResourceRegistry):
+                     f"namespace={namespace!r} name={name} tenant_id={tenant_id}",
+                 )
+             self._record_change(cur, tenant_id, kind, namespace, name, ChangeType.STATUS)
++            self._emit(key, ChangeType.STATUS, new_body, new_version, phase, correlation_id)
+             self._conn.commit()
+             return updated
+ 
+diff --git a/packages/control-plane/src/forgemesh/controlplane/version.py b/packages/control-plane/src/forgemesh/controlplane/version.py
+new file mode 100644
+index 0000000..145815c
+--- /dev/null
++++ b/packages/control-plane/src/forgemesh/controlplane/version.py
+@@ -0,0 +1,11 @@
++"""控制平面版本号。
++
++不依赖控制平面的其他模块：资源注册表等底层模块引用它时不会形成循环导入。
++"""
++
++from __future__ import annotations
++
++#: 控制平面版本（用于探针与事件 producer.version）。
++CONTROL_PLANE_VERSION = "0.0.1"
++
++__all__ = ["CONTROL_PLANE_VERSION"]
+diff --git a/tests/unit/controlplane/test_controller_manager.py b/tests/unit/controlplane/test_controller_manager.py
+index 67e67e9..6cf7aba 100644
+--- a/tests/unit/controlplane/test_controller_manager.py
++++ b/tests/unit/controlplane/test_controller_manager.py
+@@ -15,12 +15,17 @@ from typing import Any
+ import pytest
+ from forgemesh.controlplane.controller import ControllerManager, WorkQueue
+ from forgemesh.controlplane.deployment import LAUNCH_INSTANCE, LaunchedInstance
++from forgemesh.controlplane.outbox import OutboxEvent
+ from forgemesh.controlplane.reconciler import (
+     ProcessedKeyStore,
+     ReconciliationController,
+     compute_dedup_key,
+ )
+-from forgemesh.controlplane.registry import ResourceKey, SQLiteRegistry
++from forgemesh.controlplane.registry import (
++    DEFAULT_RELEASE_FINALIZER,
++    ResourceKey,
++    SQLiteRegistry,
++)
+ from forgemesh.core.errors import NotFoundError
+ from forgemesh.core.objects import Condition, ObjectMeta, Resource
+ from forgemesh.core.scheduler import AllocationRef, ScheduleRequest
+@@ -109,6 +114,17 @@ class ConcurrentWritePolicy:
+         return PolicyDecision(decision="allow", reason="ok")
+ 
+ 
++class RecordingPolicy:
++    """放行并记录每次协调的关联 ID。"""
++
++    def __init__(self) -> None:
++        self.correlation_ids: list[str] = []
++
++    async def check(self, ctx, action):  # noqa: ANN001
++        self.correlation_ids.append(ctx.correlation_id)
++        return PolicyDecision(decision="allow", reason="ok")
++
++
+ class GatedPolicy:
+     """在放行前阻塞，模拟停止时仍在进行的协调。"""
+ 
+@@ -404,6 +420,53 @@ def test_deleted_service_is_released_and_removed() -> None:
+     assert _run(scenario()) == ["svc"]
+ 
+ 
++@pytest.mark.unit
++def test_status_write_emits_an_event_with_the_correlation_id_of_the_reconcile() -> None:
++    async def scenario() -> tuple[list[str], list[OutboxEvent]]:
++        registry = SQLiteRegistry()
++        await registry.put(_service(), correlation_id="corr-create")
++        policy = RecordingPolicy()
++        await _manager(registry, policy=policy).process(_key())
++        events = registry.outbox.get_pending()
++        await registry.close()
++        return policy.correlation_ids, events
++
++    [correlation_id], (created, status) = _run(scenario())
++    assert created.payload["correlationId"] == "corr-create"
++    assert status.event_type == "inference.service.status_updated"
++    assert status.payload["correlationId"] == correlation_id
++    [ready] = status.payload["data"]["resource"]["status"]["conditions"]
++    assert ready["reason"] == "SchedulerUnavailable"
++
++
++@pytest.mark.unit
++def test_finalizer_removal_and_its_status_share_the_correlation_id_of_the_reconcile() -> None:
++    async def scenario() -> list[OutboxEvent]:
++        registry = SQLiteRegistry()
++        service = _service(phase=InferencePhase.READY)
++        service.finalizers = [DEFAULT_RELEASE_FINALIZER, "example.com/cleanup"]
++        await registry.put(service)
++        await registry.request_delete(KIND, NAMESPACE, "svc", TENANT, correlation_id="corr-delete")
++        await _manager(registry, release=RecordingRelease()).process(_key())
++        events = registry.outbox.get_pending()
++        await registry.close()
++        return events
++
++    events = _run(scenario())
++    assert [event.event_type for event in events] == [
++        "inference.service.created",
++        "inference.service.terminating",
++        "inference.service.updated",
++        "inference.service.status_updated",
++    ]
++    _, terminating, updated, status = (event.payload for event in events)
++    assert terminating["correlationId"] == "corr-delete"
++    assert updated["data"]["resource"]["finalizers"] == ["example.com/cleanup"]
++    assert updated["correlationId"] == status["correlationId"] != "corr-delete"
++    [waiting] = status["data"]["resource"]["status"]["conditions"]
++    assert waiting["reason"] == "WaitingFinalizers"
++
++
+ @pytest.mark.unit
+ def test_only_non_status_changes_of_managed_kinds_are_queued() -> None:
+     async def scenario() -> None:
+diff --git a/tests/unit/controlplane/test_registry_events.py b/tests/unit/controlplane/test_registry_events.py
+new file mode 100644
+index 0000000..b9c582c
+--- /dev/null
++++ b/tests/unit/controlplane/test_registry_events.py
+@@ -0,0 +1,392 @@
++"""资源注册表的资源变更事件：与资源写入在同一事务中写入 Outbox（ADR-008）。"""
++
++from __future__ import annotations
++
++import asyncio
++import json
++import sqlite3
++from collections.abc import Callable, Coroutine
++from datetime import UTC, datetime, timedelta, timezone
++from pathlib import Path
++from typing import Any
++
++import pytest
++from forgemesh.controlplane.events import DomainEvent, EventProducer, event_type_prefix
++from forgemesh.controlplane.outbox import Dispatcher, OutboxEvent
++from forgemesh.controlplane.registry import DEFAULT_RELEASE_FINALIZER, ChangeType, SQLiteRegistry
++from forgemesh.controlplane.version import CONTROL_PLANE_VERSION
++from forgemesh.core.errors import ConflictError, InvalidStateTransition, NotFoundError
++from forgemesh.core.objects import ObjectMeta, Resource
++from forgemesh.resource.inference import (
++    AcceleratorSpec,
++    InferencePhase,
++    InferenceService,
++    InferenceServiceSpec,
++    InferenceServiceStatus,
++    ModelRef,
++    ResourcesSpec,
++    RuntimeRef,
++)
++from jsonschema import Draft202012Validator
++from pydantic import ValidationError
++
++EVENT_SCHEMA = json.loads(
++    (Path(__file__).resolve().parents[3] / "api" / "schemas" / "event.schema.json").read_text(
++        encoding="utf-8"
++    )
++)
++
++KIND = "InferenceService"
++TENANT = "tenant-a"
++NAMESPACE = "team-a"
++
++
++def _run(coro):
++    """在同步测试中驱动协程（不依赖 pytest-asyncio）。"""
++    return asyncio.run(coro)
++
++
++def _service(name: str = "svc", phase: InferencePhase = InferencePhase.PENDING) -> InferenceService:
++    return InferenceService(
++        metadata=ObjectMeta(name=name, namespace=NAMESPACE, tenant_id=TENANT, uid=f"uid-{name}"),
++        spec=InferenceServiceSpec(
++            model=ModelRef(reference="models/llama"),
++            runtime=RuntimeRef(provider="vllm"),
++            resources=ResourcesSpec(
++                accelerator=AcceleratorSpec(type="nvidia-gpu", minMemoryGiB=16)
++            ),
++        ),
++        status=InferenceServiceStatus(phase=phase),
++    )
++
++
++def _events(reg: SQLiteRegistry) -> list[OutboxEvent]:
++    """按写入顺序返回全部 pending 事件；每个信封都须符合 ``event.schema.json``。"""
++    events = reg.outbox.get_pending()
++    for event in events:
++        Draft202012Validator(EVENT_SCHEMA).validate(event.payload)
++    return events
++
++
++def _dump(resource: Resource) -> dict[str, Any]:
++    return resource.model_dump(mode="json", by_alias=True)
++
++
++@pytest.mark.unit
++def test_create_writes_a_created_event_in_the_envelope_schema() -> None:
++    reg = SQLiteRegistry()
++    created = _run(reg.put(_service(), correlation_id="corr-create"))
++
++    [event] = _events(reg)
++    payload = event.payload
++    assert event.event_id == payload["eventId"]
++    assert (event.aggregate_type, event.aggregate_id, event.event_type) == (
++        KIND,
++        f"{TENANT}/{NAMESPACE}/svc",
++        "inference.service.created",
++    )
++    assert payload["eventType"] == "inference.service.created"
++    assert payload["schemaVersion"] == "v1"
++    assert (payload["tenantId"], payload["resourceId"], payload["resourceUid"]) == (
++        TENANT,
++        "svc",
++        "uid-svc",
++    )
++    assert payload["resourceVersion"] == 0
++    assert payload["correlationId"] == "corr-create"
++    assert payload["producer"] == {"component": "control-plane", "version": CONTROL_PLANE_VERSION}
++    assert payload["data"] == {
++        "kind": KIND,
++        "namespace": NAMESPACE,
++        "name": "svc",
++        "change": "created",
++        "phase": "Pending",
++        "resource": _dump(created),
++    }
++    assert payload["occurredAt"].endswith("Z")
++    occurred = datetime.fromisoformat(payload["occurredAt"])
++    assert occurred.utcoffset() == timedelta(0)
++    assert occurred.timestamp() == pytest.approx(event.created_at)
++
++
++@pytest.mark.unit
++def test_writes_without_a_correlation_id_get_a_generated_one() -> None:
++    reg = SQLiteRegistry()
++    _run(reg.put(_service("a")))
++    _run(reg.put(_service("b")))
++
++    first, second = (event.payload["correlationId"] for event in _events(reg))
++    assert first and second and first != second
++
++
++@pytest.mark.unit
++def test_update_and_status_writes_carry_the_state_after_the_write() -> None:
++    reg = SQLiteRegistry()
++    created = _run(reg.put(_service()))
++    created.metadata.labels["tier"] = "gold"
++    updated = _run(reg.put(created, expected_version="0", correlation_id="corr-update"))
++    scheduling = _run(
++        reg.update_status(
++            KIND, NAMESPACE, "svc", TENANT, {"phase": "Scheduling"}, correlation_id="corr-status"
++        )
++    )
++
++    _, update_event, status_event = _events(reg)
++    assert update_event.event_type == "inference.service.updated"
++    assert update_event.payload["resourceVersion"] == 1
++    assert update_event.payload["correlationId"] == "corr-update"
++    assert update_event.payload["data"]["change"] == "updated"
++    assert update_event.payload["data"]["resource"] == _dump(updated)
++    assert status_event.event_type == "inference.service.status_updated"
++    assert status_event.payload["resourceVersion"] == 2
++    assert status_event.payload["correlationId"] == "corr-status"
++    assert status_event.payload["data"]["change"] == "status_updated"
++    assert status_event.payload["data"]["phase"] == "Scheduling"
++    assert status_event.payload["data"]["resource"] == _dump(scheduling)
++
++
++@pytest.mark.unit
++def test_unchanged_status_write_emits_no_event() -> None:
++    reg = SQLiteRegistry()
++    _run(reg.put(_service()))
++    patch = {"phase": "Scheduling"}
++    _run(reg.update_status(KIND, NAMESPACE, "svc", TENANT, patch))
++    _run(reg.update_status(KIND, NAMESPACE, "svc", TENANT, patch))
++
++    assert [event.event_type for event in _events(reg)] == [
++        "inference.service.created",
++        "inference.service.status_updated",
++    ]
++
++
++@pytest.mark.unit
++def test_delete_requests_emit_deleted_or_terminating_events() -> None:
++    reg = SQLiteRegistry()
++    pending = _run(reg.put(_service("pending")))
++    _run(reg.put(_service("ready", phase=InferencePhase.READY)))
++
++    _run(reg.request_delete(KIND, NAMESPACE, "pending", TENANT, correlation_id="corr-delete"))
++    _run(reg.request_delete(KIND, NAMESPACE, "ready", TENANT, correlation_id="corr-terminate"))
++    _run(reg.request_delete(KIND, NAMESPACE, "ready", TENANT))  # 幂等：不再写入
++
++    deleted, terminating = _events(reg)[2:]
++    assert deleted.event_type == "inference.service.deleted"
++    assert deleted.payload["correlationId"] == "corr-delete"
++    assert deleted.payload["resourceVersion"] == 0
++    assert deleted.payload["data"]["phase"] == "Pending"
++    assert deleted.payload["data"]["resource"] == _dump(pending)
++    assert terminating.event_type == "inference.service.terminating"
++    assert terminating.payload["correlationId"] == "corr-terminate"
++    assert terminating.payload["resourceVersion"] == 1
++    assert terminating.payload["data"]["phase"] == "Terminating"
++    resource = terminating.payload["data"]["resource"]
++    assert resource["finalizers"] == [DEFAULT_RELEASE_FINALIZER]
++    assert resource["status"]["phase"] == "Terminating"
++    assert resource["metadata"]["resourceVersion"] == "1"
++
++
++@pytest.mark.unit
++def test_delete_emits_the_last_state_of_the_resource() -> None:
++    reg = SQLiteRegistry()
++    _run(reg.put(_service()))
++    scheduling = _run(reg.update_status(KIND, NAMESPACE, "svc", TENANT, {"phase": "Scheduling"}))
++
++    _run(reg.delete(KIND, NAMESPACE, "svc", TENANT, actor="reconciler", correlation_id="corr-gc"))
++    with pytest.raises(NotFoundError):
++        _run(reg.delete(KIND, NAMESPACE, "svc", TENANT))
++
++    *_, deleted = _events(reg)
++    assert len(_events(reg)) == 3
++    assert deleted.event_type == "inference.service.deleted"
++    assert deleted.payload["correlationId"] == "corr-gc"
++    assert deleted.payload["resourceVersion"] == 1
++    assert deleted.payload["data"]["phase"] == "Scheduling"
++    assert deleted.payload["data"]["resource"] == _dump(scheduling)
++
++
++@pytest.mark.unit
++def test_base_resources_get_events_without_a_status_subtree() -> None:
++    reg = SQLiteRegistry()
++    widget = Resource(
++        kind="Widget",
++        metadata=ObjectMeta(name="w", tenant_id=TENANT),
++        finalizers=["example.com/cleanup"],
++    )
++    _run(reg.put(widget))
++    _run(reg.request_delete("Widget", None, "w", TENANT))
++
++    created, terminating = _events(reg)
++    assert created.event_type == "widget.created"
++    assert created.aggregate_id == f"{TENANT}//w"
++    assert "resourceUid" not in created.payload
++    assert created.payload["data"]["namespace"] is None
++    assert created.payload["data"]["phase"] is None
++    assert terminating.event_type == "widget.terminating"
++    assert terminating.payload["data"]["phase"] == "Terminating"
++    assert "status" not in terminating.payload["data"]["resource"]
++
++
++@pytest.mark.unit
++def test_rejected_writes_leave_no_event() -> None:
++    reg = SQLiteRegistry()
++    _run(reg.put(_service()))
++
++    with pytest.raises(ConflictError):
++        _run(reg.put(_service()))
++    with pytest.raises(ConflictError):
++        _run(reg.put(_service(), expected_version="7"))
++    with pytest.raises(ConflictError):
++        _run(
++            reg.update_status(
++                KIND, NAMESPACE, "svc", TENANT, {"phase": "Scheduling"}, expected_version="7"
++            )
++        )
++    with pytest.raises(InvalidStateTransition):
++        _run(reg.update_status(KIND, NAMESPACE, "svc", TENANT, {"phase": "Ready"}))
++    with pytest.raises(NotFoundError):
++        _run(reg.request_delete(KIND, NAMESPACE, "missing", TENANT))
++
++    assert [event.event_type for event in _events(reg)] == ["inference.service.created"]
++
++
++#: 每种资源写入：在已有 ``svc``（Pending）与 ``ready``（Ready）的注册表上执行。
++_WRITES: dict[str, Callable[[SQLiteRegistry], Coroutine[Any, Any, Any]]] = {
++    "create": lambda reg: reg.put(_service("new")),
++    "update": lambda reg: reg.put(_service(), expected_version="0"),
++    "status": lambda reg: reg.update_status(
++        KIND, NAMESPACE, "svc", TENANT, {"phase": "Scheduling"}
++    ),
++    "request-delete": lambda reg: reg.request_delete(KIND, NAMESPACE, "svc", TENANT),
++    "terminate": lambda reg: reg.request_delete(KIND, NAMESPACE, "ready", TENANT),
++    "delete": lambda reg: reg.delete(KIND, NAMESPACE, "svc", TENANT),
++}
++
++
++def _state(reg: SQLiteRegistry) -> tuple[list[tuple[Any, ...]], ...]:
++    """资源、变更记录与事件三张表的全部内容。"""
++    return tuple(
++        [tuple(row) for row in reg._conn.execute(sql)]
++        for sql in (
++            "SELECT * FROM resources ORDER BY name",
++            "SELECT * FROM resource_changes ORDER BY seq",
++            "SELECT * FROM outbox_events ORDER BY event_id",
++        )
++    )
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize("stage", ["_record_change", "_emit"])
++@pytest.mark.parametrize("write", sorted(_WRITES))
++def test_a_failing_write_leaves_neither_the_resource_nor_the_event(
++    monkeypatch: pytest.MonkeyPatch, write: str, stage: str
++) -> None:
++    reg = SQLiteRegistry()
++    _run(reg.put(_service()))
++    _run(reg.put(_service("ready", phase=InferencePhase.READY)))
++    before = _state(reg)
++    original = getattr(reg, stage)
++
++    def fail_after(*args: Any, **kwargs: Any) -> None:
++        original(*args, **kwargs)
++        raise RuntimeError("disk I/O error")
++
++    monkeypatch.setattr(reg, stage, fail_after)
++    with pytest.raises(RuntimeError, match="disk I/O error"):
++        _run(_WRITES[write](reg))
++    monkeypatch.undo()
++
++    assert _state(reg) == before
++    _run(_WRITES[write](reg))
++    assert len(_events(reg)) == 3
++
++
++@pytest.mark.unit
++def test_an_event_write_failure_rolls_back_the_resource_write(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    reg = SQLiteRegistry()
++
++    def unavailable(event: OutboxEvent) -> None:
++        raise sqlite3.OperationalError("database or disk is full")
++
++    monkeypatch.setattr(reg.outbox, "put", unavailable)
++    with pytest.raises(sqlite3.OperationalError):
++        _run(reg.put(_service()))
++    monkeypatch.undo()
++
++    with pytest.raises(NotFoundError):
++        _run(reg.get(KIND, NAMESPACE, "svc", TENANT))
++    assert _run(reg.changes_since(0)) == []
++    assert _events(reg) == []
++
++
++@pytest.mark.unit
++def test_events_are_persisted_with_the_resource(tmp_path: Path) -> None:
++    db_path = str(tmp_path / "cp.db")
++    reg = SQLiteRegistry(db_path)
++    _run(reg.put(_service(), correlation_id="corr-create"))
++    _run(reg.close())
++
++    reopened = SQLiteRegistry(db_path)
++    [event] = _events(reopened)
++    assert event.payload["correlationId"] == "corr-create"
++    assert [change.change for change in _run(reopened.changes_since(0))] == [ChangeType.CREATED]
++    _run(reopened.close())
++
++
++@pytest.mark.unit
++def test_dispatcher_publishes_registry_events() -> None:
++    async def scenario() -> tuple[list[dict[str, Any]], dict[str, int]]:
++        reg = SQLiteRegistry()
++        await reg.put(_service())
++        published: list[dict[str, Any]] = []
++        await Dispatcher(reg.outbox, lambda event: published.append(event.payload)).dispatch_once()
++        stats = reg.outbox.get_stats()
++        await reg.close()
++        return published, stats
++
++    published, stats = _run(scenario())
++    assert [payload["eventType"] for payload in published] == ["inference.service.created"]
++    assert stats["published"] == 1
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize(
++    ("kind", "prefix"),
++    [
++        ("InferenceService", "inference.service"),
++        ("GPUNode", "gpu.node"),
++        ("DeviceProfile", "device.profile"),
++        ("Widget", "widget"),
++        ("S3Bucket", "s3.bucket"),
++        ("plugin", "plugin"),
++        ("---", "resource"),
++    ],
++)
++def test_event_type_prefix_splits_the_kind_into_dotted_words(kind: str, prefix: str) -> None:
++    assert event_type_prefix(kind) == prefix
++
++
++@pytest.mark.unit
++def test_domain_event_payload_is_utc_and_omits_empty_optional_fields() -> None:
++    event = DomainEvent(
++        event_type="inference.service.ready",
++        schema_version="v1",
++        occurred_at=datetime(2026, 10, 9, 20, 0, tzinfo=timezone(timedelta(hours=8))),
++        tenant_id="team-a",
++        resource_id="llama-service",
++        correlation_id="corr-456",
++        producer=EventProducer(component="inference-controller", version="1.0.0"),
++        data={"phase": "Ready"},
++    )
++
++    payload = event.to_payload()
++    Draft202012Validator(EVENT_SCHEMA).validate(payload)
++    assert payload["occurredAt"] == "2026-10-09T12:00:00Z"
++    assert "resourceUid" not in payload
++    assert "resourceVersion" not in payload
++    with pytest.raises(ValidationError):
++        DomainEvent.model_validate({**payload, "occurredAt": datetime(2026, 10, 9, 12, 0)})
++    with pytest.raises(ValidationError):
++        DomainEvent.model_validate({**payload, "unexpected": True})
++    assert DomainEvent.model_validate(payload).occurred_at == datetime(2026, 10, 9, 12, tzinfo=UTC)
+-- 
+2.43.0
+

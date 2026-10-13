@@ -1,0 +1,346 @@
+From a8c0328952c70d300c9f0d537a3fa3db336ce286 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 13 Oct 2026 02:54:41 +0000
+Subject: [PATCH 04/12] feat(outbox): persist consumer idempotency in SQLite
+
+IdempotentConsumer kept processed event ids in a set: it grew without
+bound and was empty after a restart, so a redelivered event ran its
+side effects again even though delivery is at-least-once by design.
+
+Processed ids now live in a consumed_events table keyed by consumer
+name and event id, on the consumer's own database or one shared through
+database=. An event is recorded only after the handler returns, so a
+failing handler sees the event again on redelivery, and consume() is
+serialized per instance so concurrent deliveries of one event run the
+handler once.
+
+ProcessedKeyStore, suggested by the improvement plan, is not reused:
+its keys expire after 24 hours, while a dead event can be redriven much
+later and must still be recognised.
+---
+ .../src/forgemesh/controlplane/outbox.py      | 91 ++++++++++++++++---
+ tests/contract/test_outbox_semantics.py       | 34 +++----
+ tests/unit/controlplane/test_outbox.py        | 58 +++++++++++-
+ tests/unit/controlplane/test_sqlite.py        | 13 ++-
+ 4 files changed, 161 insertions(+), 35 deletions(-)
+
+diff --git a/packages/control-plane/src/forgemesh/controlplane/outbox.py b/packages/control-plane/src/forgemesh/controlplane/outbox.py
+index c1738f4..3f037a7 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/outbox.py
++++ b/packages/control-plane/src/forgemesh/controlplane/outbox.py
+@@ -6,7 +6,8 @@
+ 投递语义
+ --------
+ * **至少一次**：事件发布成功后才标记 ``published``；发布成功、标记之前进程退出时，
+-  重启后会再次发布。消费者须按 ``event_id`` 去重（:class:`IdempotentConsumer`）。
++  重启后会再次发布。消费者须按 ``event_id`` 去重（:class:`IdempotentConsumer` 把已处理
++  的事件记在 ``consumed_events`` 表中）。
+ * **状态只在数据库中**：``pending`` → ``published``；发布失败时记录失败次数
+   ``attempts`` 与最近一次错误 ``last_error``，按指数退避推迟 ``next_attempt_at``
+   （:class:`RetryPolicy`）；失败次数达到上限后进入 ``dead``，不再自动重试，可经
+@@ -24,6 +25,7 @@ import inspect
+ import json
+ import logging
+ import sqlite3
++import threading
+ import time
+ import uuid
+ from collections.abc import Callable, Iterable
+@@ -54,6 +56,15 @@ CREATE TABLE IF NOT EXISTS outbox_events (
+ CREATE INDEX IF NOT EXISTS idx_outbox_status ON outbox_events(status, created_at);
+ """
+ 
++_CONSUMED_SCHEMA_SQL = """\
++CREATE TABLE IF NOT EXISTS consumed_events (
++    consumer TEXT NOT NULL,
++    event_id TEXT NOT NULL,
++    consumed_at REAL NOT NULL,
++    PRIMARY KEY (consumer, event_id)
++);
++"""
++
+ #: v1.0.0 的 ``outbox_events`` 没有的列（打开存量库时补齐）。
+ _ADDED_COLUMNS = (
+     ("attempts", "attempts INTEGER NOT NULL DEFAULT 0"),
+@@ -561,33 +572,87 @@ class Dispatcher:
+ 
+ 
+ class IdempotentConsumer:
+-    """幂等消费者：按 event_id 去重。
++    """幂等消费者：按 event_id 去重，已处理的事件记在 SQLite 中，进程重启后仍然有效。
++
++    handler 正常返回后才记录事件：handler 抛出异常时不记录，再次投递时重新处理。
++    handler 返回之后、记录之前进程退出时，重启后会再处理一次，因此有外部副作用的
++    handler 仍应自身幂等。同一个实例的 :meth:`consume` 串行执行，同一事件不会被
++    并发处理两次。
+ 
+-    重复投递同一 event_id 的事件不会重复执行 handler。
++    Args:
++        name: 消费者名称；不同名称各自去重，可共用一张表。
++        db_path: SQLite 数据库路径，默认 :memory:（只在进程内有效）。
++        database: 共用的数据库；给出时忽略 ``db_path``，:meth:`close` 不关闭它
++            （由创建者关闭）。
++
++    Raises:
++        ValueError: ``name`` 为空。
+     """
+ 
+-    def __init__(self) -> None:
+-        self._processed_ids: set[str] = set()
++    def __init__(
++        self,
++        name: str = "default",
++        db_path: str = ":memory:",
++        *,
++        database: Database | None = None,
++    ) -> None:
++        if not name:
++            raise ValueError("consumer name must not be empty")
++        self._name = name
++        self._owns_db = database is None
++        self._db = database if database is not None else Database(db_path)
++        self._conn = self._db.conn
++        self._consume_lock = threading.Lock()
++        with self._db.lock:
++            self._conn.executescript(_CONSUMED_SCHEMA_SQL)
++            self._conn.commit()
+ 
+     def is_processed(self, event_id: str) -> bool:
+         """检查是否已处理过。"""
+-        return event_id in self._processed_ids
++        row = self._db.call(
++            lambda: self._conn.execute(
++                "SELECT 1 FROM consumed_events WHERE consumer = ? AND event_id = ?",
++                (self._name, event_id),
++            ).fetchone()
++        )
++        return row is not None
+ 
+     def consume(self, event: OutboxEvent, handler: Callable[[OutboxEvent], Any]) -> bool:
+         """消费事件（幂等）。
+ 
+-        返回 True 表示首次处理，False 表示重复跳过。
++        返回 True 表示首次处理，False 表示重复跳过；handler 的异常原样抛出，
++        事件不记为已处理。
+         """
+-        if event.event_id in self._processed_ids:
+-            return False
+-        handler(event)
+-        self._processed_ids.add(event.event_id)
+-        return True
++        with self._consume_lock:
++            if self.is_processed(event.event_id):
++                return False
++            handler(event)
++
++            def _record() -> None:
++                self._conn.execute(
++                    "INSERT INTO consumed_events (consumer, event_id, consumed_at) "
++                    "VALUES (?, ?, ?) ON CONFLICT (consumer, event_id) DO NOTHING",
++                    (self._name, event.event_id, time.time()),
++                )
++                self._conn.commit()
++
++            self._db.call(_record)
++            return True
+ 
+     @property
+     def processed_count(self) -> int:
+         """已处理事件数。"""
+-        return len(self._processed_ids)
++        row = self._db.call(
++            lambda: self._conn.execute(
++                "SELECT COUNT(*) FROM consumed_events WHERE consumer = ?", (self._name,)
++            ).fetchone()
++        )
++        return int(row[0])
++
++    def close(self) -> None:
++        """关闭数据库连接（共用的 ``database`` 由创建者关闭）。"""
++        if self._owns_db:
++            self._db.close()
+ 
+ 
+ __all__ = [
+diff --git a/tests/contract/test_outbox_semantics.py b/tests/contract/test_outbox_semantics.py
+index 82d3d47..7786386 100644
+--- a/tests/contract/test_outbox_semantics.py
++++ b/tests/contract/test_outbox_semantics.py
+@@ -7,12 +7,10 @@
+ * 重复发布：Dispatcher 对同一 Outbox 记录重复发布（发布后标记前崩溃重试）
+   时，消费者侧按 eventId 去重，副作用只发生一次；
+ * 消费者提交失败：消费者处理成功但确认丢失后，重新投递不产生重复副作用；
++  去重记录持久化，消费者重启后同样成立；
+ * 退避重试与死信：发布失败按指数退避重试，目标恢复后最终送达；失败次数达到
+   上限后进入 ``dead``、可查询、不再自动重试，可经 ``redrive`` 重新投递；
+ * 重启：发布状态只在数据库中，已发布的事件不会再次发布。
+-
+-记录性测试：``IdempotentConsumer`` 去重状态仅存内存，进程重启后重复投递会
+-产生重复副作用；以测试固化当前行为并在 docstring 标注 v1.1 后续期望。
+ """
+ 
+ from __future__ import annotations
+@@ -216,29 +214,27 @@ def test_redelivery_after_ack_loss_no_duplicate_side_effect() -> None:
+ 
+ 
+ @pytest.mark.contract
+-def test_consumer_dedup_is_in_memory_only_after_restart() -> None:
+-    """记录性测试：消费者去重状态仅存内存，重启后重复投递会产生重复副作用。
+-
+-    当前实现 ``IdempotentConsumer._processed_ids`` 为进程内集合，无持久化。
+-    v1.1 期望 eventId 去重状态持久化（如 processed_events 表），
+-    使重启后重新投递仍不产生重复副作用；届时本测试应改为断言副作用仅一次。
+-    """
++def test_consumer_dedup_survives_restart(tmp_path) -> None:
++    """消费者去重记录持久化：重启后重新投递不产生重复副作用。"""
++    path = str(tmp_path / "consumer.db")
+     event = _make_event("evt-restart")
+     side_effects: list[str] = []
+ 
+     def handler(ev: OutboxEvent) -> None:
+         side_effects.append(ev.event_id)
+ 
+-    consumer_before = IdempotentConsumer()
+-    consumer_before.consume(event, handler)  # 重启前已处理过一次
++    consumer_before = IdempotentConsumer("billing", path)
++    assert consumer_before.consume(event, handler) is True  # 重启前已处理过一次
++    consumer_before.close()
+ 
+-    # 模拟进程重启：新实例的内存去重集合为空。
+-    consumer_after = IdempotentConsumer()
+-    redelivered = consumer_after.consume(event, handler)
+-
+-    # 当前行为：重复投递被误判为首次，副作用重复执行。
+-    assert redelivered is True
+-    assert side_effects == ["evt-restart", "evt-restart"]
++    # 模拟进程重启：新实例从数据库读取去重记录。
++    consumer_after = IdempotentConsumer("billing", path)
++    try:
++        assert consumer_after.consume(event, handler) is False
++        assert consumer_after.is_processed("evt-restart") is True
++    finally:
++        consumer_after.close()
++    assert side_effects == ["evt-restart"]
+ 
+ 
+ # ---------------------------------------------------------------------- #
+diff --git a/tests/unit/controlplane/test_outbox.py b/tests/unit/controlplane/test_outbox.py
+index 206704b..921c930 100644
+--- a/tests/unit/controlplane/test_outbox.py
++++ b/tests/unit/controlplane/test_outbox.py
+@@ -12,7 +12,8 @@
+ * Dispatcher 幂等（重复 dispatch 不重复处理）；
+ * Dispatcher 异步 publisher 回调；
+ * Dispatcher 后台运行：持续发布、数据库错误后继续、停止与超时取消；
+-* 幂等消费者首次消费 / 重复消费 / 计数。
++* 幂等消费者首次消费 / 重复消费 / 计数、handler 失败不记录、按名称去重、
++  并发投递只处理一次。
+ 
+ 测试以 ``asyncio.run`` 驱动异步方法，不依赖 pytest-asyncio。
+ """
+@@ -20,6 +21,7 @@ from __future__ import annotations
+ 
+ import asyncio
+ import sqlite3
++import time
+ 
+ import pytest
+ from forgemesh.controlplane.outbox import (
+@@ -547,3 +549,57 @@ def test_idempotent_consumer_count() -> None:
+     assert consumer.processed_count == 3
+     assert consumer.is_processed("evt-1") is True
+     assert consumer.is_processed("evt-4") is False
++
++
++@pytest.mark.unit
++def test_idempotent_consumer_does_not_record_a_failed_handler() -> None:
++    """handler 抛出异常：事件不记为已处理，再次投递时重新处理。"""
++    consumer = IdempotentConsumer()
++    calls: list[str] = []
++
++    def flaky(ev: OutboxEvent) -> None:
++        calls.append(ev.event_id)
++        if len(calls) == 1:
++            raise RuntimeError("downstream unavailable")
++
++    with pytest.raises(RuntimeError, match="downstream unavailable"):
++        consumer.consume(_make_event(), flaky)
++    assert consumer.is_processed("evt-1") is False
++    assert consumer.consume(_make_event(), flaky) is True
++    assert calls == ["evt-1", "evt-1"]
++
++
++@pytest.mark.unit
++def test_idempotent_consumers_dedupe_per_name_on_a_shared_database() -> None:
++    """不同名称的消费者各自去重；可与 Outbox 共用一个数据库。"""
++    outbox = Outbox()
++    billing = IdempotentConsumer("billing", database=outbox.database)
++    audit = IdempotentConsumer("audit", database=outbox.database)
++
++    assert billing.consume(_make_event(), lambda ev: None) is True
++    assert billing.consume(_make_event(), lambda ev: None) is False
++    assert audit.consume(_make_event(), lambda ev: None) is True
++    billing.close()  # 共用的数据库不随之关闭
++    assert audit.processed_count == 1
++    with pytest.raises(ValueError, match="must not be empty"):
++        IdempotentConsumer("")
++
++
++@pytest.mark.unit
++def test_idempotent_consumer_handles_concurrent_deliveries_once() -> None:
++    """同一事件被并发投递：handler 只执行一次。"""
++    consumer = IdempotentConsumer()
++    calls: list[str] = []
++
++    def slow(ev: OutboxEvent) -> None:
++        calls.append(ev.event_id)
++        time.sleep(0.01)
++
++    async def deliver_concurrently() -> list[bool]:
++        return await asyncio.gather(
++            *(asyncio.to_thread(consumer.consume, _make_event(), slow) for _ in range(8))
++        )
++
++    results = _run(deliver_concurrently())
++    assert sorted(results) == [False] * 7 + [True]
++    assert calls == ["evt-1"]
+diff --git a/tests/unit/controlplane/test_sqlite.py b/tests/unit/controlplane/test_sqlite.py
+index d26195c..ba63954 100644
+--- a/tests/unit/controlplane/test_sqlite.py
++++ b/tests/unit/controlplane/test_sqlite.py
+@@ -13,13 +13,14 @@
+ from __future__ import annotations
+ 
+ import asyncio
++import functools
+ import inspect
+ import sqlite3
+ import time
+ 
+ import pytest
+ from forgemesh.controlplane.audit import AuditLog
+-from forgemesh.controlplane.outbox import Outbox, OutboxEvent
++from forgemesh.controlplane.outbox import IdempotentConsumer, Outbox, OutboxEvent
+ from forgemesh.controlplane.reconciler import ProcessedKeyStore
+ from forgemesh.controlplane.registry import SQLiteRegistry
+ from forgemesh.controlplane.sqlite import Database, connect, workflow_db_path
+@@ -60,7 +61,15 @@ def test_connect_accepts_memory_database() -> None:
+ 
+ @pytest.mark.unit
+ @pytest.mark.parametrize(
+-    "open_store", [SQLiteRegistry, ProcessedKeyStore, TaskStore, AuditLog, Outbox]
++    "open_store",
++    [
++        SQLiteRegistry,
++        ProcessedKeyStore,
++        TaskStore,
++        AuditLog,
++        Outbox,
++        pytest.param(functools.partial(IdempotentConsumer, "wal"), id="IdempotentConsumer"),
++    ],
+ )
+ def test_stores_open_the_database_in_wal_mode(tmp_path, open_store) -> None:
+     path = str(tmp_path / "cp.db")
+-- 
+2.43.0
+

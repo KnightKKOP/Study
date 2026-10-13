@@ -1,0 +1,212 @@
+From 40cb8aa1b80ae93a17ba41c126504ac65ba202be Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 13 Oct 2026 04:07:24 +0000
+Subject: [PATCH 10/12] docs: document outbox events, the audit API and their
+ configuration
+
+Resource writes now produce outbox events that the application
+publishes, and API writes produce audit records that tenants can list,
+so operators need to know what is stored, how it is delivered and how
+to recover it.
+
+The CHANGELOG lists the new behaviour, the breaking changes to the
+Outbox Python API and the fixed defects. The README documents the three
+FORGEMESH_EVENT_WEBHOOK_* variables and how events and audit records
+behave at runtime. The module mapping adds events.py, publishers.py and
+version.py and the new test files, and moves audit records and outbox
+events into the registry database. The backup runbook lists the two new
+tables, explains what a restore means for events and audit records, and
+shows how to list and redrive dead events.
+---
+ CHANGELOG.md                        | 16 +++++++++++++++
+ README.md                           |  5 +++++
+ docs/architecture/module-mapping.md | 14 +++++++-------
+ docs/operations/backup-restore.md   | 30 ++++++++++++++++++++++++++---
+ 4 files changed, 55 insertions(+), 10 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 6b2fc00..035d2f8 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -45,6 +45,12 @@
+ - 插件策略文件（JSON，由管理员维护）：`trustedKeys` 列出受信任的 Ed25519 签名公钥（PEM），`grants` 按插件的 `metadata.id` 授予权限，对该插件的所有版本生效。`load_plugin_policy` 严格校验：文件不可读、未知字段、非法或重复的公钥、带版本号的 `pluginId`、同一插件的多条授予、词表之外或重复的权限都抛出 `PluginPolicyError`；`PluginManager.from_policy_file` 按策略文件构造插件管理器，`PluginManager.effective_permissions` 返回插件实际拥有的权限。控制平面应用目前不构造插件管理器，因此没有对应的环境变量。
+ - 插件权限词表 `forgemesh.plugin.permissions.Permission`（15 项，形如 `<域>.<动作>`，如 `resource.read`、`network.egress`、`platform.admin`）：清单的 `spec.permissions`、JSON Schema 的权限枚举、管理员的授予与 `forgemesh.plugin.isolation` 共用这一份词表，契约测试保证 Schema 枚举与词表逐项一致。
+ - `forgemesh.plugin.loader.load_entrypoint(plugin_dir, entrypoint)`：按清单 `spec.entrypoint`（`<模块>:<类>`）把插件目录作为 Python 包加载并返回入口类；插件目录必须含 `__init__.py`，入口类必须定义在插件包内。加载在当前进程内执行插件代码，不提供任何隔离。
++- 资源变更事件（事务性 Outbox，ADR-008）：`SQLiteRegistry` 对资源对象的每次写入（创建、更新、status 写入、请求删除、删除）在写入资源的同一个事务中，经共用连接的 Outbox 写入一条领域事件，任何一步失败都一起回滚；分配记录（`allocations`）的写入不产生事件。信封符合 `api/schemas/event.schema.json`（`forgemesh.controlplane.events`）：`eventId` 即 Outbox 事件 id；`eventType` 为 `<kind>.<change>`，kind 按单词拆成小写并以点连接（`inference.service.created` / `.updated` / `.status_updated` / `.terminating` / `.deleted`）；`data` 含资源身份、`phase` 与写入之后的资源表示（`deleted` 为删除前最后的状态）；同一资源（`resourceUid`）的事件以 `resourceVersion` 判断新旧。API 写入使用请求的 `X-Correlation-Id`（缺省时生成），控制器同一轮协调的 status 写入与移除 finalizer 共用一个 correlation id。
++- 控制平面在应用启动（lifespan）时运行 Outbox 的 `Dispatcher`（每 0.5 秒查询一次到期事件）发布资源变更事件：至少投递一次，接收方按 `eventId` 去重，顺序只是尽力按写入顺序。发布器由 `forgemesh.controlplane.publishers.publisher_from_env` 按环境变量选择：默认 `LogPublisher`，每个事件写一行 JSON 日志（logger `forgemesh.events`；进程没有配置 logging 时写标准输出，以 `forgemesh-control-plane` 运行即是如此）；设置 `FORGEMESH_EVENT_WEBHOOK_URL`（`http` / `https`）后为 `WebhookPublisher`，把信封以 JSON `POST` 到该地址，请求头带 `X-Forgemesh-Event-Id`，设置了 `FORGEMESH_EVENT_WEBHOOK_TOKEN` 时带 `Authorization: Bearer <token>`；2xx 视为送达，其余状态码（不跟随重定向）、超时与连接错误视为失败，每次发送的超时为 `FORGEMESH_EVENT_WEBHOOK_TIMEOUT_SECONDS`（默认 `5`，大于 0、不超过 `60`），遵循 `HTTPS_PROXY` 等代理环境变量。取值非法（如地址含用户信息或片段、token 含空白或非 ASCII 字符）或没有设置地址却设置了 token / 超时时抛出 `EventConfigError`，控制平面在打开数据库之前拒绝启动。关闭时 Dispatcher 在控制器之后、关闭数据库之前停止，仍待发布的事件在下次启动后发布。`create_app` 新增参数 `event_publisher`，供嵌入方注入发布器。变量见 README「运行控制平面」。
++- Outbox 失败重试与 `dead`：发布失败按指数退避重试（`RetryPolicy`：1 秒起翻倍、最长 300 秒，默认最多 10 次，前后约 8.5 分钟），失败次数 `attempts`、最近一次错误 `last_error`（异常类型与消息）与下次发布时间 `next_attempt_at` 记在数据库中，重启后继续；达到上限后事件进入 `dead` 并记一条 ERROR 日志，`list_dead()` 列出，`redrive()` 放回待发布队列（命令见 [docs/operations/backup-restore.md](docs/operations/backup-restore.md) 第 5 节）。`Dispatcher` 只按数据库状态取到期的事件，一轮中遇到失败即结束本轮（目标不可用时不会对每个事件各等一次超时），已发布的事件保留 7 天后删除；新增 `start()` / `shutdown()` 以后台任务运行，循环中的数据库错误不会使它退出。另新增 `Outbox.get()`（按 id 查询任意状态的事件）、`due()` 与 `purge_published()`。
++- 审计记录：经 API 创建与删除资源（`POST` / `DELETE /api/v1/inference-services`）时，在写入资源与事件的同一个事务中写入一条审计记录，含租户、主体（`actor`）、API key id（`key_id`，`dev` 模式为空）、correlation id（与事件相同）、命名空间、`action`（`create` / `delete`）与 `outcome`（`success`），`details` 记录变更类型、资源 uid、`resourceVersion` 与对应事件的 `eventId`。被拒绝或失败的请求、对已在 `Terminating` 的资源重复的删除请求以及控制器的写入不产生审计记录。`SQLiteRegistry.put` / `delete` / `request_delete` 新增仅限关键字参数 `principal`（凭证的租户与资源不一致时在写入任何数据之前拒绝），`update_status` 新增 `correlation_id`，`audit_log` 属性返回共用连接的审计日志；`Principal` 新增 `key_id`；`AuditEvent` 新增 `key_id` / `namespace`（打开旧库时自动补列）；`AuditLog.put()` 在调用方的事务中写入，不自行提交。
++- 审计查询 `GET /api/v1/audit-events`：返回凭证所属租户的审计记录，最新的在前，需要 `read` scope；参数 `limit`（1–1000，默认 100，与列表接口一致）、`pageToken` 与可选的 `correlationId`，响应为 `{items, count, nextPageToken}`，还有下一页时才有 `nextPageToken`。按位置（时间戳、记录 id）分页（`AuditLog.list_page`），翻页期间写入的新记录不会使后面的页重复或遗漏；分页令牌绑定租户与过滤条件，为其他租户或条件签发、或无法解析的令牌返回 `400`。OpenAPI 新增该操作与 `AuditEvent` / `AuditEventList`。Go 网关尚未转发这个路径（返回 `404`），需直接访问控制平面。
++- `forgemesh.controlplane.sqlite.Database`：一个 SQLite 连接加一把可重入锁。Registry、Outbox 与审计日志共用一个实例，资源写入与它的事件、审计记录在同一个事务中提交或回滚（ADR-008 的工作单元）：`transaction()` 以 `BEGIN IMMEDIATE` 开始，`call()` / `run()` 在函数抛出异常时回滚它未提交的写入，并拒绝留下未结束的事务。`TaskStore`、`AuditLog` 与 `IdempotentConsumer` 都可以经 `database=` 共用连接。
+ 
+ ### Changed
+ 
+@@ -89,6 +95,9 @@
+ - `scripts/plugin_entrypoint_smoke.py` 按清单 `spec.entrypoint` 经 `load_entrypoint` 加载入口类，缺少 `entrypoint` 即失败（此前跳过），并做基本健康检查：构造器没有必填参数时实例化一次（目前 6 个插件）；需要宿主注入依赖的只报告所需参数（`decision-typesafe-jev` 的客户端、`metering-basic` 的存储、`qos-basic` 的配置、`workflow-reference` 的存储与执行器等）。
+ - `PluginSdk.validate_manifest` 的告警与实际行为一致：未设置 `isolation` 时说明插件在进程内运行（此前称安装器默认使用 `restricted-rpc`），未设置 `entrypoint` 时说明插件无法加载；清单仍写 `artifactDigest` / `signature` 时给出弃用告警（见 Deprecated）。
+ - [docs/plugin-development/guide.md](docs/plugin-development/guide.md) 按当前实现更新运行方式与隔离、权限词表、入口点、签名与注册流程；`SECURITY.md` 3.2 / 3.3 节、README 与 [ADR-006](docs/design-decisions/adr-006.md)（新增实施现状）同步更新；[docs/architecture/module-mapping.md](docs/architecture/module-mapping.md) 更新插件的加载方式与运行形态，更正 `runtime-vllm` 的文件列表（没有 `provider.py`），新增偏差 D3（受限 RPC 宿主未实现）。
++- **破坏性**：`Outbox.put` 不再自行提交，只能在调用方已开启的事务中调用（如 `Database.transaction()` 之内），事务之外调用抛出 `RuntimeError`，事件不会写入；`Outbox` 的 `conn` 参数与属性移除，改为 `database=` 参数与 `database` 属性（`Database`）。
++- **破坏性**：Outbox 事件的终态 `failed` 改为 `dead`（打开旧库时已有的 `failed` 事件改为 `dead`，可以 `redrive()`），`get_stats()` 的键随之改变；`mark_failed()` 记录一次失败并按重试策略推迟，达到上限才进入 `dead`，返回更新后的事件（此前直接置为 `failed`）。
++- `DELETE /api/v1/inference-services/{name}` 读取 `X-Correlation-Id`（与创建一致），用于事件、审计记录与 `409` 错误信封。
+ 
+ ### Deprecated
+ 
+@@ -135,6 +144,11 @@
+ - 全部 10 个插件清单与示例清单的 `entrypoint` 写成 `python -m forgemesh_<名称>`，而这些模块并不存在，没有一个插件能按清单加载；入口冒烟只用 `entrypoint` 判断是否跳过，随后绕开它按文件路径加载 `provider.py`（或包的 `__init__.py`），只断言其中有公有类。现改为真实的 `<模块>:<类>` 入口，冒烟按入口加载（见 Changed）。
+ - 全部 10 个插件与示例清单声明 `isolation: restricted-rpc`，而受限 RPC 宿主并不存在，插件实际都在宿主进程内运行；其中 `decision-typesafe-jev` 在进程内经 `urllib` 直接请求 TypeSafe API。现全部改为 `in-process`（`decision-typesafe-jev` 已申请 `network.egress`）。
+ - `plugin-sdk` 包补齐 `pyyaml` 依赖声明：`forgemesh.plugin.sdk` 与签名工具都用它读取清单，此前独立安装（如控制平面镜像）后导入 `forgemesh.plugin.sdk` 即失败。
++- `TaskStore` 与 `Outbox` 各自使用不加锁的 sqlite3 连接，而把 Outbox 写入放进业务事务的唯一办法是把别人的连接交给它：sqlite3 的事务属于连接，线程交错时一方的提交或回滚会连带另一方尚未完成的写入（与 Registry 内已修复的 R-1 相同）。现经 `Database` 串行化（见 Added）。
++- Registry 的写入路径抛出 `IntegrityError` 以外的异常时，未提交的部分写入留在连接上，被同一连接上的下一次提交一并提交：现回滚。
++- `Outbox.put` 自行提交，事件无法与它描述的业务写入处于同一个事务：在工作单元中途调用会提交此前的全部写入，`put` 之后的业务写入失败会留下孤立的事件（改进计划 5.4）。现在调用方的事务中写入（见 Changed）。
++- Outbox 发布失败一次即标记为 `failed`，此后再不发布，一次瞬时错误就让事件永远送不到；`Dispatcher` 在内存中记录已处理的事件 id，集合无限增长，重启后清空。现按数据库状态退避重试，达到上限进入 `dead`（见 Added）。
++- `IdempotentConsumer` 已处理的事件 id 只保存在内存集合中：无限增长，重启后清空，重新投递的事件会再次执行副作用（投递本就是至少一次）。现记在 SQLite 表 `consumed_events`（按消费者名称与事件 id，可经 `database=` 与其他存储共用数据库）；handler 正常返回后才记录，handler 失败时再次投递会重新处理；同一实例的 `consume()` 串行执行，并发投递同一事件只处理一次。
+ 
+ ### Security
+ 
+@@ -146,6 +160,8 @@
+ - 网关请求体此前不设上限，原样转发给控制平面与推理实例：现限制为 `GATEWAY_MAX_REQUEST_BODY_BYTES`（见 Added）。
+ - 插件签名此前使用 HMAC-SHA256 对称密钥，能验签的一方同样能伪造签名；`verify` 只在调用方提供制品内容时重新计算摘要，否则直接信任调用方给出的摘要；签名中的算法标识从不校验；清单不在签名范围内，签名之后改动清单（例如追加申请的权限）不会被发现。现改为 Ed25519（见 Changed）：控制平面只保存公钥，摘要总是从制品内容与清单重新计算。
+ - `PluginManager.register` 此前不做任何校验，签名校验没有接入注册，任何清单都能注册；`check_permissions` 把清单自己声明的权限当作已授予，插件可以给自己授权。现注册时校验清单与签名，权限以管理员授予为准（见 Changed）。
++- 控制平面此前在生产路径中不写审计记录（`AuditLog` 默认使用内存库，应用没有接入）：现经 API 的创建与删除在写入资源的同一事务中记录发起者的租户、主体、API key id 与 correlation id；`GET /api/v1/audit-events` 只返回凭证所属租户的记录，分页令牌不能用于其他租户（见 Added）。
++- webhook 发布器不泄露凭证：日志、错误信息与 Outbox 的 `last_error` 只含 webhook 的 scheme、主机与端口（路径与查询串可能带有签名），token 从不输出；不跟随重定向，token 不会被带到另一个地址；地址中的用户信息被拒绝（改用 `FORGEMESH_EVENT_WEBHOOK_TOKEN`），token 经明文 `http` 发往非回环地址时启动日志给出警告。
+ 
+ ## [1.0.1] - 2026-10-11
+ 
+diff --git a/README.md b/README.md
+index 9cd2d69..a686a7d 100644
+--- a/README.md
++++ b/README.md
+@@ -168,6 +168,9 @@ curl -s -H "Authorization: Bearer fmk_…" http://127.0.0.1:8080/api/v1/inferenc
+ | `FORGEMESH_VLLM_ADVERTISE_HOST` | 同监听地址 | `vllm-process`：写进 `status.endpoints` 的主机名或 IP 地址；监听全部地址时必须设置 |
+ | `FORGEMESH_VLLM_READY_TIMEOUT_SECONDS` | `1200` | `vllm-process`：进程启动后等 `GET /health` 返回 `200` 的时限（秒），包括下载与加载模型 |
+ | `FORGEMESH_VLLM_STOP_GRACE_SECONDS` | `10` | `vllm-process`：停止实例时 `SIGTERM` 之后等它退出的秒数，之后 `SIGKILL` |
++| `FORGEMESH_EVENT_WEBHOOK_URL` | — | 资源变更事件的 webhook 地址（`http` / `https`，不得含用户信息与片段）：设置后把事件信封以 JSON `POST` 到这里，2xx 视为送达，不跟随重定向；未设置时事件写日志（见下文）。地址非法时拒绝启动；日志与错误信息只含地址的 scheme、主机与端口 |
++| `FORGEMESH_EVENT_WEBHOOK_TOKEN` | — | 可选，以 `Authorization: Bearer <token>` 发给 webhook，只能由可见的 ASCII 字符组成，不写入日志；经明文 `http` 发往非回环地址时启动日志给出警告 |
++| `FORGEMESH_EVENT_WEBHOOK_TIMEOUT_SECONDS` | `5` | 每次发送 webhook 的连接与读取超时（秒，大于 0、不超过 60）。这个变量与 token 只能与 `FORGEMESH_EVENT_WEBHOOK_URL` 一起设置，否则拒绝启动 |
+ 
+ > 请求可以不带 `X-Tenant-Id`；带了就必须与 key 绑定的租户一致，否则返回 `403`。缺少或无效的 key 返回 `401`。
+ 
+@@ -184,6 +187,8 @@ curl -s -H "Authorization: Bearer fmk_…" http://127.0.0.1:8080/api/v1/inferenc
+ 
+ 控制平面启动后会自动协调 `InferenceService`：新建、修改或请求删除的资源在 0.5 秒内被处理，协调结果写入 `status.conditions`（例如 `Ready=False` 及其原因）。未设置 `FORGEMESH_INVENTORY_FILE` 时，新建的服务会停在 `Pending`，并带有 `Ready=False`（`SchedulerUnavailable`）条件；只设置清单、未设置 `FORGEMESH_RUNTIME_LAUNCHER` 时，条件为 `Ready=False`（`WorkflowRuntimeUnavailable`），协调器在分配之前停下，不占用设备。两者都设置后，资源每轮推进一个 phase（`Pending` → `Scheduling` → `Preparing` → `Deploying` → `Verifying` → `Ready`）：分配设备，运行部署工作流（准备模型 → 启动实例 → 验证实例），成功后写入 `status.endpoints` 与 `Ready=True`，网关随即可以转发对话；部署失败时资源进入 `Failed`，不自动重试，删除后重新创建即可再次部署；删除时先取消部署、停止实例，再释放分配。每个服务只部署一个实例（`spec.availability.replicas` 不生效），已部署服务的 `spec` 变化不会重新部署。控制器与 API 运行在同一个进程中，是权威存储的唯一写者（ADR-013）：请以单进程运行，不要使用 `uvicorn --workers` 或多副本。设置了启动器时 `POST /api/v1/workflows` 同样返回 `503`（`WORKFLOW_RUNTIME_UNAVAILABLE`）：部署工作流的运行时只供协调器使用，不对外开放。
+ 
++每次资源写入（经 API 或控制器）都在同一个事务中记下一条资源变更事件（信封见 `api/schemas/event.schema.json`，如 `inference.service.created`、`inference.service.status_updated`），控制平面在后台发布：默认写日志（logger `forgemesh.events`，每个事件一行 JSON，没有配置 logging 时写标准输出），设置 `FORGEMESH_EVENT_WEBHOOK_URL` 后 `POST` 到 webhook。事件至少投递一次，接收方按 `eventId`（webhook 请求头 `X-Forgemesh-Event-Id`）去重；发送失败时按 1 秒起翻倍、最长 300 秒的间隔重试，失败 10 次后不再发送（`dead`，记一条 ERROR 日志），修复接收方后可以重新投递，见[备份与灾备演练](docs/operations/backup-restore.md)第 5 节。经 API 创建与删除资源时，同一事务还写入一条审计记录（租户、主体、key id、correlation id），`GET /api/v1/audit-events` 按时间倒序分页列出本租户的记录（需要 `read` scope，可按 `correlationId` 过滤；网关尚未转发这个路径，请直接访问控制平面）。
++
+ ### Go 网关
+ 
+ ```bash
+diff --git a/docs/architecture/module-mapping.md b/docs/architecture/module-mapping.md
+index 0fce571..cc97862 100644
+--- a/docs/architecture/module-mapping.md
++++ b/docs/architecture/module-mapping.md
+@@ -120,13 +120,13 @@
+ | 字段 | 内容 |
+ |---|---|
+ | 架构模块 | L2 Core Control Plane（权威状态、协调、插件管理、审计） |
+-| 当前代码路径 | `packages/control-plane/src/forgemesh/controlplane/`：`registry/{models,store}.py`、`reconciler/{core,dedup}.py`、`controller/{manager,queue}.py`、`scheduler/{inventory,first_fit}.py`、`deployment/{launcher,workflow,release,recovery,config,network,fake,vllm_process,memory}.py`、`api/{routes,dependencies,errors}.py`、`plugin_manager.py`、`outbox.py`、`audit.py`、`tasks.py`、`heartbeat.py`、`observability.py`、`diagnostics.py`、`app.py`、`auth.py`、`keygen.py`、`sqlite.py`（共 38 个 `.py`；其中 `auth.py` / `keygen.py` / `api/errors.py` 为 API 认证与错误信封，见 ADR-014；`controller/` 驱动协调器并回写 status；`scheduler/` 按静态加速器清单首次适配分配；`deployment/` 为部署工作流（准备模型 → 启动实例 → 验证实例）、启动器契约 `RuntimeLauncher` 与两个启动器（`fake.py`：控制平面进程内的 OpenAI 兼容桩服务 `FakeLauncher`；`vllm_process.py`：本机 vLLM 子进程 `VLLMProcessLauncher`；由 `config.py` 按 `FORGEMESH_RUNTIME_LAUNCHER` 选择，`network.py` 为两者共用的地址校验与健康检查）、删除时的清理 `DeploymentReleaser`、重启之后把实例已不在运行的 `Ready` 服务转为 `Degraded` 的 `mark_lost_instances`（`recovery.py`）与测试替身 `InMemoryLauncher`；`sqlite.py` 统一 SQLite 连接设置（WAL、外键），并由 `workflow_db_path` 给出工作流存储文件；其余与任务书的 9 个子模块一一对应） |
+-| 核心契约 | 实现 `core-contracts` 的 `ResourceRegistry` / `Reconciler` / `Scheduler`（`FirstFitScheduler`：清单来自 `FORGEMESH_INVENTORY_FILE`，设置时才注入控制器；分配与设备占用经 `SQLiteRegistry.create_allocation` 在同一事务中写入，设备独占由 `allocation_devices` 部分唯一索引保证）；协调器按 phase 逐轮推进 `InferenceService`（`Pending` → `Scheduling` → `Preparing` → `Deploying` → `Verifying` → `Ready`），以 `deployment:{uid}` 为幂等键启动并查询部署工作流，成功后写入 `status.endpoints`，删除时经 `DeploymentReleaser` 取消部署、停止实例（部署包只依赖工作流契约，运行时与启动器由组装方注入：`app.py` 在设置了 `FORGEMESH_RUNTIME_LAUNCHER` 时以 `workflow-runtime` 的 `LocalWorkflowRuntime` 与所选启动器组装，未设置时不注入，协调器在分配之前报告 `WorkflowRuntimeUnavailable`）；`app.py` 提供 HTTP 服务（FastAPI，未安装时回退纯标准库占位——生产必须 FastAPI/ASGI），并在 lifespan 中运行控制器（设置了启动器时，先恢复未结束的部署运行、把实例已不在运行的 `Ready` 服务转为 `Degraded`，再启动控制器）；控制器按序号增量读取 `resource_changes` 变更记录，经 `update_status`（status 子资源，CAS）回写协调结果；Outbox 事务性事件（architecture.md 3.3 规则 7）；`ProcessedKeyStore` 去重（reconciler/dedup.py）；`PluginManager`（plugin_manager.py）注册时校验插件清单与 Ed25519 签名（受信任公钥来自插件策略文件），插件实际权限为清单申请与管理员授予的交集，控制平面应用尚未接入 |
++| 当前代码路径 | `packages/control-plane/src/forgemesh/controlplane/`：`registry/{models,store}.py`、`reconciler/{core,dedup}.py`、`controller/{manager,queue}.py`、`scheduler/{inventory,first_fit}.py`、`deployment/{launcher,workflow,release,recovery,config,network,fake,vllm_process,memory}.py`、`api/{routes,dependencies,errors}.py`、`plugin_manager.py`、`outbox.py`、`events.py`、`publishers.py`、`audit.py`、`tasks.py`、`heartbeat.py`、`observability.py`、`diagnostics.py`、`app.py`、`version.py`、`auth.py`、`keygen.py`、`sqlite.py`（共 41 个 `.py`；其中 `auth.py` / `keygen.py` / `api/errors.py` 为 API 认证与错误信封，见 ADR-014；`controller/` 驱动协调器并回写 status；`scheduler/` 按静态加速器清单首次适配分配；`deployment/` 为部署工作流（准备模型 → 启动实例 → 验证实例）、启动器契约 `RuntimeLauncher` 与两个启动器（`fake.py`：控制平面进程内的 OpenAI 兼容桩服务 `FakeLauncher`；`vllm_process.py`：本机 vLLM 子进程 `VLLMProcessLauncher`；由 `config.py` 按 `FORGEMESH_RUNTIME_LAUNCHER` 选择，`network.py` 为两者共用的地址校验与健康检查）、删除时的清理 `DeploymentReleaser`、重启之后把实例已不在运行的 `Ready` 服务转为 `Degraded` 的 `mark_lost_instances`（`recovery.py`）与测试替身 `InMemoryLauncher`；`sqlite.py` 统一 SQLite 连接设置（WAL、外键），其中的 `Database`（一个连接加一把锁）供 Registry、Outbox 与审计日志共用，资源写入与它的事件、审计记录同一事务提交，并由 `workflow_db_path` 给出工作流存储文件；`events.py` 为资源变更事件的信封，`publishers.py` 为 Outbox 事件的发布器（默认写日志，`FORGEMESH_EVENT_WEBHOOK_URL` 选择 webhook），`version.py` 为控制平面版本；其余与任务书的 9 个子模块一一对应） |
++| 核心契约 | 实现 `core-contracts` 的 `ResourceRegistry` / `Reconciler` / `Scheduler`（`FirstFitScheduler`：清单来自 `FORGEMESH_INVENTORY_FILE`，设置时才注入控制器；分配与设备占用经 `SQLiteRegistry.create_allocation` 在同一事务中写入，设备独占由 `allocation_devices` 部分唯一索引保证）；协调器按 phase 逐轮推进 `InferenceService`（`Pending` → `Scheduling` → `Preparing` → `Deploying` → `Verifying` → `Ready`），以 `deployment:{uid}` 为幂等键启动并查询部署工作流，成功后写入 `status.endpoints`，删除时经 `DeploymentReleaser` 取消部署、停止实例（部署包只依赖工作流契约，运行时与启动器由组装方注入：`app.py` 在设置了 `FORGEMESH_RUNTIME_LAUNCHER` 时以 `workflow-runtime` 的 `LocalWorkflowRuntime` 与所选启动器组装，未设置时不注入，协调器在分配之前报告 `WorkflowRuntimeUnavailable`）；`app.py` 提供 HTTP 服务（FastAPI，未安装时回退纯标准库占位——生产必须 FastAPI/ASGI），并在 lifespan 中运行控制器（设置了启动器时，先恢复未结束的部署运行、把实例已不在运行的 `Ready` 服务转为 `Degraded`，再启动控制器）；控制器按序号增量读取 `resource_changes` 变更记录，经 `update_status`（status 子资源，CAS）回写协调结果；Outbox 事务性事件（architecture.md 3.3 规则 7：Registry 对资源对象的每次写入在同一事务中写入资源变更事件，`app.py` 在 lifespan 中运行 `Dispatcher` 发布；API 的创建与删除在同一事务中写入审计记录，经 `GET /api/v1/audit-events` 查询）；`ProcessedKeyStore` 去重（reconciler/dedup.py）；`PluginManager`（plugin_manager.py）注册时校验插件清单与 Ed25519 签名（受信任公钥来自插件策略文件），插件实际权限为清单申请与管理员授予的交集，控制平面应用尚未接入 |
+ | 运行形态 | 单实例控制平面进程（模块化单体，architecture.md 3.3 规则 8）；ADR-013 约束：仅允许单写方写同一 SQLite 权威库；控制器与 API 同进程运行，不得以多个 worker 进程启动 |
+-| 数据所有权 | **全部业务资源权威状态**（registry/store.py）、审计事件（audit.py，默认内存库，控制平面应用尚未接入）、Outbox 事件、任务与心跳状态 |
++| 数据所有权 | **全部业务资源权威状态**（registry/store.py）、审计记录与 Outbox 事件（audit.py / outbox.py，与资源在同一个数据库文件、同一事务中写入）、任务与心跳状态 |
+ | 允许依赖 | `forgemesh.core` / `forgemesh.resource` / `forgemesh.policy` / `forgemesh.decision` / `forgemesh.workflow*` / `forgemesh.plugin`（plugin-sdk）、标准库 `sqlite3`、FastAPI |
+ | 禁止依赖 | 任何插件私有模块（`decision_rules` / `gpu_nvidia` 等，扫描二验证 ✅，见 3.2） |
+-| 测试路径 | `tests/unit/controlplane/`：`test_api.py`、`test_routes.py`、`test_registry.py`、`test_reconciler.py`、`test_dedup_store.py`、`test_plugin_manager.py`、`test_outbox.py`、`test_audit.py`、`test_tasks.py`、`test_heartbeat.py`、`test_observability.py`、`test_diagnostics.py`、`test_app.py`、`test_auth.py`、`test_controller_manager.py`、`test_controller_queue.py`、`test_registry_changes.py`、`test_registry_status.py`、`test_registry_allocations.py`、`test_sqlite.py`、`test_scheduler.py`、`test_scheduler_inventory.py`、`test_allocation_lifecycle.py`、`test_deployment.py`、`test_deployment_lifecycle.py`、`test_fake_launcher.py`、`test_vllm_launcher.py`、`test_launcher_config.py`、`test_launcher_network.py`（29 个文件，glob 核对；`test_deployment_lifecycle.py` 以控制器、调度器、本地工作流运行时与内存启动器覆盖部署、重启、失败与删除闭环；`test_vllm_launcher.py` 以同目录的替身 `vllm_standin.py` 代替 vLLM 运行，不需要 GPU）；端到端 `tests/e2e/test_closed_loop.py`（应用 + 假启动器：创建 → `Ready` → 对话 → 删除 → 重新创建 → 重启后 `Degraded`） |
++| 测试路径 | `tests/unit/controlplane/`：`test_api.py`、`test_routes.py`、`test_registry.py`、`test_reconciler.py`、`test_dedup_store.py`、`test_plugin_manager.py`、`test_outbox.py`、`test_audit.py`、`test_tasks.py`、`test_heartbeat.py`、`test_observability.py`、`test_diagnostics.py`、`test_app.py`、`test_auth.py`、`test_controller_manager.py`、`test_controller_queue.py`、`test_registry_changes.py`、`test_registry_status.py`、`test_registry_allocations.py`、`test_sqlite.py`、`test_scheduler.py`、`test_scheduler_inventory.py`、`test_allocation_lifecycle.py`、`test_deployment.py`、`test_deployment_lifecycle.py`、`test_fake_launcher.py`、`test_vllm_launcher.py`、`test_launcher_config.py`、`test_launcher_network.py`、`test_registry_events.py`、`test_registry_audit.py`、`test_audit_api.py`、`test_publishers.py`（33 个文件，glob 核对；`test_publishers.py` 以本地 HTTP 服务覆盖 webhook 发布器；`test_deployment_lifecycle.py` 以控制器、调度器、本地工作流运行时与内存启动器覆盖部署、重启、失败与删除闭环；`test_vllm_launcher.py` 以同目录的替身 `vllm_standin.py` 代替 vLLM 运行，不需要 GPU）；端到端 `tests/e2e/test_closed_loop.py`（应用 + 假启动器：创建 → `Ready` → 对话 → 删除 → 重新创建 → 重启后 `Degraded`） |
+ | 状态 | 已实现且有测试覆盖 |
+ | 演进动作 | 保留；WP-C1 补故障路径（CAS 并发、重启恢复、finalizer 闭环、Allocation 唯一性） |
+ 
+@@ -285,13 +285,13 @@
+ | 字段 | 内容 |
+ |---|---|
+ | 架构模块 | L6 权威存储（过渡态：SQLite；目标态：PostgreSQL） |
+-| 当前代码路径 | `packages/control-plane/src/forgemesh/controlplane/registry/store.py`（`SQLiteRegistry`，权威资源状态，CAS 乐观并发 `resource_version`；分配 `allocations` 与设备占用 `allocation_devices`，部分唯一索引保证每个资源 uid 在其租户内至多一个 Active 分配、每个设备（跨租户）至多属于一个 Active 分配）；`packages/decision-api/src/forgemesh/decision/records.py`（`DecisionRecordStore`）；`packages/workflow-runtime/src/forgemesh/workflowruntime/store.py`（工作流运行存储）；审计 `audit.py` |
++| 当前代码路径 | `packages/control-plane/src/forgemesh/controlplane/registry/store.py`（`SQLiteRegistry`，权威资源状态，CAS 乐观并发 `resource_version`；分配 `allocations` 与设备占用 `allocation_devices`，部分唯一索引保证每个资源 uid 在其租户内至多一个 Active 分配、每个设备（跨租户）至多属于一个 Active 分配）；`packages/decision-api/src/forgemesh/decision/records.py`（`DecisionRecordStore`）；`packages/workflow-runtime/src/forgemesh/workflowruntime/store.py`（工作流运行存储）；审计 `audit.py` 与 Outbox `outbox.py`（与 Registry 共用连接） |
+ | 核心契约 | ADR-013：**SQLite 为权威存储、单控制平面实例写、禁止扩展 replicas；PostgreSQL 为目标态**（迁移由真实 SLO/基准触发）；Registry 对齐 `core-contracts.ResourceRegistry` 契约 |
+-| 运行形态 | 进程内嵌入式：控制平面应用打开 `FORGEMESH_DB_PATH`（Registry 与去重键，WAL 模式）；设置了 `FORGEMESH_RUNTIME_LAUNCHER` 时另以 `workflow_db_path(FORGEMESH_DB_PATH)` 给出的同目录独立文件（`*.workflows.db`，WAL 模式，步骤写入不必等待 Registry 的写锁）作为部署工作流的存储；审计、决策记录、工作流存储未指定文件时使用内存库。两个文件之间没有跨文件事务：备份时先注册表、后工作流存储，同一组恢复，见 docs/operations/backup-restore.md |
++| 运行形态 | 进程内嵌入式：控制平面应用打开 `FORGEMESH_DB_PATH`（Registry、Outbox 事件、审计记录与去重键，WAL 模式）；设置了 `FORGEMESH_RUNTIME_LAUNCHER` 时另以 `workflow_db_path(FORGEMESH_DB_PATH)` 给出的同目录独立文件（`*.workflows.db`，WAL 模式，步骤写入不必等待 Registry 的写锁）作为部署工作流的存储；决策记录、工作流存储与单独构造的审计日志未指定文件时使用内存库。两个文件之间没有跨文件事务：备份时先注册表、后工作流存储，同一组恢复，见 docs/operations/backup-restore.md |
+ | 数据所有权 | 权威写方：控制平面**唯一实例**（registry/audit/outbox）；决策记录写方为 Decision 链路（D1 关联） |
+ | 允许依赖 | 标准库 `sqlite3`（仅控制平面实现层；API 层现状见 D1） |
+ | 禁止依赖 | 第三方 DB 驱动（v1.x）、多实例并发写同一库文件 |
+-| 测试路径 | `tests/unit/controlplane/test_registry.py`、`tests/unit/controlplane/test_registry_allocations.py`、`tests/unit/decision/test_records.py`、`tests/unit/workflowruntime/test_store.py`；恢复/并发：`tests/performance/test_restart_recovery.py`、`test_conflict_correctness.py`、`tests/chaos/test_cp_restart.py`、`tests/unit/workflowruntime/test_runtime.py`、`tests/unit/controlplane/test_deployment_lifecycle.py`；应用打开两个文件（`tests/unit/controlplane/test_app.py`）、重启后服务转为 `Degraded`（`tests/e2e/test_closed_loop.py`）；备份恢复演练见 `docs/operations/backup-restore.md` |
++| 测试路径 | `tests/unit/controlplane/test_registry.py`、`tests/unit/controlplane/test_registry_allocations.py`、`tests/unit/controlplane/test_registry_events.py` / `test_registry_audit.py`（资源写入与事件、审计记录同一事务）、`tests/unit/decision/test_records.py`、`tests/unit/workflowruntime/test_store.py`；恢复/并发：`tests/performance/test_restart_recovery.py`、`test_conflict_correctness.py`、`tests/chaos/test_cp_restart.py`、`tests/unit/workflowruntime/test_runtime.py`、`tests/unit/controlplane/test_deployment_lifecycle.py`；应用打开两个文件（`tests/unit/controlplane/test_app.py`）、重启后服务转为 `Degraded`（`tests/e2e/test_closed_loop.py`）；备份恢复演练见 `docs/operations/backup-restore.md` |
+ | 状态 | 已实现且有测试覆盖 |
+ | 演进动作 | 保留；WP-C1 补 CAS 并发冲突/重启恢复/备份恢复的故障路径测试；PostgreSQL 迁移属阶段 F（有证据后） |
+ 
+diff --git a/docs/operations/backup-restore.md b/docs/operations/backup-restore.md
+index e975d46..5226f95 100644
+--- a/docs/operations/backup-restore.md
++++ b/docs/operations/backup-restore.md
+@@ -12,11 +12,12 @@ ForgeMesh 控制平面（`forgemesh-control-plane`）把权威状态存放在 SQ
+ |------|----|------|------|
+ | `forgemesh.db` | `resources` / `allocations` / `allocation_devices` / `resource_changes` | `forgemesh.controlplane.registry.SQLiteRegistry` | 资源对象（spec/status/conditions）、资源分配记录及其占用的设备、控制器读取的变更记录 |
+ | `forgemesh.db` | `processed_dedup_keys` | `forgemesh.controlplane.reconciler.dedup.ProcessedKeyStore` | 控制器已处理的去重键 |
++| `forgemesh.db` | `outbox_events` / `audit_events` | `forgemesh.controlplane.outbox.Outbox` / `forgemesh.controlplane.audit.AuditLog`（与 `SQLiteRegistry` 共用连接） | 资源变更事件（待发布、`dead` 与 7 天内已发布的）与 API 写入的审计记录，与资源在同一个事务中写入 |
+ | `forgemesh.workflows.db` | `workflow_runs` / `workflow_steps` | `forgemesh.workflowruntime.store.WorkflowStore` | 每个推理服务（按 `uid`，幂等键 `deployment:{uid}`）的部署工作流运行及其各步骤的状态与结果（含启动的实例 id 与地址） |
+ 
+ 两个文件之间没有共同的事务，备份与恢复时把它们当作一组，见 2.6 节。推理实例本身不在任何文件中：它们随控制平面进程结束，恢复之后的情况见 3.5 节。
+ 
+-审计日志（`forgemesh.controlplane.audit.AuditLog`）、决策记录（`forgemesh.decision.records.DecisionRecordStore`）等其他 SQLite 存储默认使用内存库，控制平面进程不会打开它们；嵌入方把它们指向文件时，按本文同样的方法逐个备份。
++决策记录（`forgemesh.decision.records.DecisionRecordStore`）等其他 SQLite 存储默认使用内存库，控制平面进程不会打开它们；嵌入方把它们指向文件时，按本文同样的方法逐个备份。
+ 
+ ### RPO / RTO 目标
+ 
+@@ -367,6 +368,14 @@ Kubernetes 上先 `kubectl -n forgemesh scale deploy/forgemesh-control-plane --r
+ - 仍在部署的服务从中断处继续：还没有启动实例的照常完成；已经启动了实例的进入 `Failed`（实例已不在运行：验证实例的步骤失败时原因为 `WorkflowFailed`，部署运行已经成功、只是还没写入 `Ready` 时为 `InstanceLost`），删除后重新创建即可。
+ - 注册表与工作流存储不是同一组备份时的情况见 2.6 节。
+ 
++### 3.6 恢复之后的事件与审计记录
++
++资源变更事件（`outbox_events`）与审计记录（`audit_events`）和资源在同一个文件中、由同一个事务写入，恢复之后三者是同一时刻的状态：
++
++- 备份之后的资源写入连同它们的事件与审计记录一起丢失。
++- 备份时仍待发布的事件在控制平面启动后发布，其中包括备份之后已经送达过的：接收方会再次收到它们（事件本就至少投递一次），按 `eventId` 去重即可。
++- 备份时已是 `dead` 的事件仍为 `dead`，需要时按第 5 节重新投递。
++
+ ---
+ 
+ ## 4. 灾备演练检查清单
+@@ -384,7 +393,7 @@ Kubernetes 上先 `kubectl -n forgemesh scale deploy/forgemesh-control-plane --r
+ - [ ] 控制平面运行且有写入时，执行 `forgemesh-backup.sh` 生成一份备份（容器部署按 2.5 节）
+ - [ ] 验证备份文件摘要：`sha256sum -c <backup>.db.sha256` 通过
+ - [ ] 验证备份完整性：`PRAGMA integrity_check` 返回 `ok`
+-- [ ] 验证备份可打开：`sqlite3 <backup>.db ".tables"` 列出 `allocation_devices`、`allocations`、`processed_dedup_keys`、`resource_changes`、`resources`
++- [ ] 验证备份可打开：`sqlite3 <backup>.db ".tables"` 列出 `allocation_devices`、`allocations`、`audit_events`、`outbox_events`、`processed_dedup_keys`、`resource_changes`、`resources`
+ - [ ] 部署推理服务时：同一组备份中有工作流存储（时间戳相同的 `forgemesh.workflows-<时间戳>.db`，容器部署为同一目录中的 `forgemesh.workflows.db`），`.tables` 列出 `workflow_runs`、`workflow_steps`
+ - [ ] 验证备份数据行数与源库一致（抽样表）
+ 
+@@ -397,7 +406,8 @@ Kubernetes 上先 `kubectl -n forgemesh scale deploy/forgemesh-control-plane --r
+ - [ ] `/readyz` 探针返回 200
+ - [ ] 资源注册表：`list` 返回预期资源数量
+ - [ ] 推理服务（3.5 节）：备份时 `Ready` 的服务为 `Degraded`（`Ready=False`，`InstanceLost`）；删除并重新创建其中一个，它重新进入 `Ready`
+-- [ ] 审计日志 / 决策记录（仅当部署把它们持久化到文件时）：`query_by_tenant` / `list_by_tenant` 返回预期记录数量
++- [ ] 审计记录：`GET /api/v1/audit-events` 返回备份时已有的记录
++- [ ] 决策记录（仅当部署把它持久化到文件时）：`list_by_tenant` 返回预期记录数量
+ 
+ ### 4.4 数据一致性验证
+ 
+@@ -433,6 +443,20 @@ Kubernetes 上先 `kubectl -n forgemesh scale deploy/forgemesh-control-plane --r
+ | 误删资源 | 用户报告 / 审计日志确认 | 从误删前备份恢复（需停服） |
+ | 注册表与工作流存储来自不同的备份 | 恢复后仍在部署的服务进入 `Failed`（`WorkflowRunNotFound`），或设备被注册表之外的实例占用（2.6 节） | 停止控制平面，从同一组备份重新恢复两个文件 |
+ | 租户数据串扰 | 安全测试失败 | 立即从备份恢复 + 排查隔离边界缺陷 |
++| 事件接收方（webhook）长时间不可用 | ERROR 日志 `outbox event … is dead after 10 failed attempts` | 修复接收方后重新投递 `dead` 事件（见下） |
++
++`dead` 事件不再自动发送。下面的命令只改动 `outbox_events` 中的 `dead` 行（一次短事务），可以在控制平面运行时执行，Dispatcher 在下一轮发布放回队列的事件。路径须与 `FORGEMESH_DB_PATH` 一致（路径写错时会新建一个空库）：
++
++```bash
++# 列出 dead 事件（最多 100 条）：id、类型、失败次数与最近一次错误
++.venv/bin/python -c "
++from forgemesh.controlplane.outbox import Outbox
++for e in Outbox('./forgemesh.db').list_dead(): print(e.event_id, e.event_type, e.attempts, e.last_error)"
++# 全部放回待发布队列（失败次数清零），输出放回的事件数
++.venv/bin/python -c "from forgemesh.controlplane.outbox import Outbox; print(Outbox('./forgemesh.db').redrive())"
++```
++
++容器部署中以 `docker compose -f deploy/docker/docker-compose.yaml exec control-plane python -c "…"` 执行同样的命令，数据库路径为 `/var/lib/forgemesh/forgemesh.db`。
+ 
+ ---
+ 
+-- 
+2.43.0
+

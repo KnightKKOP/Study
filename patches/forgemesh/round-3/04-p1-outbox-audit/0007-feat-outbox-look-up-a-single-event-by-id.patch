@@ -1,0 +1,98 @@
+From eaf702730b7c8d474e8e487da016ae20858ac419 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 13 Oct 2026 03:31:17 +0000
+Subject: [PATCH 07/12] feat(outbox): look up a single event by id
+
+Outbox.get returns an event in any state, or None when it does not exist
+(or was published and purged). Audit records carry the id of the event
+written with them, so operators and tests can follow that link.
+
+The audit test in test_auth paired audit records with pending events by
+position; the controller writes a status event for the new service when
+its poll runs between the create and the delete request, which made the
+pairing fail. It now looks up each record's event by id.
+---
+ .../src/forgemesh/controlplane/outbox.py          |  5 +++++
+ tests/unit/controlplane/test_auth.py              |  6 +++---
+ tests/unit/controlplane/test_outbox.py            | 15 ++++++++++++++-
+ 3 files changed, 22 insertions(+), 4 deletions(-)
+
+diff --git a/packages/control-plane/src/forgemesh/controlplane/outbox.py b/packages/control-plane/src/forgemesh/controlplane/outbox.py
+index 3f037a7..952e65c 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/outbox.py
++++ b/packages/control-plane/src/forgemesh/controlplane/outbox.py
+@@ -239,6 +239,11 @@ class Outbox:
+             ),
+         )
+ 
++    def get(self, event_id: str) -> OutboxEvent | None:
++        """按 ``event_id`` 获取任意状态的事件；不存在（或已发布并被清理）时返回 None。"""
++        rows = self._query("SELECT * FROM outbox_events WHERE event_id = ?", (event_id,))
++        return self._row_to_event(rows[0]) if rows else None
++
+     def get_pending(self, limit: int = 100) -> list[OutboxEvent]:
+         """获取 pending 事件（含尚在退避中的），按创建时间升序排列。"""
+         rows = self._query(
+diff --git a/tests/unit/controlplane/test_auth.py b/tests/unit/controlplane/test_auth.py
+index 5cc8080..efdfb8a 100644
+--- a/tests/unit/controlplane/test_auth.py
++++ b/tests/unit/controlplane/test_auth.py
+@@ -308,19 +308,19 @@ def test_api_writes_are_audited_with_the_principal(api_client) -> None:
+     assert (created.status_code, deleted.status_code) == (201, 204)
+     registry = get_registry()
+     records = sorted(registry.audit_log.query_by_tenant("tenant-a"), key=lambda e: e.timestamp)
+-    events = registry.outbox.get_pending()
+     assert [(r.action, r.correlation_id) for r in records] == [
+         ("create", "corr-create"),
+         ("delete", "corr-delete"),
+     ]
+-    for record, event in zip(records, events, strict=True):
++    for record in records:
+         assert (record.tenant_id, record.actor, record.key_id) == ("tenant-a", "alice", "a")
+         assert (record.resource_type, record.namespace, record.resource_id) == (
+             "InferenceService",
+             "default",
+             "llama",
+         )
+-        assert record.details["eventId"] == event.event_id
++        event = registry.outbox.get(record.details["eventId"])
++        assert event is not None
+         assert event.payload["correlationId"] == record.correlation_id
+     assert registry.audit_log.query_by_tenant("tenant-b") == []
+ 
+diff --git a/tests/unit/controlplane/test_outbox.py b/tests/unit/controlplane/test_outbox.py
+index 921c930..810cd30 100644
+--- a/tests/unit/controlplane/test_outbox.py
++++ b/tests/unit/controlplane/test_outbox.py
+@@ -2,7 +2,7 @@
+ 
+ 覆盖事务性 Outbox 与 Dispatcher 的核心语义：
+ 
+-* 事件写入与查询（put / get_pending）；
++* 事件写入与查询（put / get / get_pending）；
+ * 标记已发布（mark_published）与重复标记抛错；
+ * 发布失败：指数退避（RetryPolicy）、到期查询（due）、达到上限进入 dead、
+   重新投递（redrive）、错误截断；
+@@ -92,6 +92,19 @@ def test_put_and_get_pending() -> None:
+     assert pending[0].payload == {"name": "demo"}
+ 
+ 
++@pytest.mark.unit
++def test_get_returns_an_event_in_any_state() -> None:
++    """get 按 event_id 取事件，不论状态；不存在时返回 None。"""
++    outbox = Outbox()
++    _put(outbox, _make_event("evt-1"), _make_event("evt-2"))
++    outbox.mark_published("evt-1", now=100.0)
++
++    published, pending = outbox.get("evt-1"), outbox.get("evt-2")
++    assert (published.status, published.published_at) == (OutboxStatus.PUBLISHED, 100.0)
++    assert (pending.status, pending.payload) == (OutboxStatus.PENDING, {"name": "demo"})
++    assert outbox.get("missing") is None
++
++
+ @pytest.mark.unit
+ def test_mark_published() -> None:
+     """标记后 status 变为 published。"""
+-- 
+2.43.0
+

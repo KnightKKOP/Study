@@ -1,0 +1,732 @@
+From 45b4c98f8b1ba252b2846a9dc742f9a54852728b Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 13 Oct 2026 02:42:48 +0000
+Subject: [PATCH 01/12] fix(controlplane): serialize stores that share a SQLite
+ connection
+
+TaskStore and Outbox each managed a bare sqlite3 connection without a
+lock, and the only way to put an Outbox write into a business
+transaction was to hand it someone else's connection. sqlite3
+transactions belong to the connection, so interleaving threads let one
+side's commit or rollback take the other side's uncommitted writes with
+it (the hazard already fixed inside the registry for R-1).
+
+Introduce controlplane.sqlite.Database: one connection plus a
+re-entrant lock. call()/run() roll back whatever the function left
+uncommitted when it raises and refuse to leave a transaction open;
+transaction() is a BEGIN IMMEDIATE unit of work. The registry,
+TaskStore and Outbox now go through it. TaskStore and Outbox accept
+database= to share one connection, and Outbox.database replaces the raw
+conn property and conn= argument.
+
+This also fixes the registry leaving a partial write behind when a
+write path raised anything other than IntegrityError: the next commit
+on the connection used to commit it.
+---
+ .../src/forgemesh/controlplane/outbox.py      | 121 ++++++++++--------
+ .../forgemesh/controlplane/registry/store.py  |  21 ++-
+ .../src/forgemesh/controlplane/sqlite.py      |  84 +++++++++++-
+ .../src/forgemesh/controlplane/tasks.py       |  46 ++++---
+ tests/contract/test_outbox_semantics.py       |  13 +-
+ tests/contract/test_registry_hardening.py     |  23 ++++
+ tests/unit/controlplane/test_sqlite.py        | 115 ++++++++++++++++-
+ 7 files changed, 327 insertions(+), 96 deletions(-)
+
+diff --git a/packages/control-plane/src/forgemesh/controlplane/outbox.py b/packages/control-plane/src/forgemesh/controlplane/outbox.py
+index 63b0a4b..a482f55 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/outbox.py
++++ b/packages/control-plane/src/forgemesh/controlplane/outbox.py
+@@ -18,7 +18,7 @@ from typing import Any
+ 
+ from pydantic import BaseModel, ConfigDict, Field
+ 
+-from .sqlite import connect
++from .sqlite import Database
+ 
+ _SCHEMA_SQL = """\
+ CREATE TABLE IF NOT EXISTS outbox_events (
+@@ -69,52 +69,57 @@ class Outbox:
+ 
+     Args:
+         db_path: SQLite 数据库路径，默认 :memory:。
+-        conn: 可选的外部 SQLite 连接（用于与业务事务共享）。
++        database: 与业务存储共用的数据库；给出时忽略 ``db_path``，:meth:`close`
++            不关闭它（由创建者关闭）。
+     """
+ 
+-    def __init__(self, db_path: str = ":memory:", conn: sqlite3.Connection | None = None) -> None:
+-        self._db_path = db_path
+-        self._conn = conn or connect(db_path)
+-        self._conn.row_factory = sqlite3.Row
++    def __init__(self, db_path: str = ":memory:", *, database: Database | None = None) -> None:
++        self._owns_db = database is None
++        self._db = database if database is not None else Database(db_path)
++        self._conn = self._db.conn
+         self._init_schema()
+ 
+     def _init_schema(self) -> None:
+         """创建表与索引（幂等）。"""
+-        self._conn.executescript(_SCHEMA_SQL)
+-        self._conn.commit()
++        with self._db.lock:
++            self._conn.executescript(_SCHEMA_SQL)
++            self._conn.commit()
+ 
+     @property
+-    def conn(self) -> sqlite3.Connection:
+-        """暴露连接，供业务事务共享。"""
+-        return self._conn
++    def database(self) -> Database:
++        """事件表所在的数据库，供业务写入与事件共用同一个连接和锁。"""
++        return self._db
+ 
+     def put(self, event: OutboxEvent) -> None:
+-        """写入事件（同步，应在业务事务中调用）。
+-
+-        与业务状态更新在同一事务中执行，保证原子性。
+-        """
+-        self._conn.execute(
+-            "INSERT INTO outbox_events (event_id, aggregate_type, aggregate_id, "
+-            "event_type, payload, created_at, status) "
+-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+-            (
+-                event.event_id,
+-                event.aggregate_type,
+-                event.aggregate_id,
+-                event.event_type,
+-                json.dumps(event.payload, ensure_ascii=False),
+-                event.created_at,
+-                event.status,
+-            ),
+-        )
+-        self._conn.commit()
++        """写入事件并提交。"""
++
++        def _put() -> None:
++            self._conn.execute(
++                "INSERT INTO outbox_events (event_id, aggregate_type, aggregate_id, "
++                "event_type, payload, created_at, status) "
++                "VALUES (?, ?, ?, ?, ?, ?, ?)",
++                (
++                    event.event_id,
++                    event.aggregate_type,
++                    event.aggregate_id,
++                    event.event_type,
++                    json.dumps(event.payload, ensure_ascii=False),
++                    event.created_at,
++                    event.status,
++                ),
++            )
++            self._conn.commit()
++
++        self._db.call(_put)
+ 
+     def get_pending(self, limit: int = 100) -> list[OutboxEvent]:
+         """获取待发布事件，按创建时间升序排列。"""
+-        rows = self._conn.execute(
+-            "SELECT * FROM outbox_events WHERE status = 'pending' ORDER BY created_at LIMIT ?",
+-            (limit,),
+-        ).fetchall()
++        rows = self._db.call(
++            lambda: self._conn.execute(
++                "SELECT * FROM outbox_events WHERE status = 'pending' ORDER BY created_at LIMIT ?",
++                (limit,),
++            ).fetchall()
++        )
+         return [self._row_to_event(r) for r in rows]
+ 
+     def mark_published(self, event_id: str) -> None:
+@@ -122,14 +127,18 @@ class Outbox:
+ 
+         仅当事件处于 pending 状态时才可标记；否则抛 ValueError。
+         """
+-        cur = self._conn.execute(
+-            "UPDATE outbox_events SET status = 'published', published_at = ? "
+-            "WHERE event_id = ? AND status = 'pending'",
+-            (time.time(), event_id),
+-        )
+-        if cur.rowcount == 0:
+-            raise ValueError(f"event not found or already published: {event_id}")
+-        self._conn.commit()
++
++        def _mark() -> None:
++            cur = self._conn.execute(
++                "UPDATE outbox_events SET status = 'published', published_at = ? "
++                "WHERE event_id = ? AND status = 'pending'",
++                (time.time(), event_id),
++            )
++            if cur.rowcount == 0:
++                raise ValueError(f"event not found or already published: {event_id}")
++            self._conn.commit()
++
++        self._db.call(_mark)
+ 
+     def mark_failed(self, event_id: str, reason: str = "") -> None:
+         """标记事件发布失败。
+@@ -138,17 +147,24 @@ class Outbox:
+             event_id: 事件标识。
+             reason: 失败原因（保留用于未来扩展，当前未持久化）。
+         """
+-        self._conn.execute(
+-            "UPDATE outbox_events SET status = 'failed' WHERE event_id = ? AND status = 'pending'",
+-            (event_id,),
+-        )
+-        self._conn.commit()
++
++        def _mark() -> None:
++            self._conn.execute(
++                "UPDATE outbox_events SET status = 'failed' "
++                "WHERE event_id = ? AND status = 'pending'",
++                (event_id,),
++            )
++            self._conn.commit()
++
++        self._db.call(_mark)
+ 
+     def get_stats(self) -> dict[str, int]:
+         """获取 Outbox 统计信息（各状态事件数量）。"""
+-        rows = self._conn.execute(
+-            "SELECT status, COUNT(*) as cnt FROM outbox_events GROUP BY status"
+-        ).fetchall()
++        rows = self._db.call(
++            lambda: self._conn.execute(
++                "SELECT status, COUNT(*) as cnt FROM outbox_events GROUP BY status"
++            ).fetchall()
++        )
+         return {row["status"]: row["cnt"] for row in rows}
+ 
+     @staticmethod
+@@ -166,8 +182,9 @@ class Outbox:
+         )
+ 
+     async def close(self) -> None:
+-        """关闭数据库连接。"""
+-        await asyncio.to_thread(self._conn.close)
++        """关闭数据库连接（共用的 ``database`` 由创建者关闭）。"""
++        if self._owns_db:
++            await asyncio.to_thread(self._db.close)
+ 
+ 
+ class Dispatcher:
+diff --git a/packages/control-plane/src/forgemesh/controlplane/registry/store.py b/packages/control-plane/src/forgemesh/controlplane/registry/store.py
+index bb3954d..4b101f3 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/registry/store.py
++++ b/packages/control-plane/src/forgemesh/controlplane/registry/store.py
+@@ -77,7 +77,6 @@ import contextlib
+ import json
+ import logging
+ import sqlite3
+-import threading
+ from collections.abc import Callable, Collection, Iterator, Sequence
+ from dataclasses import dataclass, field
+ from datetime import UTC, datetime
+@@ -94,7 +93,7 @@ from forgemesh.resource.inference import Endpoint, InferenceService
+ from forgemesh.resource.states import ALLOCATION_STATE_MACHINE, INFERENCE_STATE_MACHINE
+ from pydantic import ValidationError
+ 
+-from ..sqlite import connect
++from ..sqlite import Database
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -262,9 +261,9 @@ class SQLiteRegistry(ResourceRegistry):
+ 
+     def __init__(self, db_path: str = ":memory:") -> None:
+         self._db_path = db_path
+-        self._conn = connect(db_path)
+-        self._conn.row_factory = sqlite3.Row
+-        self._lock = threading.RLock()
++        self._db = Database(db_path)
++        self._conn = self._db.conn
++        self._lock = self._db.lock
+         self._init_schema()
+ 
+     # ------------------------------------------------------------------ #
+@@ -272,13 +271,9 @@ class SQLiteRegistry(ResourceRegistry):
+     # ------------------------------------------------------------------ #
+ 
+     async def _run(self, fn: Callable[[], _T]) -> _T:
+-        """在工作线程中持锁执行一段同步数据库操作（读写均串行化）。"""
+-
+-        def _locked() -> _T:
+-            with self._lock:
+-                return fn()
+-
+-        return await asyncio.to_thread(_locked)
++        """在工作线程中持锁执行一段同步数据库操作（读写均串行化）；``fn`` 抛出异常时
++        回滚它未提交的写入，不会被下一次提交连带提交。"""
++        return await self._db.run(fn)
+ 
+     @staticmethod
+     def _record_change(
+@@ -1438,7 +1433,7 @@ class SQLiteRegistry(ResourceRegistry):
+ 
+     async def close(self) -> None:
+         """关闭数据库连接。"""
+-        await self._run(self._conn.close)
++        await asyncio.to_thread(self._db.close)
+ 
+ 
+ __all__ = [
+diff --git a/packages/control-plane/src/forgemesh/controlplane/sqlite.py b/packages/control-plane/src/forgemesh/controlplane/sqlite.py
+index 5075b1e..bb5f578 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/sqlite.py
++++ b/packages/control-plane/src/forgemesh/controlplane/sqlite.py
+@@ -12,6 +12,9 @@
+   确认的事务在掉电后丢失，权威存储不接受。
+ * 等待锁的时长沿用 :func:`sqlite3.connect` 默认的 5 秒（``timeout``，即 ``busy_timeout``）。
+ 
++资源注册表、Outbox 与任务存储经 :class:`Database` 访问连接：同一个连接上的操作由
++它的锁串行化，可以把几个存储的写入放进同一个事务。
++
+ 工作流运行时的存储（``forgemesh.workflowruntime.store.WorkflowStore``）不在这个文件里，
+ 而是使用 :func:`workflow_db_path` 给出的同目录独立文件：它在后台频繁写入步骤状态，
+ 放在同一个文件里会与资源注册表争用唯一的写锁（WAL 只让读写互不阻塞，写入仍然排队）。
+@@ -20,10 +23,17 @@
+ 
+ from __future__ import annotations
+ 
++import asyncio
++import contextlib
+ import sqlite3
++import threading
++from collections.abc import Callable, Iterator
+ from pathlib import Path
++from typing import Any, TypeVar
++
++__all__ = ["Database", "connect", "workflow_db_path"]
+ 
+-__all__ = ["connect", "workflow_db_path"]
++_T = TypeVar("_T")
+ 
+ 
+ def connect(db_path: str) -> sqlite3.Connection:
+@@ -42,6 +52,78 @@ def connect(db_path: str) -> sqlite3.Connection:
+     return conn
+ 
+ 
++class Database:
++    """一个 SQLite 连接加一把可重入锁，供同一个数据库上的多个存储共用。
++
++    sqlite3 的事务属于连接：多个线程交错使用同一个连接时，一方的 ``commit`` /
++    ``rollback`` 会连带提交或丢弃另一方尚未完成的写入。共用一个 :class:`Database` 的
++    存储只在持锁时使用连接，因此可以把几个存储的写入放进同一个事务，一起提交或回滚
++    （ADR-008 的工作单元，例如资源写入与它的 Outbox 事件、审计记录）。
++
++    Args:
++        db_path: 数据库文件路径，默认 ``:memory:``（内存库只能经同一个实例共用）。
++    """
++
++    def __init__(self, db_path: str = ":memory:") -> None:
++        self.path = db_path
++        self.conn = connect(db_path)
++        self.conn.row_factory = sqlite3.Row
++        self.lock = threading.RLock()
++
++    def call(self, fn: Callable[..., _T], /, *args: Any, **kwargs: Any) -> _T:
++        """持锁执行 ``fn``，由 ``fn`` 自行提交；``fn`` 抛出异常时回滚它未提交的写入。
++
++        Raises:
++            RuntimeError: ``fn`` 正常返回，却留下了它开启的未提交事务（已回滚）。
++        """
++        with self.lock:
++            already_open = self.conn.in_transaction
++            try:
++                result = fn(*args, **kwargs)
++            except BaseException:
++                self._rollback()
++                raise
++            if not already_open and self.conn.in_transaction:
++                self.conn.rollback()
++                raise RuntimeError(f"{fn!r} left a transaction open; it has been rolled back")
++            return result
++
++    async def run(self, fn: Callable[..., _T], /, *args: Any, **kwargs: Any) -> _T:
++        """在工作线程中执行 :meth:`call`，不阻塞事件循环。"""
++        return await asyncio.to_thread(self.call, fn, *args, **kwargs)
++
++    @contextlib.contextmanager
++    def transaction(self) -> Iterator[sqlite3.Connection]:
++        """持锁执行一组读写：开始即持有写锁（``BEGIN IMMEDIATE``），正常退出时提交，
++        抛出异常时回滚。
++
++        不能嵌套在另一个事务中：内层的提交会把外层尚未完成的写入一起提交。
++
++        Raises:
++            RuntimeError: 进入时连接上已有未提交的事务。
++        """
++        with self.lock:
++            if self.conn.in_transaction:
++                raise RuntimeError("a transaction is already open on this connection")
++            self.conn.execute("BEGIN IMMEDIATE")
++            try:
++                yield self.conn
++            except BaseException:
++                self._rollback()
++                raise
++            self.conn.commit()
++
++    def close(self) -> None:
++        """关闭连接（等待持锁的操作结束）。"""
++        with self.lock:
++            self.conn.close()
++
++    def _rollback(self) -> None:
++        with contextlib.suppress(sqlite3.ProgrammingError):  # 连接已关闭
++            if self.conn.in_transaction:
++                self.conn.rollback()
++
++
+ def workflow_db_path(db_path: str) -> str:
+     """控制平面数据库 ``db_path`` 对应的工作流存储文件（同目录）。
+ 
+diff --git a/packages/control-plane/src/forgemesh/controlplane/tasks.py b/packages/control-plane/src/forgemesh/controlplane/tasks.py
+index a716d52..f5ab17b 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/tasks.py
++++ b/packages/control-plane/src/forgemesh/controlplane/tasks.py
+@@ -8,8 +8,10 @@
+   EXEC 等任意命令类型**（ADR-009）。
+ * **幂等**：:class:`TaskStore.create` 以 ``idempotency_key`` 为唯一约束，同一键
+   重复创建返回已有任务，不产生新记录（断线重连去重）。
+-* **SQLite 持久化**：与 :class:`WorkflowStore` 风格一致，所有异步方法通过
+-  :func:`asyncio.to_thread` 包装同步 sqlite3 调用，``check_same_thread=False``。
++* **SQLite 持久化**：所有异步方法经
++  :meth:`Database.run <forgemesh.controlplane.sqlite.Database.run>` 在工作线程中持锁
++  执行同步 sqlite3 调用；可与 Outbox 等存储共用一个
++  :class:`~forgemesh.controlplane.sqlite.Database`（同一把锁串行化同一个连接）。
+ * **去重器**：:class:`TaskDeduplicator` 提供进程内轻量去重（与 SQLite 幂等互补，
+   用于下发前的快速判重）。
+ """
+@@ -24,7 +26,7 @@ from enum import StrEnum
+ from forgemesh.core.errors import NotFoundError
+ from pydantic import BaseModel, ConfigDict
+ 
+-from .sqlite import connect
++from .sqlite import Database
+ 
+ # ---------------------------------------------------------------------- #
+ # 枚举
+@@ -143,17 +145,19 @@ CREATE INDEX IF NOT EXISTS idx_tasks_agent_status ON tasks(agent_id, status);
+ class TaskStore:
+     """基于 SQLite 的任务持久化存储。
+ 
+-    与 :class:`forgemesh.workflowruntime.WorkflowStore` 风格一致：所有异步方法
+-    通过 :func:`asyncio.to_thread` 在独立线程执行同步 sqlite3 调用。
++    所有异步方法在工作线程中持 :class:`~forgemesh.controlplane.sqlite.Database` 的锁
++    执行同步 sqlite3 调用，抛出异常时回滚未提交的写入。
+ 
+     Args:
+         db_path: SQLite 数据库文件路径，默认 ``:memory:``（内存库，单测友好）。
++        database: 与其他存储共用的数据库；给出时忽略 ``db_path``，:meth:`close`
++            不关闭它（由创建者关闭）。
+     """
+ 
+-    def __init__(self, db_path: str = ":memory:") -> None:
+-        self._db_path = db_path
+-        self._conn = connect(db_path)
+-        self._conn.row_factory = sqlite3.Row
++    def __init__(self, db_path: str = ":memory:", *, database: Database | None = None) -> None:
++        self._owns_db = database is None
++        self._db = database if database is not None else Database(db_path)
++        self._conn = self._db.conn
+         self._init_schema()
+ 
+     # ------------------------------------------------------------------ #
+@@ -162,8 +166,9 @@ class TaskStore:
+ 
+     def _init_schema(self) -> None:
+         """创建表与索引（幂等）。"""
+-        self._conn.executescript(_SCHEMA_SQL)
+-        self._conn.commit()
++        with self._db.lock:
++            self._conn.executescript(_SCHEMA_SQL)
++            self._conn.commit()
+ 
+     @staticmethod
+     def _now() -> float:
+@@ -189,7 +194,7 @@ class TaskStore:
+         )
+ 
+     # ------------------------------------------------------------------ #
+-    # 同步实现（由 async 方法通过 asyncio.to_thread 调用）
++    # 同步实现（由 async 方法经 Database.run 持锁调用）
+     # ------------------------------------------------------------------ #
+ 
+     def _create_sync(self, task: Task) -> Task:
+@@ -294,8 +299,9 @@ class TaskStore:
+         return self._row_to_task(row)
+ 
+     def _close_sync(self) -> None:
+-        """同步关闭连接。"""
+-        self._conn.close()
++        """同步关闭连接（共用的 ``database`` 由创建者关闭）。"""
++        if self._owns_db:
++            self._db.close()
+ 
+     # ------------------------------------------------------------------ #
+     # 公开异步 API
+@@ -313,7 +319,7 @@ class TaskStore:
+         Returns:
+             写入后的任务（含时间戳）；或同幂等键的既有任务。
+         """
+-        return await asyncio.to_thread(self._create_sync, task)
++        return await self._db.run(self._create_sync, task)
+ 
+     async def get(self, task_id: str) -> Task:
+         """查询单个任务。
+@@ -321,7 +327,7 @@ class TaskStore:
+         Raises:
+             NotFoundError: 任务不存在。
+         """
+-        return await asyncio.to_thread(self._get_sync, task_id)
++        return await self._db.run(self._get_sync, task_id)
+ 
+     async def update_status(
+         self,
+@@ -334,7 +340,7 @@ class TaskStore:
+         Raises:
+             NotFoundError: 任务不存在。
+         """
+-        await asyncio.to_thread(self._update_status_sync, task_id, status, result)
++        await self._db.run(self._update_status_sync, task_id, status, result)
+ 
+     async def list_pending(self, agent_id: str | None = None) -> list[Task]:
+         """列出待执行（非终态）任务。
+@@ -345,16 +351,16 @@ class TaskStore:
+         Returns:
+             按 ``created_at`` 升序排列的待执行任务列表。
+         """
+-        return await asyncio.to_thread(self._list_pending_sync, agent_id)
++        return await self._db.run(self._list_pending_sync, agent_id)
+ 
+     async def list_by_idempotency_key(self, idempotency_key: str) -> Task | None:
+         """按幂等键查询任务，不存在返回 ``None``。"""
+-        return await asyncio.to_thread(
++        return await self._db.run(
+             self._list_by_idempotency_key_sync, idempotency_key
+         )
+ 
+     async def close(self) -> None:
+-        """关闭数据库连接。"""
++        """关闭数据库连接（共用的 ``database`` 由创建者关闭）。"""
+         await asyncio.to_thread(self._close_sync)
+ 
+ 
+diff --git a/tests/contract/test_outbox_semantics.py b/tests/contract/test_outbox_semantics.py
+index 48187c3..74b2e8b 100644
+--- a/tests/contract/test_outbox_semantics.py
++++ b/tests/contract/test_outbox_semantics.py
+@@ -30,6 +30,7 @@ from forgemesh.controlplane.outbox import (
+     Outbox,
+     OutboxEvent,
+ )
++from forgemesh.controlplane.sqlite import Database
+ 
+ 
+ def _run(coro):
+@@ -57,11 +58,11 @@ def _make_event(
+ def _open_shared_outbox(db_file) -> tuple[Outbox, sqlite3.Connection]:
+     """打开共享连接的 Outbox 并初始化业务表。
+ 
+-    实现提供的事务集成方式即 ``Outbox(conn=...)`` 共享同一 SQLite 连接，
+-    业务状态与事件记录在该连接的同一事务上下文中写入。
++    实现提供的事务集成方式即 ``Outbox(database=...)`` 与业务存储共用一个
++    :class:`Database`，业务状态与事件记录在该连接的同一事务上下文中写入。
+     """
+-    conn = sqlite3.connect(str(db_file), check_same_thread=False)
+-    outbox = Outbox(conn=conn)
++    outbox = Outbox(database=Database(str(db_file)))
++    conn = outbox.database.conn
+     conn.execute(
+         "CREATE TABLE IF NOT EXISTS biz_services (id TEXT PRIMARY KEY, status TEXT NOT NULL)"
+     )
+@@ -315,11 +316,11 @@ def test_manual_replay_failed_event(tmp_path) -> None:
+     assert side_effects == []
+ 
+     # 手动重放：通过 Outbox 暴露的共享连接重置状态（模拟运维重放动作）。
+-    outbox.conn.execute(
++    outbox.database.conn.execute(
+         "UPDATE outbox_events SET status = 'pending' WHERE event_id = ?",
+         ("evt-replay",),
+     )
+-    outbox.conn.commit()
++    outbox.database.conn.commit()
+     assert [e.event_id for e in outbox.get_pending()] == ["evt-replay"]
+ 
+     replay_round = Dispatcher(outbox, flaky_publisher)
+diff --git a/tests/contract/test_registry_hardening.py b/tests/contract/test_registry_hardening.py
+index 3d80a6c..abed4ed 100644
+--- a/tests/contract/test_registry_hardening.py
++++ b/tests/contract/test_registry_hardening.py
+@@ -103,6 +103,29 @@ def test_shared_instance_concurrent_writes_are_not_lost() -> None:
+     asyncio.run(scenario())
+ 
+ 
++@pytest.mark.contract
++def test_unexpected_error_rolls_back_the_partial_write(monkeypatch) -> None:
++    """写入中途抛出非预期异常时回滚：残留的写入不能被下一次提交连带提交。"""
++
++    def broken(*args, **kwargs) -> None:
++        raise RuntimeError("boom")
++
++    async def scenario() -> None:
++        reg = SQLiteRegistry(":memory:")
++        try:
++            monkeypatch.setattr(reg, "_record_change", broken)
++            with pytest.raises(RuntimeError, match="boom"):
++                await reg.put(_make_resource("orphan"))
++            monkeypatch.undo()
++            await reg.put(_make_resource("next"))
++            assert [r.metadata.name for r in await reg.list(KIND, TENANT)] == ["next"]
++            assert [c.key.name for c in await reg.changes_since(0)] == ["next"]
++        finally:
++            await reg.close()
++
++    asyncio.run(scenario())
++
++
+ @pytest.mark.contract
+ def test_create_without_namespace_rejects_duplicate_name() -> None:
+     """namespace 为空的同名资源只能创建一次（SQLite 主键 NULL 互不相等）。"""
+diff --git a/tests/unit/controlplane/test_sqlite.py b/tests/unit/controlplane/test_sqlite.py
+index 751824a..d26195c 100644
+--- a/tests/unit/controlplane/test_sqlite.py
++++ b/tests/unit/controlplane/test_sqlite.py
+@@ -5,7 +5,9 @@
+ * ``connect`` 启用 WAL 与外键约束，``synchronous`` 保持 ``FULL``，等锁 5 秒；
+ * 控制平面的各个存储都以 WAL 模式打开数据库文件；
+ * 同一文件上一个连接的读事务不阻塞另一个存储写入；
+-* 工作流存储使用同目录的独立文件，控制平面库被写锁占用时照常写入。
++* 工作流存储使用同目录的独立文件，控制平面库被写锁占用时照常写入；
++* :class:`Database`：异常时回滚、拒绝遗留未提交的事务、事务整体提交或回滚，
++  共用它的存储不会丢失彼此的写入。
+ """
+ 
+ from __future__ import annotations
+@@ -17,11 +19,12 @@ import time
+ 
+ import pytest
+ from forgemesh.controlplane.audit import AuditLog
+-from forgemesh.controlplane.outbox import Outbox
++from forgemesh.controlplane.outbox import Outbox, OutboxEvent
+ from forgemesh.controlplane.reconciler import ProcessedKeyStore
+ from forgemesh.controlplane.registry import SQLiteRegistry
+-from forgemesh.controlplane.sqlite import connect, workflow_db_path
+-from forgemesh.controlplane.tasks import TaskStore
++from forgemesh.controlplane.sqlite import Database, connect, workflow_db_path
++from forgemesh.controlplane.tasks import TaskStatus, TaskStore
++from forgemesh.core.errors import NotFoundError
+ from forgemesh.workflow.runtime import Step, WorkflowDefinition
+ from forgemesh.workflowruntime.store import WorkflowStore
+ 
+@@ -129,3 +132,107 @@ def test_workflow_store_writes_while_the_control_plane_database_is_locked(tmp_pa
+         writer.rollback()
+         writer.close()
+         asyncio.run(workflows.close())
++
++
++def _values(conn: sqlite3.Connection) -> list[str]:
++    return [row[0] for row in conn.execute("SELECT v FROM t ORDER BY v")]
++
++
++@pytest.mark.unit
++def test_database_call_rolls_back_when_the_function_raises() -> None:
++    db = Database()
++    try:
++        db.conn.execute("CREATE TABLE t (v TEXT)")
++
++        def _fail() -> None:
++            db.conn.execute("INSERT INTO t VALUES ('lost')")
++            raise RuntimeError("boom")
++
++        def _write() -> None:
++            db.conn.execute("INSERT INTO t VALUES ('kept')")
++            db.conn.commit()
++
++        with pytest.raises(RuntimeError, match="boom"):
++            db.call(_fail)
++        assert not db.conn.in_transaction
++        db.call(_write)
++        assert _values(db.conn) == ["kept"]
++    finally:
++        db.close()
++
++
++@pytest.mark.unit
++def test_database_call_refuses_to_leave_a_transaction_open() -> None:
++    db = Database()
++    try:
++        db.conn.execute("CREATE TABLE t (v TEXT)")
++        with pytest.raises(RuntimeError, match="left a transaction open"):
++            db.call(db.conn.execute, "INSERT INTO t VALUES ('uncommitted')")
++        assert not db.conn.in_transaction
++        assert _values(db.conn) == []
++    finally:
++        db.close()
++
++
++@pytest.mark.unit
++def test_database_transaction_commits_or_rolls_back_as_a_unit(tmp_path) -> None:
++    path = str(tmp_path / "cp.db")
++    db = Database(path)
++    probe = sqlite3.connect(path, timeout=0)
++    try:
++        db.conn.execute("CREATE TABLE t (v TEXT)")
++        with db.transaction() as conn:
++            conn.execute("INSERT INTO t VALUES ('a')")
++            assert _values(probe) == []
++            # 事务开始即持有写锁：其他连接此时无法写入。
++            with pytest.raises(sqlite3.OperationalError, match="locked"):
++                probe.execute("INSERT INTO t VALUES ('other')")
++            probe.rollback()
++            with pytest.raises(RuntimeError, match="already open"), db.transaction():
++                pass
++        assert _values(probe) == ["a"]
++
++        with pytest.raises(RuntimeError, match="boom"), db.transaction() as conn:
++            conn.execute("INSERT INTO t VALUES ('b')")
++            raise RuntimeError("boom")
++        assert not db.conn.in_transaction
++        assert _values(probe) == ["a"]
++    finally:
++        probe.close()
++        db.close()
++
++
++@pytest.mark.unit
++def test_stores_sharing_a_database_do_not_lose_each_others_writes(tmp_path) -> None:
++    """任务存储与 Outbox 共用一个连接：一方的回滚不会连带丢弃另一方尚未提交的写入。"""
++
++    async def scenario() -> None:
++        database = Database(str(tmp_path / "cp.db"))
++        tasks = TaskStore(database=database)
++        outbox = Outbox(database=database)
++
++        def put(event_id: str) -> None:
++            with database.transaction():
++                outbox.put(
++                    OutboxEvent(
++                        event_id=event_id, aggregate_type="T", aggregate_id="a", event_type="t"
++                    )
++                )
++
++        try:
++            for round_no in range(10):
++                puts = [asyncio.to_thread(put, f"evt-{round_no}-{i}") for i in range(16)]
++                misses = [
++                    tasks.update_status(f"missing-{i}", TaskStatus.RUNNING) for i in range(16)
++                ]
++                results = await asyncio.gather(*puts, *misses, return_exceptions=True)
++                assert results[:16] == [None] * 16
++                assert all(isinstance(r, NotFoundError) for r in results[16:])
++            assert outbox.get_stats() == {"pending": 160}
++            await tasks.close()
++            await outbox.close()
++            assert database.call(lambda: database.conn.execute("SELECT 1").fetchone()[0]) == 1
++        finally:
++            database.close()
++
++    asyncio.run(scenario())
+-- 
+2.43.0
+

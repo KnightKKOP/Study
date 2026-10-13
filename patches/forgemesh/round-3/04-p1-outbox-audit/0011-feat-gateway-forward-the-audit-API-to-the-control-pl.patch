@@ -1,0 +1,227 @@
+From 49c85dbfea5c43d2526d70aef070a606c4f6d28f Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 13 Oct 2026 04:21:33 +0000
+Subject: [PATCH 11/12] feat(gateway): forward the audit API to the control
+ plane
+
+GET /api/v1/audit-events was only reachable on the control plane
+itself: the gateway's proxy routes did not include it, so requests
+through the documented entry point got 404.
+
+The path joins proxyRoutes like the other resource routes (exact path
+and subtree), so it goes through the same chain: the API key is
+checked, the tenant header is overwritten with the verified tenant,
+requests count against the tenant's rate limit, the correlation id is
+passed through, and path and query reach the control plane unchanged.
+As for the other resource routes, the gateway does not check scopes;
+the control plane enforces the read scope with the forwarded
+credentials.
+
+The README, the gateway README, the CHANGELOG entry and the OpenAPI
+operation no longer say that the gateway returns 404 for this path.
+---
+ CHANGELOG.md                         |  2 +-
+ README.md                            |  2 +-
+ api/openapi/openapi.yaml             |  2 +-
+ gateway/README.md                    |  1 +
+ gateway/internal/router/auth_test.go | 84 ++++++++++++++++++++++++++--
+ gateway/internal/router/router.go    |  2 +
+ 6 files changed, 85 insertions(+), 8 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 035d2f8..ec422f1 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -49,7 +49,7 @@
+ - 控制平面在应用启动（lifespan）时运行 Outbox 的 `Dispatcher`（每 0.5 秒查询一次到期事件）发布资源变更事件：至少投递一次，接收方按 `eventId` 去重，顺序只是尽力按写入顺序。发布器由 `forgemesh.controlplane.publishers.publisher_from_env` 按环境变量选择：默认 `LogPublisher`，每个事件写一行 JSON 日志（logger `forgemesh.events`；进程没有配置 logging 时写标准输出，以 `forgemesh-control-plane` 运行即是如此）；设置 `FORGEMESH_EVENT_WEBHOOK_URL`（`http` / `https`）后为 `WebhookPublisher`，把信封以 JSON `POST` 到该地址，请求头带 `X-Forgemesh-Event-Id`，设置了 `FORGEMESH_EVENT_WEBHOOK_TOKEN` 时带 `Authorization: Bearer <token>`；2xx 视为送达，其余状态码（不跟随重定向）、超时与连接错误视为失败，每次发送的超时为 `FORGEMESH_EVENT_WEBHOOK_TIMEOUT_SECONDS`（默认 `5`，大于 0、不超过 `60`），遵循 `HTTPS_PROXY` 等代理环境变量。取值非法（如地址含用户信息或片段、token 含空白或非 ASCII 字符）或没有设置地址却设置了 token / 超时时抛出 `EventConfigError`，控制平面在打开数据库之前拒绝启动。关闭时 Dispatcher 在控制器之后、关闭数据库之前停止，仍待发布的事件在下次启动后发布。`create_app` 新增参数 `event_publisher`，供嵌入方注入发布器。变量见 README「运行控制平面」。
+ - Outbox 失败重试与 `dead`：发布失败按指数退避重试（`RetryPolicy`：1 秒起翻倍、最长 300 秒，默认最多 10 次，前后约 8.5 分钟），失败次数 `attempts`、最近一次错误 `last_error`（异常类型与消息）与下次发布时间 `next_attempt_at` 记在数据库中，重启后继续；达到上限后事件进入 `dead` 并记一条 ERROR 日志，`list_dead()` 列出，`redrive()` 放回待发布队列（命令见 [docs/operations/backup-restore.md](docs/operations/backup-restore.md) 第 5 节）。`Dispatcher` 只按数据库状态取到期的事件，一轮中遇到失败即结束本轮（目标不可用时不会对每个事件各等一次超时），已发布的事件保留 7 天后删除；新增 `start()` / `shutdown()` 以后台任务运行，循环中的数据库错误不会使它退出。另新增 `Outbox.get()`（按 id 查询任意状态的事件）、`due()` 与 `purge_published()`。
+ - 审计记录：经 API 创建与删除资源（`POST` / `DELETE /api/v1/inference-services`）时，在写入资源与事件的同一个事务中写入一条审计记录，含租户、主体（`actor`）、API key id（`key_id`，`dev` 模式为空）、correlation id（与事件相同）、命名空间、`action`（`create` / `delete`）与 `outcome`（`success`），`details` 记录变更类型、资源 uid、`resourceVersion` 与对应事件的 `eventId`。被拒绝或失败的请求、对已在 `Terminating` 的资源重复的删除请求以及控制器的写入不产生审计记录。`SQLiteRegistry.put` / `delete` / `request_delete` 新增仅限关键字参数 `principal`（凭证的租户与资源不一致时在写入任何数据之前拒绝），`update_status` 新增 `correlation_id`，`audit_log` 属性返回共用连接的审计日志；`Principal` 新增 `key_id`；`AuditEvent` 新增 `key_id` / `namespace`（打开旧库时自动补列）；`AuditLog.put()` 在调用方的事务中写入，不自行提交。
+-- 审计查询 `GET /api/v1/audit-events`：返回凭证所属租户的审计记录，最新的在前，需要 `read` scope；参数 `limit`（1–1000，默认 100，与列表接口一致）、`pageToken` 与可选的 `correlationId`，响应为 `{items, count, nextPageToken}`，还有下一页时才有 `nextPageToken`。按位置（时间戳、记录 id）分页（`AuditLog.list_page`），翻页期间写入的新记录不会使后面的页重复或遗漏；分页令牌绑定租户与过滤条件，为其他租户或条件签发、或无法解析的令牌返回 `400`。OpenAPI 新增该操作与 `AuditEvent` / `AuditEventList`。Go 网关尚未转发这个路径（返回 `404`），需直接访问控制平面。
++- 审计查询 `GET /api/v1/audit-events`：返回凭证所属租户的审计记录，最新的在前，需要 `read` scope；参数 `limit`（1–1000，默认 100，与列表接口一致）、`pageToken` 与可选的 `correlationId`，响应为 `{items, count, nextPageToken}`，还有下一页时才有 `nextPageToken`。按位置（时间戳、记录 id）分页（`AuditLog.list_page`），翻页期间写入的新记录不会使后面的页重复或遗漏；分页令牌绑定租户与过滤条件，为其他租户或条件签发、或无法解析的令牌返回 `400`。OpenAPI 新增该操作与 `AuditEvent` / `AuditEventList`。Go 网关转发这个路径，与其他资源路由相同：校验 API key、按已验证租户限流、透传关联 ID 与查询串，`read` scope 由控制平面检查。
+ - `forgemesh.controlplane.sqlite.Database`：一个 SQLite 连接加一把可重入锁。Registry、Outbox 与审计日志共用一个实例，资源写入与它的事件、审计记录在同一个事务中提交或回滚（ADR-008 的工作单元）：`transaction()` 以 `BEGIN IMMEDIATE` 开始，`call()` / `run()` 在函数抛出异常时回滚它未提交的写入，并拒绝留下未结束的事务。`TaskStore`、`AuditLog` 与 `IdempotentConsumer` 都可以经 `database=` 共用连接。
+ 
+ ### Changed
+diff --git a/README.md b/README.md
+index a686a7d..6ac908b 100644
+--- a/README.md
++++ b/README.md
+@@ -187,7 +187,7 @@ curl -s -H "Authorization: Bearer fmk_…" http://127.0.0.1:8080/api/v1/inferenc
+ 
+ 控制平面启动后会自动协调 `InferenceService`：新建、修改或请求删除的资源在 0.5 秒内被处理，协调结果写入 `status.conditions`（例如 `Ready=False` 及其原因）。未设置 `FORGEMESH_INVENTORY_FILE` 时，新建的服务会停在 `Pending`，并带有 `Ready=False`（`SchedulerUnavailable`）条件；只设置清单、未设置 `FORGEMESH_RUNTIME_LAUNCHER` 时，条件为 `Ready=False`（`WorkflowRuntimeUnavailable`），协调器在分配之前停下，不占用设备。两者都设置后，资源每轮推进一个 phase（`Pending` → `Scheduling` → `Preparing` → `Deploying` → `Verifying` → `Ready`）：分配设备，运行部署工作流（准备模型 → 启动实例 → 验证实例），成功后写入 `status.endpoints` 与 `Ready=True`，网关随即可以转发对话；部署失败时资源进入 `Failed`，不自动重试，删除后重新创建即可再次部署；删除时先取消部署、停止实例，再释放分配。每个服务只部署一个实例（`spec.availability.replicas` 不生效），已部署服务的 `spec` 变化不会重新部署。控制器与 API 运行在同一个进程中，是权威存储的唯一写者（ADR-013）：请以单进程运行，不要使用 `uvicorn --workers` 或多副本。设置了启动器时 `POST /api/v1/workflows` 同样返回 `503`（`WORKFLOW_RUNTIME_UNAVAILABLE`）：部署工作流的运行时只供协调器使用，不对外开放。
+ 
+-每次资源写入（经 API 或控制器）都在同一个事务中记下一条资源变更事件（信封见 `api/schemas/event.schema.json`，如 `inference.service.created`、`inference.service.status_updated`），控制平面在后台发布：默认写日志（logger `forgemesh.events`，每个事件一行 JSON，没有配置 logging 时写标准输出），设置 `FORGEMESH_EVENT_WEBHOOK_URL` 后 `POST` 到 webhook。事件至少投递一次，接收方按 `eventId`（webhook 请求头 `X-Forgemesh-Event-Id`）去重；发送失败时按 1 秒起翻倍、最长 300 秒的间隔重试，失败 10 次后不再发送（`dead`，记一条 ERROR 日志），修复接收方后可以重新投递，见[备份与灾备演练](docs/operations/backup-restore.md)第 5 节。经 API 创建与删除资源时，同一事务还写入一条审计记录（租户、主体、key id、correlation id），`GET /api/v1/audit-events` 按时间倒序分页列出本租户的记录（需要 `read` scope，可按 `correlationId` 过滤；网关尚未转发这个路径，请直接访问控制平面）。
++每次资源写入（经 API 或控制器）都在同一个事务中记下一条资源变更事件（信封见 `api/schemas/event.schema.json`，如 `inference.service.created`、`inference.service.status_updated`），控制平面在后台发布：默认写日志（logger `forgemesh.events`，每个事件一行 JSON，没有配置 logging 时写标准输出），设置 `FORGEMESH_EVENT_WEBHOOK_URL` 后 `POST` 到 webhook。事件至少投递一次，接收方按 `eventId`（webhook 请求头 `X-Forgemesh-Event-Id`）去重；发送失败时按 1 秒起翻倍、最长 300 秒的间隔重试，失败 10 次后不再发送（`dead`，记一条 ERROR 日志），修复接收方后可以重新投递，见[备份与灾备演练](docs/operations/backup-restore.md)第 5 节。经 API 创建与删除资源时，同一事务还写入一条审计记录（租户、主体、key id、correlation id），`GET /api/v1/audit-events` 按时间倒序分页列出本租户的记录（需要 `read` scope，可按 `correlationId` 过滤）。
+ 
+ ### Go 网关
+ 
+diff --git a/api/openapi/openapi.yaml b/api/openapi/openapi.yaml
+index fbfc671..7f84f0a 100644
+--- a/api/openapi/openapi.yaml
++++ b/api/openapi/openapi.yaml
+@@ -252,7 +252,7 @@ paths:
+         事务中写入一条审计记录，记录调用主体与关联 ID；被拒绝的请求、对已在 Terminating 的资源
+         重复的删除请求以及控制器的内部写入不产生审计记录。分页：nextPageToken 只在还有下一页时
+         出现，原样作为 pageToken 传入即取下一页；翻页期间写入的新记录不会让后面的页重复或遗漏
+-        记录。Go 网关尚未转发此路径（返回 404），需直接访问控制平面（使用同一个 API key）。
++        记录。
+       parameters:
+         - name: correlationId
+           in: query
+diff --git a/gateway/README.md b/gateway/README.md
+index 826fedb..1fb5b60 100644
+--- a/gateway/README.md
++++ b/gateway/README.md
+@@ -38,6 +38,7 @@ ForgeMesh 的**统一外部入口**与**高性能流式代理**。与 Python 控
+ | ANY | `/api/v1/inference-services[/...]` | 反代 → Python 控制平面 | 全链 |
+ | ANY | `/api/v1/workflows[/...]` | 反代 → Python 控制平面 | 全链 |
+ | ANY | `/api/v1/decisions[/...]` | 反代 → Python 控制平面 | 全链 |
++| ANY | `/api/v1/audit-events[/...]` | 反代 → Python 控制平面（审计查询） | 全链 |
+ | ANY | `/api/v1/namespaces/{ns}/inference/{svc}/chat` | **SSE 流式代理**（命名空间 `{ns}` 中的服务） | 全链 + `read` scope |
+ | ANY | `/api/v1/inference/{svc}/chat` | **SSE 流式代理**（不带命名空间的服务） | 全链 + `read` scope |
+ 
+diff --git a/gateway/internal/router/auth_test.go b/gateway/internal/router/auth_test.go
+index d047be7..76c14e3 100644
+--- a/gateway/internal/router/auth_test.go
++++ b/gateway/internal/router/auth_test.go
+@@ -3,7 +3,8 @@
+ //   - 无凭证或凭证无效 → 401，不触达上游；
+ //   - 租户取自 key 绑定的租户，与凭证不符的租户头 → 403；
+ //   - 控制平面收到调用方凭证，可独立校验（含 Resolver 查询）；推理实例收不到；
+-//   - 推理调用要求 read 作用域。
++//   - 推理调用要求 read 作用域；
++//   - 审计查询与其他资源路由一样经认证后反代，路径与查询串原样到达控制平面。
+ package router
+ 
+ import (
+@@ -67,17 +68,19 @@ func newAPIKeyRouter(t *testing.T, upstreamURL string) *Router {
+ 	return r
+ }
+ 
+-// headerRecorder 是记录请求头的假上游。
++// headerRecorder 是记录请求头与请求目标（路径与查询串）的假上游。
+ type headerRecorder struct {
+-	mu      sync.Mutex
+-	calls   int
+-	headers http.Header
++	mu         sync.Mutex
++	calls      int
++	headers    http.Header
++	requestURI string
+ }
+ 
+ func (h *headerRecorder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 	h.mu.Lock()
+ 	h.calls++
+ 	h.headers = r.Header.Clone()
++	h.requestURI = r.RequestURI
+ 	h.mu.Unlock()
+ 	w.WriteHeader(http.StatusOK)
+ 	_, _ = io.WriteString(w, `{"items":[],"count":0}`)
+@@ -89,6 +92,13 @@ func (h *headerRecorder) snapshot() (int, http.Header) {
+ 	return h.calls, h.headers
+ }
+ 
++// lastRequestURI 返回最近一次请求行中的请求目标，未经解析。
++func (h *headerRecorder) lastRequestURI() string {
++	h.mu.Lock()
++	defer h.mu.Unlock()
++	return h.requestURI
++}
++
+ func newRecordingUpstream(t *testing.T) (*headerRecorder, string) {
+ 	t.Helper()
+ 	rec := &headerRecorder{}
+@@ -169,6 +179,70 @@ func TestAPIKeyMode_RejectsForeignTenantHeader(t *testing.T) {
+ 	}
+ }
+ 
++// TestAPIKeyMode_ForwardsAuditEventsQuery 验证审计查询与其他资源路由一样反代到控制平面：
++// 路径与查询串原样到达，租户取自凭证，凭证一并转发（read scope 由控制平面检查），
++// 调用方的关联 ID 透传到控制平面并回写到响应头。
++func TestAPIKeyMode_ForwardsAuditEventsQuery(t *testing.T) {
++	upstreamRec, url := newRecordingUpstream(t)
++	r := newAPIKeyRouter(t, url)
++
++	const target = "/api/v1/audit-events?limit=2&correlationId=corr-audit&pageToken=eyJwIjoxfQ%3D%3D"
++	rec := httptest.NewRecorder()
++	req := httptest.NewRequest(http.MethodGet, target, nil)
++	req.Header.Set("Authorization", "Bearer "+routerKeyTenantA)
++	req.Header.Set("X-Correlation-ID", "corr-audit")
++	r.ServeHTTP(rec, req)
++
++	if rec.Code != http.StatusOK || rec.Body.String() != `{"items":[],"count":0}` {
++		t.Fatalf("应原样返回控制平面的 200 响应，实际 %d（body=%s）", rec.Code, rec.Body.String())
++	}
++	calls, headers := upstreamRec.snapshot()
++	if calls != 1 {
++		t.Fatalf("请求应触达控制平面 1 次，实际 %d", calls)
++	}
++	if got := upstreamRec.lastRequestURI(); got != target {
++		t.Fatalf("控制平面收到的请求目标应为 %q，实际 %q", target, got)
++	}
++	if got := headers.Values("X-Tenant-ID"); len(got) != 1 || got[0] != "tenant-a" {
++		t.Fatalf("控制平面收到的租户头应为 [tenant-a]，实际 %v", got)
++	}
++	if got := headers.Get("Authorization"); got != "Bearer "+routerKeyTenantA {
++		t.Fatalf("控制平面应收到调用方凭证，实际 %q", got)
++	}
++	if got := headers.Get("X-Correlation-ID"); got != "corr-audit" {
++		t.Fatalf("关联 ID 应透传到控制平面，实际 %q", got)
++	}
++	if got := rec.Header().Get("X-Correlation-ID"); got != "corr-audit" {
++		t.Fatalf("响应头应带回关联 ID，实际 %q", got)
++	}
++}
++
++// TestAPIKeyMode_AuditEventsRequireCredentials 验证审计查询同样先经网关认证：无凭证或
++// 未知 key 返回 401（带 WWW-Authenticate），不触达控制平面。
++func TestAPIKeyMode_AuditEventsRequireCredentials(t *testing.T) {
++	upstreamRec, url := newRecordingUpstream(t)
++	r := newAPIKeyRouter(t, url)
++
++	for name, auth := range map[string]string{"无凭证": "", "未知 key": "Bearer fmk_unknown"} {
++		rec := httptest.NewRecorder()
++		req := httptest.NewRequest(http.MethodGet, "/api/v1/audit-events?limit=1", nil)
++		if auth != "" {
++			req.Header.Set("Authorization", auth)
++		}
++		r.ServeHTTP(rec, req)
++
++		if rec.Code != http.StatusUnauthorized {
++			t.Fatalf("%s：应 401，实际 %d", name, rec.Code)
++		}
++		if rec.Header().Get("WWW-Authenticate") == "" {
++			t.Fatalf("%s：401 应携带 WWW-Authenticate", name)
++		}
++	}
++	if calls, _ := upstreamRec.snapshot(); calls != 0 {
++		t.Fatalf("被拒请求不应触达控制平面，实际 %d 次", calls)
++	}
++}
++
+ // inferenceEnv 是假控制平面 + 假推理实例；两者都记录收到的 Authorization。
+ type inferenceEnv struct {
+ 	router       *Router
+diff --git a/gateway/internal/router/router.go b/gateway/internal/router/router.go
+index 4049580..e8f18e3 100644
+--- a/gateway/internal/router/router.go
++++ b/gateway/internal/router/router.go
+@@ -8,6 +8,7 @@
+ //	ANY  /api/v1/inference-services[/...]      反代到 Python 控制平面
+ //	ANY  /api/v1/workflows[/...]               反代到 Python 控制平面
+ //	ANY  /api/v1/decisions[/...]               反代到 Python 控制平面
++//	ANY  /api/v1/audit-events[/...]            反代到 Python 控制平面
+ //	ANY  /api/v1/namespaces/{ns}/inference/{svc}/chat
+ //	                                          SSE 流式代理（服务经 Resolver 解析为
+ //	                                          ready 实例，轮询分发，按实例协议映射
+@@ -43,6 +44,7 @@ var proxyRoutes = []string{
+ 	"/api/v1/inference-services",
+ 	"/api/v1/workflows",
+ 	"/api/v1/decisions",
++	"/api/v1/audit-events",
+ }
+ 
+ // 流式（SSE）代理路由：{ns} 为命名空间，{svc} 为推理服务名。
+-- 
+2.43.0
+

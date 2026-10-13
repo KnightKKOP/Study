@@ -1,0 +1,898 @@
+From 1e2250618cdc74c3a1bde84a0ab80c13fb563b87 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 13 Oct 2026 03:34:44 +0000
+Subject: [PATCH 08/12] feat(api): list the tenant's audit records
+
+GET /api/v1/audit-events returns the audit records of the caller's
+tenant, newest first, and needs the read scope. It accepts limit (1 to
+1000, default 100, like the list endpoints), pageToken and an optional
+correlationId filter, and returns {items, count, nextPageToken}; the
+token is only present when there is another page.
+
+AuditLog.list_page pages by position (timestamp, then audit id), so
+records written while a client pages do not repeat or skip records on
+later pages. The opaque token carries that position and a digest of the
+tenant and the filter; a token issued for another tenant or filter, or
+one that cannot be parsed, is rejected with 400. The token is not a
+credential: the query is always limited to the caller's tenant. A new
+index on (tenant_id, correlation_id, timestamp) serves the filter.
+
+The operation and the AuditEvent / AuditEventList schemas are in the
+OpenAPI document. The Go gateway does not forward this path yet, so it
+is only reachable on the control plane itself.
+---
+ api/openapi/openapi.yaml                      | 122 ++++++
+ .../src/forgemesh/controlplane/api/routes.py  |  76 +++-
+ .../src/forgemesh/controlplane/audit.py       | 106 ++++-
+ tests/security/test_tenant_isolation.py       |  61 ++-
+ tests/unit/controlplane/test_audit_api.py     | 365 ++++++++++++++++++
+ 5 files changed, 725 insertions(+), 5 deletions(-)
+ create mode 100644 tests/unit/controlplane/test_audit_api.py
+
+diff --git a/api/openapi/openapi.yaml b/api/openapi/openapi.yaml
+index 622e552..fbfc671 100644
+--- a/api/openapi/openapi.yaml
++++ b/api/openapi/openapi.yaml
+@@ -28,6 +28,8 @@ tags:
+     description: 工作流运行启动与状态查询
+   - name: decisions
+     description: 结构化决策请求（决策≠授权；授权由 Scheduler/Policy 完成）
++  - name: audit
++    description: 审计记录查询（只读，限定在凭证绑定的租户内）
+   - name: probes
+     description: 存活与就绪探针
+ 
+@@ -240,6 +242,54 @@ paths:
+           $ref: "#/components/responses/Forbidden"
+ 
+ 
++  /api/v1/audit-events:
++    get:
++      tags: [audit]
++      summary: 列出审计记录
++      operationId: listAuditEvents
++      description: >-
++        列出凭证所属租户的审计记录，最新的在前。API 创建资源与受理删除时，在写入资源的同一个
++        事务中写入一条审计记录，记录调用主体与关联 ID；被拒绝的请求、对已在 Terminating 的资源
++        重复的删除请求以及控制器的内部写入不产生审计记录。分页：nextPageToken 只在还有下一页时
++        出现，原样作为 pageToken 传入即取下一页；翻页期间写入的新记录不会让后面的页重复或遗漏
++        记录。Go 网关尚未转发此路径（返回 404），需直接访问控制平面（使用同一个 API key）。
++      parameters:
++        - name: correlationId
++          in: query
++          description: 只列出该关联 ID 的记录；省略或为空时不过滤。
++          schema:
++            type: string
++        - name: limit
++          in: query
++          description: 单页最多返回的条数；超出 1–1000 返回 400。
++          schema:
++            type: integer
++            minimum: 1
++            maximum: 1000
++            default: 100
++        - name: pageToken
++          in: query
++          description: >-
++            上一页响应中的 nextPageToken；省略或为空时从最新的记录开始。令牌与租户和
++            correlationId 绑定：无法解析、或是为另一个租户或另一个 correlationId 签发的令牌
++            返回 400。limit 可以逐页改变。
++          schema:
++            type: string
++      responses:
++        "200":
++          description: 一页审计记录
++          content:
++            application/json:
++              schema:
++                $ref: "#/components/schemas/AuditEventList"
++        "400":
++          $ref: "#/components/responses/BadRequest"
++        "401":
++          $ref: "#/components/responses/Unauthorized"
++        "403":
++          $ref: "#/components/responses/Forbidden"
++
++
+ components:
+   securitySchemes:
+     apiKey:
+@@ -415,6 +465,78 @@ components:
+         degraded:
+           type: boolean
+           description: 是否走了 Provider 降级路径。
++    AuditEvent:
++      type: object
++      description: 一条审计记录：调用主体在什么时间对哪个资源执行了什么操作。
++      required:
++        - auditId
++        - occurredAt
++        - tenantId
++        - actor
++        - keyId
++        - correlationId
++        - action
++        - resourceType
++        - namespace
++        - resourceId
++        - outcome
++        - details
++      additionalProperties: false
++      properties:
++        auditId:
++          type: string
++        occurredAt:
++          type: string
++          format: date-time
++          description: 写入时间（UTC），与同一次写入产生的资源变更事件的 occurredAt 相同。
++        tenantId:
++          type: string
++        actor:
++          type: [string, "null"]
++          description: 调用主体：API key 的 subject；dev 认证模式下为 dev:<租户>。
++        keyId:
++          type: [string, "null"]
++          description: 调用者使用的 API key 的 id；dev 认证模式下为 null。
++        correlationId:
++          type: string
++          description: >-
++            请求的 X-Correlation-Id（未携带时由服务端生成），与同一次写入产生的资源变更事件的
++            correlationId 相同。
++        action:
++          type: string
++          description: 操作：create（创建资源）或 delete（受理删除，含置为 Terminating）。
++        resourceType:
++          type: string
++          description: 资源的 kind，如 InferenceService。
++        namespace:
++          type: [string, "null"]
++        resourceId:
++          type: string
++          description: 资源名。
++        outcome:
++          type: string
++          description: 操作结果；当前只记录成功的写入（success）。
++        details:
++          type: [object, "null"]
++          additionalProperties: true
++          description: >-
++            资源写入的记录含 change（created / terminating / deleted）、resourceUid、
++            resourceVersion 与 eventId（同一次写入产生的资源变更事件）。
++    AuditEventList:
++      type: object
++      required: [items, count]
++      properties:
++        items:
++          type: array
++          items:
++            $ref: "#/components/schemas/AuditEvent"
++        count:
++          type: integer
++          minimum: 0
++          description: 本页的条数。
++        nextPageToken:
++          type: string
++          description: 取下一页的令牌；只在还有下一页时出现。
+   responses:
+     BadRequest:
+       description: 请求不合法
+diff --git a/packages/control-plane/src/forgemesh/controlplane/api/routes.py b/packages/control-plane/src/forgemesh/controlplane/api/routes.py
+index ef2f7a9..d047d0f 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/api/routes.py
++++ b/packages/control-plane/src/forgemesh/controlplane/api/routes.py
+@@ -11,6 +11,7 @@
+ * ``POST   /workflows``                   —— 启动工作流运行（development-plan 5.4）
+ * ``POST   /decisions``                   —— 结构化决策（决策≠授权，development-plan 5.5）
+ * ``GET    /resources``                   —— 通用资源列表（可选 kind 过滤）
++* ``GET    /audit-events``                —— 当前租户的审计记录（分页）
+ 
+ 租户取自已验证的凭证（见 :func:`.dependencies.get_principal` 与
+ :mod:`forgemesh.controlplane.auth`），作为多租户隔离的权威来源，覆盖请求体中的
+@@ -24,18 +25,21 @@
+ 
+ from __future__ import annotations
+ 
++import asyncio
++from datetime import UTC, datetime
+ from typing import Any
+ from uuid import uuid4
+ 
+-from fastapi import APIRouter, Depends, Header, HTTPException
++from fastapi import APIRouter, Depends, Header, HTTPException, Query
+ from fastapi.responses import JSONResponse, Response
+ from forgemesh.core.errors import ConflictError, NotFoundError
+ from forgemesh.decision.provider import DecisionRequest as InternalDecisionRequest
+ from forgemesh.resource.inference import InferenceService
+ from forgemesh.workflow.runtime import WorkflowDefinition
+-from pydantic import BaseModel, ConfigDict, Field, ValidationError
++from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, ValidationError
+ 
+ from ..app import error_envelope
++from ..audit import AuditEvent, InvalidPageTokenError
+ from ..auth import Principal
+ from .dependencies import (
+     ComponentNotReadyError,
+@@ -240,6 +244,74 @@ async def list_resources(
+     return {"items": [r.model_dump(by_alias=True) for r in items], "count": len(items)}
+ 
+ 
++# ------------------------------------------------------------------ #
++# 审计记录端点
++# ------------------------------------------------------------------ #
++
++
++class AuditRecordResponse(BaseModel):
++    """一条审计记录（对齐 OpenAPI ``AuditEvent``）。"""
++
++    model_config = ConfigDict(extra="forbid", populate_by_name=True)
++
++    audit_id: str = Field(alias="auditId")
++    occurred_at: AwareDatetime = Field(alias="occurredAt")
++    tenant_id: str = Field(alias="tenantId")
++    actor: str | None
++    key_id: str | None = Field(alias="keyId")
++    correlation_id: str = Field(alias="correlationId")
++    action: str
++    resource_type: str = Field(alias="resourceType")
++    namespace: str | None
++    resource_id: str = Field(alias="resourceId")
++    outcome: str
++    details: dict[str, Any] | None
++
++    @classmethod
++    def from_event(cls, event: AuditEvent) -> AuditRecordResponse:
++        """由存储的审计记录构造：时间戳转为 UTC 的 ``occurredAt``。"""
++        occurred_at = datetime.fromtimestamp(event.timestamp, UTC)
++        return cls(**event.model_dump(exclude={"timestamp"}), occurred_at=occurred_at)
++
++
++@router.get("/audit-events", dependencies=[Depends(require_read)])
++async def list_audit_events(
++    tenant_id: str = Depends(get_tenant_id),
++    correlation_id: str | None = Query(default=None, alias="correlationId"),
++    limit: int = 100,
++    page_token: str | None = Query(default=None, alias="pageToken"),
++) -> Any:
++    """列出当前租户的审计记录，最新的在前（可选按 ``correlationId`` 过滤）。
++
++    ``nextPageToken`` 只在还有下一页时返回，原样作为 ``pageToken`` 传入即取下一页；
++    ``pageToken`` / ``correlationId`` 为空串时视为未给出。``limit`` 超出 1–1000、令牌无法
++    解析或不是为这个租户与过滤条件签发的，返回 400。
++    """
++    if (invalid := _invalid_limit(limit)) is not None:
++        return invalid
++    audit_log = get_registry().audit_log
++    try:
++        page = await asyncio.to_thread(
++            audit_log.list_page,
++            tenant_id,
++            limit=limit,
++            page_token=page_token or None,
++            correlation_id=correlation_id or None,
++        )
++    except InvalidPageTokenError as exc:
++        return _error_response(400, "BAD_REQUEST", f"invalid pageToken: {exc}", uuid4().hex)
++    body: dict[str, Any] = {
++        "items": [
++            AuditRecordResponse.from_event(event).model_dump(mode="json", by_alias=True)
++            for event in page.items
++        ],
++        "count": len(page.items),
++    }
++    if page.next_page_token is not None:
++        body["nextPageToken"] = page.next_page_token
++    return body
++
++
+ # ------------------------------------------------------------------ #
+ # 工作流运行端点（development-plan 5.4）
+ # ------------------------------------------------------------------ #
+diff --git a/packages/control-plane/src/forgemesh/controlplane/audit.py b/packages/control-plane/src/forgemesh/controlplane/audit.py
+index 65a218e..5ce8d0b 100644
+--- a/packages/control-plane/src/forgemesh/controlplane/audit.py
++++ b/packages/control-plane/src/forgemesh/controlplane/audit.py
+@@ -5,13 +5,17 @@ correlation_id 全链路贯穿，支持调用链查询。
+ 
+ 资源注册表在 API 写入资源的同一个事务中写入审计记录（:meth:`AuditLog.put`），记录调用
+ 主体（租户、主体、凭证 id）与关联 ID：资源写入失败时不会留下审计记录。
+-:meth:`AuditLog.record` 单独写入并提交一条记录。
++:meth:`AuditLog.record` 单独写入并提交一条记录。:meth:`AuditLog.list_page` 按租户分页
++列出记录（``GET /api/v1/audit-events``）。
+ """
+ 
+ from __future__ import annotations
+ 
++import base64
++import hashlib
+ import json
+ import logging
++import math
+ import sqlite3
+ import time
+ import uuid
+@@ -40,6 +44,8 @@ CREATE TABLE IF NOT EXISTS audit_events (
+ );
+ CREATE INDEX IF NOT EXISTS idx_audit_correlation ON audit_events(correlation_id);
+ CREATE INDEX IF NOT EXISTS idx_audit_tenant ON audit_events(tenant_id, timestamp);
++CREATE INDEX IF NOT EXISTS idx_audit_tenant_correlation
++    ON audit_events(tenant_id, correlation_id, timestamp);
+ """
+ 
+ #: v1.0.0 的 ``audit_events`` 没有的列（打开存量库时补齐）。
+@@ -83,6 +89,24 @@ class AuditEvent(BaseModel):
+     timestamp: float = Field(default_factory=time.time)
+ 
+ 
++class InvalidPageTokenError(ValueError):
++    """分页令牌无法解析，或不是为这组查询条件（租户、过滤条件）签发的。"""
++
++
++class AuditPage(BaseModel):
++    """一页审计记录。
++
++    Attributes:
++        items: 本页的记录，最新的在前。
++        next_page_token: 取下一页的令牌；没有下一页时为 None。
++    """
++
++    model_config = ConfigDict(extra="forbid")
++
++    items: list[AuditEvent]
++    next_page_token: str | None = None
++
++
+ class AuditLog:
+     """审计日志（SQLite 后端）。
+ 
+@@ -169,6 +193,50 @@ class AuditLog:
+             (tenant_id, limit),
+         )
+ 
++    def list_page(
++        self,
++        tenant_id: str,
++        *,
++        limit: int = 100,
++        page_token: str | None = None,
++        correlation_id: str | None = None,
++    ) -> AuditPage:
++        """按租户分页列出审计记录：最新的在前，时间相同时按 ``audit_id`` 降序。
++
++        下一页从上一页最后一条记录的位置继续，翻页期间写入的新记录排在已经取过的位置之前，
++        不会让后面的页重复或遗漏记录。令牌只记录位置并绑定这组查询条件，不是访问凭据：
++        查询始终限定在 ``tenant_id`` 内。
++
++        Args:
++            tenant_id: 只列出该租户的记录。
++            limit: 单页最多返回的条数（至少为 1）。
++            page_token: 上一页的 ``next_page_token``；为空时从最新的记录开始。
++            correlation_id: 给出时只列出该关联 ID 的记录。
++
++        Raises:
++            ValueError: ``limit`` 小于 1。
++            InvalidPageTokenError: 令牌无法解析，或是为另一个租户、另一组过滤条件签发的。
++        """
++        if limit < 1:
++            raise ValueError(f"limit must be at least 1, got {limit}")
++        digest = _query_digest(tenant_id, correlation_id)
++        sql = "SELECT * FROM audit_events WHERE tenant_id = ?"
++        params: list[Any] = [tenant_id]
++        if correlation_id is not None:
++            sql += " AND correlation_id = ?"
++            params.append(correlation_id)
++        if page_token is not None:
++            timestamp, audit_id = _decode_page_token(page_token, digest)
++            sql += " AND timestamp <= ? AND (timestamp < ? OR audit_id < ?)"
++            params += [timestamp, timestamp, audit_id]
++        sql += " ORDER BY timestamp DESC, audit_id DESC LIMIT ?"
++        params.append(limit + 1)
++        events = self._query(sql, tuple(params))
++        if len(events) <= limit:
++            return AuditPage(items=events)
++        items = events[:limit]
++        return AuditPage(items=items, next_page_token=_encode_page_token(items[-1], digest))
++
+     @staticmethod
+     def _row_to_event(row: sqlite3.Row) -> AuditEvent:
+         """将数据库行反序列化为 AuditEvent。"""
+@@ -193,4 +261,38 @@ class AuditLog:
+             self._db.close()
+ 
+ 
+-__all__ = ["AuditEvent", "AuditLog"]
++def _query_digest(tenant_id: str, correlation_id: str | None) -> str:
++    """一组查询条件的摘要：写入分页令牌，翻页时据此拒绝换了条件的令牌。"""
++    conditions = json.dumps([tenant_id, correlation_id], ensure_ascii=False)
++    return hashlib.sha256(conditions.encode("utf-8")).hexdigest()[:16]
++
++
++def _encode_page_token(last: AuditEvent, digest: str) -> str:
++    """上一页最后一条记录的位置 → 不透明的分页令牌（URL 安全的 base64，无填充）。"""
++    position = {"ts": last.timestamp, "id": last.audit_id, "q": digest}
++    raw = json.dumps(position, separators=(",", ":")).encode("utf-8")
++    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
++
++
++def _decode_page_token(token: str, digest: str) -> tuple[float, str]:
++    """解析分页令牌，返回上一页最后一条记录的 ``(timestamp, audit_id)``。
++
++    Raises:
++        InvalidPageTokenError: 令牌无法解析，或不是为 ``digest`` 这组查询条件签发的。
++    """
++    try:
++        position = json.loads(base64.urlsafe_b64decode(token + "=" * (-len(token) % 4)))
++    except ValueError:
++        position = None
++    if not isinstance(position, dict) or set(position) != {"ts", "id", "q"}:
++        raise InvalidPageTokenError("page token is malformed")
++    timestamp, audit_id = position["ts"], position["id"]
++    valid = isinstance(timestamp, float) and math.isfinite(timestamp) and isinstance(audit_id, str)
++    if not valid:
++        raise InvalidPageTokenError("page token is malformed")
++    if position["q"] != digest:
++        raise InvalidPageTokenError("page token was issued for a different tenant or filter")
++    return timestamp, audit_id
++
++
++__all__ = ["AuditEvent", "AuditLog", "AuditPage", "InvalidPageTokenError"]
+diff --git a/tests/security/test_tenant_isolation.py b/tests/security/test_tenant_isolation.py
+index 40f04c7..975ef64 100644
+--- a/tests/security/test_tenant_isolation.py
++++ b/tests/security/test_tenant_isolation.py
+@@ -4,7 +4,8 @@
+ 
+ * **配额隔离**：租户 A 超配额不影响租户 B 的配额决策。
+ * **注册表隔离**：租户 A 的资源对租户 B 不可见（list / get / delete 均隔离）。
+-* **审计隔离**：租户 A 的审计记录对租户 B 不可见。
++* **审计隔离**：租户 A 的审计记录对租户 B 不可见（存储查询与
++  ``GET /api/v1/audit-events``，含按 correlationId 过滤与分页令牌）。
+ * **决策记录隔离**：租户 A 的决策记录对租户 B 不可见。
+ * **诊断包隔离**：诊断包只返回请求租户的数据，绝不泄露其他租户信息。
+ * **跨租户访问**：跨租户 get / delete 一律返回 NotFoundError，不泄露存在性。
+@@ -19,7 +20,10 @@ import time
+ from typing import Any
+ 
+ import pytest
++from fastapi.testclient import TestClient
++from forgemesh.controlplane.app import create_app
+ from forgemesh.controlplane.audit import AuditEvent, AuditLog
++from forgemesh.controlplane.auth import ApiKeyAuthenticator, ApiKeyEntry, hash_api_key
+ from forgemesh.controlplane.diagnostics import DiagnosticCollector
+ from forgemesh.controlplane.registry import SQLiteRegistry
+ from forgemesh.core.errors import NotFoundError
+@@ -194,6 +198,61 @@ def test_audit_tenant_isolation() -> None:
+     assert "res-a" not in resource_ids_b
+ 
+ 
++def _service_body(name: str) -> dict[str, Any]:
++    """经 API 创建推理服务的最小请求体。"""
++    return {
++        "kind": KIND,
++        "metadata": {"name": name, "namespace": "team"},
++        "spec": {
++            "model": {"reference": "models/demo"},
++            "runtime": {"provider": "vllm"},
++            "resources": {"accelerator": {"type": "nvidia-gpu", "minMemoryGiB": 16}},
++        },
++    }
++
++
++@pytest.mark.unit
++def test_audit_api_tenant_isolation(tmp_path) -> None:
++    """审计查询接口只返回凭证所属租户的记录：按租户 A 的关联 ID 过滤、使用租户 A 的分页
++    令牌或伪造租户头，都拿不到租户 A 的记录。"""
++    key_a, key_b = "fmk_isolation-key-a", "fmk_isolation-key-b"
++    authenticator = ApiKeyAuthenticator(
++        [
++            ApiKeyEntry(id="a", sha256=hash_api_key(key_a), tenantId=TENANT_A, subject="alice"),
++            ApiKeyEntry(id="b", sha256=hash_api_key(key_b), tenantId=TENANT_B, subject="bob"),
++        ]
++    )
++    headers_a = {"Authorization": f"Bearer {key_a}"}
++    headers_b = {"Authorization": f"Bearer {key_b}"}
++    url = "/api/v1/audit-events"
++
++    app = create_app(db_path=str(tmp_path / "cp.db"), authenticator=authenticator)
++    with TestClient(app) as client:
++        for headers, name in ((headers_a, "svc-a1"), (headers_a, "svc-a2"), (headers_b, "svc-b")):
++            created = client.post(
++                "/api/v1/inference-services",
++                json=_service_body(name),
++                headers={**headers, "X-Correlation-Id": f"corr-{name}"},
++            )
++            assert created.status_code == 201
++
++        page_a = client.get(url, params={"limit": 1}, headers=headers_a).json()
++        listed_b = client.get(url, headers=headers_b).json()
++        filtered_b = client.get(url, params={"correlationId": "corr-svc-a1"}, headers=headers_b)
++        token_of_a = client.get(
++            url, params={"pageToken": page_a["nextPageToken"]}, headers=headers_b
++        )
++        spoofed = client.get(url, headers={**headers_b, "X-Tenant-Id": TENANT_A})
++
++    assert page_a["items"][0]["tenantId"] == TENANT_A
++    assert [(i["tenantId"], i["resourceId"]) for i in listed_b["items"]] == [(TENANT_B, "svc-b")]
++    assert filtered_b.json()["items"] == []
++    assert token_of_a.status_code == 400
++    assert spoofed.status_code == 403
++    for response in (filtered_b, token_of_a, spoofed):
++        assert "svc-a" not in response.text
++
++
+ # --------------------------------------------------------------------------- #
+ # 决策记录隔离
+ # --------------------------------------------------------------------------- #
+diff --git a/tests/unit/controlplane/test_audit_api.py b/tests/unit/controlplane/test_audit_api.py
+new file mode 100644
+index 0000000..432d496
+--- /dev/null
++++ b/tests/unit/controlplane/test_audit_api.py
+@@ -0,0 +1,365 @@
++"""审计记录查询测试：``AuditLog.list_page`` 分页与 ``GET /api/v1/audit-events``。
++
++* 最新的在前，时间相同时按 ``audit_id``；逐页取完不重不漏，翻页期间写入的新记录不影响
++  后面的页；
++* 令牌绑定租户与 correlationId：换了条件或无法解析的令牌被拒绝（HTTP 400）；
++* 端点要求 read scope，返回 API 写入产生的审计记录，响应符合 OpenAPI ``AuditEventList``；
++* ``limit`` 的校验与列表接口一致。
++
++租户隔离见 ``tests/security/test_tenant_isolation.py``。
++"""
++
++from __future__ import annotations
++
++import base64
++import json
++from datetime import UTC, datetime
++from pathlib import Path
++from typing import Any
++
++import pytest
++import yaml
++from fastapi.testclient import TestClient
++from forgemesh.controlplane.api.dependencies import get_registry
++from forgemesh.controlplane.app import create_app
++from forgemesh.controlplane.audit import AuditEvent, AuditLog, InvalidPageTokenError
++from forgemesh.controlplane.auth import ApiKeyAuthenticator, ApiKeyEntry, hash_api_key
++from jsonschema import Draft202012Validator
++
++TENANT_A = "tenant-a"
++TENANT_B = "tenant-b"
++URL = "/api/v1/audit-events"
++SERVICES_URL = "/api/v1/inference-services"
++
++KEY_A = "fmk_audit-key-for-tenant-a"
++KEY_READ_ONLY = "fmk_audit-read-only-key"
++KEY_WRITE_ONLY = "fmk_audit-write-only-key"
++ENTRIES = [
++    ApiKeyEntry(id="a", sha256=hash_api_key(KEY_A), tenantId=TENANT_A, subject="alice"),
++    ApiKeyEntry(
++        id="ro",
++        sha256=hash_api_key(KEY_READ_ONLY),
++        tenantId=TENANT_A,
++        subject="viewer",
++        scopes=("read",),
++    ),
++    ApiKeyEntry(
++        id="wo",
++        sha256=hash_api_key(KEY_WRITE_ONLY),
++        tenantId=TENANT_A,
++        subject="writer",
++        scopes=("write",),
++    ),
++]
++
++BODY = {
++    "kind": "InferenceService",
++    "metadata": {"name": "llama", "namespace": "default"},
++    "spec": {
++        "model": {"reference": "models/llama"},
++        "runtime": {"provider": "vllm"},
++        "resources": {"accelerator": {"type": "nvidia-gpu", "minMemoryGiB": 16}},
++    },
++}
++
++_OPENAPI = yaml.safe_load(
++    (Path(__file__).resolve().parents[3] / "api" / "openapi" / "openapi.yaml").read_text(
++        encoding="utf-8"
++    )
++)
++#: 以 OpenAPI 文档为根校验，``#/components/...`` 引用在文档内解析。
++LIST_SCHEMA = Draft202012Validator({**_OPENAPI, "$ref": "#/components/schemas/AuditEventList"})
++
++
++def _event(
++    resource_id: str,
++    timestamp: float,
++    *,
++    tenant_id: str = TENANT_A,
++    correlation_id: str = "corr",
++    audit_id: str | None = None,
++) -> AuditEvent:
++    ids = {"audit_id": audit_id} if audit_id is not None else {}
++    return AuditEvent(
++        correlation_id=correlation_id,
++        tenant_id=tenant_id,
++        actor="alice",
++        action="create",
++        resource_type="InferenceService",
++        resource_id=resource_id,
++        outcome="success",
++        timestamp=timestamp,
++        **ids,
++    )
++
++
++def _all_pages(log: AuditLog, tenant_id: str, limit: int, **filters: Any) -> list[list[str]]:
++    pages: list[list[str]] = []
++    token = None
++    while True:
++        page = log.list_page(tenant_id, limit=limit, page_token=token, **filters)
++        pages.append([event.resource_id for event in page.items])
++        token = page.next_page_token
++        if token is None:
++            return pages
++
++
++def _token(position: object) -> str:
++    raw = json.dumps(position).encode("utf-8")
++    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
++
++
++# ---------------------------------------------------------------------- #
++# 分页查询（AuditLog.list_page）
++# ---------------------------------------------------------------------- #
++
++
++@pytest.mark.unit
++def test_pages_list_the_newest_records_first_without_repeats_or_gaps() -> None:
++    log = AuditLog()
++    for i in range(7):
++        log.record(_event(f"svc-{i}", 100.0 + i))
++    log.record(_event("other-tenant", 200.0, tenant_id=TENANT_B))
++
++    assert _all_pages(log, TENANT_A, limit=3) == [
++        ["svc-6", "svc-5", "svc-4"],
++        ["svc-3", "svc-2", "svc-1"],
++        ["svc-0"],
++    ]
++    assert _all_pages(log, TENANT_A, limit=7) == [[f"svc-{i}" for i in range(6, -1, -1)]]
++
++
++@pytest.mark.unit
++def test_records_with_the_same_timestamp_are_ordered_by_audit_id() -> None:
++    log = AuditLog()
++    for audit_id in ("b", "e", "a", "d", "c"):
++        log.record(_event(f"svc-{audit_id}", 100.0, audit_id=audit_id))
++    log.record(_event("older", 99.0))
++
++    assert _all_pages(log, TENANT_A, limit=2) == [
++        ["svc-e", "svc-d"],
++        ["svc-c", "svc-b"],
++        ["svc-a", "older"],
++    ]
++
++
++@pytest.mark.unit
++def test_records_written_while_paging_do_not_shift_later_pages() -> None:
++    log = AuditLog()
++    for i in range(4):
++        log.record(_event(f"svc-{i}", 100.0 + i))
++
++    first = log.list_page(TENANT_A, limit=2)
++    log.record(_event("newer", 200.0))
++    second = log.list_page(TENANT_A, limit=2, page_token=first.next_page_token)
++
++    assert [event.resource_id for event in first.items] == ["svc-3", "svc-2"]
++    assert [event.resource_id for event in second.items] == ["svc-1", "svc-0"]
++    assert second.next_page_token is None
++
++
++@pytest.mark.unit
++def test_correlation_filter_pages_within_the_tenant() -> None:
++    log = AuditLog()
++    for i in range(3):
++        log.record(_event(f"svc-{i}", 100.0 + i, correlation_id="corr-1"))
++        log.record(_event(f"other-{i}", 100.5 + i, correlation_id="corr-2"))
++    log.record(_event("other-tenant", 300.0, tenant_id=TENANT_B, correlation_id="corr-1"))
++
++    assert _all_pages(log, TENANT_A, limit=2, correlation_id="corr-1") == [
++        ["svc-2", "svc-1"],
++        ["svc-0"],
++    ]
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize(
++    ("issued_for", "used_for"),
++    [
++        ((TENANT_A, None), (TENANT_B, None)),
++        ((TENANT_A, None), (TENANT_A, "corr-1")),
++        ((TENANT_A, "corr-1"), (TENANT_A, None)),
++        ((TENANT_A, "corr-1"), (TENANT_A, "corr-2")),
++        ((TENANT_A, "corr-1"), (TENANT_B, "corr-1")),
++    ],
++)
++def test_page_tokens_are_bound_to_the_tenant_and_the_filter(
++    issued_for: tuple[str, str | None], used_for: tuple[str, str | None]
++) -> None:
++    log = AuditLog()
++    for i in range(2):
++        log.record(_event(f"svc-{i}", 100.0 + i, correlation_id="corr-1"))
++    tenant_id, correlation_id = issued_for
++    token = log.list_page(tenant_id, limit=1, correlation_id=correlation_id).next_page_token
++    assert token is not None
++
++    tenant_id, correlation_id = used_for
++    with pytest.raises(InvalidPageTokenError, match="different tenant or filter"):
++        log.list_page(tenant_id, limit=1, page_token=token, correlation_id=correlation_id)
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize(
++    "token",
++    [
++        "not a token",
++        "令牌",
++        base64.urlsafe_b64encode(b"\xff\xfe").decode("ascii"),
++        _token([100.0, "id"]),
++        _token({"ts": 100.0, "id": "id"}),
++        _token({"ts": "100.0", "id": "id", "q": "0" * 16}),
++        _token({"ts": 100, "id": "id", "q": "0" * 16}),
++        _token({"ts": float("nan"), "id": "id", "q": "0" * 16}),
++        _token({"ts": 100.0, "id": 7, "q": "0" * 16}),
++    ],
++)
++def test_malformed_page_tokens_are_rejected(token: str) -> None:
++    log = AuditLog()
++    log.record(_event("svc", 100.0))
++
++    with pytest.raises(InvalidPageTokenError, match="malformed"):
++        log.list_page(TENANT_A, page_token=token)
++
++
++@pytest.mark.unit
++def test_limit_must_be_positive() -> None:
++    with pytest.raises(ValueError, match="limit"):
++        AuditLog().list_page(TENANT_A, limit=0)
++
++
++# ---------------------------------------------------------------------- #
++# GET /api/v1/audit-events
++# ---------------------------------------------------------------------- #
++
++
++@pytest.fixture()
++def client(tmp_path):
++    app = create_app(db_path=str(tmp_path / "cp.db"), authenticator=ApiKeyAuthenticator(ENTRIES))
++    with TestClient(app) as test_client:
++        yield test_client
++
++
++def _bearer(key: str = KEY_A, **extra: str) -> dict[str, str]:
++    return {"Authorization": f"Bearer {key}", **extra}
++
++
++def _get(client: TestClient, key: str = KEY_A, **params: Any) -> Any:
++    return client.get(URL, params=params, headers=_bearer(key))
++
++
++def _ids(response: Any) -> list[str]:
++    assert response.status_code == 200, response.text
++    return [item["resourceId"] for item in response.json()["items"]]
++
++
++@pytest.mark.unit
++def test_lists_the_audit_records_of_api_writes(client: TestClient) -> None:
++    created = client.post(
++        SERVICES_URL, json=BODY, headers=_bearer(**{"X-Correlation-Id": "corr-create"})
++    )
++    deleted = client.delete(
++        f"{SERVICES_URL}/llama",
++        params={"namespace": "default"},
++        headers=_bearer(**{"X-Correlation-Id": "corr-delete"}),
++    )
++    assert (created.status_code, deleted.status_code) == (201, 204)
++
++    response = _get(client)
++
++    assert response.status_code == 200
++    body = response.json()
++    LIST_SCHEMA.validate(body)
++    assert body["count"] == 2
++    assert "nextPageToken" not in body
++    stored = {e.audit_id: e for e in get_registry().audit_log.query_by_tenant(TENANT_A)}
++    newest, oldest = body["items"]
++    assert (newest["action"], newest["correlationId"]) == ("delete", "corr-delete")
++    assert (oldest["action"], oldest["correlationId"]) == ("create", "corr-create")
++    assert (newest["details"]["change"], oldest["details"]["change"]) == ("deleted", "created")
++    for item in body["items"]:
++        record = stored[item["auditId"]]
++        assert (item["tenantId"], item["actor"], item["keyId"]) == (TENANT_A, "alice", "a")
++        assert (item["resourceType"], item["namespace"], item["resourceId"]) == (
++            "InferenceService",
++            "default",
++            "llama",
++        )
++        assert item["outcome"] == "success"
++        assert item["details"] == record.details
++        assert item["occurredAt"].endswith("Z")
++        assert datetime.fromisoformat(item["occurredAt"]) == datetime.fromtimestamp(
++            record.timestamp, UTC
++        )
++
++
++@pytest.mark.unit
++def test_pages_through_audit_records(client: TestClient) -> None:
++    log = get_registry().audit_log
++    for i in range(5):
++        log.record(_event(f"svc-{i}", 100.0 + i))
++
++    first = _get(client, limit=2).json()
++    second = _get(client, limit=2, pageToken=first["nextPageToken"]).json()
++    third = _get(client, limit=2, pageToken=second["nextPageToken"]).json()
++    resized = _get(client, limit=3, pageToken=first["nextPageToken"])
++
++    for page in (first, second, third):
++        LIST_SCHEMA.validate(page)
++    assert [[item["resourceId"] for item in page["items"]] for page in (first, second, third)] == [
++        ["svc-4", "svc-3"],
++        ["svc-2", "svc-1"],
++        ["svc-0"],
++    ]
++    assert [page["count"] for page in (first, second, third)] == [2, 2, 1]
++    assert "nextPageToken" not in third
++    assert _ids(resized) == ["svc-2", "svc-1", "svc-0"]
++
++
++@pytest.mark.unit
++def test_filters_by_correlation_id(client: TestClient) -> None:
++    log = get_registry().audit_log
++    log.record(_event("svc-1", 100.0, correlation_id="corr-1"))
++    log.record(_event("svc-2", 101.0, correlation_id="corr-2"))
++
++    assert _ids(_get(client, correlationId="corr-1")) == ["svc-1"]
++    assert _ids(_get(client, correlationId="unknown")) == []
++    assert _ids(_get(client, correlationId="", pageToken="")) == ["svc-2", "svc-1"]
++
++
++@pytest.mark.unit
++def test_rejects_page_tokens_it_cannot_use(client: TestClient) -> None:
++    log = get_registry().audit_log
++    for i in range(2):
++        log.record(_event(f"svc-{i}", 100.0 + i, correlation_id="corr-1"))
++    token = _get(client, limit=1).json()["nextPageToken"]
++
++    malformed = _get(client, pageToken="garbage")
++    other_filter = _get(client, pageToken=token, correlationId="corr-1")
++
++    for response in (malformed, other_filter):
++        assert response.status_code == 400
++        error = response.json()["error"]
++        assert error["code"] == "BAD_REQUEST"
++        assert error["message"].startswith("invalid pageToken")
++
++
++@pytest.mark.unit
++def test_requires_the_read_scope(client: TestClient) -> None:
++    anonymous = client.get(URL)
++    read_only = _get(client, key=KEY_READ_ONLY)
++    write_only = _get(client, key=KEY_WRITE_ONLY)
++
++    assert anonymous.status_code == 401
++    assert anonymous.json()["error"]["code"] == "UNAUTHENTICATED"
++    assert read_only.status_code == 200
++    assert write_only.status_code == 403
++    assert write_only.json()["error"]["code"] == "FORBIDDEN"
++
++
++@pytest.mark.unit
++@pytest.mark.parametrize("limit", ["0", "1001", "many"])
++def test_rejects_an_invalid_limit(client: TestClient, limit: str) -> None:
++    response = _get(client, limit=limit)
++
++    assert response.status_code == 400
++    assert response.json()["error"]["code"] == "BAD_REQUEST"
+-- 
+2.43.0
+
