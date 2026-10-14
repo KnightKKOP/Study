@@ -1,0 +1,38 @@
+From 3d918467a7d71d3692a25772fe58ad01d3da7f2b Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Wed, 14 Oct 2026 03:14:57 +0000
+Subject: [PATCH 2/2] docs: list every architecture document and ADR in the
+ README tree
+
+The directory tree in the README listed only architecture.md and
+development-plan.md under docs/architecture and said the ADRs run from
+001 to 012. The directory also holds v1.1-development-plan.md,
+module-mapping.md and now roadmap.md, and there are 14 ADRs.
+---
+ README.md | 9 ++++++---
+ 1 file changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/README.md b/README.md
+index 7c7dfd9..ee6f668 100644
+--- a/README.md
++++ b/README.md
+@@ -87,10 +87,13 @@ forgemesh/
+ ├── scripts/                    # CI 校验脚本（manifest/OpenAPI/元数据/插件冒烟）
+ │
+ └── docs/
+-    ├── architecture/           # 架构基线与开发计划
++    ├── architecture/           # 架构基线、开发计划、模块映射与路线图
+     │   ├── architecture.md
+-    │   └── development-plan.md
+-    ├── design-decisions/       # ADR 索引与 ADR-001~012
++    │   ├── development-plan.md
++    │   ├── v1.1-development-plan.md
++    │   ├── module-mapping.md
++    │   └── roadmap.md
++    ├── design-decisions/       # ADR 索引与 ADR-001~014
+     ├── governance/             # 弃用政策
+     ├── operations/             # 备份与灾备
+     ├── plugin-development/     # 插件开发指南
+-- 
+2.43.0
+
