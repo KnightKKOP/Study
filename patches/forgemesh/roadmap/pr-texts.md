@@ -1,6 +1,69 @@
 # 路线图 PR 的标题与描述
 
-分支 `cursor/docs-roadmap-b108` 基于上游 `main`（`871cf9b`，#17–#23 合入之后），只改文档，不依赖其他 PR。
+## 第 2 版：`cursor/docs-roadmap-backends-b108`（待提交）
+
+分支基于上游 `main`（`cd5226f`，#24 合入之后），只改文档，不依赖其他 PR。
+
+### 标题
+
+```text
+docs(architecture): 路线图第 2 版：Kubernetes 上以 Kthena / KServe 为执行后端，各主题注明承接的遗留问题
+```
+
+### 描述
+
+```markdown
+## 概述
+
+#24 合入的路线图第 1 版计划在 Kubernetes 上自己实现多副本、多机、prefill / decode 分离、扩缩与推理感知的路由。这些能力 KServe（`LLMInferenceService`，自 v0.17 起标为生产可用）与 Kthena（`ModelServing` 与 router）已经提供，重做的意义不大；而两者都不管理 GPU 本身、只在 Kubernetes 上运行，也没有租户、计费用的用量记录、审批与审计这类平台层能力。本 PR 据此调整路线图的分工，并在每个主题中注明它承接的遗留问题。只改文档。
+
+**依赖**：基于最新 `main`（`cd5226f`，#24 合入之后），不依赖其他 PR。
+
+## 改动
+
+- **新增 1.2 节「与 Kubernetes 原生推理框架的关系」**：
+  - 两者覆盖什么、不覆盖什么；
+  - 按资源层、工作负载层、请求路由层与平台治理层列出分工：Kubernetes 上的工作负载与实例选择交给后端；裸机、单机与边缘环境由 Node Agent 与 ForgeMesh 自己的启动器覆盖；平台治理层以 ForgeMesh 为准；
+  - 原则：认证、配额与计量只在 ForgeMesh 网关执行一次，转发给后端时关闭或放宽后端的限流，并把已认证的主体传给后端；
+  - 参考的设计点与对应的主题：Kthena 的 `ModelServing` / `ModelServer` / `ModelRoute`、KServe 的 `ServingRuntime` 与 `LocalModelCache`、Gateway API Inference Extension 的实例选择器、token 限流与公平排队、扩缩策略、多机与 prefill / decode 分离；
+  - ForgeMesh 的 `InferenceService` 与 KServe 的同名，对接时要写清对应关系。
+- **主题调整**：
+  - 4.1-B 改为「容器启动器与 Kubernetes 后端」，拆成 3 个 PR：`container` 启动器、`kthena` 后端（生成 `ModelServing`、`ModelServer`、`ModelRoute`）、`kserve` 后端（生成 `LLMInferenceService`）；迭代 4.1 的退出条件增加：后端在 kind 上以 CPU 上运行的小模型跑通；
+  - 4.2-A/B/C、4.4-A/B/C/D 与 5.4 区分 ForgeMesh 自己的启动器与 Kubernetes 后端，后者的能力由后端承担；
+  - 4.3-C、4.3-D、4.3-E：配额与计量只在 ForgeMesh 网关执行；向后端传递已认证的主体；后端需要凭证时由网关注入；
+  - 新增 4.4-E「多集群与多后端的放置」：同一个模型由多个集群或后端提供时，决策 Provider 提出放置，Policy 与 Scheduler 做最终授权，网关在后端之间路由与故障转移；
+  - 第 6 节新增三项待定事项：先接哪个后端、是否做纯 Pod 启动器、裸机路径上是否自己实现 prefill / decode 分离；第 8 节新增后端 API 演进的风险。
+- **遗留问题**：
+  - 第 3、4 节的每个主题注明承接了哪些 PR 的遗留问题，与第 7 节的归属表逐条对应；
+  - 第 7 节补上不在 PR 描述中、但记录在文档与验证中的遗留问题：实例丢失后重新部署的退避只记在内存中（#18 的实现）、TGI 实例的私有目录可能残留在 emptyDir 中（#22 的 kind 验证）、ADR-014「代价与约束」中的实例凭证注入与认证之前的洪泛防护；5.1、5.2 补上 #10、#16 中还没有写进主题的部分。
+- 文档头部的版本改为第 2 版，状态改为「已采纳」（第 1 版经 #24 合入）；CHANGELOG 中路线图的条目同步。
+
+## 兼容性
+
+只改文档。
+
+## 测试
+
+- CI 的 architecture-docs job 中的各项检查与 4 个校验脚本在本地通过；文档中的相对链接都指向存在的文件，表格的列数一致。
+- 逐条核对：第 7 节的每一行都有主题承接，每个主题注明的来源都在第 7 节中。
+- KServe 与 Kthena 的能力依据它们的公开文档（截至 2026-10）：KServe v0.17 发布说明与 `LLMInferenceService` 文档，Kthena 的架构、router 与扩缩文档。
+
+## 检查项
+
+- [x] 分支基于最新 `main`（`cd5226f`）。
+- [x] 提交信息符合 Conventional Commits，并已 `Signed-off-by`（DCO）。
+- [x] 只改文档；CI 的文档检查在本地通过。
+- [x] 关于 KServe 与 Kthena 的描述都依据它们的公开文档，并注明了版本。
+- [ ] ADR：路线图本身不是 ADR；Kubernetes 后端的接入方式与模型的抽象在实施时另写 ADR。
+- [x] CHANGELOG 已同步。
+- [ ] 关联 Issue：上游目前没有对应的 Issue。
+```
+
+---
+
+## 第 1 版：`cursor/docs-roadmap-b108`（已作为 #24 合入）
+
+分支基于上游 `main`（`871cf9b`，#17–#23 合入之后）。
 
 ### 标题
 

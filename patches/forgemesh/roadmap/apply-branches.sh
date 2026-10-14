@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Recreate the ForgeMesh roadmap documentation branch from the patch folder next to this script.
+# Recreate the pending ForgeMesh roadmap documentation branch from the patch folders next to this script.
 #
-# The folder is one branch (and one pull request) on upstream main 871cf9b
-# (the merge of the round 3 pull requests #17-#23).
+# 01-docs-roadmap is the first version of docs/architecture/roadmap.md; it was merged upstream
+# as #24 (main cd5226f) and is kept for reference only. This script recreates the pending
+# branch 02-docs-roadmap-backends on that main.
 #
 # Usage:
 #   apply-branches.sh <ForgeMesh clone> [--signoff] [--reset-author] [--push <remote>]
@@ -38,11 +39,11 @@ while [ $# -gt 0 ]; do
 done
 
 here=$(cd "$(dirname "$0")" && pwd)
-base=871cf9b0c6ce959907df72886f0b6f8cae04ec15
+base=cd5226f9c5a4c8a11ac336b223de6b8ea4f9fb06
 
 # folder:branch, in stacking order
 topics="
-01-docs-roadmap:cursor/docs-roadmap-b108
+02-docs-roadmap-backends:cursor/docs-roadmap-backends-b108
 "
 
 cd "$repo"
