@@ -8,7 +8,7 @@
 | [`patches/forgemesh/`](patches/forgemesh/) | 第一轮：7 个分支，基于 `5a0be13`，已作为 [#5](https://github.com/Mekoforge/ForgeMesh/pull/5) 至 [#11](https://github.com/Mekoforge/ForgeMesh/pull/11) 合入上游 |
 | [`patches/forgemesh/round-2/`](patches/forgemesh/round-2/) | 第二轮：5 个分支，基于 `3dc1342`，已作为 [#12](https://github.com/Mekoforge/ForgeMesh/pull/12) 至 [#16](https://github.com/Mekoforge/ForgeMesh/pull/16) 合入上游 |
 | [`patches/forgemesh/round-3/`](patches/forgemesh/round-3/) | 第三轮：7 个分支，基于 `c5b7f76`，已作为 [#17](https://github.com/Mekoforge/ForgeMesh/pull/17) 至 [#23](https://github.com/Mekoforge/ForgeMesh/pull/23) 合入上游；[`pr-texts.md`](patches/forgemesh/round-3/pr-texts.md) 是 7 个 PR 的标题与描述 |
-| [`patches/forgemesh/roadmap/`](patches/forgemesh/roadmap/) | 上游路线图文档 `docs/architecture/roadmap.md`：1 个分支，基于第三轮合入后的上游 `main`（`871cf9b`）；[`pr-texts.md`](patches/forgemesh/roadmap/pr-texts.md) 是 PR 的标题与描述 |
+| [`patches/forgemesh/roadmap/`](patches/forgemesh/roadmap/) | 上游路线图文档 `docs/architecture/roadmap.md`：第 1 版已作为 [#24](https://github.com/Mekoforge/ForgeMesh/pull/24) 合入；第 2 版（与 KServe、Kthena 的分工，各主题注明承接的遗留问题）1 个分支，基于 `cd5226f`，待提交；[`pr-texts.md`](patches/forgemesh/roadmap/pr-texts.md) 是两个 PR 的标题与描述 |
 
 每一轮（以及路线图文档）都有一个 `apply-branches.sh`，在 ForgeMesh 克隆里按顺序重建对应的分支，可选签署 DCO、改作者、推送到 fork。
 
