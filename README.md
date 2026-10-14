@@ -7,13 +7,14 @@
 | [`docs/forgemesh-improvement-plan.md`](docs/forgemesh-improvement-plan.md) | 改进优化文档：P0/P1/P2 问题清单（附基线代码位置）、修复与设计方案、验收标准、分阶段路线图、实施情况与后续开发计划 |
 | [`patches/forgemesh/`](patches/forgemesh/) | 第一轮：7 个分支，基于 `5a0be13`，已作为 [#5](https://github.com/Mekoforge/ForgeMesh/pull/5) 至 [#11](https://github.com/Mekoforge/ForgeMesh/pull/11) 合入上游 |
 | [`patches/forgemesh/round-2/`](patches/forgemesh/round-2/) | 第二轮：5 个分支，基于 `3dc1342`，已作为 [#12](https://github.com/Mekoforge/ForgeMesh/pull/12) 至 [#16](https://github.com/Mekoforge/ForgeMesh/pull/16) 合入上游 |
-| [`patches/forgemesh/round-3/`](patches/forgemesh/round-3/) | 第三轮：7 个分支，基于第二轮合入后的上游 `main`（`c5b7f76`）；[`pr-texts.md`](patches/forgemesh/round-3/pr-texts.md) 是 7 个 PR 的标题与描述 |
+| [`patches/forgemesh/round-3/`](patches/forgemesh/round-3/) | 第三轮：7 个分支，基于 `c5b7f76`，已作为 [#17](https://github.com/Mekoforge/ForgeMesh/pull/17) 至 [#23](https://github.com/Mekoforge/ForgeMesh/pull/23) 合入上游；[`pr-texts.md`](patches/forgemesh/round-3/pr-texts.md) 是 7 个 PR 的标题与描述 |
+| [`patches/forgemesh/roadmap/`](patches/forgemesh/roadmap/) | 上游路线图文档 `docs/architecture/roadmap.md`：1 个分支，基于第三轮合入后的上游 `main`（`871cf9b`）；[`pr-texts.md`](patches/forgemesh/roadmap/pr-texts.md) 是 PR 的标题与描述 |
 
-每一轮都有一个 `apply-branches.sh`，在 ForgeMesh 克隆里按顺序重建该轮的全部分支，可选签署 DCO、改作者、推送到 fork。
+每一轮（以及路线图文档）都有一个 `apply-branches.sh`，在 ForgeMesh 克隆里按顺序重建对应的分支，可选签署 DCO、改作者、推送到 fork。
 
 ## 第三轮主题分支
 
-第三轮实施改进文档 9.1 节的第三阶段。分支是叠放的：每个分支以前一个分支为基础，第一个基于 `c5b7f76`，共 87 个提交，按顺序合入。
+第三轮实施改进文档 9.1 节的第三阶段，已作为 #17 至 #23 合入上游（合入后 `main` 为 `871cf9b`）。分支是叠放的：每个分支以前一个分支为基础，第一个基于 `c5b7f76`，共 87 个提交。
 
 | 顺序 | 目录 / 分支 | 提交数 | 内容 |
 |---|---|---|---|
