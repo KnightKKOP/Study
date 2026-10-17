@@ -18,18 +18,19 @@ export function TimeView({ time, stages }: { time: TimeEstimate; stages: Stage[]
         <CardHeader>
           <CardTitle className="text-lg font-semibold">每周能投入多少小时？</CardTitle>
           <CardDescription className="leading-relaxed">
-            <RichText nodes={time.intro} /> <RichText nodes={time.weeklyHint} />
+            <RichText nodes={time.intro} />
+            <RichText nodes={time.weeklyHint} />
           </CardDescription>
         </CardHeader>
         <CardContent>
           <ToggleGroup
             type="single"
             variant="outline"
-            spacing={0}
+            spacing={2}
             value={String(weekly)}
             onValueChange={(value) => value && setWeekly(Number(value))}
             aria-label="每周投入"
-            className="max-w-full flex-wrap"
+            className="grid w-full grid-cols-3 sm:flex sm:w-fit"
           >
             {WEEKLY_OPTIONS.map((hours) => (
               <ToggleGroupItem
