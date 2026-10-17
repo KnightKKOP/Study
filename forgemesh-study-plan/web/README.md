@@ -58,6 +58,8 @@ npm run build      # 类型检查并输出到 dist/
 npm run deploy     # 测试、构建，然后把 dist/ 推到 gh-pages 分支
 ```
 
+`main` 分支上 `forgemesh-study-plan/` 有改动时，GitHub Actions 工作流 [`forgemesh-plan-site.yml`](../../.github/workflows/forgemesh-plan-site.yml) 会自动做同样的事，所以在 GitHub 网页上改完文档提交即可，一两分钟后网页更新。
+
 第一次发布后，如果网址打不开，到仓库的 Settings → Pages，把 Source 设为 “Deploy from a branch”，分支选 `gh-pages`、目录选 `/ (root)`。
 
 网页上“Markdown 原文”链接指向的仓库和分支在 `plan.config.ts` 里配置。

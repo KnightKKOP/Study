@@ -1,0 +1,39 @@
+name: Publish the learning plan site
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - forgemesh-study-plan/**
+      - .github/workflows/forgemesh-plan-site.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: forgemesh-plan-site
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: forgemesh-study-plan/web
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: forgemesh-study-plan/web/package-lock.json
+      - run: npm ci
+      - name: Test, build and push dist/ to gh-pages
+        # gh-pages takes the commit author from git config; its -u flag rejects the bot address.
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          npm run deploy -- -x -r "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
